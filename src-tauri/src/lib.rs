@@ -1,7 +1,297 @@
+// Vicuna backend: all Ollama inference traffic goes through here.
+// The frontend (JS) is display-only: it invokes these commands and renders
+// the streamed events. Direct `fetch("http://localhost:11434/...")` from JS
+// is only a web-dev fallback (see src/lib/ollama.ts).
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
+
+const OLLAMA_BASE: &str = "http://localhost:11434";
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ChatEvent {
+    Token { text: String },
+    Think { text: String },
+    Done { done_reason: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum GenerateEvent {
+    Token { text: String },
+    Done { done_reason: Option<String> },
+}
+
+fn ollama_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
+    format!("ollama {context} failed: {status} {body}")
+}
+
+#[tauri::command]
+async fn ollama_list_models() -> Result<serde_json::Value, String> {
+    let res = reqwest::get(format!("{OLLAMA_BASE}/api/tags"))
+        .await
+        .map_err(|e| format!("ollama tags failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("tags", status, &body));
+    }
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("ollama tags failed: {e}"))?;
+    Ok(data)
+}
+
+#[tauri::command]
+async fn ollama_list_running() -> Result<serde_json::Value, String> {
+    let res = reqwest::get(format!("{OLLAMA_BASE}/api/ps"))
+        .await
+        .map_err(|e| format!("ollama ps failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("ps", status, &body));
+    }
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("ollama ps failed: {e}"))?;
+    Ok(data)
+}
+
+/// Load/unload a model by generating one throwaway token with the given
+/// keep-alive. Same 32k ctx as chat so follow-ups don't trigger a reload.
+#[tauri::command]
+async fn ollama_warm_model(model: String, keep_alive: String) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OLLAMA_BASE}/api/generate"))
+        .json(&serde_json::json!({
+            "model": model,
+            "prompt": "hi",
+            "stream": false,
+            "think": false,
+            "keep_alive": keep_alive,
+            "options": { "num_predict": 1, "num_ctx": 32768 }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama warm failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        let action = if keep_alive == "0" { "unload" } else { "load" };
+        return Err(format!("model {action} failed: {status} {body}"));
+    }
+    Ok(())
+}
+
+/// Streaming chat completion. Emits Token/Think/Done events over the channel
+/// and returns the full concatenated content. `stop` words are forwarded as
+/// `options.stop` so the model ends the turn instead of roleplaying new ones.
+#[tauri::command]
+async fn ollama_chat_stream(
+    model: String,
+    messages: Vec<ChatMessage>,
+    think: Option<bool>,
+    temperature: Option<f64>,
+    stop: Option<Vec<String>>,
+    on_event: Channel<ChatEvent>,
+) -> Result<String, String> {
+    let mut options = serde_json::Map::new();
+    options.insert("num_ctx".to_string(), serde_json::json!(32768));
+    if let Some(t) = temperature {
+        options.insert("temperature".to_string(), serde_json::json!(t));
+    }
+    if let Some(s) = stop {
+        options.insert("stop".to_string(), serde_json::json!(s));
+    }
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OLLAMA_BASE}/api/chat"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "think": think.unwrap_or(true),
+            "options": options,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama chat failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("chat", status, &body));
+    }
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut full = String::new();
+    let mut done_reason: Option<String> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("ollama chat failed: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        // split off complete lines; keep the trailing partial line buffered
+        let mut start = 0;
+        for i in 0..buf.len() {
+            if buf[i] == b'\n' {
+                let line = String::from_utf8_lossy(&buf[start..i]).trim().to_string();
+                start = i + 1;
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
+                        done_reason = Some(r.to_string());
+                    }
+                    if let Some(t) = obj
+                        .get("message")
+                        .and_then(|m| m.get("thinking"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if !t.is_empty() {
+                            let _ = on_event.send(ChatEvent::Think { text: t.to_string() });
+                        }
+                    }
+                    if let Some(t) = obj
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if !t.is_empty() {
+                            full.push_str(t);
+                            let _ = on_event.send(ChatEvent::Token { text: t.to_string() });
+                        }
+                    }
+                }
+            }
+        }
+        buf.drain(..start);
+    }
+    // flush remainder
+    let rest = String::from_utf8_lossy(&buf).trim().to_string();
+    if !rest.is_empty() {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&rest) {
+            if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
+                done_reason = Some(r.to_string());
+            }
+            if let Some(t) = obj
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_str())
+            {
+                if !t.is_empty() {
+                    full.push_str(t);
+                    let _ = on_event.send(ChatEvent::Token { text: t.to_string() });
+                }
+            }
+        }
+    }
+    let _ = on_event.send(ChatEvent::Done { done_reason });
+    Ok(full)
+}
+
+/// Raw text completion (no chat template). Kept for parity with the old JS
+/// helper; Continue does NOT use this (see AGENTS.md).
+#[tauri::command]
+async fn ollama_generate_stream(
+    model: String,
+    prompt: String,
+    temperature: Option<f64>,
+    stop: Option<Vec<String>>,
+    on_event: Channel<GenerateEvent>,
+) -> Result<String, String> {
+    let mut options = serde_json::Map::new();
+    options.insert("num_ctx".to_string(), serde_json::json!(32768));
+    if let Some(t) = temperature {
+        options.insert("temperature".to_string(), serde_json::json!(t));
+    }
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OLLAMA_BASE}/api/generate"))
+        .json(&serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": true,
+            "raw": true,
+            "think": false,
+            "stop": stop.unwrap_or_else(|| vec![
+                "\nUser:".to_string(),
+                "\nAssistant:".to_string(),
+                "<end_of_turn>".to_string(),
+                "<|im_end|>".to_string(),
+            ]),
+            "options": options,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama generate failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("generate", status, &body));
+    }
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut full = String::new();
+    let mut done_reason: Option<String> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("ollama generate failed: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        let mut start = 0;
+        for i in 0..buf.len() {
+            if buf[i] == b'\n' {
+                let line = String::from_utf8_lossy(&buf[start..i]).trim().to_string();
+                start = i + 1;
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
+                        done_reason = Some(r.to_string());
+                    }
+                    if let Some(t) = obj.get("response").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            full.push_str(t);
+                            let _ = on_event.send(GenerateEvent::Token { text: t.to_string() });
+                        }
+                    }
+                }
+            }
+        }
+        buf.drain(..start);
+    }
+    let rest = String::from_utf8_lossy(&buf).trim().to_string();
+    if !rest.is_empty() {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&rest) {
+            if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
+                done_reason = Some(r.to_string());
+            }
+            if let Some(t) = obj.get("response").and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    full.push_str(t);
+                    let _ = on_event.send(GenerateEvent::Token { text: t.to_string() });
+                }
+            }
+        }
+    }
+    let _ = on_event.send(GenerateEvent::Done { done_reason });
+    Ok(full)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -9,7 +299,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            ollama_list_models,
+            ollama_list_running,
+            ollama_warm_model,
+            ollama_chat_stream,
+            ollama_generate_stream
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

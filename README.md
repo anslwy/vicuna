@@ -51,9 +51,22 @@ npm run build   # static build to ./build
 
 `cargo check` / `cargo build` also pass for the Tauri shell in `src-tauri/`.
 
+## Architecture
+
+- `src-tauri/src/lib.rs` owns all Ollama traffic: `ollama_list_models`,
+  `ollama_list_running`, `ollama_warm_model`, `ollama_chat_stream`,
+  `ollama_generate_stream` (reqwest → `http://localhost:11434`).
+- `src/lib/ollama.ts` is display-only: in the Tauri webview it invokes those
+  commands and renders streamed `Channel` events (`token` / `think` / `done`);
+  in a plain browser (`npm run dev`) it falls back to direct `fetch` so
+  web-only dev works without the shell.
+- Chat streaming returns the full text; `done_reason: "load"` retries up to
+  3x after a 2s wait (model was reloading). Stop-button abort raises
+  `AbortError` on the frontend; the backend request runs detached (no cancel
+  propagation yet).
+
 ## Notes
 
-- The app expects Ollama at `http://localhost:11434` (see `OLLAMA_BASE` in `src/lib/ollama.ts`).
-- Empty responses with `done_reason: "load"` happen when a model is (re)loading; `chatStream` retries up to 3x after a short wait.
+- The app expects Ollama at `http://localhost:11434` (`OLLAMA_BASE` in `src/lib/ollama.ts`, `src-tauri/src/lib.rs`).
 - Continue uses `/api/chat`, not `/api/generate`: the raw generate path was tested and emits harmony channel tokens, ignores stops, and roleplays new turns on gpt-oss-style models. Keep it that way.
 - Web dev server and the Tauri webview share the same frontend; storage backend is chosen at runtime (`__TAURI_INTERNALS__` / `__TAURI__` present = sqlite).
