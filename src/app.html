@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vicuna</title>
+    <style>
+      html { scrollbar-width: thin; scrollbar-color: rgba(130, 130, 130, 0.45) transparent; }
+      ::-webkit-scrollbar { width: 10px; height: 10px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(130, 130, 130, 0.45); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(130, 130, 130, 0.7); border: 3px solid transparent; background-clip: content-box; }
+    </style>
+    <script>
+      try {
+        var p = JSON.parse(localStorage.getItem("vicuna-prefs") || localStorage.getItem("ollama-min-prefs") || "{}");
+        if (p.theme === "dark") document.documentElement.dataset.theme = "dark";
+      } catch (e) {}
+    </script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

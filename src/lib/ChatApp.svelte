@@ -1,0 +1,1688 @@
+<script lang="ts">
+  import { onMount, onDestroy } from "svelte";
+  import { goto } from "$app/navigation";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, chatStream, generateStream, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { renderMarkdown } from "$lib/markdown";
+  import {
+    initStorage,
+    loadChats,
+    saveChats,
+    loadModel,
+    saveModel,
+    loadPrefs,
+    savePrefs,
+    readLocalPrefs,
+    DEFAULT_STOP_WORDS,
+    type Chat
+  } from "$lib/store";
+
+  let { sessionId = null }: { sessionId: string | null } = $props();
+
+  let chats = $state<Chat[]>([]);
+  let activeId = $state<string | null>(null);
+  let ready = $state(false);
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS] };
+  let sidebarOpen = $state(initialPrefs.sidebarOpen);
+  let input = $state("");
+  let models = $state<string[]>(["muse-glimmer:30b-mlx"]);
+  let selectedModel = $state("muse-glimmer:30b-mlx");
+  let modelOpen = $state(false);
+  let modelQuery = $state("");
+  let streaming = $state(false);
+  let continuing = $state(false);
+  let attachText = $state<string | null>(null);
+  let attachName = $state<string | null>(null);
+  let error = $state<string | null>(null);
+  let aborter = $state<AbortController | null>(null);
+  let messagesEl = $state<HTMLDivElement | null>(null);
+  let fileInput = $state<HTMLInputElement | null>(null);
+  let editingIndex = $state<number | null>(null);
+  let editDraft = $state("");
+  let copiedKey = $state<string | null>(null);
+  let isPinned = $state(true);
+  // scrollTop value of our last programmatic jump; a scroll event landing
+  // exactly here is our own doing and must not unpin
+  let lastJumpTop = Number.MIN_SAFE_INTEGER;
+  // set when swapping chats: content replacement clamps scrollTop and fires
+  // one reset event that belongs to us, not the user
+  let suppressReset = false;
+
+  let lastSeenTop = 0;
+  function onMessagesScroll() {
+    if (!messagesEl) return;
+    if (suppressReset) {
+      suppressReset = false;
+      lastSeenTop = messagesEl.scrollTop;
+      return;
+    }
+    const { scrollTop, scrollHeight, clientHeight } = messagesEl;
+    // our own jump lands exactly on lastJumpTop (1px tolerance for rounding)
+    if (Math.abs(scrollTop - lastJumpTop) < 2) {
+      lastSeenTop = scrollTop;
+      return;
+    }
+    const dist = scrollHeight - scrollTop - clientHeight;
+    if (scrollTop < lastSeenTop - 1 && dist >= 1) {
+      // user moved up, even by 1px: pause auto-follow immediately
+      isPinned = false;
+    } else {
+      // at the very bottom the arrow hides and follow resumes;
+      // anywhere else it stays paused
+      isPinned = dist < 80;
+    }
+    lastSeenTop = scrollTop;
+  }
+
+  function jumpToBottom() {
+    isPinned = true;
+    scrollBottom();
+  }
+
+  const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
+
+  function save() {
+    void saveChats(chats);
+    void saveModel(selectedModel);
+  }
+
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSaveAt = 0;
+  function saveSoon() {
+    // leading + trailing throttle: persist at most every 2s mid-stream,
+    // plus a trailing write after tokens stop, so a refresh never
+    // loses more than ~2s of streamed content
+    const now = Date.now();
+    if (now - lastSaveAt > 2000) {
+      lastSaveAt = now;
+      save();
+      return;
+    }
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      lastSaveAt = Date.now();
+      save();
+    }, 600);
+  }
+
+  function flushSave() {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    save();
+  }
+
+  function newChat() {
+    aborter?.abort();
+    aborter = null;
+    streaming = false;
+    // reuse the existing empty draft instead of stacking blank sessions
+    const draft = chats.find((c) => c.messages.length === 0);
+    if (draft) {
+      pruneEmptyDrafts(draft.id);
+      activeId = draft.id;
+      isPinned = true;
+      editingIndex = null;
+      editDraft = "";
+      input = "";
+      error = null;
+      void goto(`/s/${draft.id}`);
+      return;
+    }
+    const c: Chat = {
+      id: crypto.randomUUID(),
+      title: "New chat",
+      createdAt: Date.now(),
+      messages: []
+    };
+    chats = [c, ...chats];
+    activeId = c.id;
+    isPinned = true;
+    editingIndex = null;
+    editDraft = "";
+    input = "";
+    error = null;
+    save();
+    void goto(`/s/${c.id}`);
+  }
+
+  function selectChat(id: string) {
+    if (id === activeId) return;
+    aborter?.abort();
+    aborter = null;
+    streaming = false;
+    editingIndex = null;
+    editDraft = "";
+    copiedKey = null;
+    pendingMsgDelete = null;
+    dropActiveDraft(id);
+    activeId = id;
+    isPinned = true;
+    suppressReset = true;
+    void goto(`/s/${id}`);
+  }
+
+  // adopt URL changes that didn't come from a local action (back/forward).
+  // keyed on the URL itself, NOT on activeId: our own actions set activeId
+  // first and navigate after, which must never be mistaken for external nav
+  // (that misread aborted fresh streams and wiped the session).
+  let appliedSession: string | null | undefined = undefined;
+  $effect(() => {
+    if (!ready) return;
+    const sid = sessionId;
+    if (sid === appliedSession) return;
+    appliedSession = sid;
+    if (sid === activeId) return;
+    aborter?.abort();
+    aborter = null;
+    streaming = false;
+    editingIndex = null;
+    editDraft = "";
+    copiedKey = null;
+    pendingMsgDelete = null;
+    dropActiveDraft(sid);
+    if (sid && chats.some((c) => c.id === sid)) {
+      activeId = sid;
+      isPinned = true;
+      suppressReset = true;
+    } else if (!sid) {
+      activeId = null;
+    } else {
+      void goto("/");
+    }
+  });
+
+  function deleteChat(id: string) {
+    aborter?.abort();
+    aborter = null;
+    streaming = false;
+    ctxMenu = null;
+    pendingDeleteId = null;
+    const remaining = chats.filter((c) => c.id !== id);
+    chats = remaining;
+    if (id === activeId) {
+      activeId = null;
+      save();
+      void goto("/");
+    } else {
+      save();
+    }
+  }
+
+  let pendingDeleteId = $state<string | null>(null);
+  let pendingMsgDelete = $state<number | null>(null);
+  let gotoOpen = $state(false);
+  let gotoInput = $state("");
+  let gotoError = $state<string | null>(null);
+  let settingsOpen = $state(false);
+  let settingsTab = $state<"general" | "models">("general");
+  let runners = $state<RunningModel[]>([]);
+  let runnersError = $state<string | null>(null);
+  let modelOp = $state<string | null>(null);
+
+  async function openSettings() {
+    settingsTab = "general";
+    settingsOpen = true;
+  }
+
+  async function openModelsTab() {
+    settingsTab = "models";
+    await refreshRunners();
+  }
+
+  async function refreshRunners() {
+    runnersError = null;
+    try {
+      runners = await listRunning();
+    } catch (e: any) {
+      runnersError = e?.message ?? String(e);
+      runners = [];
+    }
+  }
+
+  async function toggleModelLoaded(name: string, loaded: boolean) {
+    if (modelOp) return;
+    modelOp = name;
+    runnersError = null;
+    try {
+      if (loaded) await unloadModelFromMemory(name);
+      else await loadModelIntoMemory(name);
+      await refreshRunners();
+    } catch (e: any) {
+      runnersError = e?.message ?? String(e);
+    } finally {
+      modelOp = null;
+    }
+  }
+
+  let theme = $state<"light" | "dark">(initialPrefs.theme);
+  let accent = $state(initialPrefs.accent);
+  let fontSize = $state(initialPrefs.fontSize);
+  let stopWords = $state<string[]>([...initialPrefs.stopWords]);
+  let stopWordsText = $state(stopWordsToText(initialPrefs.stopWords));
+
+  function stopWordsToText(list: string[]): string {
+    return list.map((s) => s.replace(/\n/g, "\\n")).join("\n");
+  }
+
+  function textToStopWords(text: string): string[] {
+    return text
+      .split("\n")
+      .map((line) => line.trim().replace(/\\n/g, "\n"))
+      .filter((s) => s.length > 0);
+  }
+
+  const ACCENTS: Record<string, { label: string; light: { bg: string; hover: string; fg: string }; dark: { bg: string; hover: string; fg: string } }> = {
+    orange: { label: "Orange", light: { bg: "#ef6c00", hover: "#d96000", fg: "#ffffff" }, dark: { bg: "#ef6c00", hover: "#d96000", fg: "#ffffff" } },
+    black: { label: "Black", light: { bg: "#111111", hover: "#000000", fg: "#ffffff" }, dark: { bg: "#e8e8e8", hover: "#ffffff", fg: "#111111" } },
+    blue: { label: "Blue", light: { bg: "#2563eb", hover: "#1d4ed8", fg: "#ffffff" }, dark: { bg: "#3b82f6", hover: "#2563eb", fg: "#ffffff" } },
+    green: { label: "Green", light: { bg: "#16a34a", hover: "#15803d", fg: "#ffffff" }, dark: { bg: "#22c55e", hover: "#16a34a", fg: "#111111" } }
+  };
+
+  function applyAppearance() {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    const a = ACCENTS[accent] ?? ACCENTS.orange;
+    const v = theme === "dark" ? a.dark : a.light;
+    root.style.setProperty("--accent", v.bg);
+    root.style.setProperty("--accent-hover", v.hover);
+    root.style.setProperty("--accent-fg", v.fg);
+    root.style.setProperty("--msg-font-size", `${fontSize}px`);
+  }
+
+  $effect(() => {
+    theme;
+    accent;
+    fontSize;
+    applyAppearance();
+  });
+
+  function setTheme(t: "light" | "dark") {
+    theme = t;
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+  }
+
+  function setAccent(a: string) {
+    if (!ACCENTS[a]) return;
+    accent = a;
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+  }
+
+  function setFontSize(n: number) {
+    fontSize = Math.min(24, Math.max(12, Math.round(n)));
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+  }
+
+  function setStopWords(text: string) {
+    stopWordsText = text;
+    stopWords = textToStopWords(text);
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+  }
+
+  function openGoto() {
+    gotoInput = "";
+    gotoError = null;
+    gotoOpen = true;
+  }
+
+  function closeGoto() {
+    gotoOpen = false;
+    gotoInput = "";
+    gotoError = null;
+  }
+
+  function submitGoto() {
+    const m = gotoInput.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (!m) {
+      gotoError = "Couldn't find a session id in that link.";
+      return;
+    }
+    const id = m[0].toLowerCase();
+    if (!chats.some((c) => c.id.toLowerCase() === id)) {
+      gotoError = "No chat found for that session.";
+      return;
+    }
+    const target = chats.find((c) => c.id.toLowerCase() === id)!;
+    closeGoto();
+    selectChat(target.id);
+  }
+
+  function requestDelete(id: string) {
+    ctxMenu = null;
+    pendingDeleteId = id;
+  }
+
+  function confirmDelete() {
+    const id = pendingDeleteId;
+    pendingDeleteId = null;
+    if (id) deleteChat(id);
+  }
+
+  let ctxMenu = $state<{ chatId: string; x: number; y: number } | null>(null);
+  let renamingId = $state<string | null>(null);
+  let renameDraft = $state("");
+
+  function openMenu(e: MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    renamingId = null;
+    ctxMenu = {
+      chatId: id,
+      x: Math.min(e.clientX, window.innerWidth - 170),
+      y: Math.min(e.clientY, window.innerHeight - 120)
+    };
+  }
+
+  function copySessionLink(id: string) {
+    ctxMenu = null;
+    void copyText(`${window.location.origin}/s/${id}`);
+  }
+
+  function startRename(id: string) {
+    const c = chats.find((x) => x.id === id);
+    if (!c) return;
+    ctxMenu = null;
+    renamingId = id;
+    renameDraft = c.title;
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLInputElement>("[data-testid=rename-input]");
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    });
+  }
+
+  function commitRename() {
+    if (renamingId == null) return;
+    const text = renameDraft.trim();
+    if (text) {
+      const c = chats.find((x) => x.id === renamingId);
+      if (c) {
+        c.title = text;
+        chats = [...chats];
+        save();
+      }
+    }
+    renamingId = null;
+  }
+
+  function cancelRename() {
+    renamingId = null;
+  }
+
+  // an empty draft you navigate away from without sending anything is
+  // discarded instead of lingering in the list doing nothing
+  function dropActiveDraft(exceptId: string | null) {
+    if (!activeId || activeId === exceptId) return;
+    const c = chats.find((x) => x.id === activeId);
+    if (c && c.messages.length === 0) {
+      chats = chats.filter((x) => x.id !== activeId);
+      save();
+    }
+  }
+
+  // keep at most one empty draft: pressing New Chat repeatedly must not
+  // pile up blank sessions (also cleans up previously accumulated ones)
+  function pruneEmptyDrafts(keepId: string | null) {
+    let kept = false;
+    const remaining = chats.filter((c) => {
+      if (c.messages.length > 0) return true;
+      if (keepId !== null) return c.id === keepId;
+      if (!kept) {
+        kept = true;
+        return true;
+      }
+      return false;
+    });
+    if (remaining.length !== chats.length) {
+      chats = remaining;
+      save();
+    }
+  }
+
+  function requestMsgDelete(i: number) {
+    if (streaming) return;
+    ctxMenu = null;
+    pendingMsgDelete = i;
+  }
+
+  function confirmMsgDelete() {
+    const chat = chats.find((c) => c.id === activeId);
+    const i = pendingMsgDelete;
+    pendingMsgDelete = null;
+    if (!chat || i == null || streaming) return;
+    const target = chat.messages[i];
+    if (!target) return;
+    // deleting a user message also removes the reply that follows it;
+    // deleting a bot message also removes the user message above it
+    let from = i;
+    let count = 1;
+    if (target.role === "user" && chat.messages[i + 1]?.role === "assistant") {
+      count = 2;
+    } else if (target.role === "assistant" && i > 0 && chat.messages[i - 1]?.role === "user") {
+      from = i - 1;
+      count = 2;
+    }
+    if (editingIndex != null && editingIndex >= from) cancelEdit();
+    copiedKey = null;
+    chat.messages = [...chat.messages.slice(0, from), ...chat.messages.slice(from + count)];
+    chats = [...chats];
+    save();
+  }
+
+  function toggleModel() {
+    modelOpen = !modelOpen;
+    if (modelOpen) modelQuery = "";
+  }
+
+  const filteredModels = $derived(
+    models.filter((m) => m.toLowerCase().includes(modelQuery.trim().toLowerCase()))
+  );
+
+  // manage tab: current chat's model first, then loaded models, then the rest
+  const sortedManageModels = $derived.by(() => {
+    const running = new Set(runners.map((r) => r.name));
+    const rank = (m: string) => (m === selectedModel ? 0 : running.has(m) ? 1 : 2);
+    return models.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m) || a.i - b.i).map((x) => x.m);
+  });
+
+  // generic starter prompts (no tools required on the model's side)
+  const SUGGESTIONS = [
+    { title: "Explain a concept", prompt: "Explain black holes in simple terms", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
+    { title: "Write code", prompt: "Write a Python function to sort a list", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' },
+    { title: "Draft a message", prompt: "Write a friendly follow-up email", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>' },
+    { title: "Brainstorm ideas", prompt: "Give me ideas for a weekend project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>' },
+    { title: "Summarize text", prompt: "Summarize this paragraph in two sentences:", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
+    { title: "What can you do?", prompt: "What can you do?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
+  ];
+
+  function useSuggestion(prompt: string) {
+    input = prompt;
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLTextAreaElement>("[data-testid=message-input]")?.focus();
+    });
+  }
+
+  const forkInfo = $derived(activeChat?.forkedFrom ?? null);
+  const forkNoteIndex = $derived(activeChat?.forkFromIndex ?? null);
+
+  const grouped = $derived.by(() => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfYesterday = startOfToday - 24 * 3600 * 1000;
+    const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+    const today: Chat[] = [];
+    const yesterday: Chat[] = [];
+    const week: Chat[] = [];
+    const older: Chat[] = [];
+    for (const c of chats) {
+      if (c.createdAt >= startOfToday) today.push(c);
+      else if (c.createdAt >= startOfYesterday) yesterday.push(c);
+      else if (c.createdAt >= weekAgo) week.push(c);
+      else older.push(c);
+    }
+    return { today, yesterday, week, older };
+  });
+
+  async function refreshModels() {
+    try {
+      const tags = await listModels();
+      if (tags.length > 0) {
+        models = tags.map((t) => t.name);
+        if (!models.includes(selectedModel)) selectedModel = models[0];
+        error = null;
+      }
+    } catch (err: any) {
+      error = "Cannot reach Ollama at localhost:11434. Is `ollama serve` running?";
+    }
+  }
+
+  function scrollBottom() {
+    requestAnimationFrame(() => {
+      if (!messagesEl || !isPinned) return;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      // record the clamped value actually applied: a scroll event reporting
+      // exactly this position is our own doing and must not unpin
+      lastJumpTop = messagesEl.scrollTop;
+    });
+  }
+
+  $effect(() => {
+    activeChat?.messages.length;
+    scrollBottom();
+  });
+
+  $effect(() => {
+    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen) return;
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        pendingDeleteId = null;
+        pendingMsgDelete = null;
+        closeGoto();
+        settingsOpen = false;
+      }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
+  // delegated handler for code-block copy buttons rendered via {@html}
+  const CODE_CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  $effect(() => {
+    const el = messagesEl;
+    if (!el) return;
+    const onClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      const btn = t?.closest?.("[data-copy-code]") as HTMLElement | null;
+      if (!btn) return;
+      const code = btn.closest(".codeblock")?.querySelector("code");
+      const txt = code?.textContent ?? "";
+      if (!txt) return;
+      void copyText(txt).then((ok) => {
+        if (!ok) return;
+        const orig = btn.innerHTML;
+        btn.innerHTML = CODE_CHECK_SVG;
+        btn.classList.add("ok");
+        setTimeout(() => {
+          btn.innerHTML = orig;
+          btn.classList.remove("ok");
+        }, 1200);
+      });
+    };
+    el.addEventListener("click", onClick);
+    return () => el.removeEventListener("click", onClick);
+  });
+
+  async function copyText(t: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(t);
+      return true;
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = t;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  function copyMessage(i: number) {
+    const m = activeChat?.messages[i];
+    if (!m) return;
+    const key = `${activeId}:${i}`;
+    void copyText(m.content).then((ok) => {
+      if (ok) {
+        copiedKey = key;
+        setTimeout(() => {
+          if (copiedKey === key) copiedKey = null;
+        }, 1200);
+      } else {
+        error = "Copy failed (clipboard unavailable)";
+      }
+    });
+  }
+
+  function startEdit(i: number) {
+    const m = activeChat?.messages[i];
+    if (!m || streaming) return;
+    editingIndex = i;
+    editDraft = m.content;
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLTextAreaElement>("[data-testid=edit-input]");
+      if (el) {
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    });
+  }
+
+  function cancelEdit() {
+    editingIndex = null;
+    editDraft = "";
+  }
+
+  async function saveEdit() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat || editingIndex == null || streaming) return;
+    const text = editDraft.trim();
+    if (!text) return;
+    const target = chat.messages[editingIndex];
+    if (!target) {
+      cancelEdit();
+      return;
+    }
+    if (target.role === "assistant") {
+      // editing a reply: replace it in place and drop everything after,
+      // no regeneration (use Continue to extend it)
+      chat.messages = [
+        ...chat.messages.slice(0, editingIndex),
+        { ...target, content: text }
+      ];
+      chats = [...chats];
+      cancelEdit();
+      isPinned = true;
+      save();
+      scrollBottom();
+      return;
+    }
+    // editing own message: replace it, drop everything after, regenerate
+    chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text }];
+    if (chat.title === "New chat" || chat.title === "New Chat") {
+      chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
+    }
+    cancelEdit();
+    const history: ChatMsg[] = [
+      ...chat.messages.map((m) => ({ role: m.role, content: m.content }))
+    ];
+    chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+    await streamInto(chat, chat.messages.length - 1, history, true);
+  }
+
+  function onEditKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit();
+    } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void saveEdit();
+    }
+  }
+
+  function forkAt(i: number) {
+    const c = chats.find((x) => x.id === activeId);
+    if (!c || streaming) return;
+    aborter?.abort();
+    aborter = null;
+    const fork: Chat = {
+      id: crypto.randomUUID(),
+      title: `${c.title} (fork)`,
+      createdAt: Date.now(),
+      messages: JSON.parse(JSON.stringify(c.messages.slice(0, i + 1))),
+      forkedFrom: { id: c.id, title: c.title },
+      forkFromIndex: i
+    };
+    chats = [fork, ...chats];
+    activeId = fork.id;
+    isPinned = true;
+    editingIndex = null;
+    editDraft = "";
+    save();
+    void goto(`/s/${fork.id}`);
+  }
+
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[] } = {}) {
+    streaming = true;
+    const ctrl = new AbortController();
+    aborter = ctrl;
+    let produced = false;
+    isPinned = true;
+    save();
+    scrollBottom();
+    try {
+      const onTok = (tok: string) => {
+        produced = true;
+        const c = chats.find((x) => x.id === chat.id);
+        if (c && c.messages[index]) {
+          const m = c.messages[index];
+          c.messages[index] = { role: "assistant", content: m.content + tok, thinking: m.thinking, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel };
+          chats = [...chats];
+        }
+        scrollBottom();
+        saveSoon();
+      };
+      const onTh = (tok: string) => {
+        produced = true;
+        const c = chats.find((x) => x.id === chat.id);
+        if (c && c.messages[index]) {
+          const m = c.messages[index];
+          c.messages[index] = { role: "assistant", content: m.content, thinking: (m.thinking ?? "") + tok, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel };
+          chats = [...chats];
+        }
+        scrollBottom();
+        saveSoon();
+      };
+      if (opts.generatePrompt !== undefined) {
+        await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
+      } else {
+        await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop });
+      }
+    } catch (err: any) {
+      if (err?.name === "AbortError") {
+        // keep partial
+      } else {
+        error = err?.message ?? String(err);
+        const c = chats.find((x) => x.id === chat.id);
+        if (c && removeIfEmpty && !produced) {
+          c.messages = c.messages.filter((_, j) => j !== index);
+          chats = [...chats];
+        }
+      }
+    } finally {
+      streaming = false;
+      aborter = null;
+      save();
+      scrollBottom();
+    }
+  }
+
+  async function continueFrom(i: number) {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat || streaming) return;
+    if (i !== chat.messages.length - 1) return;
+    const target = chat.messages[i];
+    if (!target || target.role !== "assistant") return;
+    error = null;
+    // Continue via /api/chat: resend the history ending with the partial
+    // reply as-is so the model carries on exactly where it stopped instead
+    // of starting a fresh turn. No re-thinking and low temperature: no
+    // fresh plans, no wandering. Custom stop words end the generation if
+    // it tries to start a new turn ("User:" etc.).
+    const history: ChatMsg[] = chat.messages.slice(0, i + 1).map((mm) => ({ role: mm.role, content: mm.content }));
+    continuing = true;
+    try {
+      await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords });
+    } finally {
+      continuing = false;
+    }
+  }
+
+  async function regenerate(i: number) {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat || streaming) return;
+    if (i !== chat.messages.length - 1) return;
+    const target = chat.messages[i];
+    if (!target || target.role !== "assistant") return;
+    error = null;
+    cancelEdit();
+    // drop the old reply and generate fresh with the currently selected model
+    chat.messages = [...chat.messages.slice(0, i)];
+    const freshHistory: ChatMsg[] = chat.messages.map((m) => ({ role: m.role, content: m.content }));
+    chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+    chats = [...chats];
+    await streamInto(chat, chat.messages.length - 1, freshHistory, true);
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || streaming) return;
+    let chat = chats.find((c) => c.id === activeId);
+    let freshChat = false;
+    if (!chat) {
+      // sending from home (or any stateless view): create the session inline.
+      // navigation is deferred until the stream finishes, otherwise the
+      // page unmount would abort the just-started request.
+      chat = {
+        id: crypto.randomUUID(),
+        title: "New chat",
+        createdAt: Date.now(),
+        messages: []
+      };
+      chats = [chat, ...chats];
+      activeId = chat.id;
+      isPinned = true;
+      freshChat = true;
+      save();
+    }
+
+    let fullInput = text;
+    if (attachText) {
+      fullInput = `[attached file ${attachName}]\n${attachText}\n\n${text}`;
+    }
+    chat.messages = [...chat.messages, { role: "user", content: fullInput }];
+    if (chat.title === "New chat" || chat.title === "New Chat") {
+      chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
+    }
+    input = "";
+    attachText = null;
+    attachName = null;
+    error = null;
+
+    const history: ChatMsg[] = [
+      ...chat.messages.map((m) => ({ role: m.role, content: m.content }))
+    ];
+    chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+    await streamInto(chat, chat.messages.length - 1, history, true);
+    if (freshChat && activeId === chat.id) {
+      // user stayed put: now reflect the session in the URL
+      void goto(`/s/${chat.id}`);
+    }
+  }
+
+  function stop() {
+    aborter?.abort();
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  }
+
+  function pickFile() {
+    fileInput?.click();
+  }
+
+  async function onFile(e: Event) {
+    const el = e.target as HTMLInputElement;
+    const f = el.files?.[0];
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      attachName = f.name;
+      attachText = txt.slice(0, 8000);
+    } catch {
+      attachName = f.name;
+      attachText = "(binary file, content not readable in minimal build)";
+    }
+    el.value = "";
+  }
+
+  function setSidebar(open: boolean) {
+    sidebarOpen = open;
+    savePrefs({ theme, accent, fontSize, sidebarOpen: open, stopWords });
+  }
+
+  onMount(() => {
+    window.addEventListener("beforeunload", flushSave);
+    void initApp();
+    return () => window.removeEventListener("beforeunload", flushSave);
+  });
+
+  onDestroy(() => {
+    aborter?.abort();
+  });
+
+  async function initApp() {
+    try {
+      await initStorage();
+      const prefs = await loadPrefs();
+      theme = prefs.theme;
+      accent = ACCENTS[prefs.accent] ? prefs.accent : "orange";
+      fontSize = prefs.fontSize;
+      stopWords = [...prefs.stopWords];
+      stopWordsText = stopWordsToText(stopWords);
+      // narrow screens start collapsed regardless of the saved preference
+      sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
+      chats = await loadChats();
+      // collapse previously accumulated empty drafts into one (prefer the
+      // session in the URL so a deep-linked blank draft isn't yanked away)
+      const empties = chats.filter((c) => c.messages.length === 0);
+      if (empties.length > 1) {
+        const keepId = empties.some((c) => c.id === sessionId) ? sessionId : empties[0].id;
+        chats = chats.filter((c) => c.messages.length > 0 || c.id === keepId);
+        save();
+      }
+      if (sessionId) {
+        // deep link: only open the chat named in the URL
+        if (chats.some((c) => c.id === sessionId)) {
+          activeId = sessionId;
+        } else {
+          void goto("/");
+        }
+      } else {
+        // home: no active session
+        activeId = null;
+      }
+      const m = await loadModel();
+      if (m) selectedModel = m;
+    } catch (e) {
+      console.error("storage load failed:", e);
+    } finally {
+      ready = true;
+    }
+    refreshModels();
+  }
+</script>
+
+{#if ready}
+<div class="app">
+  {#if sidebarOpen}
+    <aside
+      class="sidebar"
+      data-testid="sidebar"
+      oncontextmenu={(e) => {
+        // right-click on empty sidebar space just closes the menu
+        if (e.defaultPrevented) return;
+        e.preventDefault();
+        ctxMenu = null;
+      }}
+    >
+      <div class="topbar">
+        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Toggle sidebar" onclick={() => setSidebar(false)}>
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
+        </button>
+      </div>
+
+      <div class="side-actions">
+        <button class="newchat" data-testid="new-chat-btn" onclick={newChat}>
+          <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/><path d="M14 3l3 3L8 15l-4 1 1-4L14 3z"/></svg>
+          <span>New Chat</span>
+        </button>
+        <button class="goto" data-testid="goto-btn" onclick={openGoto}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          <span>Go to</span>
+        </button>
+      </div>
+
+      <div class="history">
+        {#snippet chatList(items: Chat[])}
+          {#each items as c (c.id)}
+            <button
+              class="chat-item {c.id === activeId ? 'active' : ''}"
+              data-testid="chat-item"
+              onclick={() => selectChat(c.id)}
+              oncontextmenu={(e) => openMenu(e, c.id)}
+            >
+              {#if renamingId === c.id}
+                <input
+                  class="rename-input"
+                  data-testid="rename-input"
+                  bind:value={renameDraft}
+                  onclick={(e) => e.stopPropagation()}
+                  onkeydown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") commitRename();
+                    else if (e.key === "Escape") cancelRename();
+                  }}
+                  onblur={commitRename}
+                />
+              {:else}
+                <span class="title">{c.title}</span>
+              {/if}
+            </button>
+          {/each}
+        {/snippet}
+        {#if grouped.today.length > 0}
+          <div class="group-label">Today</div>
+          {@render chatList(grouped.today)}
+        {/if}
+        {#if grouped.yesterday.length > 0}
+          <div class="group-label">Yesterday</div>
+          {@render chatList(grouped.yesterday)}
+        {/if}
+        {#if grouped.week.length > 0}
+          <div class="group-label">This week</div>
+          {@render chatList(grouped.week)}
+        {/if}
+        {#if grouped.older.length > 0}
+          <div class="group-label">Older</div>
+          {@render chatList(grouped.older)}
+        {/if}
+        {#if chats.length === 0}
+          <div class="group-label">Today</div>
+          <div class="empty-hint">No chats yet</div>
+        {/if}
+      </div>
+      <div class="side-footer">
+        <button class="goto" data-testid="settings-btn" aria-label="Settings" title="Settings" onclick={openSettings}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
+          <span>Settings</span>
+        </button>
+      </div>
+      {#if ctxMenu}
+        <button
+          class="ctx-backdrop"
+          data-testid="session-menu-backdrop"
+          aria-label="Close menu"
+          onclick={() => (ctxMenu = null)}
+          oncontextmenu={(e) => {
+            e.preventDefault();
+            ctxMenu = null;
+          }}
+          tabindex="-1"
+        ></button>
+        <div
+          class="ctx-menu"
+          data-testid="session-menu"
+          style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;"
+        >
+          <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
+          <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
+          <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
+        </div>
+      {/if}
+    </aside>
+  {/if}
+
+  <main class="main">
+    {#snippet forkNote(title: string, sourceId: string)}
+      {@const source = chats.find((c) => c.id === sourceId)}
+      <div class="fork-note" data-testid="fork-note">
+        <span>Forked from </span>
+        {#if source}
+          <button class="fork-link" data-testid="fork-source-link" onclick={() => selectChat(source.id)}>{title}</button>
+        {:else}
+          <span>{title}</span>
+        {/if}
+      </div>
+    {/snippet}
+    {#if !sidebarOpen}
+      <div class="collapsed-rail">
+        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Open sidebar" onclick={() => setSidebar(true)}>
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
+        </button>
+        <button class="icon-btn" data-testid="settings-btn-collapsed" aria-label="Open settings" title="Settings" onclick={openSettings}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
+        </button>
+      </div>
+    {/if}
+
+    {#if !activeChat || activeChat.messages.length === 0}
+      <div class="empty">
+        <h1 class="empty-title">How can I help you today?</h1>
+        <div class="suggest-grid" data-testid="empty-suggestions">
+          {#each SUGGESTIONS as s, idx}
+            <button class="suggest-card" data-testid="suggest-card" onclick={() => useSuggestion(s.prompt)}>
+              <span class="suggest-text">
+                <span class="suggest-title">{s.title}</span>
+                <span class="suggest-sub">{s.prompt}</span>
+              </span>
+              <span class="suggest-icon">{@html s.icon}</span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {:else}
+      <div
+        class="messages"
+        bind:this={messagesEl}
+        data-testid="messages"
+        role="log"
+        aria-label="Chat messages"
+        onscroll={onMessagesScroll}
+      >
+        {#if forkInfo && forkNoteIndex == null}
+          {@render forkNote(forkInfo.title, forkInfo.id)}
+        {/if}
+        {#each activeChat.messages as m, i}
+          {@const copyKey = `${activeId}:${i}`}
+          {#if m.role === "user"}
+            <div class="row user-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
+              {#if editingIndex === i}
+                <div class="editbox" data-testid="edit-box">
+                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey}></textarea>
+                  <div class="edit-actions">
+                    <span class="edit-hint">Esc to cancel · ⌘↵ to save</span>
+                    <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === ""} onclick={() => void saveEdit()}>Save</button>
+                  </div>
+                </div>
+              {:else}
+              <div class="bubble user">{m.content}</div>
+              <div class="actions">
+                <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
+                  {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
+                </button>
+                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={streaming} onclick={() => startEdit(i)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                </button>
+                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={streaming} onclick={() => requestMsgDelete(i)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+              </div>
+              {/if}
+            </div></div>
+          {:else}
+            {@const isLast = i === activeChat.messages.length - 1}
+            {@const thinkingActive = streaming && isLast && !m.content && !continuing}
+            <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
+              {#if editingIndex === i}
+                <div class="editbox" data-testid="edit-box">
+                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey}></textarea>
+                  <div class="edit-actions">
+                    <span class="edit-hint">Esc to cancel · ⌘↵ to save</span>
+                    <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === ""} onclick={() => void saveEdit()}>Save</button>
+                  </div>
+                </div>
+              {:else}
+              <div class="bubble asst">
+              {#if m.thinking}
+                {@const expanded = thinkingActive || (m.thinkingOpen ?? false)}
+                <div class="thinking" data-testid="thinking-block">
+                  <button
+                    class="thinking-head"
+                    data-testid="thinking-toggle"
+                    aria-expanded={expanded}
+                    onclick={() => { m.thinkingOpen = !expanded; chats = [...chats]; }}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.7 1 1.5 1 2.5h6c0-1 .2-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>
+                    <span>{thinkingActive ? "Thinking..." : "Thinking"}</span>
+                    <span class="chev">{expanded ? "▾" : "▸"}</span>
+                  </button>
+                  {#if expanded}
+                    <div class="thinking-body">{m.thinking}</div>
+                  {/if}
+                </div>
+              {/if}
+              <div class="answer">{@html m.content ? renderMarkdown(m.content) : (streaming && isLast ? "…" : "")}</div>
+              <div class="actions">
+                <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
+                  {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
+                </button>
+                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={streaming} onclick={() => startEdit(i)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                </button>
+                {#if isLast}
+                  <button class="act" data-testid="continue-btn" aria-label="Continue generating" title="Continue" disabled={streaming} onclick={() => continueFrom(i)}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                  </button>
+                  <button class="act" data-testid="regen-btn" aria-label="Regenerate response" title="Regenerate" disabled={streaming} onclick={() => void regenerate(i)}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                  </button>
+                {/if}
+                <button class="act" data-testid="fork-btn" aria-label="Fork chat from here" title="Fork" disabled={streaming} onclick={() => forkAt(i)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="8" r="2.2"/><path d="M6 8.2v7.6"/><path d="M18 10.2c0 3.5-5 2.8-8.5 5.3"/></svg>
+                </button>
+                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={streaming} onclick={() => requestMsgDelete(i)}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+                {#if m.model}
+                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{m.model}</span>
+                {/if}
+              </div>
+            </div>
+            {/if}
+          </div></div>
+          {/if}
+          {#if forkInfo && forkNoteIndex === i}
+            {@render forkNote(forkInfo.title, forkInfo.id)}
+          {/if}
+        {/each}
+      </div>
+    {/if}
+
+    {#if error}
+      <div class="err" data-testid="error-box">{error}</div>
+    {/if}
+
+    <div class="composer-wrap">
+      {#if !isPinned}
+        <button
+          class="scroll-jump"
+          data-testid="jump-bottom"
+          aria-label="Scroll to bottom and resume auto-scroll"
+          onclick={jumpToBottom}
+        >↓</button>
+      {/if}
+      {#if attachName}
+        <div class="attach-chip" data-testid="attach-chip">
+          <span>{attachName}</span>
+          <button aria-label="remove attachment" onclick={() => { attachName = null; attachText = null; }}>×</button>
+        </div>
+      {/if}
+      <div class="composer">
+        <textarea
+          data-testid="message-input"
+          placeholder="Send a message"
+          bind:value={input}
+          onkeydown={onKey}
+          rows={1}
+        ></textarea>
+        <div class="composer-bar">
+          <div class="spacer"></div>
+          <button class="pill-btn" data-testid="attach-btn" aria-label="Attach file" onclick={pickFile}>+</button>
+          <div class="model-pill-wrap">
+            <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
+              <span class="model-name">{selectedModel}</span>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
+            </button>
+            {#if modelOpen}
+              <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
+              <div class="model-drop" data-testid="model-dropdown">
+                <input
+                  class="model-search"
+                  data-testid="model-search"
+                  placeholder="Find model..."
+                  bind:value={modelQuery}
+                  autofocus
+                />
+                <div class="model-list-drop">
+                  {#each filteredModels as m}
+                    <button
+                      class="model-opt {m === selectedModel ? 'sel' : ''}"
+                      onclick={() => { selectedModel = m; modelOpen = false; save(); }}
+                    >{m}</button>
+                  {:else}
+                    <div class="no-match">No matches</div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          </div>
+          {#if streaming}
+            <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
+          {:else}
+            <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === ""} onclick={send}>↑</button>
+          {/if}
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+{#if pendingDeleteId}
+  <button
+    class="confirm-backdrop"
+    data-testid="delete-confirm-backdrop"
+    aria-label="Cancel"
+    onclick={() => (pendingDeleteId = null)}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card"
+    data-testid="delete-confirm"
+    role="alertdialog"
+    aria-modal="true"
+    aria-label="Confirm delete chat"
+  >
+    <p class="confirm-text">Are you sure you want to remove this chat?</p>
+    <div class="confirm-actions">
+      <button class="confirm-cancel" data-testid="cancel-delete-btn" onclick={() => (pendingDeleteId = null)}>Cancel</button>
+      <button class="confirm-ok" data-testid="confirm-delete-btn" onclick={confirmDelete}>Confirm</button>
+    </div>
+  </div>
+{/if}
+{#if pendingMsgDelete != null && activeChat && activeChat.messages[pendingMsgDelete]}
+  {@const delTarget = activeChat.messages[pendingMsgDelete]}
+  {@const delCascadeNext = delTarget.role === "user" && activeChat.messages[pendingMsgDelete + 1]?.role === "assistant"}
+  {@const delCascadePrev = delTarget.role === "assistant" && pendingMsgDelete > 0 && activeChat.messages[pendingMsgDelete - 1]?.role === "user"}
+  <button
+    class="confirm-backdrop"
+    data-testid="delete-msg-backdrop"
+    aria-label="Cancel"
+    onclick={() => (pendingMsgDelete = null)}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card"
+    data-testid="delete-msg-confirm"
+    role="alertdialog"
+    aria-modal="true"
+    aria-label="Confirm delete message"
+  >
+    <p class="confirm-text">{delCascadeNext ? "Remove this message and the following reply?" : delCascadePrev ? "Remove this message and the question above it?" : "Are you sure you want to remove this message?"}</p>
+    <div class="confirm-actions">
+      <button class="confirm-cancel" data-testid="cancel-msg-delete-btn" onclick={() => (pendingMsgDelete = null)}>Cancel</button>
+      <button class="confirm-ok" data-testid="confirm-msg-delete-btn" onclick={confirmMsgDelete}>Confirm</button>
+    </div>
+  </div>
+{/if}
+{#if gotoOpen}
+  <button
+    class="confirm-backdrop"
+    data-testid="goto-backdrop"
+    aria-label="Cancel"
+    onclick={closeGoto}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card"
+    data-testid="goto-dialog"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Go to session"
+  >
+    <p class="confirm-text">Go to session</p>
+    <input
+      class="goto-input"
+      data-testid="goto-input"
+      placeholder="Paste a session link or ID…"
+      bind:value={gotoInput}
+      autofocus
+      onkeydown={(e) => {
+        if (e.key === "Enter") submitGoto();
+        else if (e.key === "Escape") closeGoto();
+      }}
+    />
+    {#if gotoError}
+      <p class="goto-error" data-testid="goto-error">{gotoError}</p>
+    {/if}
+    <div class="confirm-actions">
+      <button class="confirm-cancel" data-testid="cancel-goto-btn" onclick={closeGoto}>Cancel</button>
+      <button class="confirm-ok goto-go" data-testid="goto-go-btn" onclick={submitGoto}>Go</button>
+    </div>
+  </div>
+{/if}
+{#if settingsOpen}
+  <button
+    class="confirm-backdrop"
+    data-testid="settings-backdrop"
+    aria-label="Close settings"
+    onclick={() => (settingsOpen = false)}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card settings-card"
+    data-testid="settings-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Settings"
+  >
+    <button class="modal-x" data-testid="close-settings-btn" aria-label="Close settings" onclick={() => (settingsOpen = false)}>×</button>
+    <p class="confirm-text">Settings</p>
+    <div class="seg settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="seg-btn {settingsTab === 'general' ? 'sel' : ''}" data-testid="settings-tab-general" role="tab" onclick={() => (settingsTab = "general")}>General</button>
+      <button class="seg-btn {settingsTab === 'models' ? 'sel' : ''}" data-testid="settings-tab-models" role="tab" onclick={openModelsTab}>Models</button>
+    </div>
+    {#if settingsTab === "general"}
+    <div class="setting-row">
+      <span class="setting-label">Theme</span>
+      <div class="seg">
+        <button class="seg-btn {theme === 'light' ? 'sel' : ''}" data-testid="theme-light-btn" onclick={() => setTheme("light")}>Light</button>
+        <button class="seg-btn {theme === 'dark' ? 'sel' : ''}" data-testid="theme-dark-btn" onclick={() => setTheme("dark")}>Dark</button>
+      </div>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">Accent color</span>
+      <div class="swatches">
+        {#each Object.entries(ACCENTS) as [key, a]}
+          <button
+            class="swatch {accent === key ? 'sel' : ''}"
+            data-testid="accent-{key}"
+            aria-label={a.label}
+            title={a.label}
+            style="background: {theme === 'dark' ? a.dark.bg : a.light.bg}"
+            onclick={() => setAccent(key)}
+          >{#if accent === key}<span class="swatch-check">✓</span>{/if}</button>
+        {/each}
+      </div>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">Font size</span>
+      <div class="seg">
+        <button class="seg-btn" data-testid="font-decrease" aria-label="Decrease font size" onclick={() => setFontSize(fontSize - 1)}>−</button>
+        <span class="font-val" data-testid="font-size-value">{fontSize}px</span>
+        <button class="seg-btn" data-testid="font-increase" aria-label="Increase font size" onclick={() => setFontSize(fontSize + 1)}>+</button>
+      </div>
+    </div>
+    <div class="setting-stacked">
+      <span class="setting-label">Stop words <span class="setting-hint">· applied when continuing a reply</span></span>
+      <textarea
+        class="stopwords-input"
+        data-testid="stopwords-input"
+        rows="4"
+        spellcheck={false}
+        placeholder={"\\nUser:\\nAssistant:"}
+        bind:value={stopWordsText}
+        onblur={() => setStopWords(stopWordsText)}
+      ></textarea>
+      <span class="setting-note">One per line. Use \n for newlines. Generation stops when the model outputs one of these.</span>
+    </div>
+    {:else}
+    <div class="model-manage-list" data-testid="model-manage-list">
+      {#if runnersError}
+        <p class="goto-error" data-testid="models-error">{runnersError}</p>
+      {/if}
+      {#each sortedManageModels as name}
+        {@const running = runners.find((r) => r.name === name)}
+        <div class="model-manage-row" data-testid="model-row" data-name={name}>
+          <div class="model-manage-info">
+            <span class="model-manage-name">{name}{#if name === selectedModel} <span class="model-inuse" title="Used by current chat">• in use</span>{/if}</span>
+            <span class="model-manage-sub">
+              {#if running}
+                <span class="dot-live"></span> Loaded · {(running.size_vram / 1e9).toFixed(1)} GB VRAM
+              {:else}
+                <span class="dot-idle"></span> Unloaded
+              {/if}
+            </span>
+          </div>
+          {#if running}
+            <button class="mini-btn" data-testid="unload-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => toggleModelLoaded(name, true)}>{modelOp === name ? "…" : "Unload"}</button>
+          {:else}
+            <button class="mini-btn primary" data-testid="load-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => toggleModelLoaded(name, false)}>{modelOp === name ? "…" : "Load"}</button>
+          {/if}
+        </div>
+      {:else}
+        <p class="no-match">No models installed.</p>
+      {/each}
+    </div>
+    {/if}
+  </div>
+{/if}
+{/if}
+
+<input type="file" bind:this={fileInput} hidden onchange={onFile} data-testid="file-input" />
+
+<style>
+  :global(html) { color-scheme: light; }
+  :global(html[data-theme="dark"]) { color-scheme: dark; }
+  :global(:root) {
+    --bg: #ffffff; --text: #111111; --text-dim: #333333;
+    --muted: #9a9a9a; --muted-2: #8a8a8a; --faint: #aaaaaa;
+    --hover: #f0f0f0; --hover-2: #ececec; --hover-3: #f2f2f3;
+    --active-item: #efefef; --item-bg: #f4f4f5; --composer: #f4f4f5;
+    --card: #ffffff; --border: #ececec; --border-2: #e2e2e2; --border-3: #e5e5e5;
+    --border-strong: #c9c9c9; --input-border: #dddddd;
+    --bubble-user: #efefef; --chip: #eeeeee;
+    --icon: #555555; --icon-dim: #909090;
+    --thinking: #7a7a7a; --link: #0b57d0; --link-hover: #084298;
+    --danger: #b3261e; --err-text: #b3261e; --err-bg: #fdecea;
+    --code-bg: #f4f4f5; --code-inline: #f0f0f0;
+    --code-keyword: #d73a49; --code-string: #032f62; --code-comment: #6a737d;
+    --code-number: #005cc5; --code-title: #6f42c1; --code-builtin: #005cc5;
+    --code-literal: #005cc5; --code-attr: #6f42c1;
+    --send-disabled: #d9d9de;
+    --cancel-bg: #ececf1; --cancel-hover: #e0e0e6;
+    --ok: #1a7f37;
+    --accent: #ef6c00; --accent-hover: #d96000; --accent-fg: #ffffff;
+  }
+  :global(html[data-theme="dark"]) {
+    --bg: #1e1e1e; --text: #ececec; --text-dim: #bbbbbb;
+    --muted: #9a9a9a; --muted-2: #8a8a8a; --faint: #777777;
+    --hover: #2c2c2c; --hover-2: #333333; --hover-3: #2a2a2a;
+    --active-item: #2e2e2e; --item-bg: #2b2b2b; --composer: #2b2b2b;
+    --card: #2b2b2b; --border: #3a3a3a; --border-2: #444444; --border-3: #444444;
+    --border-strong: #555555; --input-border: #444444;
+    --bubble-user: #2f2f2f; --chip: #383838;
+    --icon: #bbbbbb; --icon-dim: #999999;
+    --thinking: #a3a3a3; --link: #8ab4f8; --link-hover: #aecbfa;
+    --danger: #ff8a80; --err-text: #ffb4a9; --err-bg: #4a1f1a;
+    --code-bg: #282828; --code-inline: #383838;
+    --code-keyword: #ff7b72; --code-string: #a5d6ff; --code-comment: #8b949e;
+    --code-number: #79c0ff; --code-title: #d2a8ff; --code-builtin: #79c0ff;
+    --code-literal: #79c0ff; --code-attr: #7ee787;
+    --send-disabled: #3a3a3a;
+    --cancel-bg: #3a3a3a; --cancel-hover: #444444;
+    --ok: #7ee787;
+  }
+  :global(html, body) { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }
+  .app { display: flex; height: 100vh; background: var(--bg); }
+  .sidebar { width: 264px; min-width: 264px; padding: 10px 10px 20px 10px; display: flex; flex-direction: column; }
+  .topbar { display: flex; align-items: center; justify-content: flex-end; padding: 2px 4px 12px 4px; }
+  .icon-btn { background: transparent; border: none; cursor: pointer; color: var(--icon); padding: 4px; border-radius: 6px; }
+  .icon-btn:hover { background: var(--hover); }
+  .side-actions { display: flex; flex-direction: column; gap: 2px; margin-bottom: 18px; }
+  .newchat { display: flex; gap: 8px; align-items: center; background: var(--item-bg); border: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); }
+  .newchat:hover { background: var(--hover-2); }
+  .goto { display: flex; gap: 8px; align-items: center; background: transparent; border: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text-dim); }
+  .goto:hover { background: var(--hover-2); }
+  .side-footer { margin-top: auto; padding-top: 10px; display: flex; flex-direction: column; align-items: stretch; }
+  .side-footer .goto { width: 100%; box-sizing: border-box; }
+  .goto-input { width: 100%; box-sizing: border-box; border: 1px solid var(--input-border); border-radius: 12px; outline: none; padding: 10px 14px; font-size: 14px; font-family: inherit; margin-bottom: 12px; background: transparent; color: var(--text); }
+  .goto-input:focus { border-color: var(--muted); }
+  .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
+  
+  .history { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .group-label { font-size: 12px; color: var(--muted); margin: 12px 4px 6px 4px; }
+  .chat-item { display: flex; justify-content: space-between; align-items: center; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
+  .chat-item:hover { background: var(--hover-3); }
+  .chat-item.active { background: var(--active-item); }
+  .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
+  .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
+  .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
+  .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
+  .ctx-item:hover { background: var(--hover-3); }
+  .ctx-item.danger { color: var(--danger); }
+  .confirm-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 50; }
+  .confirm-card { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); z-index: 51; background: var(--card); border-radius: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.18); padding: 26px 26px 22px 26px; width: 340px; max-width: calc(100vw - 48px); box-sizing: border-box; }
+  .modal-x { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border: none; background: transparent; border-radius: 50%; cursor: pointer; color: var(--icon-dim); font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center; }
+  .modal-x:hover { background: var(--hover); color: var(--text); }
+  .confirm-text { font-size: 17px; font-weight: 700; line-height: 1.4; margin: 0 0 20px 0; color: var(--text); }
+  .confirm-actions { display: flex; gap: 10px; }
+  .confirm-cancel { flex: 1; border: none; background: var(--cancel-bg); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--text); }
+  .confirm-cancel:hover { background: var(--cancel-hover); }
+  .confirm-ok { flex: 1; border: none; background: var(--accent); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--accent-fg); }
+  .confirm-ok:hover { background: var(--accent-hover); }
+  .empty-hint { color: var(--faint); font-size: 13px; padding: 0 8px; }
+  .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
+  .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
+  .collapsed-rail .icon-btn { width: 100%; padding: 8px 0; border-radius: 8px; }
+  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
+  .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
+  .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
+  .suggest-card { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 14px 14px 18px; cursor: pointer; }
+  .suggest-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); border-color: var(--accent); }
+  .suggest-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .suggest-title { font-size: 15px; font-weight: 650; color: var(--text); }
+  .suggest-sub { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .suggest-icon { flex-shrink: 0; width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: var(--accent-fg); display: flex; align-items: center; justify-content: center; }
+  .messages { flex: 1; overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 40px 24px 12px 24px; display: flex; flex-direction: column; gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
+  .row { display: flex; }
+  .user-row { justify-content: flex-end; }
+  .asst-row { justify-content: flex-start; }
+  .bubble { max-width: 100%; padding: 10px 14px; border-radius: 16px; font-size: var(--msg-font-size, 14.5px); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .bubble.user { background: var(--accent); color: var(--accent-fg); }
+  .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; }
+  .col { display: flex; flex-direction: column; max-width: 75%; }
+  .user-row .col { align-items: flex-end; }
+  .asst-row .col { align-items: flex-start; }
+  .actions { display: flex; gap: 2px; margin-top: 6px; align-items: center; }
+  .model-tag { opacity: 0; transition: opacity 0.15s; font-size: 12px; color: var(--muted-2); margin-left: 6px; white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  .row:hover .model-tag, .row:focus-within .model-tag { opacity: 1; }
+  .fork-note { display: flex; justify-content: center; align-items: baseline; gap: 4px; font-size: 13px; color: var(--muted-2); margin: 4px 0 8px 0; }
+  .fork-link { background: transparent; border: none; cursor: pointer; font: inherit; font-size: 13px; color: var(--link); padding: 0; text-decoration: underline; text-underline-offset: 2px; }
+  .fork-link:hover { color: var(--link-hover); }
+  .act { background: transparent; border: none; cursor: pointer; color: var(--icon-dim); width: 25px; height: 25px; padding: 0; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; }
+  .act:hover:not(:disabled) { background: var(--hover-3); color: var(--text); }
+  .act:disabled { opacity: .35; cursor: default; }
+  .answer :global(.codeblock) { position: relative; }
+  .answer :global(.codecopy) { position: absolute; top: 8px; right: 8px; background: var(--card); border: 1px solid var(--border-2); border-radius: 8px; cursor: pointer; color: var(--icon-dim); width: 24px; height: 24px; padding: 0; display: flex; align-items: center; justify-content: center; }
+  .answer :global(.codecopy:hover) { background: var(--hover); color: var(--text); }
+  .answer :global(.codecopy.ok) { color: var(--ok); }
+  .thinking { margin-bottom: 10px; }
+  .thinking-head { display: flex; align-items: center; gap: 8px; font-size: 17px; font-weight: 500; color: var(--text); margin-bottom: 14px; background: transparent; border: none; padding: 0; cursor: pointer; font-family: inherit; text-align: left; }
+  .thinking-head .chev { color: var(--muted); font-size: 13px; }
+  .thinking-body { color: var(--thinking); font-size: 15px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+  .answer:empty { display: none; }
+  .answer :global(p) { margin: 0 0 12px 0; }
+  .answer :global(p:last-child) { margin-bottom: 0; }
+  .answer :global(strong) { font-weight: 700; }
+  .answer :global(em) { font-style: italic; }
+  .answer :global(code) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
+  .answer :global(pre) { background: var(--code-bg); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; }
+  .answer :global(pre code) { background: transparent; padding: 0; }
+  .answer :global(.hljs-keyword), .answer :global(.hljs-selector-tag) { color: var(--code-keyword); }
+  .answer :global(.hljs-string), .answer :global(.hljs-regexp) { color: var(--code-string); }
+  .answer :global(.hljs-comment), .answer :global(.hljs-quote) { color: var(--code-comment); font-style: italic; }
+  .answer :global(.hljs-number), .answer :global(.hljs-literal) { color: var(--code-number); }
+  .answer :global(.hljs-title), .answer :global(.hljs-title.function_) { color: var(--code-title); }
+  .answer :global(.hljs-built_in) { color: var(--code-builtin); }
+  .answer :global(.hljs-attr), .answer :global(.hljs-attribute), .answer :global(.hljs-variable), .answer :global(.hljs-template-variable) { color: var(--code-attr); }
+  .answer :global(.hljs-name), .answer :global(.hljs-selector-id), .answer :global(.hljs-selector-class) { color: var(--code-builtin); }
+  .answer :global(.hljs-type), .answer :global(.hljs-params) { color: var(--text); }
+  .answer :global(.hljs-addition) { color: var(--ok); }
+  .answer :global(.hljs-deletion) { color: var(--danger); }
+  .answer :global(.hljs-emphasis) { font-style: italic; }
+  .answer :global(.hljs-strong) { font-weight: 700; }
+  .answer :global(ul), .answer :global(ol) { margin: 0 0 12px 0; padding-left: 22px; }
+  .answer :global(li) { margin: 4px 0; }
+  .answer :global(h1), .answer :global(h2), .answer :global(h3), .answer :global(h4) { margin: 14px 0 8px 0; font-weight: 650; line-height: 1.3; }
+  .answer :global(h1) { font-size: 20px; } .answer :global(h2) { font-size: 18px; } .answer :global(h3) { font-size: 16px; } .answer :global(h4) { font-size: 15px; }
+  .answer :global(a) { color: var(--link); }
+  .answer :global(blockquote) { border-left: 3px solid var(--border-2); margin: 0 0 12px 0; padding-left: 12px; color: var(--text-dim); }
+  .answer :global(table) { border-collapse: collapse; margin: 0; }
+  .answer :global(.table-wrap) { overflow-x: auto; max-width: 100%; margin: 0 0 12px 0; }
+  .answer :global(th), .answer :global(td) { border: 1px solid var(--border-2); padding: 6px 10px; font-size: 13.5px; }
+  .err { max-width: 720px; margin: 0 auto; color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 12px; font-size: 13px; }
+  .composer-wrap { position: relative; padding: 12px 24px 22px 24px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
+  .scroll-jump { position: absolute; top: -44px; left: 50%; transform: translateX(-50%); width: 44px; height: 36px; background: var(--card); border: 1px solid var(--border-3); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: pointer; font-size: 17px; line-height: 1; color: var(--text); z-index: 5; }
+  .scroll-jump:hover { background: var(--composer); }
+  .attach-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--chip); border-radius: 16px; padding: 4px 8px; font-size: 12px; margin-bottom: 8px; }
+  .attach-chip button { border: none; background: transparent; cursor: pointer; font-size: 14px; color: var(--text); }
+  .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
+  .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-wrap: break-word; }
+  .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-end; }
+  .spacer { flex: 1; }
+  .pill-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--card); cursor: pointer; font-size: 18px; color: var(--icon-dim); display: flex; align-items: center; justify-content: center; }
+  .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
+  .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
+  .model-pill-wrap { position: relative; }
+  .model-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 9; }
+  .model-drop { position: absolute; bottom: 40px; right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,.14); width: 300px; overflow: hidden; z-index: 10; }
+  .model-search { width: 100%; box-sizing: border-box; border: none; border-bottom: 1px solid var(--border); outline: none; padding: 13px 18px; font-size: 17px; font-family: inherit; background: var(--card); color: var(--text); }
+  .model-search::placeholder { color: var(--faint); }
+  .model-list-drop { max-height: 252px; overflow-y: auto; padding: 4px 0 8px 0; }
+  .model-opt { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 18px; font-size: 17px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-opt:hover { background: var(--hover-3); }
+  .model-opt.sel { background: var(--hover-3); }
+  .no-match { padding: 12px 18px; font-size: 14px; color: var(--muted); }
+  .send { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--send-disabled); color: #fff; font-size: 18px; cursor: pointer; }
+  .send:disabled { opacity: .8; cursor: default; }
+  .send:not(:disabled) { background: var(--accent); color: var(--accent-fg); }
+  .editbox { width: 100%; border: 1.5px solid var(--border-strong); border-radius: 16px; padding: 10px 12px 8px 12px; background: var(--card); }
+  .editbox textarea { width: 100%; box-sizing: border-box; border: none; outline: none; resize: none; font: inherit; font-size: 14.5px; line-height: 1.5; background: transparent; color: var(--text); }
+  .edit-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .edit-hint { font-size: 11.5px; color: var(--muted-2); margin-right: auto; }
+  .edit-cancel { background: transparent; border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; color: var(--text-dim); padding: 6px 12px; border-radius: 8px; }
+  .edit-cancel:hover { background: var(--hover); }
+  .edit-save { background: var(--accent); color: var(--accent-fg); border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; padding: 6px 18px; border-radius: 16px; }
+  .edit-save:disabled { opacity: .5; cursor: default; }
+  .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+  .settings-card { width: 360px; }
+  .settings-tabs { margin-bottom: 16px; align-self: stretch; }
+  .settings-tabs .seg-btn { flex: 1; }
+  .font-val { font-size: 14px; min-width: 48px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 5px; }
+  .model-manage-list { display: flex; flex-direction: column; gap: 4px; max-height: 280px; overflow-y: auto; margin-bottom: 4px; }
+  .model-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
+  .model-manage-row:last-child { border-bottom: none; }
+  .model-manage-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .model-manage-name { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-inuse { color: var(--accent); font-weight: 500; }
+  .model-manage-sub { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot-live { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; display: inline-block; }
+  .dot-idle { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .mini-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; flex-shrink: 0; }
+  .mini-btn:hover:not(:disabled) { background: var(--hover); }
+  .mini-btn:disabled { opacity: .5; cursor: default; }
+  .mini-btn.primary { background: var(--accent); border-color: transparent; color: var(--accent-fg); }
+  .mini-btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px 0; }
+  .setting-label { font-size: 14px; color: var(--text); }
+  .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }
+  .seg-btn { border: none; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--text-dim); padding: 6px 16px; border-radius: 9px; }
+  .seg-btn.sel { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+  .swatches { display: flex; gap: 10px; }
+  .swatch { width: 32px; height: 32px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #fff; padding: 0; }
+  .swatch.sel { border-color: var(--text); }
+  .swatch-check { line-height: 1; text-shadow: 0 1px 2px rgba(0,0,0,.4); }
+  .setting-stacked { display: flex; flex-direction: column; gap: 8px; margin: 0 0 4px 0; }
+  .setting-hint { color: var(--muted); font-weight: 400; }
+  .stopwords-input { width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--card); color: var(--text); font: inherit; font-size: 13px; line-height: 1.6; padding: 10px 12px; resize: vertical; outline: none; }
+  .stopwords-input:focus { border-color: var(--accent); }
+  .setting-note { font-size: 12px; color: var(--muted); }
+
+  @media (max-width: 700px) {
+    .messages { padding: 20px 12px 8px 12px; }
+    .composer-wrap { padding: 8px 12px 14px 12px; }
+    .col { max-width: 92%; }
+    .suggest-grid { grid-template-columns: 1fr; }
+    .empty-title { font-size: 20px; margin-bottom: 20px; }
+    .model-pill { max-width: 150px; }
+    .model-drop { width: 300px; max-width: calc(100vw - 48px); }
+  .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
+    .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
+    .confirm-card { width: calc(100vw - 32px); }
+  }
+</style>
