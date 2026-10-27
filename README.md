@@ -64,6 +64,8 @@ npm run build   # static build to ./build
   3x after a 2s wait (model was reloading). Stop-button abort raises
   `AbortError` on the frontend; the backend request runs detached (no cancel
   propagation yet).
+- Refreshing mid-stream resumes automatically: a pending-stream marker
+  survives page unload and `initApp` picks the turn back up (live-verified).
 
 ## Notes
 

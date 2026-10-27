@@ -14,6 +14,52 @@ const LS_CHATS = "vicuna-chats";
 const LS_MODEL = "vicuna-model";
 const DB_PATH = "sqlite:vicuna.db";
 
+/** Marker for a stream in flight. Written synchronously when a stream starts
+ *  and cleared when it settles, so a refresh mid-stream can resume. The
+ *  partial tokens themselves persist via the regular chat save. */
+const LS_PENDING = "vicuna-pending-stream";
+
+export interface PendingStream {
+  chatId: string;
+  index: number;
+  /** fresh: placeholder generated from scratch (history excludes it);
+   *  continue: appending to an existing partial (history includes it) */
+  mode: "fresh" | "continue";
+  model: string;
+  think?: boolean;
+  temperature?: number;
+  stop?: string[];
+}
+
+export function writePendingStream(p: PendingStream): void {
+  try {
+    localStorage.setItem(LS_PENDING, JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function readPendingStream(): PendingStream | null {
+  try {
+    const raw = localStorage.getItem(LS_PENDING);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as PendingStream;
+    if (typeof p.chatId !== "string" || typeof p.index !== "number") return null;
+    if (p.mode !== "fresh" && p.mode !== "continue") return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingStream(): void {
+  try {
+    localStorage.removeItem(LS_PENDING);
+  } catch {
+    /* ignore */
+  }
+}
+
 // legacy keys from the pre-rebrand "ollama-desktop-min" builds; read once as
 // fallback so existing users keep their chats/prefs, writes go to vicuna-*.
 const LEGACY_LS_CHATS = "ollama-min-chats";

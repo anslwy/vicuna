@@ -143,6 +143,7 @@ async fn ollama_chat_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
     let mut done_reason: Option<String> = None;
+    let mut client_gone = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("ollama chat failed: {e}"))?;
         buf.extend_from_slice(&chunk);
@@ -165,7 +166,15 @@ async fn ollama_chat_stream(
                         .and_then(|v| v.as_str())
                     {
                         if !t.is_empty() {
-                            let _ = on_event.send(ChatEvent::Think { text: t.to_string() });
+                            if on_event
+                                .send(ChatEvent::Think { text: t.to_string() })
+                                .is_err()
+                            {
+                                // frontend went away (e.g. refresh): stop
+                                // draining Ollama instead of streaming nowhere
+                                client_gone = true;
+                                break;
+                            }
                         }
                     }
                     if let Some(t) = obj
@@ -175,13 +184,23 @@ async fn ollama_chat_stream(
                     {
                         if !t.is_empty() {
                             full.push_str(t);
-                            let _ = on_event.send(ChatEvent::Token { text: t.to_string() });
+                            if on_event
+                                .send(ChatEvent::Token { text: t.to_string() })
+                                .is_err()
+                            {
+                                client_gone = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
         buf.drain(..start);
+        if client_gone {
+            buf.clear();
+            break;
+        }
     }
     // flush remainder
     let rest = String::from_utf8_lossy(&buf).trim().to_string();
@@ -250,6 +269,7 @@ async fn ollama_generate_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
     let mut done_reason: Option<String> = None;
+    let mut client_gone = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("ollama generate failed: {e}"))?;
         buf.extend_from_slice(&chunk);
@@ -268,13 +288,24 @@ async fn ollama_generate_stream(
                     if let Some(t) = obj.get("response").and_then(|v| v.as_str()) {
                         if !t.is_empty() {
                             full.push_str(t);
-                            let _ = on_event.send(GenerateEvent::Token { text: t.to_string() });
+                            if on_event
+                                .send(GenerateEvent::Token { text: t.to_string() })
+                                .is_err()
+                            {
+                                // frontend went away: stop draining Ollama
+                                client_gone = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
         buf.drain(..start);
+        if client_gone {
+            buf.clear();
+            break;
+        }
     }
     let rest = String::from_utf8_lossy(&buf).trim().to_string();
     if !rest.is_empty() {

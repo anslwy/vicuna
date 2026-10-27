@@ -30,6 +30,18 @@ There is no test suite; verification is `npm run check`, `npm run build`
    only invokes + renders `Channel` events. Direct `fetch` to Ollama exists
    solely as the plain-browser dev fallback. Stop-button abort surfaces
    `AbortError` on the frontend; the backend request runs detached.
+   Backend send failures (dead `Channel` after a refresh) break the drain
+   loop instead of streaming nowhere.
+
+8. **Refresh mid-stream resumes.** `streamInto` writes a `vicuna-pending-stream`
+   marker (`chatId/index/mode/model/think/temperature/stop`) synchronously at
+   start; `finally` clears it — except on page unload (`unloading` flag via
+   `beforeunload`), where an abort means refresh/close and the marker must
+   survive. `initApp` auto-resumes validated markers (fresh mode truncates the
+   stale partial first, otherwise the from-scratch regeneration duplicates on
+   append; continue mode keeps it and appends). User-Stopped streams clear the
+   marker and never resume. Live-verified: reload mid-list → exact 1..100,
+   no duplication, marker cleared.
 
 1. **Continue uses `/api/chat`, never `/api/generate`.** Live-tested: `/api/generate` with `raw:true` emits raw harmony channel tokens on gpt-oss-style models, ignores `stop`, and roleplays new turns. `/api/chat` with the partial assistant message sent as-is, `think:false`, `temperature: 0.2`, `num_ctx: 32768`, and `options.stop = stopWords` appends natively. There is deliberately NO sentence-boundary rewind — it caused duplication (`yo!yo!...`) because a complete sentence reads as a finished turn and the model restarts instead of continuing mid-sentence.
 2. **`/api/continue` does not exist** (verified 404 on Ollama 0.32.x). Don't try it.

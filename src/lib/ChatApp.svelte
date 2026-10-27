@@ -12,6 +12,9 @@
     loadPrefs,
     savePrefs,
     readLocalPrefs,
+    writePendingStream,
+    readPendingStream,
+    clearPendingStream,
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
@@ -111,6 +114,15 @@
       saveTimer = null;
     }
     save();
+  }
+
+  // set during page unload: an abort then means "refresh/close", not
+  // "user pressed Stop" — the pending-stream marker must survive so the
+  // next load resumes instead of dropping the turn
+  let unloading = false;
+  function handleUnload() {
+    unloading = true;
+    flushSave();
   }
 
   function newChat() {
@@ -720,12 +732,23 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[] } = {}) {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue" } = {}) {
     streaming = true;
     const ctrl = new AbortController();
     aborter = ctrl;
     let produced = false;
     isPinned = true;
+    // mark the in-flight stream synchronously: a refresh before settle
+    // resumes from the persisted partial instead of losing the turn
+    writePendingStream({
+      chatId: chat.id,
+      index,
+      mode: opts.mode ?? "fresh",
+      model: selectedModel,
+      think: opts.think,
+      temperature: opts.temperature,
+      stop: opts.stop
+    });
     save();
     scrollBottom();
     try {
@@ -770,6 +793,9 @@
     } finally {
       streaming = false;
       aborter = null;
+      // user stop / natural settle clears the marker; a refresh/close
+      // abort keeps it so the next load resumes the turn
+      if (!unloading) clearPendingStream();
       save();
       scrollBottom();
     }
@@ -790,7 +816,7 @@
     const history: ChatMsg[] = chat.messages.slice(0, i + 1).map((mm) => ({ role: mm.role, content: mm.content }));
     continuing = true;
     try {
-      await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords });
+      await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
     } finally {
       continuing = false;
     }
@@ -894,9 +920,9 @@
   }
 
   onMount(() => {
-    window.addEventListener("beforeunload", flushSave);
+    window.addEventListener("beforeunload", handleUnload);
     void initApp();
-    return () => window.removeEventListener("beforeunload", flushSave);
+    return () => window.removeEventListener("beforeunload", handleUnload);
   });
 
   onDestroy(() => {
@@ -942,6 +968,51 @@
       ready = true;
     }
     refreshModels();
+    // resume a stream interrupted by a refresh: the partial tokens persisted
+    // via the regular save, the pending marker tells us how to continue it
+    // (user-stopped streams clear the marker, so they never resume here)
+    const pending = readPendingStream();
+    if (pending && (!sessionId || sessionId === pending.chatId)) {
+      const pc = chats.find((c) => c.id === pending.chatId);
+      const pm = pc?.messages[pending.index];
+      if (pc && pm && pm.role === "assistant") {
+        activeId = pc.id;
+        if (pending.model) {
+          selectedModel = pending.model;
+          void saveModel(pending.model);
+        }
+        error = null;
+        if (pending.mode === "fresh") {
+          // fresh generations restart from scratch (history excludes the
+          // placeholder): drop the stale partial first, or the resumed run
+          // regenerates those tokens and duplicates them on append
+          pm.content = "";
+          pm.thinking = "";
+          chats = [...chats];
+        } else if (!pm.content) {
+          // nothing answered yet: drop the stale partial thinking so the
+          // resumed generation re-thinks cleanly instead of doubling it
+          pm.thinking = "";
+          chats = [...chats];
+        }
+        const resumeHistory: ChatMsg[] = (
+          pending.mode === "continue" ? pc.messages.slice(0, pending.index + 1) : pc.messages.slice(0, pending.index)
+        ).map((mm) => ({ role: mm.role, content: mm.content }));
+        if (pending.mode === "continue") continuing = true;
+        try {
+          await streamInto(pc, pending.index, resumeHistory, false, {
+            think: pending.think,
+            temperature: pending.temperature,
+            stop: pending.stop,
+            mode: pending.mode
+          });
+        } finally {
+          continuing = false;
+        }
+      } else {
+        clearPendingStream();
+      }
+    }
   }
 </script>
 
