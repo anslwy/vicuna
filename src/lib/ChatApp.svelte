@@ -34,9 +34,7 @@
   let modelQuery = $state("");
   let streaming = $state(false);
   let continuing = $state(false);
-  let attachText = $state<string | null>(null);
-  let attachName = $state<string | null>(null);
-  /** pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
+  /** picked or pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
   let attachImages = $state<string[]>([]);
   let error = $state<string | null>(null);
   let aborter = $state<AbortController | null>(null);
@@ -1107,10 +1105,6 @@
     if ((!text && attachImages.length === 0) || streaming) return;
     let chat = chats.find((c) => c.id === activeId);
     let freshChat = false;
-    let fullInput = text;
-    if (attachText) {
-      fullInput = `[attached file ${attachName}]\n${attachText}\n\n${text}`;
-    }
     const images = attachImages.length ? [...attachImages] : undefined;
     if (!chat) {
       // sending from home (or any stateless view): create the session inline.
@@ -1126,7 +1120,7 @@
         title: titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : ""),
         createdAt: Date.now(),
         messages: [
-          { role: "user", content: fullInput, ...(images ? { images } : {}) },
+          { role: "user", content: text, ...(images ? { images } : {}) },
           { role: "assistant", content: "", thinking: "", model: selectedModel }
         ]
       };
@@ -1136,7 +1130,7 @@
       freshChat = true;
       save();
     } else {
-      chat.messages = [...chat.messages, { role: "user", content: fullInput, ...(images ? { images } : {}) }];
+      chat.messages = [...chat.messages, { role: "user", content: text, ...(images ? { images } : {}) }];
       if (chat.title === "New chat" || chat.title === "New Chat") {
         const titleSrc = text || (images ? "Image" : "New chat");
         chat.title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
@@ -1144,8 +1138,6 @@
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     }
     input = "";
-    attachText = null;
-    attachName = null;
     attachImages = [];
     error = null;
 
@@ -1250,17 +1242,27 @@
 
   async function onFile(e: Event) {
     const el = e.target as HTMLInputElement;
-    const f = el.files?.[0];
-    if (!f) return;
-    try {
-      const txt = await f.text();
-      attachName = f.name;
-      attachText = txt.slice(0, 8000);
-    } catch {
-      attachName = f.name;
-      attachText = "(binary file, content not readable in minimal build)";
-    }
+    const files = el.files ? [...el.files] : [];
     el.value = "";
+    if (!files.length) return;
+    let skipped = 0;
+    for (const f of files) {
+      if (!f.type.startsWith("image/")) {
+        skipped++;
+        continue;
+      }
+      try {
+        attachImages = [...attachImages, await imageFileToDataUrl(f)];
+      } catch {
+        error = `Couldn't read image (${f.name || f.type || "unknown type"})`;
+        skipped++;
+      }
+    }
+    if (skipped > 0) {
+      error = `Skipped ${skipped} non-image file${skipped === 1 ? "" : "s"} — only images can be attached`;
+    }
+    autosizeComposer();
+    requestAnimationFrame(() => composerEl?.focus());
   }
 
   function setSidebar(open: boolean) {
@@ -1674,12 +1676,6 @@
           onclick={jumpToBottom}
         >↓</button>
       {/if}
-      {#if attachName}
-        <div class="attach-chip" data-testid="attach-chip">
-          <span>{attachName}</span>
-          <button aria-label="remove attachment" onclick={() => { attachName = null; attachText = null; }}>×</button>
-        </div>
-      {/if}
       <div class="composer">
         {#if attachImages.length}
           <div class="image-strip" data-testid="image-strip">
@@ -1704,7 +1700,7 @@
         ></textarea>
         <div class="composer-bar">
           <div class="spacer"></div>
-          <button class="pill-btn" data-testid="attach-btn" aria-label="Attach file" onclick={pickFile}>+</button>
+          <button class="pill-btn" data-testid="attach-btn" aria-label="Attach image" onclick={pickFile}>+</button>
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
               <span class="model-name">{selectedModel}</span>
@@ -2085,7 +2081,7 @@
 {/if}
 {/if}
 
-<input type="file" bind:this={fileInput} hidden onchange={onFile} data-testid="file-input" />
+<input type="file" bind:this={fileInput} hidden accept="image/*" multiple onchange={onFile} data-testid="file-input" />
 
 <style>
   :global(html) { color-scheme: light; }
@@ -2242,8 +2238,6 @@
   .composer-wrap { position: relative; padding: 12px 24px 22px 24px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
   .scroll-jump { position: absolute; top: -44px; left: 50%; transform: translateX(-50%); width: 44px; height: 36px; background: var(--card); border: 1px solid var(--border-3); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: pointer; font-size: 17px; line-height: 1; color: var(--text); z-index: 5; }
   .scroll-jump:hover { background: var(--composer); }
-  .attach-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--chip); border-radius: 16px; padding: 4px 8px; font-size: 12px; margin-bottom: 8px; }
-  .attach-chip button { border: none; background: transparent; cursor: pointer; font-size: 14px; color: var(--text); }
   .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
   .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; }
   .image-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
