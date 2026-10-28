@@ -125,6 +125,28 @@ export interface ChatMsg {
   thinkingOpen?: boolean;
   /** model that generated this message (assistant only) */
   model?: string;
+  /** attached images as data URLs (user only). Stripped to raw base64 at
+   *  the transport layer — Ollama's `images[]` takes base64, not data URLs. */
+  images?: string[];
+}
+
+/** Raw base64 for Ollama: drop any `data:...;base64,` prefix. */
+function toB64(u: string): string {
+  const i = u.indexOf(",");
+  return i >= 0 ? u.slice(i + 1) : u;
+}
+
+/** Transport shape: only fields Ollama understands. */
+function toWireMessages(messages: ChatMsg[]) {
+  return messages.map((m) => ({
+    role: m.role,
+    content: m.content,
+    ...(m.images?.length ? { images: m.images.map(toB64) } : {})
+  }));
+}
+
+function stripImages(messages: ChatMsg[]): ChatMsg[] {
+  return messages.map((m) => (m.images?.length ? { ...m, images: undefined } : m));
 }
 
 type ChatEvent =
@@ -152,7 +174,7 @@ async function chatStreamViaBackend(
   };
   const invokePromise = invoke<string>("ollama_chat_stream", {
     model,
-    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+    messages: toWireMessages(messages),
     think: opts.think ?? true,
     temperature: opts.temperature ?? null,
     stop: opts.stop ?? null,
@@ -194,7 +216,7 @@ async function chatStreamViaFetch(
     // num_ctx: long chats (stories, code) exceed Ollama's small default
     // window, which makes continued generations forget the middle and
     // diverge into generic wrap-ups. 32k fits comfortably on this machine.
-    body: JSON.stringify({ model, messages, stream: true, think: opts.think ?? true, options }),
+    body: JSON.stringify({ model, messages: toWireMessages(messages), stream: true, think: opts.think ?? true, options }),
     signal
   });
   if (!res.ok) {
@@ -251,7 +273,7 @@ export async function chatStream(
   signal?: AbortSignal,
   onThink?: (t: string) => void,
   attempt = 0,
-  opts: { think?: boolean; temperature?: number; stop?: string[] } = {}
+  opts: { think?: boolean; temperature?: number; stop?: string[]; onImagesStripped?: () => void } = {}
 ): Promise<string> {
   try {
     const { text, doneReason } = isTauriRuntime()
@@ -267,6 +289,14 @@ export async function chatStream(
     }
     return text;
   } catch (e: unknown) {
+    if (isVisionUnsupportedError(e)) {
+      // text-only model: retry the same turn without images (the stripped
+      // request can't retrigger this, so no attempt gate needed). The caller
+      // surfaces a note via onImagesStripped so the user knows the model
+      // never saw the picture.
+      opts.onImagesStripped?.();
+      return chatStream(model, stripImages(messages), onToken, signal, onThink, attempt, opts);
+    }
     if (attempt === 0 && isThinkUnsupportedError(e)) {
       // plain (non-reasoning) models reject think:true outright: retry once
       // with thinking disabled instead of failing the turn
@@ -274,6 +304,11 @@ export async function chatStream(
     }
     throw e;
   }
+}
+
+function isVisionUnsupportedError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.includes("does not support multimodal");
 }
 
 function isThinkUnsupportedError(e: unknown): boolean {

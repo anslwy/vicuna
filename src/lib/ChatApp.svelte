@@ -36,6 +36,8 @@
   let continuing = $state(false);
   let attachText = $state<string | null>(null);
   let attachName = $state<string | null>(null);
+  /** pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
+  let attachImages = $state<string[]>([]);
   let error = $state<string | null>(null);
   let aborter = $state<AbortController | null>(null);
   let messagesEl = $state<HTMLDivElement | null>(null);
@@ -711,13 +713,14 @@
   });
 
   $effect(() => {
-    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen) return;
+    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !lightboxSrc) return;
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         pendingDeleteId = null;
         pendingMsgDelete = null;
         closeGoto();
         settingsOpen = false;
+        closeLightbox();
       }
     };
     window.addEventListener("keydown", h);
@@ -730,7 +733,7 @@
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen) return;
+      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc) return;
       e.preventDefault();
       composerEl?.focus();
     };
@@ -821,6 +824,15 @@
     editDraft = "";
   }
 
+  // fullscreen image viewer (composer thumbnails + in-thread pictures)
+  let lightboxSrc = $state<string | null>(null);
+  function openLightbox(src: string) {
+    lightboxSrc = src;
+  }
+  function closeLightbox() {
+    lightboxSrc = null;
+  }
+
   async function saveEdit() {
     const chat = chats.find((c) => c.id === activeId);
     if (!chat || editingIndex == null || streaming) return;
@@ -846,13 +858,13 @@
       return;
     }
     // editing own message: replace it, drop everything after, regenerate
-    chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text }];
+    chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text, ...(target.images?.length ? { images: [...target.images] } : {}) }];
     if (chat.title === "New chat" || chat.title === "New Chat") {
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
     const history: ChatMsg[] = [
-      ...chat.messages.map((m) => ({ role: m.role, content: m.content }))
+      ...chat.messages.map(toHistory)
     ];
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     await streamInto(chat, chat.messages.length - 1, history, true);
@@ -890,7 +902,7 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue" } = {}) {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; onImagesStripped?: () => void } = {}) {
     streaming = true;
     const ctrl = new AbortController();
     aborter = ctrl;
@@ -935,7 +947,7 @@
       if (opts.generatePrompt !== undefined) {
         await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
       } else {
-        await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop });
+        await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
       }
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -971,7 +983,7 @@
     // of starting a fresh turn. No re-thinking and low temperature: no
     // fresh plans, no wandering. Custom stop words end the generation if
     // it tries to start a new turn ("User:" etc.).
-    const history: ChatMsg[] = chat.messages.slice(0, i + 1).map((mm) => ({ role: mm.role, content: mm.content }));
+    const history: ChatMsg[] = chat.messages.slice(0, i + 1).map(toHistory);
     continuing = true;
     try {
       await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
@@ -990,7 +1002,7 @@
     cancelEdit();
     // drop the old reply and generate fresh with the currently selected model
     chat.messages = [...chat.messages.slice(0, i)];
-    const freshHistory: ChatMsg[] = chat.messages.map((m) => ({ role: m.role, content: m.content }));
+    const freshHistory: ChatMsg[] = chat.messages.map(toHistory);
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     chats = [...chats];
     await streamInto(chat, chat.messages.length - 1, freshHistory, true);
@@ -998,49 +1010,53 @@
 
   async function send() {
     const text = input.trim();
-    if (!text || streaming) return;
+    if ((!text && attachImages.length === 0) || streaming) return;
     let chat = chats.find((c) => c.id === activeId);
     let freshChat = false;
+    let fullInput = text;
+    if (attachText) {
+      fullInput = `[attached file ${attachName}]\n${attachText}\n\n${text}`;
+    }
+    const images = attachImages.length ? [...attachImages] : undefined;
     if (!chat) {
       // sending from home (or any stateless view): create the session inline.
       // navigation is deferred until the stream finishes, otherwise the
       // page unmount would abort the just-started request.
+      // NOTE: the session must enter reactive state COMPLETE (both messages).
+      // Svelte 5 caches proxied reads, so mutating the raw object after
+      // prepending stays invisible until the first streamed token writes
+      // through the proxy — the composer would look stuck on empty.
+      const titleSrc = text || (images ? "Image" : "New chat");
       chat = {
         id: crypto.randomUUID(),
-        title: "New chat",
+        title: titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : ""),
         createdAt: Date.now(),
-        messages: []
+        messages: [
+          { role: "user", content: fullInput, ...(images ? { images } : {}) },
+          { role: "assistant", content: "", thinking: "", model: selectedModel }
+        ]
       };
       chats = [chat, ...chats];
       activeId = chat.id;
       isPinned = true;
       freshChat = true;
       save();
-    }
-
-    let fullInput = text;
-    if (attachText) {
-      fullInput = `[attached file ${attachName}]\n${attachText}\n\n${text}`;
-    }
-    chat.messages = [...chat.messages, { role: "user", content: fullInput }];
-    if (chat.title === "New chat" || chat.title === "New Chat") {
-      chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
+    } else {
+      chat.messages = [...chat.messages, { role: "user", content: fullInput, ...(images ? { images } : {}) }];
+      if (chat.title === "New chat" || chat.title === "New Chat") {
+        const titleSrc = text || (images ? "Image" : "New chat");
+        chat.title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
+      }
+      chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     }
     input = "";
     attachText = null;
     attachName = null;
+    attachImages = [];
     error = null;
 
-    const history: ChatMsg[] = [
-      ...chat.messages.map((m) => ({ role: m.role, content: m.content }))
-    ];
-    chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
-    if (freshChat) {
-      // the chat object above is still the raw (unproxied) reference, so
-      // writes through it don't notify Svelte — reassign to render the new
-      // messages immediately instead of waiting for the first streamed token
-      chats = [...chats];
-    }
+    // history excludes the trailing placeholder being generated
+    const history: ChatMsg[] = chat.messages.slice(0, -1).map(toHistory);
     await streamInto(chat, chat.messages.length - 1, history, true);
     if (freshChat && activeId === chat.id) {
       // user stayed put: now reflect the session in the URL
@@ -1061,6 +1077,63 @@
 
   function pickFile() {
     fileInput?.click();
+  }
+
+  // history entries keep attached images so regenerate/continue/resume
+  // resend the same picture instead of silently dropping it
+  function toHistory(m: ChatMsg): ChatMsg {
+    return m.images?.length
+      ? { role: m.role, content: m.content, images: [...m.images] }
+      : { role: m.role, content: m.content };
+  }
+
+  function noteImagesStripped() {
+    error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
+  }
+
+  // downscale pasted images: full screenshots blow up localStorage quotas
+  // and model context windows, and vision models don't need more than this
+  async function imageFileToDataUrl(f: File | Blob): Promise<string> {
+    const bitmap = await createImageBitmap(f);
+    const MAX = 1568;
+    const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      bitmap.close();
+      throw new Error("canvas unavailable");
+    }
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    return canvas.toDataURL("image/jpeg", 0.85);
+  }
+
+  async function onPaste(e: ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const it of items) {
+      if (it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (!files.length) return;
+    // image paste: attach thumbnails instead of dumping anything as text
+    e.preventDefault();
+    for (const f of files) {
+      try {
+        attachImages = [...attachImages, await imageFileToDataUrl(f)];
+      } catch {
+        error = `Couldn't read pasted image (${f.name || f.type || "unknown type"})`;
+      }
+    }
+    autosizeComposer();
+    requestAnimationFrame(() => composerEl?.focus());
   }
 
   async function onFile(e: Event) {
@@ -1163,7 +1236,7 @@
         }
         const resumeHistory: ChatMsg[] = (
           pending.mode === "continue" ? pc.messages.slice(0, pending.index + 1) : pc.messages.slice(0, pending.index)
-        ).map((mm) => ({ role: mm.role, content: mm.content }));
+        ).map(toHistory);
         if (pending.mode === "continue") continuing = true;
         try {
           await streamInto(pc, pending.index, resumeHistory, false, {
@@ -1356,6 +1429,15 @@
                   </div>
                 </div>
               {:else}
+              {#if m.images?.length}
+                <div class="msg-images">
+                  {#each m.images as img, k}
+                    <button class="msg-image-open" aria-label="View attached picture {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                      <img src={img} alt="" />
+                    </button>
+                  {/each}
+                </div>
+              {/if}
               <div class="bubble user">{m.content}</div>
               <div class="actions">
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
@@ -1461,12 +1543,25 @@
         </div>
       {/if}
       <div class="composer">
+        {#if attachImages.length}
+          <div class="image-strip" data-testid="image-strip">
+            {#each attachImages as img, k}
+              <div class="image-chip" data-testid="image-chip">
+                <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                  <img src={img} alt="" />
+                </button>
+                <button class="image-remove" aria-label="remove image {k + 1}" onclick={(e) => { e.stopPropagation(); attachImages = attachImages.filter((_, j) => j !== k); }}>×</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
         <textarea
           data-testid="message-input"
           placeholder="Send a message ( / to focus )"
           bind:this={composerEl}
           bind:value={input}
           onkeydown={onKey}
+          onpaste={onPaste}
           rows={1}
         ></textarea>
         <div class="composer-bar">
@@ -1503,13 +1598,23 @@
           {#if streaming}
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
           {:else}
-            <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === ""} onclick={send}>↑</button>
+            <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
           {/if}
         </div>
       </div>
     </div>
   </main>
 </div>
+{#if lightboxSrc}
+  <button
+    class="lightbox-backdrop"
+    data-testid="image-lightbox"
+    aria-label="Close fullscreen image"
+    onclick={closeLightbox}
+  >
+    <img src={lightboxSrc} alt="" />
+  </button>
+{/if}
 {#if pendingDeleteId}
   <button
     class="confirm-backdrop"
@@ -1954,6 +2059,16 @@
   .attach-chip button { border: none; background: transparent; cursor: pointer; font-size: 14px; color: var(--text); }
   .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
   .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; }
+  .image-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
+  .image-chip { position: relative; width: 64px; height: 64px; border-radius: 14px; overflow: hidden; background: var(--card); flex: none; }
+  .image-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .image-open { display: block; width: 100%; height: 100%; border: none; background: none; padding: 0; cursor: zoom-in; }
+  .msg-image-open { border: none; background: none; padding: 0; cursor: zoom-in; display: block; }
+  .image-chip .image-remove { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; border: none; background: rgba(0,0,0,.55); color: #fff; font-size: 12px; line-height: 1; cursor: pointer; padding: 0; }
+  .msg-images { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .msg-images img { display: block; max-width: min(100%, 320px); max-height: 220px; border-radius: 12px; }
+  .lightbox-backdrop { position: fixed; inset: 0; z-index: 60; border: none; padding: 24px; box-sizing: border-box; background: rgba(0, 0, 0, 0.85); cursor: zoom-out; display: flex; align-items: center; justify-content: center; }
+  .lightbox-backdrop img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; }
   .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-end; }
   .spacer { flex: 1; }
   .pill-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--card); cursor: pointer; font-size: 18px; color: var(--icon-dim); display: flex; align-items: center; justify-content: center; }

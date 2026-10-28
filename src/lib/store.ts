@@ -125,6 +125,22 @@ const lsBackend: Backend = {
   }
 };
 
+// images are stored as a JSON array of data URLs (or NULL when absent)
+function parseImages(raw: string | null): string[] | undefined {
+  if (!raw) return undefined;
+  try {
+    const arr: unknown = JSON.parse(raw);
+    if (Array.isArray(arr) && arr.every((s): s is string => typeof s === "string")) return arr;
+  } catch {
+    /* corrupt entry: drop it rather than breaking the chat */
+  }
+  return undefined;
+}
+
+function serializeImages(images: string[] | undefined): string | null {
+  return images?.length ? JSON.stringify(images) : null;
+}
+
 // ---- sqlite backend (Tauri desktop) ----
 
 async function createSqliteBackend(): Promise<Backend> {
@@ -159,6 +175,12 @@ async function createSqliteBackend(): Promise<Backend> {
   await db.execute(
     `CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, idx)`
   );
+  // databases created before image attachments existed lack this column
+  try {
+    await db.execute(`ALTER TABLE messages ADD COLUMN images TEXT`);
+  } catch {
+    /* column already exists */
+  };
   await db.execute(`
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
@@ -180,8 +202,8 @@ async function createSqliteBackend(): Promise<Backend> {
         let i = 0;
         for (const m of c.messages) {
           await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx) VALUES ($1, $2, $3, $4, $5, $6)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++]
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images)]
           );
         }
       }
@@ -209,9 +231,9 @@ async function createSqliteBackend(): Promise<Backend> {
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
-          { role: string; content: string; thinking: string; model: string | null }[]
+          { role: string; content: string; thinking: string; model: string | null; images: string | null }[]
         >(
-          "SELECT role, content, thinking, model FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
+          "SELECT role, content, thinking, model, images FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
           [r.id]
         );
         chats.push({
@@ -224,7 +246,8 @@ async function createSqliteBackend(): Promise<Backend> {
             role: m.role as ChatMsg["role"],
             content: m.content,
             thinking: m.thinking || undefined,
-          model: m.model || undefined
+          model: m.model || undefined,
+          images: parseImages(m.images)
         }))
         });
       }
@@ -242,8 +265,8 @@ async function createSqliteBackend(): Promise<Backend> {
         let i = 0;
         for (const m of c.messages) {
           await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx) VALUES ($1, $2, $3, $4, $5, $6)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++]
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images)]
           );
         }
       }

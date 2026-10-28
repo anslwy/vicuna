@@ -19,6 +19,8 @@ fn greet(name: &str) -> String {
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
