@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, chatStream, generateStream, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
+  import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat } from "$lib/catalog";
   import {
     initStorage,
     loadChats,
@@ -24,7 +25,7 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS] };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "" };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let input = $state("");
   let models = $state<string[]>(["muse-glimmer:30b-mlx"]);
@@ -232,6 +233,17 @@
   let runners = $state<RunningModel[]>([]);
   let runnersError = $state<string | null>(null);
   let modelOp = $state<string | null>(null);
+  let pullName = $state("");
+  let pulling = $state<string | null>(null);
+  let pullStatus = $state("");
+  let pullDone = $state(0);
+  let pullTotal = $state(0);
+  let pullAborter: AbortController | null = null;
+  let confirmDeleteModel = $state<string | null>(null);
+  let browseView = $state<"installed" | "discover">("installed");
+  let browseQuery = $state("");
+  let browseCat = $state<"all" | CatalogCat | "small">("all");
+  let variantPick = $state<Record<string, string>>({});
 
   async function openSettings() {
     settingsTab = "general";
@@ -240,6 +252,8 @@
 
   async function openModelsTab() {
     settingsTab = "models";
+    confirmDeleteModel = null;
+    await refreshModels();
     await refreshRunners();
   }
 
@@ -254,7 +268,7 @@
   }
 
   async function toggleModelLoaded(name: string, loaded: boolean) {
-    if (modelOp) return;
+    if (modelOp || pulling) return;
     modelOp = name;
     runnersError = null;
     try {
@@ -268,11 +282,91 @@
     }
   }
 
+  async function submitPull() {
+    const name = pullName.trim();
+    if (!name || pulling || modelOp) return;
+    await submitPullName(name);
+    pullName = "";
+  }
+
+  async function submitPullName(name: string) {
+    if (!name || pulling || modelOp) return;
+    pulling = name;
+    pullStatus = "starting…";
+    pullDone = 0;
+    pullTotal = 0;
+    runnersError = null;
+    pullAborter = new AbortController();
+    try {
+      await pullModel(
+        name,
+        (p) => {
+          pullStatus = p.status;
+          if (typeof p.completed === "number") pullDone = p.completed;
+          if (typeof p.total === "number") pullTotal = p.total;
+        },
+        pullAborter.signal
+      );
+      pullName = "";
+      await refreshModels();
+      if (models.includes(name)) {
+        selectedModel = name;
+        save();
+      } else if (models.length > 0 && !models.includes(selectedModel)) {
+        selectedModel = models[0];
+        save();
+      }
+      await refreshRunners();
+    } catch (e: any) {
+      if (e?.name !== "AbortError") runnersError = e?.message ?? String(e);
+    } finally {
+      pulling = null;
+      pullAborter = null;
+    }
+  }
+
+  function cancelPull() {
+    pullAborter?.abort();
+  }
+
+  async function requestDeleteModel(name: string) {
+    if (modelOp || pulling) return;
+    if (confirmDeleteModel !== name) {
+      confirmDeleteModel = name;
+      return;
+    }
+    confirmDeleteModel = null;
+    modelOp = name;
+    runnersError = null;
+    try {
+      // a loaded model may refuse deletion: unload first, then delete
+      if (runners.some((r) => r.name === name)) {
+        try {
+          await unloadModelFromMemory(name);
+        } catch {
+          // fall through: the delete below surfaces the real error
+        }
+      }
+      await deleteModel(name);
+      await refreshModels();
+      await refreshRunners();
+      if (!models.includes(selectedModel) && models.length > 0) {
+        selectedModel = models[0];
+        save();
+      }
+    } catch (e: any) {
+      runnersError = e?.message ?? String(e);
+    } finally {
+      modelOp = null;
+    }
+  }
+
   let theme = $state<"light" | "dark">(initialPrefs.theme);
   let accent = $state(initialPrefs.accent);
   let fontSize = $state(initialPrefs.fontSize);
   let stopWords = $state<string[]>([...initialPrefs.stopWords]);
   let stopWordsText = $state(stopWordsToText(initialPrefs.stopWords));
+  let ollamaBase = $state(initialPrefs.ollamaBase);
 
   function stopWordsToText(list: string[]): string {
     return list.map((s) => s.replace(/\n/g, "\\n")).join("\n");
@@ -312,24 +406,35 @@
 
   function setTheme(t: "light" | "dark") {
     theme = t;
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+    persistPrefs();
   }
 
   function setAccent(a: string) {
     if (!ACCENTS[a]) return;
     accent = a;
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+    persistPrefs();
   }
 
   function setFontSize(n: number) {
     fontSize = Math.min(24, Math.max(12, Math.round(n)));
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+    persistPrefs();
   }
 
   function setStopWords(text: string) {
     stopWordsText = text;
     stopWords = textToStopWords(text);
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords });
+    persistPrefs();
+  }
+
+  function persistPrefs() {
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase });
+  }
+
+  function setOllamaHost(text: string) {
+    ollamaBase = text.trim();
+    setOllamaBase(ollamaBase);
+    persistPrefs();
+    refreshModels();
   }
 
   function openGoto() {
@@ -500,6 +605,28 @@
     return models.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m) || a.i - b.i).map((x) => x.m);
   });
 
+  // discover tab: curated registry catalog with client-side search + filters
+  const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small"] as const;
+  const filteredCatalog = $derived.by(() => {
+    const q = browseQuery.trim().toLowerCase();
+    return MODEL_CATALOG.filter((e) => {
+      if (browseCat === "small") {
+        if (Math.max(...e.variants.map((v) => v.sizeMB)) > 2560) return false;
+      } else if (browseCat !== "all" && !e.cats.includes(browseCat)) return false;
+      if (!q) return true;
+      return (
+        e.name.toLowerCase().includes(q) ||
+        e.blurb.toLowerCase().includes(q) ||
+        e.cats.some((c) => c.includes(q)) ||
+        e.variants.some((v) => v.tag.toLowerCase().includes(q))
+      );
+    });
+  });
+
+  function pickedVariant(entryName: string, fallback: string): string {
+    return variantPick[entryName] ?? fallback;
+  }
+
   // generic starter prompts (no tools required on the model's side)
   const SUGGESTIONS = [
     { title: "Explain a concept", prompt: "Explain black holes in simple terms", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
@@ -541,13 +668,11 @@
   async function refreshModels() {
     try {
       const tags = await listModels();
-      if (tags.length > 0) {
-        models = tags.map((t) => t.name);
-        if (!models.includes(selectedModel)) selectedModel = models[0];
-        error = null;
-      }
+      models = tags.map((t) => t.name);
+      if (models.length > 0 && !models.includes(selectedModel)) selectedModel = models[0];
+      error = null;
     } catch (err: any) {
-      error = "Cannot reach Ollama at localhost:11434. Is `ollama serve` running?";
+      error = `Cannot reach Ollama at ${activeOllamaBase()}. Is \`ollama serve\` running?`;
     }
   }
 
@@ -916,7 +1041,7 @@
 
   function setSidebar(open: boolean) {
     sidebarOpen = open;
-    savePrefs({ theme, accent, fontSize, sidebarOpen: open, stopWords });
+    persistPrefs();
   }
 
   onMount(() => {
@@ -938,6 +1063,8 @@
       fontSize = prefs.fontSize;
       stopWords = [...prefs.stopWords];
       stopWordsText = stopWordsToText(stopWords);
+      ollamaBase = prefs.ollamaBase;
+      setOllamaBase(ollamaBase);
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
@@ -1246,7 +1373,8 @@
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                 </button>
                 {#if isLast}
-                  <button class="act" data-testid="continue-btn" aria-label="Continue generating" title="Continue" disabled={streaming} onclick={() => continueFrom(i)}>
+                  {@const noContinue = isCloudModel(selectedModel)}
+                  <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for cloud models" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                   </button>
                   <button class="act" data-testid="regen-btn" aria-label="Regenerate response" title="Regenerate" disabled={streaming} onclick={() => void regenerate(i)}>
@@ -1478,6 +1606,19 @@
       </div>
     </div>
     <div class="setting-stacked">
+      <span class="setting-label">Ollama host <span class="setting-hint">· browser mode only</span></span>
+      <input
+        class="pull-input"
+        data-testid="ollama-host-input"
+        placeholder="http://localhost:11434"
+        bind:value={ollamaBase}
+        onblur={() => setOllamaHost(ollamaBase)}
+        onkeydown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+        spellcheck={false}
+      />
+      <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. For remote access use the https tailscale URL. The Tauri shell always uses its local Ollama.</span>
+    </div>
+    <div class="setting-stacked">
       <span class="setting-label">Stop words <span class="setting-hint">· applied when continuing a reply</span></span>
       <textarea
         class="stopwords-input"
@@ -1492,6 +1633,11 @@
     </div>
     {:else}
     <div class="model-manage-list" data-testid="model-manage-list">
+      <div class="seg browse-tabs" role="tablist" aria-label="Model library sections">
+        <button class="seg-btn {browseView === 'installed' ? 'sel' : ''}" data-testid="browse-installed-btn" role="tab" onclick={() => (browseView = "installed")}>Installed</button>
+        <button class="seg-btn {browseView === 'discover' ? 'sel' : ''}" data-testid="browse-discover-btn" role="tab" onclick={() => (browseView = "discover")}>Discover</button>
+      </div>
+      {#if browseView === "installed"}
       {#if runnersError}
         <p class="goto-error" data-testid="models-error">{runnersError}</p>
       {/if}
@@ -1503,20 +1649,104 @@
             <span class="model-manage-sub">
               {#if running}
                 <span class="dot-live"></span> Loaded · {(running.size_vram / 1e9).toFixed(1)} GB VRAM
+              {:else if isCloudModel(name)}
+                <span class="dot-live"></span> Cloud · ready, no load needed
               {:else}
                 <span class="dot-idle"></span> Unloaded
               {/if}
             </span>
           </div>
-          {#if running}
-            <button class="mini-btn" data-testid="unload-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => toggleModelLoaded(name, true)}>{modelOp === name ? "…" : "Unload"}</button>
-          {:else}
-            <button class="mini-btn primary" data-testid="load-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => toggleModelLoaded(name, false)}>{modelOp === name ? "…" : "Load"}</button>
-          {/if}
+          <div class="model-manage-actions">
+            {#if !isCloudModel(name)}
+              {#if running}
+                <button class="mini-btn" data-testid="unload-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => toggleModelLoaded(name, true)}>{modelOp === name ? "…" : "Unload"}</button>
+              {:else}
+                <button class="mini-btn primary" data-testid="load-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => toggleModelLoaded(name, false)}>{modelOp === name ? "…" : "Load"}</button>
+              {/if}
+            {/if}
+            {#if confirmDeleteModel === name}
+              <button class="mini-btn danger" data-testid="confirm-delete-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => requestDeleteModel(name)}>{modelOp === name ? "…" : "Confirm?"}</button>
+              <button class="mini-btn" data-testid="keep-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => (confirmDeleteModel = null)}>Keep</button>
+            {:else}
+              <button class="mini-btn" data-testid="delete-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => requestDeleteModel(name)}>Delete</button>
+            {/if}
+          </div>
         </div>
       {:else}
         <p class="no-match">No models installed.</p>
       {/each}
+      {:else}
+      <div class="pull-row" data-testid="model-pull-row">
+        <input
+          class="pull-input"
+          data-testid="model-pull-input"
+          placeholder="Pull by exact name, e.g. gemma4:e4b"
+          bind:value={pullName}
+          disabled={pulling !== null}
+          onkeydown={(e) => { if (e.key === "Enter") void submitPull(); }}
+        />
+        {#if pulling !== null}
+          <button class="mini-btn" data-testid="cancel-pull-btn" onclick={cancelPull}>Cancel</button>
+        {:else}
+          <button class="mini-btn primary" data-testid="pull-model-btn" disabled={pullName.trim() === "" || modelOp !== null} onclick={() => void submitPull()}>Pull</button>
+        {/if}
+      </div>
+      {#if pulling !== null}
+        <div class="pull-progress" data-testid="model-pull-progress">
+          <span class="pull-status">{pulling} · {pullStatus}</span>
+          {#if pullTotal > 0}
+            <div class="pull-bar"><div class="pull-fill" style="width: {Math.min(100, (pullDone / pullTotal) * 100).toFixed(1)}%"></div></div>
+            <span class="pull-pct">{((pullDone / pullTotal) * 100).toFixed(0)}% · {(pullDone / 1e9).toFixed(1)} / {(pullTotal / 1e9).toFixed(1)} GB</span>
+          {/if}
+        </div>
+      {/if}
+      <div class="pull-row" data-testid="model-search-row">
+        <input
+          class="pull-input"
+          data-testid="discover-search-input"
+          placeholder="Search the library — try llama, code, vision…"
+          bind:value={browseQuery}
+        />
+      </div>
+      <div class="chip-row" data-testid="discover-chips" role="group" aria-label="Filter by capability">
+        {#each BROWSE_CATS as c}
+          <button class="chip {browseCat === c ? 'sel' : ''}" data-testid="discover-chip" data-cat={c} onclick={() => (browseCat = c)}>{c === "all" ? "All" : c[0].toUpperCase() + c.slice(1)}</button>
+        {/each}
+      </div>
+      <p class="browse-count" data-testid="discover-count">{filteredCatalog.length} of {MODEL_CATALOG.length} models · catalog {CATALOG_UPDATED}</p>
+      {#each filteredCatalog as entry}
+        {@const picked = pickedVariant(entry.name, entry.variants[0].tag)}
+        {@const fullName = `${entry.name}:${picked}`}
+        {@const installed = entry.variants.some((v) => models.includes(`${entry.name}:${v.tag}`))}
+        <div class="browse-card" data-testid="browse-card" data-name={entry.name}>
+          <div class="browse-head">
+            <span class="browse-name">{entry.name}</span>
+            {#if installed}<span class="browse-installed" title="A variant of this model is in your library">In library</span>{/if}
+          </div>
+          <p class="browse-blurb">{entry.blurb}</p>
+          <div class="browse-meta">
+            {#each entry.cats as c}<span class="browse-cat">{c}</span>{/each}
+            <span class="browse-params">{entry.params}</span>
+          </div>
+          <div class="browse-actions">
+            <select
+              class="browse-variant"
+              data-testid="variant-select"
+              aria-label="Variant of {entry.name}"
+              value={picked}
+              onchange={(e) => (variantPick = { ...variantPick, [entry.name]: e.currentTarget.value })}
+            >
+              {#each entry.variants as v}
+                <option value={v.tag}>{v.tag} · {v.size}</option>
+              {/each}
+            </select>
+            <button class="mini-btn primary" data-testid="browse-pull-btn" data-name={fullName} disabled={pulling !== null || modelOp !== null} onclick={() => void submitPullName(fullName)}>{pulling === fullName ? "…" : "Pull"}</button>
+          </div>
+        </div>
+      {:else}
+        <p class="no-match">No matches — try another search, or pull by exact name above.</p>
+      {/each}
+      {/if}
     </div>
     {/if}
   </div>
@@ -1711,11 +1941,11 @@
   .edit-save { background: var(--accent); color: var(--accent-fg); border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; padding: 6px 18px; border-radius: 16px; }
   .edit-save:disabled { opacity: .5; cursor: default; }
   .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
-  .settings-card { width: 360px; }
+  .settings-card { width: 80vw; max-width: 900px; height: 80vh; max-height: 820px; top: 50%; display: flex; flex-direction: column; overflow-y: auto; }
   .settings-tabs { margin-bottom: 16px; align-self: stretch; }
   .settings-tabs .seg-btn { flex: 1; }
   .font-val { font-size: 14px; min-width: 48px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 5px; }
-  .model-manage-list { display: flex; flex-direction: column; gap: 4px; max-height: 280px; overflow-y: auto; margin-bottom: 4px; }
+  .model-manage-list { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 4px; }
   .model-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
   .model-manage-row:last-child { border-bottom: none; }
   .model-manage-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -1729,6 +1959,35 @@
   .mini-btn:disabled { opacity: .5; cursor: default; }
   .mini-btn.primary { background: var(--accent); border-color: transparent; color: var(--accent-fg); }
   .mini-btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .mini-btn.danger { border-color: var(--danger); color: var(--danger); }
+  .mini-btn.danger:hover:not(:disabled) { background: var(--err-bg); }
+  .model-manage-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .pull-row { display: flex; gap: 8px; padding: 4px 4px 10px 4px; }
+  .pull-input { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 13px; font-family: inherit; padding: 6px 14px; }
+  .pull-input:focus { outline: none; border-color: var(--accent); }
+  .pull-input:disabled { opacity: .5; }
+  .pull-progress { display: flex; flex-direction: column; gap: 6px; padding: 0 4px 10px 4px; font-size: 12px; color: var(--muted); }
+  .pull-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pull-bar { height: 6px; border-radius: 999px; background: var(--hover); overflow: hidden; }
+  .pull-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .2s; }
+  .pull-pct { font-variant-numeric: tabular-nums; }
+  .browse-tabs { margin-bottom: 8px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 4px 8px 4px; }
+  .chip { border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 12px; font-family: inherit; cursor: pointer; }
+  .chip:hover { background: var(--hover); color: var(--text); }
+  .chip.sel { background: var(--text); border-color: transparent; color: var(--bg); }
+  .browse-count { font-size: 12px; color: var(--muted); margin: 0; padding: 0 4px 8px 4px; }
+  .browse-card { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; margin: 0 0 8px 0; display: flex; flex-direction: column; gap: 6px; }
+  .browse-head { display: flex; align-items: center; gap: 8px; }
+  .browse-name { font-size: 13.5px; font-weight: 700; color: var(--text); }
+  .browse-installed { font-size: 11px; font-weight: 600; color: var(--ok); border: 1px solid var(--ok); border-radius: 999px; padding: 1px 8px; }
+  .browse-blurb { font-size: 12.5px; color: var(--text-dim); margin: 0; line-height: 1.4; }
+  .browse-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .browse-cat { font-size: 11px; color: var(--muted); background: var(--hover); border-radius: 999px; padding: 1px 8px; }
+  .browse-params { font-size: 11.5px; color: var(--muted); }
+  .browse-actions { display: flex; gap: 8px; align-items: center; }
+  .browse-variant { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 12.5px; font-family: inherit; padding: 5px 10px; }
+  .browse-variant:focus { outline: none; border-color: var(--accent); }
   .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px 0; }
   .setting-label { font-size: 14px; color: var(--text); }
   .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }

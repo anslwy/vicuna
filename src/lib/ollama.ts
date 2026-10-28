@@ -7,6 +7,26 @@
 // fetch so web-only dev keeps working without the shell.
 
 export const OLLAMA_BASE = "http://localhost:11434";
+/** Plain-browser override for the Ollama endpoint (Settings → General →
+ *  Ollama host). Empty = default above. The Tauri backend always uses the
+ *  local Ollama and ignores this. */
+let customBase = "";
+
+export function setOllamaBase(url: string): void {
+  customBase = (url || "").trim().replace(/\/+$/, "");
+}
+
+export function ollamaBase(): string {
+  return customBase || OLLAMA_BASE;
+}
+
+/** Cloud-hosted models (tags like `cloud`, `31b-cloud`) run on Ollama's
+ *  servers: they never appear in /api/ps, so Load/Unload has no meaning
+ *  for them — chatting just works. */
+export function isCloudModel(name: string): boolean {
+  const tag = name.includes(":") ? (name.split(":").pop() ?? "") : "latest";
+  return tag === "cloud" || tag.endsWith("-cloud");
+}
 
 export function isTauriRuntime(): boolean {
   return (
@@ -34,7 +54,7 @@ export async function listModels(): Promise<OllamaTag[]> {
     const data = await invoke<{ models?: OllamaTag[] }>("ollama_list_models");
     return data.models ?? [];
   }
-  const res = await fetch(`${OLLAMA_BASE}/api/tags`);
+  const res = await fetch(`${ollamaBase()}/api/tags`);
   if (!res.ok) throw new Error(`ollama tags failed: ${res.status}`);
   const data = await res.json();
   return (data.models ?? []) as OllamaTag[];
@@ -55,7 +75,7 @@ export async function listRunning(): Promise<RunningModel[]> {
     const data = await invoke<{ models?: RunningModel[] }>("ollama_list_running");
     return data.models ?? [];
   }
-  const res = await fetch(`${OLLAMA_BASE}/api/ps`);
+  const res = await fetch(`${ollamaBase()}/api/ps`);
   if (!res.ok) throw new Error(`ollama ps failed: ${res.status}`);
   const data = await res.json();
   return (data.models ?? []) as RunningModel[];
@@ -79,7 +99,7 @@ async function warmModel(name: string, keepAlive: string): Promise<void> {
     await invoke("ollama_warm_model", { model: name, keepAlive });
     return;
   }
-  const res = await fetch(`${OLLAMA_BASE}/api/generate`, {
+  const res = await fetch(`${ollamaBase()}/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -168,7 +188,7 @@ async function chatStreamViaFetch(
   // to stay on the most likely next token); otherwise server default
   if (opts.temperature !== undefined) options.temperature = opts.temperature;
   if (opts.stop !== undefined) options.stop = opts.stop;
-  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+  const res = await fetch(`${ollamaBase()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // num_ctx: long chats (stories, code) exceed Ollama's small default
@@ -247,8 +267,18 @@ export async function chatStream(
     }
     return text;
   } catch (e: unknown) {
+    if (attempt === 0 && isThinkUnsupportedError(e)) {
+      // plain (non-reasoning) models reject think:true outright: retry once
+      // with thinking disabled instead of failing the turn
+      return chatStream(model, messages, onToken, signal, onThink, 1, { ...opts, think: false });
+    }
     throw e;
   }
+}
+
+function isThinkUnsupportedError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.includes("does not support thinking");
 }
 
 /**
@@ -323,7 +353,7 @@ export async function generateStream(
   if (opts.temperature !== undefined) options.temperature = opts.temperature;
   let res: Response;
   try {
-    res = await fetch(`${OLLAMA_BASE}/api/generate`, {
+    res = await fetch(`${ollamaBase()}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -386,4 +416,112 @@ export async function generateStream(
     }
   }
   return full;
+}
+
+export interface PullProgress {
+  status: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+}
+
+/**
+ * Pull (download) a model from the Ollama registry. Progress lines from
+ * /api/pull are forwarded to onProgress; the stream ends with
+ * {"status":"success"}. Abortable via signal in the plain-browser fallback;
+ * in Tauri the backend request runs detached (same limitation as chat abort).
+ */
+export async function pullModel(
+  name: string,
+  onProgress: (p: PullProgress) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  if (isTauriRuntime()) {
+    const { invoke, Channel } = await tauri();
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    const onEvent = new Channel<PullProgress>();
+    onEvent.onmessage = (ev) => {
+      if (signal?.aborted) return;
+      onProgress(ev);
+    };
+    const invokePromise = invoke<void>("ollama_pull_model", { model: name, onEvent });
+    if (!signal) {
+      await invokePromise;
+      return;
+    }
+    await Promise.race([
+      invokePromise,
+      new Promise<never>((_, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+          once: true
+        });
+      })
+    ]);
+    return;
+  }
+  const res = await fetch(`${ollamaBase()}/api/pull`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: name, stream: true }),
+    signal
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`model pull failed: ${res.status} ${txt}`);
+  }
+  if (!res.body) {
+    await res.json().catch(() => {});
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const feed = (line: string) => {
+    const l = line.trim();
+    if (!l) return;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(l) as Record<string, unknown>;
+    } catch {
+      return; // ignore partial json
+    }
+    if (typeof obj.error === "string" && obj.error) {
+      throw new Error(`model pull failed: ${obj.error}`);
+    }
+    if (typeof obj.status === "string") {
+      onProgress({
+        status: obj.status,
+        digest: typeof obj.digest === "string" ? obj.digest : undefined,
+        total: typeof obj.total === "number" ? obj.total : undefined,
+        completed: typeof obj.completed === "number" ? obj.completed : undefined
+      });
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) feed(line);
+  }
+  if (buf.trim()) feed(buf);
+}
+
+/** Delete a model from local storage. The caller should unload it first. */
+export async function deleteModel(name: string): Promise<void> {
+  if (isTauriRuntime()) {
+    const { invoke } = await tauri();
+    await invoke("ollama_delete_model", { model: name });
+    return;
+  }
+  const res = await fetch(`${ollamaBase()}/api/delete`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: name })
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`model delete failed: ${res.status} ${txt}`);
+  }
 }

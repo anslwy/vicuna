@@ -36,6 +36,17 @@ enum GenerateEvent {
     Done { done_reason: Option<String> },
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum PullEvent {
+    Progress {
+        status: String,
+        digest: Option<String>,
+        total: Option<u64>,
+        completed: Option<u64>,
+    },
+}
+
 fn ollama_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
     format!("ollama {context} failed: {status} {body}")
 }
@@ -325,6 +336,84 @@ async fn ollama_generate_stream(
     Ok(full)
 }
 
+/// Streaming model pull. Forwards each /api/pull status line as a Progress
+/// event; a final line with {"status":"success"} ends the stream. An
+/// {"error": ...} line fails the command.
+#[tauri::command]
+async fn ollama_pull_model(model: String, on_event: Channel<PullEvent>) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OLLAMA_BASE}/api/pull"))
+        .json(&serde_json::json!({ "model": model, "stream": true }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama pull failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("pull", status, &body));
+    }
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("ollama pull failed: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        let mut start = 0;
+        for i in 0..buf.len() {
+            if buf[i] == b'\n' {
+                let line = String::from_utf8_lossy(&buf[start..i]).trim().to_string();
+                start = i + 1;
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+                        if !err.is_empty() {
+                            return Err(format!("ollama pull failed: {err}"));
+                        }
+                    }
+                    if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+                        let ev = PullEvent::Progress {
+                            status: status.to_string(),
+                            digest: obj
+                                .get("digest")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            total: obj.get("total").and_then(|v| v.as_u64()),
+                            completed: obj.get("completed").and_then(|v| v.as_u64()),
+                        };
+                        if on_event.send(ev).is_err() {
+                            // frontend went away (e.g. refresh): stop draining
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        buf.drain(..start);
+    }
+    Ok(())
+}
+
+/// Delete a model from local storage. The frontend unloads it first so the
+/// delete is never rejected as in-use.
+#[tauri::command]
+async fn ollama_delete_model(model: String) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .delete(format!("{OLLAMA_BASE}/api/delete"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama delete failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("delete", status, &body));
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -336,7 +425,9 @@ pub fn run() {
             ollama_list_running,
             ollama_warm_model,
             ollama_chat_stream,
-            ollama_generate_stream
+            ollama_generate_stream,
+            ollama_pull_model,
+            ollama_delete_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

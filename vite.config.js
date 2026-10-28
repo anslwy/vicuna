@@ -17,6 +17,8 @@ export default defineConfig(() => ({
     port: 1420,
     strictPort: true,
     host: host || "127.0.0.1",
+    // allow the tailscale-shared hostname (proxied to 127.0.0.1)
+    allowedHosts: ["cachyos-x8664.tail6986be.ts.net"],
     hmr: host
       ? {
           protocol: "ws",
