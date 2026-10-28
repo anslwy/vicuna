@@ -39,6 +39,7 @@
   let error = $state<string | null>(null);
   let aborter = $state<AbortController | null>(null);
   let messagesEl = $state<HTMLDivElement | null>(null);
+  let composerEl = $state<HTMLTextAreaElement | null>(null);
   let fileInput = $state<HTMLInputElement | null>(null);
   let editingIndex = $state<number | null>(null);
   let editDraft = $state("");
@@ -691,6 +692,24 @@
     scrollBottom();
   });
 
+  // the composer stays one row tall by default and grows with its content
+  // (rows={1} alone never expands, and resize:none blocks manual Drag to
+  // grow — without this, multiline drafts scroll inside a 1-line box)
+  function autosizeComposer() {
+    const el = composerEl;
+    if (!el) return;
+    el.style.height = "auto";
+    const lh = parseFloat(getComputedStyle(el).lineHeight) || 22;
+    const max = Math.round(lh * 8);
+    el.style.height = Math.min(el.scrollHeight, max) + "px";
+    el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+  }
+
+  $effect(() => {
+    input;
+    autosizeComposer();
+  });
+
   $effect(() => {
     if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen) return;
     const h = (e: KeyboardEvent) => {
@@ -1002,6 +1021,12 @@
       ...chat.messages.map((m) => ({ role: m.role, content: m.content }))
     ];
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+    if (freshChat) {
+      // the chat object above is still the raw (unproxied) reference, so
+      // writes through it don't notify Svelte — reassign to render the new
+      // messages immediately instead of waiting for the first streamed token
+      chats = [...chats];
+    }
     await streamInto(chat, chat.messages.length - 1, history, true);
     if (freshChat && activeId === chat.id) {
       // user stayed put: now reflect the session in the URL
@@ -1425,6 +1450,7 @@
         <textarea
           data-testid="message-input"
           placeholder="Send a message"
+          bind:this={composerEl}
           bind:value={input}
           onkeydown={onKey}
           rows={1}
@@ -1913,7 +1939,7 @@
   .attach-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--chip); border-radius: 16px; padding: 4px 8px; font-size: 12px; margin-bottom: 8px; }
   .attach-chip button { border: none; background: transparent; cursor: pointer; font-size: 14px; color: var(--text); }
   .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
-  .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-wrap: break-word; }
+  .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; }
   .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-end; }
   .spacer { flex: 1; }
   .pill-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--card); cursor: pointer; font-size: 18px; color: var(--icon-dim); display: flex; align-items: center; justify-content: center; }
