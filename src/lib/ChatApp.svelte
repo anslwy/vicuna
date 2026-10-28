@@ -45,6 +45,7 @@
   let fileInput = $state<HTMLInputElement | null>(null);
   let editingIndex = $state<number | null>(null);
   let editDraft = $state("");
+  let editImages = $state<string[]>([]);
   let copiedKey = $state<string | null>(null);
   let isPinned = $state(true);
   // scrollTop value of our last programmatic jump; a scroll event landing
@@ -713,7 +714,7 @@
   });
 
   $effect(() => {
-    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !lightboxSrc) return;
+    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !lightboxSrc && !pendingSaveConfirm) return;
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         pendingDeleteId = null;
@@ -721,6 +722,7 @@
         closeGoto();
         settingsOpen = false;
         closeLightbox();
+        pendingSaveConfirm = false;
       }
     };
     window.addEventListener("keydown", h);
@@ -733,7 +735,7 @@
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc) return;
+      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
       e.preventDefault();
       composerEl?.focus();
     };
@@ -810,6 +812,7 @@
     if (!m || streaming) return;
     editingIndex = i;
     editDraft = m.content;
+    editImages = [...(m.images ?? [])];
     requestAnimationFrame(() => {
       const el = document.querySelector<HTMLTextAreaElement>("[data-testid=edit-input]");
       if (el) {
@@ -822,6 +825,42 @@
   function cancelEdit() {
     editingIndex = null;
     editDraft = "";
+    editImages = [];
+    pendingSaveConfirm = false;
+  }
+
+  // saving an edit drops everything after the message. Saving the last
+  // message is lossless; saving anywhere earlier asks first, and offers a
+  // fork so the original thread (and its progress) survives the edit.
+  let pendingSaveConfirm = $state(false);
+  function saveOrConfirm() {
+    const c = activeChat;
+    if (!c || editingIndex == null || streaming) return;
+    if (editingIndex >= c.messages.length - 1) {
+      void saveEdit();
+    } else {
+      pendingSaveConfirm = true;
+    }
+  }
+  function cancelSaveConfirm() {
+    pendingSaveConfirm = false;
+  }
+  function confirmSaveHere() {
+    pendingSaveConfirm = false;
+    void saveEdit();
+  }
+  async function forkAndSave() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat || editingIndex == null || streaming) return;
+    const i = editingIndex;
+    const draft = editDraft;
+    const imgs = [...editImages];
+    forkAt(i);
+    // forkAt clears the edit state; restore the pending edits onto the fork
+    editingIndex = i;
+    editDraft = draft;
+    editImages = imgs;
+    await saveEdit();
   }
 
   // fullscreen image viewer (composer thumbnails + in-thread pictures)
@@ -837,7 +876,8 @@
     const chat = chats.find((c) => c.id === activeId);
     if (!chat || editingIndex == null || streaming) return;
     const text = editDraft.trim();
-    if (!text) return;
+    const images = editImages.length ? [...editImages] : undefined;
+    if (!text && !images) return;
     const target = chat.messages[editingIndex];
     if (!target) {
       cancelEdit();
@@ -848,7 +888,7 @@
       // no regeneration (use Continue to extend it)
       chat.messages = [
         ...chat.messages.slice(0, editingIndex),
-        { ...target, content: text }
+        { ...target, content: text, images }
       ];
       chats = [...chats];
       cancelEdit();
@@ -858,8 +898,8 @@
       return;
     }
     // editing own message: replace it, drop everything after, regenerate
-    chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text, ...(target.images?.length ? { images: [...target.images] } : {}) }];
-    if (chat.title === "New chat" || chat.title === "New Chat") {
+    chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text, ...(images ? { images } : {}) }];
+    if (text && (chat.title === "New chat" || chat.title === "New Chat")) {
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
@@ -876,7 +916,7 @@
       cancelEdit();
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      void saveEdit();
+      saveOrConfirm();
     }
   }
 
@@ -898,6 +938,8 @@
     isPinned = true;
     editingIndex = null;
     editDraft = "";
+    editImages = [];
+    pendingSaveConfirm = false;
     save();
     void goto(`/s/${fork.id}`);
   }
@@ -1113,15 +1155,7 @@
   }
 
   async function onPaste(e: ClipboardEvent) {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const files: File[] = [];
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        const f = it.getAsFile();
-        if (f) files.push(f);
-      }
-    }
+    const files = pastedImageFiles(e);
     if (!files.length) return;
     // image paste: attach thumbnails instead of dumping anything as text
     e.preventDefault();
@@ -1134,6 +1168,32 @@
     }
     autosizeComposer();
     requestAnimationFrame(() => composerEl?.focus());
+  }
+
+  function pastedImageFiles(e: ClipboardEvent): File[] {
+    const items = e.clipboardData?.items;
+    if (!items) return [];
+    const files: File[] = [];
+    for (const it of items) {
+      if (it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    return files;
+  }
+
+  async function onEditPaste(e: ClipboardEvent) {
+    const files = pastedImageFiles(e);
+    if (!files.length) return;
+    e.preventDefault();
+    for (const f of files) {
+      try {
+        editImages = [...editImages, await imageFileToDataUrl(f)];
+      } catch {
+        error = `Couldn't read pasted image (${f.name || f.type || "unknown type"})`;
+      }
+    }
   }
 
   async function onFile(e: Event) {
@@ -1421,11 +1481,24 @@
             <div class="row user-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
-                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey}></textarea>
+                  {#if editImages.length}
+                    <div class="image-strip" data-testid="edit-image-strip">
+                      {#each editImages as img, k}
+                        <div class="image-chip">
+                          <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                            <img src={img} alt="" />
+                          </button>
+                          <button class="image-remove" aria-label="remove image {k + 1}" onclick={() => { editImages = editImages.filter((_, j) => j !== k); }}>×</button>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey} onpaste={onEditPaste}></textarea>
                   <div class="edit-actions">
-                    <span class="edit-hint">Esc to cancel · ⌘↵ to save</span>
+                    <span class="edit-hint">Esc to cancel · ⌘↵ to save · paste images to attach</span>
                     <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
-                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === ""} onclick={() => void saveEdit()}>Save</button>
+                    <button class="edit-fork" data-testid="fork-save-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => void forkAndSave()}>Fork &amp; Save</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOrConfirm()}>Save</button>
                   </div>
                 </div>
               {:else}
@@ -1458,11 +1531,24 @@
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
-                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey}></textarea>
+                  {#if editImages.length}
+                    <div class="image-strip" data-testid="edit-image-strip">
+                      {#each editImages as img, k}
+                        <div class="image-chip">
+                          <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                            <img src={img} alt="" />
+                          </button>
+                          <button class="image-remove" aria-label="remove image {k + 1}" onclick={() => { editImages = editImages.filter((_, j) => j !== k); }}>×</button>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                  <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey} onpaste={onEditPaste}></textarea>
                   <div class="edit-actions">
-                    <span class="edit-hint">Esc to cancel · ⌘↵ to save</span>
+                    <span class="edit-hint">Esc to cancel · ⌘↵ to save · paste images to attach</span>
                     <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
-                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === ""} onclick={() => void saveEdit()}>Save</button>
+                    <button class="edit-fork" data-testid="fork-save-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => void forkAndSave()}>Fork &amp; Save</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOrConfirm()}>Save</button>
                   </div>
                 </div>
               {:else}
@@ -1659,6 +1745,29 @@
     <div class="confirm-actions">
       <button class="confirm-cancel" data-testid="cancel-msg-delete-btn" onclick={() => (pendingMsgDelete = null)}>Cancel</button>
       <button class="confirm-ok" data-testid="confirm-msg-delete-btn" onclick={confirmMsgDelete}>Confirm</button>
+    </div>
+  </div>
+{/if}
+{#if pendingSaveConfirm && activeChat && editingIndex != null && editingIndex < activeChat.messages.length - 1}
+  {@const saveAfterCount = activeChat.messages.length - 1 - editingIndex}
+  <button
+    class="confirm-backdrop"
+    data-testid="edit-confirm-backdrop"
+    aria-label="Cancel"
+    onclick={cancelSaveConfirm}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card"
+    data-testid="edit-confirm"
+    role="alertdialog"
+    aria-modal="true"
+    aria-label="Confirm save"
+  >
+    <p class="confirm-text">Saving here will permanently remove the {saveAfterCount} message{saveAfterCount === 1 ? "" : "s"} after it.</p>
+    <div class="confirm-actions">
+      <button class="confirm-cancel" data-testid="cancel-edit-choice-btn" onclick={cancelSaveConfirm}>Cancel</button>
+      <button class="confirm-ok" data-testid="confirm-save-btn" onclick={confirmSaveHere}>Save here</button>
     </div>
   </div>
 {/if}
@@ -2093,6 +2202,9 @@
   .edit-hint { font-size: 11.5px; color: var(--muted-2); margin-right: auto; }
   .edit-cancel { background: transparent; border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; color: var(--text-dim); padding: 6px 12px; border-radius: 8px; }
   .edit-cancel:hover { background: var(--hover); }
+  .edit-fork { background: transparent; border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; color: var(--text-dim); padding: 6px 12px; border-radius: 8px; white-space: nowrap; }
+  .edit-fork:hover:not(:disabled) { background: var(--hover); }
+  .edit-fork:disabled { opacity: .5; cursor: default; }
   .edit-save { background: var(--accent); color: var(--accent-fg); border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; padding: 6px 18px; border-radius: 16px; }
   .edit-save:disabled { opacity: .5; cursor: default; }
   .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
