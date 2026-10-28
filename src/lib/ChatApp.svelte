@@ -239,6 +239,7 @@
   let gotoOpen = $state(false);
   let gotoInput = $state("");
   let gotoError = $state<string | null>(null);
+  let gotoSel = $state(0);
   let settingsOpen = $state(false);
   let settingsTab = $state<"general" | "models">("general");
   let runners = $state<RunningModel[]>([]);
@@ -503,6 +504,7 @@
   function openGoto() {
     gotoInput = "";
     gotoError = null;
+    gotoSel = 0;
     gotoOpen = true;
   }
 
@@ -510,23 +512,122 @@
     gotoOpen = false;
     gotoInput = "";
     gotoError = null;
+    gotoSel = 0;
   }
 
-  function submitGoto() {
+  // search modal: filter sessions by title, message text, or id substring.
+  // A pasted session id/link still resolves directly via gotoIdHit.
+  const searchQuery = $derived(gotoInput.trim());
+  const searchQueryLow = $derived(searchQuery.toLowerCase());
+  const gotoIdHit = $derived.by((): { id: string; chat: Chat | null } | null => {
     const m = gotoInput.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-    if (!m) {
-      gotoError = "Couldn't find a session id in that link.";
-      return;
-    }
+    if (!m) return null;
     const id = m[0].toLowerCase();
-    if (!chats.some((c) => c.id.toLowerCase() === id)) {
+    return { id, chat: chats.find((c) => c.id.toLowerCase() === id) ?? null };
+  });
+  const searchResults = $derived.by((): Chat[] => {
+    const q = searchQueryLow;
+    if (!q) return chats.filter((c) => c.messages.length > 0).slice(0, 8);
+    return chats.filter((c) => {
+      if (c.title.toLowerCase().includes(q)) return true;
+      if (c.id.toLowerCase().includes(q)) return true;
+      return c.messages.some((m) => m.content.toLowerCase().includes(q));
+    }).slice(0, 20);
+  });
+  type SearchItem = { kind: "new" } | { kind: "chat"; chat: Chat };
+  const searchItems = $derived.by((): SearchItem[] => {
+    const items: SearchItem[] = [{ kind: "new" }];
+    const seen = new Set<string>();
+    // a pasted session link surfaces its session first, even though the raw
+    // link text matches nothing
+    if (gotoIdHit?.chat) {
+      items.push({ kind: "chat", chat: gotoIdHit.chat });
+      seen.add(gotoIdHit.chat.id);
+    }
+    for (const c of searchResults) {
+      if (seen.has(c.id)) continue;
+      items.push({ kind: "chat", chat: c });
+    }
+    return items;
+  });
+
+  // excerpt centered on the first content match (or the opening message)
+  function searchSnippet(c: Chat, q: string): string {
+    const firstUser = c.messages.find((m) => m.role === "user")?.content ?? c.messages[0]?.content ?? "";
+    if (!q) return firstUser.slice(0, 140);
+    const low = q.toLowerCase();
+    const hit = c.messages.find((m) => m.content.toLowerCase().includes(low));
+    const src = hit?.content ?? firstUser;
+    const idx = src.toLowerCase().indexOf(low);
+    if (idx < 0) return src.slice(0, 140);
+    const start = Math.max(0, idx - 48);
+    const end = Math.min(src.length, idx + q.length + 96);
+    return (start > 0 ? "…" : "") + src.slice(start, end) + (end < src.length ? "…" : "");
+  }
+
+  function highlightHtml(text: string, q: string): string {
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const base = esc(text);
+    const needle = q.trim();
+    if (!needle) return base;
+    const pattern = esc(needle).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    try {
+      return base.replace(new RegExp(`(${pattern})`, "gi"), '<mark class="search-mark">$1</mark>');
+    } catch {
+      return base;
+    }
+  }
+
+  function openSearchItem(it: SearchItem) {
+    closeGoto();
+    if (it.kind === "new") newChat();
+    else selectChat(it.chat.id);
+  }
+
+  function submitSearch() {
+    if (gotoIdHit && !gotoIdHit.chat) {
       gotoError = "No chat found for that session.";
       return;
     }
-    const target = chats.find((c) => c.id.toLowerCase() === id)!;
-    closeGoto();
-    selectChat(target.id);
+    const it = searchItems[Math.min(gotoSel, searchItems.length - 1)];
+    if (!it) {
+      gotoError = "No matching chats.";
+      return;
+    }
+    openSearchItem(it);
   }
+
+  function onSearchKey(e: KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      gotoSel = (gotoSel + 1) % searchItems.length;
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      gotoSel = (gotoSel - 1 + searchItems.length) % searchItems.length;
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      submitSearch();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeGoto();
+    }
+  }
+
+  // typing restarts keyboard selection at the top; the selection-follow
+  // effect below keeps the highlighted row visible while arrowing
+  $effect(() => {
+    if (!gotoOpen) return;
+    gotoInput;
+    gotoSel = 0;
+  });
+  $effect(() => {
+    if (!gotoOpen) return;
+    gotoSel;
+    requestAnimationFrame(() => {
+      document.querySelector("[data-testid=goto-dialog] .search-row.sel")?.scrollIntoView({ block: "nearest" });
+    });
+  });
 
   function requestDelete(id: string) {
     ctxMenu = null;
@@ -683,6 +784,9 @@
     modelOpen = !modelOpen;
     if (modelOpen) modelQuery = "";
   }
+
+  // ⌘N on macOS, Ctrl+N elsewhere (shown as the New Chat hover hint)
+  const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent ?? "");
 
   const filteredModels = $derived(
     models.filter((m) => m.toLowerCase().includes(modelQuery.trim().toLowerCase()))
@@ -898,6 +1002,34 @@
       if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
       e.preventDefault();
       composerEl?.focus();
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
+  // Cmd/Ctrl+N anywhere creates a new chat (preventDefault blocks the
+  // browser's new-window default)
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        newChat();
+      }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
+  // Cmd/Ctrl+P anywhere opens the search popup (preventDefault blocks the
+  // browser's print default). Skipped inside other modals so dialogs don't
+  // stack on top of each other.
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
+        if (settingsOpen || pendingDeleteId || pendingMsgDelete != null || pendingSaveConfirm || lightboxSrc || modelOpen) return;
+        e.preventDefault();
+        openGoto();
+      }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
@@ -1558,13 +1690,15 @@
       </div>
 
       <div class="side-actions">
-        <button class="newchat" data-testid="new-chat-btn" onclick={newChat}>
-          <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/><path d="M14 3l3 3L8 15l-4 1 1-4L14 3z"/></svg>
+        <button class="newchat" data-testid="new-chat-btn" title="New chat ({isMac ? '⌘N' : 'Ctrl+N'})" onclick={newChat}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
           <span>New Chat</span>
+          <span class="kbd-hint">{isMac ? "⌘N" : "Ctrl+N"}</span>
         </button>
-        <button class="goto" data-testid="goto-btn" onclick={openGoto}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-          <span>Go to</span>
+        <button class="goto" data-testid="goto-btn" title="Search chats ({isMac ? '⌘P' : 'Ctrl+P'})" onclick={openGoto}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <span>Search</span>
+          <span class="kbd-hint">{isMac ? "⌘P" : "Ctrl+P"}</span>
         </button>
       </div>
 
@@ -1997,31 +2131,72 @@
     tabindex="-1"
   ></button>
   <div
-    class="confirm-card"
+    class="confirm-card search-card"
     data-testid="goto-dialog"
     role="dialog"
     aria-modal="true"
-    aria-label="Go to session"
+    aria-label="Search chats"
   >
-    <p class="confirm-text">Go to session</p>
-    <input
-      class="goto-input"
-      data-testid="goto-input"
-      placeholder="Paste a session link or ID…"
-      bind:value={gotoInput}
-      autofocus
-      onkeydown={(e) => {
-        if (e.key === "Enter") submitGoto();
-        else if (e.key === "Escape") closeGoto();
-      }}
-    />
+    <div class="search-bar">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <input
+        class="search-input"
+        data-testid="goto-input"
+        placeholder="Search chats or paste a session link…"
+        bind:value={gotoInput}
+        autofocus
+        onkeydown={onSearchKey}
+      />
+      {#if gotoInput}
+        <button
+          class="search-clear"
+          data-testid="search-clear-btn"
+          aria-label="Clear search"
+          onclick={() => {
+            gotoInput = "";
+            document.querySelector<HTMLInputElement>("[data-testid=goto-input]")?.focus();
+          }}
+        >×</button>
+      {/if}
+    </div>
+    <div class="search-results" data-testid="search-results" role="listbox" aria-label="Matching chats">
+      {#each searchItems as it, idx (it.kind === "new" ? "new" : it.chat.id)}
+        {#if it.kind === "new"}
+          <button
+            class="search-row {idx === gotoSel ? 'sel' : ''}"
+            role="option"
+            aria-selected={idx === gotoSel}
+            data-testid="search-new"
+            onclick={() => openSearchItem(it)}
+            onmousemove={() => (gotoSel = idx)}
+          >
+            <span class="search-ico"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg></span>
+            <span class="search-text"><span class="search-title">New chat</span></span>
+          </button>
+        {:else}
+          <button
+            class="search-row {idx === gotoSel ? 'sel' : ''}"
+            role="option"
+            aria-selected={idx === gotoSel}
+            data-testid="search-result"
+            data-id={it.chat.id}
+            onclick={() => openSearchItem(it)}
+            onmousemove={() => (gotoSel = idx)}
+          >
+            <span class="search-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg></span>
+            <span class="search-text">
+              <span class="search-title">{@html highlightHtml(it.chat.title, searchQuery)}</span>
+              <span class="search-snippet">{@html highlightHtml(searchSnippet(it.chat, searchQuery), searchQuery)}</span>
+            </span>
+          </button>
+        {/if}
+      {:else}
+        <div class="no-match">No matching chats</div>
+      {/each}
+    </div>
     {#if gotoError}
       <p class="goto-error" data-testid="goto-error">{gotoError}</p>
     {/if}
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="cancel-goto-btn" onclick={closeGoto}>Cancel</button>
-      <button class="confirm-ok goto-go" data-testid="goto-go-btn" onclick={submitGoto}>Go</button>
-    </div>
   </div>
 {/if}
 {#if settingsOpen}
@@ -2301,14 +2476,30 @@
   .icon-btn { background: transparent; border: none; cursor: pointer; color: var(--icon); padding: 4px; border-radius: 6px; }
   .icon-btn:hover { background: var(--hover); }
   .side-actions { display: flex; flex-direction: column; gap: 2px; margin-bottom: 18px; }
-  .newchat { display: flex; gap: 8px; align-items: center; background: var(--item-bg); border: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); }
+  .newchat { display: flex; gap: 8px; align-items: center; background: transparent; border: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text-dim); }
   .newchat:hover { background: var(--hover-2); }
+  .newchat .kbd-hint, .goto .kbd-hint { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted-2); opacity: 0; transition: opacity .15s; white-space: nowrap; }
+  .newchat:hover .kbd-hint, .newchat:focus-visible .kbd-hint, .goto:hover .kbd-hint, .goto:focus-visible .kbd-hint { opacity: 1; }
   .goto { display: flex; gap: 8px; align-items: center; background: transparent; border: none; border-radius: 8px; padding: 8px 10px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text-dim); }
   .goto:hover { background: var(--hover-2); }
   .side-footer { margin-top: auto; padding-top: 10px; display: flex; flex-direction: column; align-items: stretch; }
   .side-footer .goto { width: 100%; box-sizing: border-box; }
-  .goto-input { width: 100%; box-sizing: border-box; border: 1px solid var(--input-border); border-radius: 12px; outline: none; padding: 10px 14px; font-size: 14px; font-family: inherit; margin-bottom: 12px; background: transparent; color: var(--text); }
-  .goto-input:focus { border-color: var(--muted); }
+  .confirm-card.search-card { width: min(720px, calc(100vw - 48px)); top: 14%; transform: translate(-50%, 0); padding: 10px; }
+  .search-bar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 16px; }
+  .search-input::placeholder { color: var(--faint); }
+  .search-clear { border: none; background: transparent; color: var(--icon-dim); font-size: 18px; line-height: 1; cursor: pointer; border-radius: 6px; padding: 2px 7px; }
+  .search-clear:hover { background: var(--hover); color: var(--text); }
+  .search-results { max-height: 360px; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+  .search-row { display: flex; gap: 12px; align-items: flex-start; width: 100%; box-sizing: border-box; text-align: left; border: none; background: transparent; border-radius: 10px; padding: 10px 12px; cursor: pointer; color: var(--text); font: inherit; }
+  .search-row:hover, .search-row.sel { background: var(--hover-2); }
+  .search-ico { flex-shrink: 0; color: var(--muted-2); margin-top: 2px; display: flex; }
+  .search-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .search-snippet { font-size: 13px; color: var(--muted-2); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+  .search-snippet:empty { display: none; }
+  .search-card :global(.search-mark) { background: #f0bd76; color: #1e1e1e; border-radius: 3px; padding: 0 1px; }
+  .search-card .goto-error { margin: 4px 10px 6px 10px; }
   .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
   
   .history { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
