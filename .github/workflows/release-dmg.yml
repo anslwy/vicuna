@@ -35,13 +35,14 @@ jobs:
 
       - run: npx tauri build --target universal-apple-darwin --bundles dmg
 
-      - uses: marvinpinto/action-automatic-releases@latest
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          automatic_release_tag: latest
-          prerelease: true
-          title: "Latest dev build"
-          files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+      - name: Upload DMG to rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --prerelease --title "Latest dev build"
+          fi
+          gh release upload latest --clobber src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
 
       - name: Update release notes
         env:
