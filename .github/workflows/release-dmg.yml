@@ -42,3 +42,20 @@ jobs:
           prerelease: true
           title: "Latest dev build"
           files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+      - name: Update release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit latest --notes-file - <<'EOF'
+          ## Install
+
+          1. Download the `.dmg` below, open it, and drag **Vicuna** to Applications.
+          2. This build is unsigned, so macOS will block the first launch. Run once in Terminal:
+
+             ```
+             xattr -dr com.apple.quarantine /Applications/Vicuna.app
+             ```
+
+             then open Vicuna normally (or right-click → Open on first launch).
+          EOF
