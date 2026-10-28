@@ -68,3 +68,4 @@ There is no test suite; verification is `npm run check`, `npm run build`
 - Always run `npm run check` (expect 0 errors; 2 pre-existing a11y/autofocus warnings are fine) and `npm run build` after touching UI/store/ollama code.
 - Prefer `edit` with minimal boundary over rewriting files. Never use `shell`/comments to talk to the user. Verify by executing, don't assert from memory.
 - No git history rewriting; working tree has had parallel edits before — read files before editing, don't assume contents.
+- Releases: `.github/workflows/release-dmg.yml` builds a universal (arm64+x86_64) DMG on every `main` push and attaches it to the rolling `latest` prerelease. Unsigned build — other Macs need right-click → Open on first launch.

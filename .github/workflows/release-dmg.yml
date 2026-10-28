@@ -1,0 +1,44 @@
+# Build the macOS app and attach the .dmg to a rolling `latest` prerelease
+# on every push to main. Local equivalent: `scripts/build-dmg.sh --universal`
+# (universal = one binary for both Apple Silicon and Intel Macs).
+name: Build macOS DMG + release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - run: npx tauri build --target universal-apple-darwin --bundles dmg
+
+      - uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: latest
+          prerelease: true
+          title: "Latest dev build"
+          files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
