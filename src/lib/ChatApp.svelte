@@ -547,7 +547,34 @@
 
   function copySessionLink(id: string) {
     ctxMenu = null;
-    void copyText(`${window.location.origin}/s/${id}`);
+    // desktop links use the app's URL scheme so they reopen Vicuna;
+    // `tauri://…` URLs are webview-internal and dead outside the app
+    void copyText(isTauriRuntime() ? `vicuna://s/${id}` : `${window.location.origin}/s/${id}`);
+  }
+
+  // deep links (`vicuna://s/<id>`, e.g. pasted into a browser) land here via
+  // the deep-link plugin; navigate once chats are loaded, stash until then
+  let pendingDeepLinkId: string | null = null;
+  function extractSessionId(urls: string[]): string | null {
+    for (const u of urls) {
+      const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+      const m = path.match(/^\/?s\/([A-Za-z0-9-]+)\/?$/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+  function handleDeepLinkUrls(urls: string[] | null) {
+    if (!urls?.length) return;
+    const id = extractSessionId(urls);
+    if (!id) return;
+    if (ready && chats.some((c) => c.id === id)) {
+      activeId = id;
+      isPinned = true;
+      void goto(`/s/${id}`);
+    } else {
+      // initApp flushes this after load; unknown ids are dropped there
+      pendingDeepLinkId = id;
+    }
   }
 
   function startRename(id: string) {
@@ -1273,7 +1300,27 @@
   onMount(() => {
     window.addEventListener("beforeunload", handleUnload);
     void initApp();
-    return () => window.removeEventListener("beforeunload", handleUnload);
+    // deep links (Copy Link in desktop mode) arrive here, both at launch
+    // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
+    let unlistenDeepLink: (() => void) | null = null;
+    if (isTauriRuntime()) {
+      void import("@tauri-apps/plugin-deep-link")
+        .then(({ onOpenUrl, getCurrent }) => {
+          getCurrent()
+            .then((urls) => handleDeepLinkUrls(urls))
+            .catch(() => {});
+          onOpenUrl((urls: string[]) => handleDeepLinkUrls(urls))
+            .then((u) => {
+              unlistenDeepLink = u;
+            })
+            .catch(() => {});
+        })
+        .catch(() => {});
+    }
+    return () => {
+      window.removeEventListener("beforeunload", handleUnload);
+      unlistenDeepLink?.();
+    };
   });
 
   onDestroy(() => {
@@ -1312,6 +1359,16 @@
       } else {
         // home: no active session
         activeId = null;
+      }
+      // app launched via a vicuna:// link: the listener stashed it above
+      if (pendingDeepLinkId) {
+        const id = pendingDeepLinkId;
+        pendingDeepLinkId = null;
+        if (chats.some((c) => c.id === id)) {
+          activeId = id;
+          isPinned = true;
+          void goto(`/s/${id}`);
+        }
       }
       const m = await loadModel();
       if (m) selectedModel = m;

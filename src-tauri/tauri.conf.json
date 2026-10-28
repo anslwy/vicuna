@@ -21,6 +21,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["vicuna"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
