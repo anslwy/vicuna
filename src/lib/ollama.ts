@@ -166,6 +166,10 @@ export interface ChatMsg {
   /** attached images as data URLs (user only). Stripped to raw base64 at
    *  the transport layer — Ollama's `images[]` takes base64, not data URLs. */
   images?: string[];
+  /** wall-clock ms spent generating this message (accumulates across Continue) */
+  genMs?: number;
+  /** generation speed in tok/s from Ollama's eval stats (latest run) */
+  genTps?: number;
 }
 
 /** Raw base64 for Ollama: drop any `data:...;base64,` prefix. */
@@ -190,7 +194,7 @@ function stripImages(messages: ChatMsg[]): ChatMsg[] {
 type ChatEvent =
   | { type: "token"; text: string }
   | { type: "think"; text: string }
-  | { type: "done"; done_reason?: string | null };
+  | { type: "done"; done_reason?: string | null; eval_count?: number | null; eval_duration?: number | null };
 
 async function chatStreamViaBackend(
   model: string,
@@ -199,16 +203,22 @@ async function chatStreamViaBackend(
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
   opts: { think?: boolean; temperature?: number; stop?: string[] }
-): Promise<{ text: string; doneReason: string }> {
+): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number }> {
   const { invoke, Channel } = await tauri();
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   let doneReason = "";
+  let evalCount = 0;
+  let evalDurationNs = 0;
   const onEvent = new Channel<ChatEvent>();
   onEvent.onmessage = (ev) => {
     if (signal?.aborted) return;
     if (ev.type === "token") onToken(ev.text);
     else if (ev.type === "think") onThink?.(ev.text);
-    else if (ev.type === "done" && ev.done_reason) doneReason = ev.done_reason;
+    else if (ev.type === "done") {
+      if (ev.done_reason) doneReason = ev.done_reason;
+      if (typeof ev.eval_count === "number") evalCount = ev.eval_count;
+      if (typeof ev.eval_duration === "number") evalDurationNs = ev.eval_duration;
+    }
   };
   const invokePromise = invoke<string>("ollama_chat_stream", {
     model,
@@ -220,7 +230,7 @@ async function chatStreamViaBackend(
   });
   if (!signal) {
     const text = await invokePromise;
-    return { text, doneReason };
+    return { text, doneReason, evalCount, evalDurationNs };
   }
   // Abort: stop rendering and surface AbortError; the backend request runs
   // to completion detached (documented limitation — no cancel propagation).
@@ -232,7 +242,7 @@ async function chatStreamViaBackend(
       });
     })
   ]);
-  return { text, doneReason };
+  return { text, doneReason, evalCount, evalDurationNs };
 }
 
 async function chatStreamViaFetch(
@@ -242,7 +252,7 @@ async function chatStreamViaFetch(
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
   opts: { think?: boolean; temperature?: number; stop?: string[] }
-): Promise<{ text: string; doneReason: string }> {
+): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number }> {
   const options: Record<string, number | string[]> = { num_ctx: 32768 };
   // temperature only set when explicitly requested (continue uses low temp
   // to stay on the most likely next token); otherwise server default
@@ -268,19 +278,23 @@ async function chatStreamViaFetch(
     const thinking = data?.message?.thinking ?? "";
     if (thinking && onThink) onThink(thinking);
     onToken(content);
-    return { text: content, doneReason: "" };
+    return { text: content, doneReason: "", evalCount: 0, evalDurationNs: 0 };
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   let full = "";
   let doneReason = "";
+  let evalCount = 0;
+  let evalDurationNs = 0;
   const feed = (line: string) => {
     const l = line.trim();
     if (!l) return;
     try {
       const obj = JSON.parse(l);
       if (typeof obj?.done_reason === "string") doneReason = obj.done_reason;
+      if (typeof obj?.eval_count === "number") evalCount = obj.eval_count;
+      if (typeof obj?.eval_duration === "number") evalDurationNs = obj.eval_duration;
       const thinkPiece: string = obj?.message?.thinking ?? "";
       if (thinkPiece && onThink) onThink(thinkPiece);
       const piece: string = obj?.message?.content ?? "";
@@ -301,7 +315,7 @@ async function chatStreamViaFetch(
     for (const line of lines) feed(line);
   }
   if (buf.trim()) feed(buf);
-  return { text: full, doneReason };
+  return { text: full, doneReason, evalCount, evalDurationNs };
 }
 
 export async function chatStream(
@@ -312,9 +326,9 @@ export async function chatStream(
   onThink?: (t: string) => void,
   attempt = 0,
   opts: { think?: boolean; temperature?: number; stop?: string[]; onImagesStripped?: () => void } = {}
-): Promise<string> {
+): Promise<{ text: string; evalCount: number; evalDurationNs: number }> {
   try {
-    const { text, doneReason } = isTauriRuntime()
+    const { text, doneReason, evalCount, evalDurationNs } = isTauriRuntime()
       ? await chatStreamViaBackend(model, messages, onToken, signal, onThink, opts)
       : await chatStreamViaFetch(model, messages, onToken, signal, onThink, opts);
     if (text === "" && doneReason === "load" && attempt < 3 && !signal?.aborted) {
@@ -325,7 +339,7 @@ export async function chatStream(
         return chatStream(model, messages, onToken, signal, onThink, attempt + 1, opts);
       }
     }
-    return text;
+    return { text, evalCount, evalDurationNs };
   } catch (e: unknown) {
     if (isVisionUnsupportedError(e)) {
       // text-only model: retry the same turn without images (the stripped

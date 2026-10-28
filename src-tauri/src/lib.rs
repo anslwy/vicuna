@@ -32,7 +32,13 @@ struct ChatMessage {
 enum ChatEvent {
     Token { text: String },
     Think { text: String },
-    Done { done_reason: Option<String> },
+    Done {
+        done_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval_duration: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +166,8 @@ async fn ollama_chat_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
     let mut done_reason: Option<String> = None;
+    let mut eval_count: Option<u64> = None;
+    let mut eval_duration: Option<u64> = None;
     let mut client_gone = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("ollama chat failed: {e}"))?;
@@ -176,6 +184,12 @@ async fn ollama_chat_stream(
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
                     if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
                         done_reason = Some(r.to_string());
+                    }
+                    if eval_count.is_none() {
+                        eval_count = obj.get("eval_count").and_then(|v| v.as_u64());
+                    }
+                    if eval_duration.is_none() {
+                        eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
                     }
                     if let Some(t) = obj
                         .get("message")
@@ -226,6 +240,12 @@ async fn ollama_chat_stream(
             if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
                 done_reason = Some(r.to_string());
             }
+            if eval_count.is_none() {
+                eval_count = obj.get("eval_count").and_then(|v| v.as_u64());
+            }
+            if eval_duration.is_none() {
+                eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
+            }
             if let Some(t) = obj
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -238,7 +258,11 @@ async fn ollama_chat_stream(
             }
         }
     }
-    let _ = on_event.send(ChatEvent::Done { done_reason });
+    let _ = on_event.send(ChatEvent::Done {
+        done_reason,
+        eval_count,
+        eval_duration
+    });
     Ok(full)
 }
 

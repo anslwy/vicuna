@@ -46,7 +46,7 @@ There is no test suite; verification is `npm run check`, `npm run build`
 1. **Continue uses `/api/chat`, never `/api/generate`.** Live-tested: `/api/generate` with `raw:true` emits raw harmony channel tokens on gpt-oss-style models, ignores `stop`, and roleplays new turns. `/api/chat` with the partial assistant message sent as-is, `think:false`, `temperature: 0.2`, `num_ctx: 32768`, and `options.stop = stopWords` appends natively. There is deliberately NO sentence-boundary rewind — it caused duplication (`yo!yo!...`) because a complete sentence reads as a finished turn and the model restarts instead of continuing mid-sentence.
 2. **`/api/continue` does not exist** (verified 404 on Ollama 0.32.x). Don't try it.
 3. **Custom stop words** live in prefs (`DEFAULT_STOP_WORDS` in `store.ts`), edited in Settings → General textarea (`\n` escape per line), sent only on Continue via `streamInto(..., { think:false, temperature:0.2, stop })` → `chatStream` → `options.stop`. Normal sends do not set `stop`/`temperature`.
-4. **Model tag** (`m.model`) is recorded per assistant message, revealed on row hover only.
+4. **Assistant footer shows `model time tok/s` (space-separated).** `genMs` (wall-clock, accumulated across Continue) and `genTps` are recorded at settle, rendered always-visible in `.model-tag` (explicit `{" "}` separators — literal spaces get trimmed around block tags), and persisted to sqlite (`gen_ms`/`gen_tps`, ALTER-added). `genTps` prefers server eval stats; cloud APIs omit `eval_duration` (verified), so it falls back to eval tokens over wall time. Continue appends wall time and overwrites tok/s. `toHistory` strips stats (Ollama ignores them anyway); `onTok`/`onTh` carry them through so mid-stream renders don't drop them.
 5. **Delete cascades**: deleting a user message deletes the following assistant message and vice versa, both behind confirm dialogs.
 6. **Empty `done_reason:"load"`** responses mean the model was reloading; `chatStream`/`generateStream` retry up to 3x. Don't "fix" this by removing the retry.
 7. **No fake macOS traffic lights, no center llama art** — removed per user request, don't re-add.
@@ -67,6 +67,7 @@ There is no test suite; verification is `npm run check`, `npm run build`
 ## Workflow
 
 - Dev server: `npm run dev` → `http://127.0.0.1:1420`. Live-browser drives tab 2; if `click` hangs, call `activate_tab({tab: 2})` first, prefer CSS-selector clicks, fall back to keyboard Enter.
+- Desktop dev: `npm run desktop:dev` → `tauri dev`, whose `beforeDevCommand` is `scripts/desktop-dev.sh`: it reuses an already-running dev server on :1420 (verified ours by `<title>Vicuna</title>`) instead of crashing on the busy port, and fails loudly if the occupant isn't Vicuna. Never leave a stray `npm run dev` running — it blocks nothing now, but kill it when done anyway.
 - Always run `npm run check` (expect 0 errors; 2 pre-existing a11y/autofocus warnings are fine) and `npm run build` after touching UI/store/ollama code.
 - Prefer `edit` with minimal boundary over rewriting files. Never use `shell`/comments to talk to the user. Verify by executing, don't assert from memory.
 - No git history rewriting; working tree has had parallel edits before — read files before editing, don't assume contents.
