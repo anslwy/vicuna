@@ -81,6 +81,44 @@ export async function listRunning(): Promise<RunningModel[]> {
   return (data.models ?? []) as RunningModel[];
 }
 
+/** Local Ollama server version (`/api/version`). Throws when unreachable. */
+export async function serverVersion(): Promise<string> {
+  if (isTauriRuntime()) {
+    const { invoke } = await tauri();
+    return await invoke<string>("ollama_server_version");
+  }
+  const res = await fetch(`${ollamaBase()}/api/version`).catch(() => {
+    throw new Error("ollama server not reachable");
+  });
+  if (!res.ok) throw new Error("ollama server not reachable");
+  const data = await res.json();
+  return data?.version ?? "unknown";
+}
+
+/**
+ * Start a local `ollama serve` when none is reachable (Tauri only — a plain
+ * browser cannot spawn processes). Adopts an already-running server instead
+ * of spawning a second one. Resolves with the server version once ready.
+ */
+export async function startServer(): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("start the server in a terminal: `ollama serve`");
+  }
+  const { invoke } = await tauri();
+  return await invoke<string>("ollama_start_server");
+}
+
+/**
+ * Stop the `ollama serve` this app launched. Refuses when Vicuna didn't
+ * start one — foreign servers die in their own terminal.
+ */
+export async function stopServer(): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("stop your own `ollama serve` in its terminal");
+  }
+  const { invoke } = await tauri();
+  await invoke("ollama_stop_server");
+}
 /** Load a model into memory (or extend its residency). Generates a single
  *  throwaway token; uses the same context size as chat so follow-up chats
  *  don't trigger a reload. */

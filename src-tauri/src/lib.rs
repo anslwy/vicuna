@@ -5,7 +5,11 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::Duration;
 use tauri::ipc::Channel;
+use tauri::State;
 
 const OLLAMA_BASE: &str = "http://localhost:11434";
 
@@ -416,11 +420,133 @@ async fn ollama_delete_model(model: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the `ollama` binary may live. GUI apps launched from Finder get a
+/// sparse PATH (`/usr/bin:/bin/...`), so a Homebrew install is invisible to
+/// a bare `"ollama"` lookup — probe the usual locations in order.
+fn ollama_candidates() -> [&'static str; 3] {
+    [
+        "ollama",
+        "/opt/homebrew/bin/ollama",
+        "/usr/local/bin/ollama",
+    ]
+}
+
+/// The `ollama serve` child this app launched (if any). Only a server Vicuna
+/// itself started can be stopped from here — a foreign `ollama serve` (user
+/// terminal, another app) is left alone.
+#[derive(Default)]
+struct OllamaServerState {
+    child: Mutex<Option<Child>>,
+}
+
+async fn ollama_version_inner(client: &reqwest::Client) -> Result<String, String> {
+    let res = client
+        .get(format!("{OLLAMA_BASE}/api/version"))
+        .send()
+        .await
+        .map_err(|_| "ollama server not reachable".to_string())?;
+    if !res.status().is_success() {
+        return Err("ollama server not reachable".to_string());
+    }
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|_| "ollama server not reachable".to_string())?;
+    Ok(data
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string())
+}
+
+/// Report the local Ollama server version, or an error when it is down.
+#[tauri::command]
+async fn ollama_server_version() -> Result<String, String> {
+    let client = reqwest::Client::new();
+    ollama_version_inner(&client).await
+}
+
+/// Start a local `ollama serve` when none is reachable. If a server already
+/// answers (user's terminal, another app), it is adopted as-is instead of
+/// spawning a second one on the busy port.
+#[tauri::command]
+async fn ollama_start_server(state: State<'_, OllamaServerState>) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    if let Ok(v) = ollama_version_inner(&client).await {
+        return Ok(v);
+    }
+    let mut child: Option<Child> = None;
+    let mut spawn_err = String::from("no `ollama` binary tried");
+    for bin in ollama_candidates() {
+        match Command::new(bin)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) => spawn_err = format!("{bin}: {e}"),
+        }
+    }
+    let mut child = child.ok_or_else(|| {
+        format!("could not start `ollama serve` ({spawn_err}). Is Ollama installed? (brew install ollama)")
+    })?;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(v) = ollama_version_inner(&client).await {
+            state
+                .child
+                .lock()
+                .map_err(|_| "server state poisoned".to_string())?
+                .replace(child);
+            return Ok(v);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "`ollama serve` exited ({status}): port in use or another error — run `ollama serve` in a terminal for details"
+                ))
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("could not watch `ollama serve`: {e}"));
+            }
+        }
+    }
+    let _ = child.kill();
+    Err("`ollama serve` did not become ready in time".to_string())
+}
+
+/// Stop the `ollama serve` this app launched. Refuses when Vicuna didn't
+/// start one — kill foreign servers in their own terminal.
+#[tauri::command]
+async fn ollama_stop_server(state: State<'_, OllamaServerState>) -> Result<(), String> {
+    let mut guard = state
+        .child
+        .lock()
+        .map_err(|_| "server state poisoned".to_string())?;
+    match guard.take() {
+        Some(mut child) => child
+            .kill()
+            .map_err(|e| format!("could not stop the server: {e}")),
+        None => Err(
+            "no server was started by Vicuna — stop your own `ollama serve` in its terminal"
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
+        .manage(OllamaServerState::default())
         .invoke_handler(tauri::generate_handler![
             greet,
             ollama_list_models,
@@ -429,7 +555,10 @@ pub fn run() {
             ollama_chat_stream,
             ollama_generate_stream,
             ollama_pull_model,
-            ollama_delete_model
+            ollama_delete_model,
+            ollama_server_version,
+            ollama_start_server,
+            ollama_stop_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

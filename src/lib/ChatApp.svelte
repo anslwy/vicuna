@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat } from "$lib/catalog";
   import {
@@ -259,6 +259,58 @@
     confirmDeleteModel = null;
     await refreshModels();
     await refreshRunners();
+    await refreshServerStatus();
+  }
+
+  let ollamaVersion: string | null = $state(null);
+  let serverChecking = $state(false);
+  let serverOp: null | "start" | "stop" = $state(null);
+  let serverError: string | null = $state(null);
+
+  async function refreshServerStatus() {
+    if (serverChecking) return;
+    serverChecking = true;
+    serverError = null;
+    try {
+      ollamaVersion = await serverVersion();
+    } catch (e: any) {
+      ollamaVersion = null;
+      serverError = e?.message ?? String(e);
+    } finally {
+      serverChecking = false;
+    }
+  }
+
+  async function startServerFlow() {
+    if (serverOp) return;
+    serverOp = "start";
+    serverError = null;
+    try {
+      ollamaVersion = await startOllamaServer();
+      await refreshModels();
+      await refreshRunners();
+    } catch (e: any) {
+      ollamaVersion = null;
+      serverError = e?.message ?? String(e);
+    } finally {
+      serverOp = null;
+    }
+  }
+
+  async function stopServerFlow() {
+    if (serverOp) return;
+    serverOp = "stop";
+    serverError = null;
+    try {
+      await stopOllamaServer();
+      ollamaVersion = null;
+      await refreshModels();
+      await refreshRunners();
+    } catch (e: any) {
+      serverError = e?.message ?? String(e);
+    } finally {
+      serverOp = null;
+    }
   }
 
   async function refreshRunners() {
@@ -1887,6 +1939,32 @@
     </div>
     {:else}
     <div class="model-manage-list" data-testid="model-manage-list">
+      <div class="server-row" data-testid="ollama-server-row">
+        <div class="model-manage-info">
+          <span class="model-manage-name">Ollama server</span>
+          <span class="model-manage-sub">
+            {#if ollamaVersion}
+              <span class="dot-live"></span> Running · v{ollamaVersion}
+            {:else if serverChecking || serverOp}
+              <span class="dot-idle"></span> {serverOp === "start" ? "Starting…" : serverOp === "stop" ? "Stopping…" : "Checking…"}
+            {:else}
+              <span class="dot-idle"></span> Not reachable{serverError ? ` — ${serverError}` : ""}
+            {/if}
+          </span>
+        </div>
+        <div class="model-manage-actions">
+          {#if isTauriRuntime()}
+            {#if ollamaVersion}
+              <button class="mini-btn" data-testid="stop-server-btn" disabled={serverOp !== null} onclick={stopServerFlow}>{serverOp === "stop" ? "…" : "Stop"}</button>
+            {:else}
+              <button class="mini-btn primary" data-testid="start-server-btn" disabled={serverOp !== null} onclick={startServerFlow}>{serverOp === "start" ? "…" : "Start"}</button>
+            {/if}
+          {/if}
+        </div>
+      </div>
+      {#if serverError}
+        <p class="goto-error" data-testid="server-error">{serverError}</p>
+      {/if}
       <div class="seg browse-tabs" role="tablist" aria-label="Model library sections">
         <button class="seg-btn {browseView === 'installed' ? 'sel' : ''}" data-testid="browse-installed-btn" role="tab" onclick={() => (browseView = "installed")}>Installed</button>
         <button class="seg-btn {browseView === 'discover' ? 'sel' : ''}" data-testid="browse-discover-btn" role="tab" onclick={() => (browseView = "discover")}>Discover</button>
@@ -2213,6 +2291,7 @@
   .settings-tabs .seg-btn { flex: 1; }
   .font-val { font-size: 14px; min-width: 48px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 5px; }
   .model-manage-list { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 4px; }
+  .server-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--composer); border-radius: 16px; }
   .model-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
   .model-manage-row:last-child { border-bottom: none; }
   .model-manage-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
