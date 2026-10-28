@@ -724,6 +724,20 @@
     return () => window.removeEventListener("keydown", h);
   });
 
+  // press `/` anywhere (outside text fields and modals) to jump to the composer
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen) return;
+      e.preventDefault();
+      composerEl?.focus();
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
   // delegated handler for code-block copy buttons rendered via {@html}
   const CODE_CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
   $effect(() => {
@@ -1449,7 +1463,7 @@
       <div class="composer">
         <textarea
           data-testid="message-input"
-          placeholder="Send a message"
+          placeholder="Send a message ( / to focus )"
           bind:this={composerEl}
           bind:value={input}
           onkeydown={onKey}
