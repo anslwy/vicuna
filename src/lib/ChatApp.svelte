@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
@@ -767,6 +767,11 @@
   }
 
   function scrollBottom() {
+    // never yank the viewport while the user is selecting text: every
+    // streamed token calls this, which would otherwise drag the selection
+    // (and the view) out from under them mid-drag
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed && messagesEl?.contains(sel.anchorNode)) return;
     requestAnimationFrame(() => {
       if (!messagesEl || !isPinned) return;
       messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -780,6 +785,75 @@
     activeChat?.messages.length;
     scrollBottom();
   });
+
+  // The streaming reply re-renders `{@html renderMarkdown(...)}` on every
+  // token, which replaces the answer DOM and collapses any selection inside
+  // it. Capture the selection as character offsets before the update and
+  // restore it after Svelte applies the new HTML, so selecting mid-stream
+  // no longer "goes off on its own".
+  type StreamSel = { cls: string; a: number; f: number };
+  function textOffsetIn(root: Element, node: Node | null, nodeOffset: number): number | null {
+    if (!node) return null;
+    try {
+      // length of the scope's text from its start up to the caret: correct
+      // for text anchors, element anchors, and markup-nested carets alike
+      const range = document.createRange();
+      range.selectNodeContents(root);
+      range.setEnd(node, nodeOffset);
+      return range.toString().length;
+    } catch {
+      return null;
+    }
+  }
+  function nodeForOffset(root: Element, offset: number): { node: Node; off: number } {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let cur: Node | null = walker.nextNode();
+    let acc = 0;
+    let last: Node = root;
+    while (cur) {
+      const len = cur.textContent?.length ?? 0;
+      if (acc + len >= offset) return { node: cur, off: offset - acc };
+      acc += len;
+      last = cur;
+      cur = walker.nextNode();
+    }
+    return { node: last, off: last.textContent?.length ?? 0 };
+  }
+  function captureStreamSel(index: number): StreamSel | null {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !messagesEl) return null;
+    const row = messagesEl.querySelector(`[data-msg-index="${index}"]`);
+    if (!row || !row.contains(sel.anchorNode) || !row.contains(sel.focusNode)) return null;
+    const ans = row.querySelector(".answer");
+    const th = row.querySelector(".thinking-body");
+    let scope: Element | null = null;
+    if (ans && ans.contains(sel.anchorNode) && ans.contains(sel.focusNode)) scope = ans;
+    else if (th && th.contains(sel.anchorNode) && th.contains(sel.focusNode)) scope = th;
+    else return null;
+    const a = textOffsetIn(scope, sel.anchorNode, sel.anchorOffset);
+    const f = textOffsetIn(scope, sel.focusNode, sel.focusOffset);
+    if (a == null || f == null) return null;
+    return { cls: scope.className, a, f };
+  }
+  function restoreStreamSel(index: number, s: StreamSel) {
+    if (!messagesEl) return;
+    const row = messagesEl.querySelector(`[data-msg-index="${index}"]`);
+    const scope = row?.querySelector(`.${CSS.escape(s.cls.split(" ")[0])}`);
+    if (!scope) return;
+    const total = scope.textContent?.length ?? 0;
+    const a = Math.min(s.a, total);
+    const f = Math.min(s.f, total);
+    const pa = nodeForOffset(scope, a);
+    const pf = nodeForOffset(scope, f);
+    try {
+      const sel = window.getSelection();
+      if (!sel) return;
+      sel.setBaseAndExtent(pa.node, pa.off, pf.node, pf.off);
+    } catch {
+      // selection restore is best-effort; a failed restore just leaves the
+      // caret where the re-render put it
+    }
+  }
 
   // the composer stays one row tall by default and grows with its content
   // (rows={1} alone never expands, and resize:none blocks manual Drag to
@@ -1055,23 +1129,27 @@
     try {
       const onTok = (tok: string) => {
         produced = true;
+        const keep = captureStreamSel(index);
         const c = chats.find((x) => x.id === chat.id);
         if (c && c.messages[index]) {
           const m = c.messages[index];
           c.messages[index] = { role: "assistant", content: m.content + tok, thinking: m.thinking, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
           chats = [...chats];
         }
+        if (keep) void tick().then(() => restoreStreamSel(index, keep));
         scrollBottom();
         saveSoon();
       };
       const onTh = (tok: string) => {
         produced = true;
+        const keep = captureStreamSel(index);
         const c = chats.find((x) => x.id === chat.id);
         if (c && c.messages[index]) {
           const m = c.messages[index];
           c.messages[index] = { role: "assistant", content: m.content, thinking: (m.thinking ?? "") + tok, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
           chats = [...chats];
         }
+        if (keep) void tick().then(() => restoreStreamSel(index, keep));
         scrollBottom();
         saveSoon();
       };
@@ -1623,7 +1701,7 @@
         {#each activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
           {#if m.role === "user"}
-            <div class="row user-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
+            <div class="row user-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
                   {#if editImages.length}
@@ -1673,7 +1751,7 @@
           {:else}
             {@const isLast = i === activeChat.messages.length - 1}
             {@const thinkingActive = streaming && isLast && !m.content && !continuing}
-            <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}"><div class="col">
+            <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
                   {#if editImages.length}
@@ -2274,7 +2352,8 @@
   .asst-row { justify-content: flex-start; }
   .bubble { max-width: 100%; padding: 10px 14px; border-radius: 16px; font-size: var(--msg-font-size, 14.5px); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
   .bubble.user { background: var(--accent); color: var(--accent-fg); }
-  .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; }
+  .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; white-space: normal; user-select: text; }
+  .answer { user-select: text; white-space: normal; }
   .col { display: flex; flex-direction: column; max-width: 75%; }
   .user-row .col { align-items: flex-end; }
   .asst-row .col { align-items: flex-start; }
