@@ -1035,6 +1035,19 @@
     return () => window.removeEventListener("keydown", h);
   });
 
+  // Cmd/Ctrl+B anywhere toggles the sidebar (preventDefault blocks the
+  // browser's bookmarks-bar default)
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setSidebar(!sidebarOpen);
+      }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
   // delegated handler for code-block copy buttons rendered via {@html}
   const CODE_CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
   $effect(() => {
@@ -1684,7 +1697,7 @@
       }}
     >
       <div class="topbar">
-        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Toggle sidebar" onclick={() => setSidebar(false)}>
+        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Toggle sidebar" title="Toggle sidebar ({isMac ? '⌘B' : 'Ctrl+B'})" onclick={() => setSidebar(false)}>
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
         </button>
       </div>
@@ -1796,7 +1809,7 @@
     {/snippet}
     {#if !sidebarOpen}
       <div class="collapsed-rail">
-        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Open sidebar" onclick={() => setSidebar(true)}>
+        <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Open sidebar" title="Toggle sidebar ({isMac ? '⌘B' : 'Ctrl+B'})" onclick={() => setSidebar(true)}>
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
         </button>
         <button class="icon-btn" data-testid="settings-btn-collapsed" aria-label="Open settings" title="Settings" onclick={openSettings}>
@@ -2545,7 +2558,7 @@
   .bubble.user { background: var(--accent); color: var(--accent-fg); }
   .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; white-space: normal; user-select: text; }
   .answer { user-select: text; white-space: normal; }
-  .col { display: flex; flex-direction: column; max-width: 75%; }
+  .col { display: flex; flex-direction: column; }
   .user-row .col { align-items: flex-end; }
   .asst-row .col { align-items: flex-start; }
   .actions { display: flex; gap: 2px; margin-top: 6px; align-items: center; }
@@ -2712,7 +2725,6 @@
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
     .composer-wrap { padding: 8px 12px 14px 12px; }
-    .col { max-width: 92%; }
     .suggest-grid { grid-template-columns: 1fr; }
     .empty-title { font-size: 20px; margin-bottom: 20px; }
     .model-pill { max-width: 150px; }
