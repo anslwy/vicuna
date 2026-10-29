@@ -24,6 +24,12 @@ marked.use(markedKatex({ throwOnError: false }));
 
 marked.use({
   renderer: {
+    // inline code (`...`): marked pink + click-to-copy in ChatApp, so tag it
+    // here. `text` arrives RAW (marked escapes at render time), hence the
+    // explicit escape — fenced blocks go through `code()` below instead.
+    codespan({ text }: { text: string }) {
+      return `<code class="inl">${escapeHtml(text)}</code>`;
+    },
     code({ text, lang }: { text: string; lang?: string }) {
       let html: string;
       let cls = "hljs";

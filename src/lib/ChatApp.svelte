@@ -1056,19 +1056,32 @@
     const onClick = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null;
       const btn = t?.closest?.("[data-copy-code]") as HTMLElement | null;
-      if (!btn) return;
-      const code = btn.closest(".codeblock")?.querySelector("code");
-      const txt = code?.textContent ?? "";
+      if (btn) {
+        const code = btn.closest(".codeblock")?.querySelector("code");
+        const txt = code?.textContent ?? "";
+        if (!txt) return;
+        void copyText(txt).then((ok) => {
+          if (!ok) return;
+          const orig = btn.innerHTML;
+          btn.innerHTML = CODE_CHECK_SVG;
+          btn.classList.add("ok");
+          setTimeout(() => {
+            btn.innerHTML = orig;
+            btn.classList.remove("ok");
+          }, 1200);
+        });
+        return;
+      }
+      // inline code (`...`): click copies, with a transient "Copied" tip
+      const inl = t?.closest?.("code.inl") as HTMLElement | null;
+      if (!inl || inl.closest("pre")) return;
+      e.preventDefault();
+      const txt = inl.textContent ?? "";
       if (!txt) return;
       void copyText(txt).then((ok) => {
         if (!ok) return;
-        const orig = btn.innerHTML;
-        btn.innerHTML = CODE_CHECK_SVG;
-        btn.classList.add("ok");
-        setTimeout(() => {
-          btn.innerHTML = orig;
-          btn.classList.remove("ok");
-        }, 1200);
+        inl.classList.add("copied");
+        setTimeout(() => inl.classList.remove("copied"), 1200);
       });
     };
     el.addEventListener("click", onClick);
@@ -2461,6 +2474,7 @@
     --send-disabled: #d9d9de;
     --cancel-bg: #ececf1; --cancel-hover: #e0e0e6;
     --ok: #1a7f37;
+    --pink: #d63384;
     --accent: #ef6c00; --accent-hover: #d96000; --accent-fg: #ffffff;
   }
   :global(html[data-theme="dark"]) {
@@ -2481,6 +2495,7 @@
     --send-disabled: #3a3a3a;
     --cancel-bg: #3a3a3a; --cancel-hover: #444444;
     --ok: #7ee787;
+    --pink: #f472b6;
   }
   :global(html, body) { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }
   .app { display: flex; height: 100vh; background: var(--bg); }
@@ -2589,6 +2604,10 @@
   .answer :global(strong) { font-weight: 700; }
   .answer :global(em) { font-style: italic; }
   .answer :global(code) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
+  .answer :global(code.inl) { color: var(--pink); cursor: pointer; position: relative; }
+  .answer :global(code.inl:hover)::before { content: "Copy"; position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; font-size: 11.5px; font-weight: 500; padding: 3px 8px; border-radius: 6px; white-space: nowrap; pointer-events: none; }
+  .answer :global(code.inl.copied:hover)::before { display: none; }
+  .answer :global(code.inl.copied)::after { content: "Copied"; position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; font-size: 11.5px; font-weight: 500; padding: 3px 8px; border-radius: 6px; white-space: nowrap; pointer-events: none; }
   .answer :global(pre) { background: var(--code-bg); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; }
   .answer :global(pre code) { background: transparent; padding: 0; }
   .answer :global(.hljs-keyword), .answer :global(.hljs-selector-tag) { color: var(--code-keyword); }
