@@ -3,17 +3,18 @@
 
 ollama.com sends no CORS headers, so the browser cannot query the registry
 at runtime (see AGENTS.md #12). Instead this build-time script scrapes the
-registry and rewrites the curated catalog with fresh tags + sizes:
+registry and rewrites the catalog with fresh tags + sizes:
 
-    npm run catalog:refresh                  # refresh curated entries only
-    npm run catalog:refresh -- --all         # also add new registry models
+    npm run catalog:refresh                  # full refresh: all registry models
+    npm run catalog:refresh -- --curated-only # only refresh shipped entries
     python3 scripts/refresh-catalog.py --model gemma4 --print  # dry run one
 
 Merge policy: existing blurbs/cats/params are kept (they are hand-curated);
 variant tag lists and sizes are refreshed from the registry. New models get
-their blurb from the registry page, cats ["chat"], and params "" — curate
-afterwards. Sizes come from OCI manifests (sum of layer bytes); cloud tags
-have no layers and are marked size "cloud".
+their blurb from the registry page, cats from its capability chips, and a
+params range derived from the size tags — curate afterwards. Sizes come from
+OCI manifests (sum of layer bytes); cloud tags have no layers and are
+marked size "cloud".
 """
 
 import argparse
@@ -70,11 +71,8 @@ def index_models():
     return sorted(out)
 
 
-def model_meta(name):
-    """(blurb, tags) from the model page + tags page, order-preserved."""
-    page = fetch(f"{LIB}/{name}")
-    m = re.search(r'<meta name="description" content="([^"]*)"', page)
-    blurb = html.unescape(m.group(1)).strip() if m else ""
+def model_tags(name):
+    """Headline-candidate tags from the model's tags page, order-preserved."""
     tags_page = fetch(f"{LIB}/{name}/tags")
     tags = re.findall(rf'href="/library/{re.escape(name)}:([^"]+)"', tags_page)
     seen, ordered = set(), []
@@ -83,7 +81,47 @@ def model_meta(name):
         if t not in seen:
             seen.add(t)
             ordered.append(t)
-    return blurb, ordered
+    return ordered
+
+
+def model_page(name):
+    return fetch(f"{LIB}/{name}")
+
+
+def meta_description(page):
+    m = re.search(r'<meta name="description" content="([^"]*)"', page)
+    return html.unescape(m.group(1)).strip() if m else ""
+
+
+def cats_from_chips(page):
+    """Registry capability chips (indigo badges) → catalog cats. The `tools`
+    chip marks both chat and code models, so it maps to nothing — code models
+    land in chat until curated."""
+    chips = set(re.findall(r'text-indigo-600 sm:text-\[13px\]">([a-z]+)</span>', page))
+    cats = ["chat"]
+    if "reasoning" in chips or "thinking" in chips:
+        cats.append("reasoning")
+    if "vision" in chips:
+        cats.append("vision")
+    if "embedding" in chips:
+        cats.append("embedding")
+    return sorted(set(cats), key=cats.index)
+
+
+def params_from_tags(tags):
+    """'0.6B–235B' style range from the numeric headline tags."""
+    nums = []
+    for t in tags:
+        m = re.match(r"^([a-z]?)(\d+(?:\.\d+)?)([bm])$", t, re.I)
+        if m:
+            nums.append((
+                f"{m.group(1).upper()}{m.group(2)}{m.group(3).upper()}",
+                float(m.group(2)) * (1000 if m.group(3).lower() == "b" else 1),
+            ))
+    nums.sort(key=lambda x: x[1])
+    if not nums:
+        return ""
+    return nums[0][0] if len(nums) == 1 else f"{nums[0][0]}–{nums[-1][0]}"
 
 
 def headline_tags(tags):
@@ -144,10 +182,9 @@ def load_existing():
 
 
 def refresh_model(name, existing):
-    blurb, tags = model_meta(name)
+    tags = model_tags(name)
     if not tags:
         return None
-    old = existing.get(name)
     old = existing.get(name)
     head = headline_tags(tags)
     if old:
@@ -171,12 +208,12 @@ def refresh_model(name, existing):
     variants.sort(key=lambda v: order.get(v[0], 99))
     if old:
         return {"name": name, "blurb": old[0], "params": old[1], "cats": old[2], "variants": variants}
-    caps = "vision" if re.search(r"\bimage\b", " ".join(tags[:5]), re.I) else ""
+    page = model_page(name)
     return {
         "name": name,
-        "blurb": blurb or f"{name} — pulled from the Ollama registry; blurb pending curation.",
-        "params": "",
-        "cats": ["chat"] + ([caps] if caps else []),
+        "blurb": meta_description(page) or f"{name} — pulled from the Ollama registry; blurb pending curation.",
+        "params": params_from_tags(head),
+        "cats": cats_from_chips(page),
         "variants": variants,
     }
 
@@ -238,7 +275,9 @@ def emit(entries, date):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--all", action="store_true", help="also add new registry models")
+    ap.add_argument("--curated-only", dest="all", action="store_false", help="only refresh shipped entries")
+    ap.add_argument("--all", dest="all", action="store_true", help="fetch all registry models (default)")
+    ap.set_defaults(all=True)
     ap.add_argument("--model", help="refresh a single model (implied dry-run with --print)")
     ap.add_argument("--print", dest="show", action="store_true", help="print to stdout, don't write")
     ap.add_argument("--write", action="store_true", help="write catalog.ts (default unless --print/--model)")
@@ -255,7 +294,7 @@ def main():
         print(f"refreshing {len(names)} curated models", file=sys.stderr)
 
     results = {}
-    with futures.ThreadPoolExecutor(max_workers=6) as pool:
+    with futures.ThreadPoolExecutor(max_workers=8) as pool:
         fut = {pool.submit(refresh_model, n, existing): n for n in names}
         for f in futures.as_completed(fut):
             n = fut[f]
@@ -270,12 +309,10 @@ def main():
             else:
                 print(f"  skip: {n} (no tags found)", file=sys.stderr)
 
-    if args.all:
-        ordered = [results[n] for n in sorted(results)]
-    else:
-        prev_order = [n for n in re.findall(r'name:\s*"([^"]+)"', OUT.read_text())] if OUT.exists() else []
-        ordered = [results[n] for n in prev_order if n in results]
-        ordered += [results[n] for n in sorted(results) if n not in prev_order]
+    # curated order first, newly discovered models appended alphabetically
+    prev_order = [n for n in re.findall(r'name:\s*"([^"]+)"', OUT.read_text())] if OUT.exists() else []
+    ordered = [results[n] for n in prev_order if n in results]
+    ordered += [results[n] for n in sorted(results) if n not in prev_order]
 
     date = datetime.date.today().isoformat()
     out = emit(ordered, date if not args.model else existing and date)

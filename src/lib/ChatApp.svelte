@@ -3,13 +3,16 @@
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
-  import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat } from "$lib/catalog";
+  import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
+  import { refreshCatalog, type CatalogOverride } from "$lib/library";
   import {
     initStorage,
     loadChats,
     saveChats,
     loadModel,
     saveModel,
+    loadCatalog,
+    saveCatalog,
     loadPrefs,
     savePrefs,
     readLocalPrefs,
@@ -277,6 +280,30 @@
   let browseQuery = $state("");
   let browseCat = $state<"all" | CatalogCat | "small">("all");
   let variantPick = $state<Record<string, string>>({});
+  // discover catalog: bundled list, replaced by a fetched override when the
+  // user hits Fetch (persisted via store so it survives restarts)
+  let catalog = $state<CatalogEntry[]>([...MODEL_CATALOG]);
+  let catalogUpdated = $state(CATALOG_UPDATED);
+  let fetching = $state<{ done: number; total: number } | null>(null);
+  let catalogError = $state<string | null>(null);
+
+  async function fetchCatalog() {
+    if (fetching) return;
+    catalogError = null;
+    fetching = { done: 0, total: catalog.length };
+    try {
+      const over: CatalogOverride = await refreshCatalog(catalog, (done, total) => {
+        fetching = { done, total };
+      });
+      catalog = over.entries;
+      catalogUpdated = over.updated;
+      saveCatalog(over);
+    } catch (e: any) {
+      catalogError = e?.message ?? String(e);
+    } finally {
+      fetching = null;
+    }
+  }
 
   async function openSettings() {
     settingsTab = "general";
@@ -830,7 +857,7 @@
   const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small"] as const;
   const filteredCatalog = $derived.by(() => {
     const q = browseQuery.trim().toLowerCase();
-    return MODEL_CATALOG.filter((e) => {
+    return catalog.filter((e) => {
       if (browseCat === "small") {
         if (Math.max(...e.variants.map((v) => v.sizeMB)) > 2560) return false;
       } else if (browseCat !== "all" && !e.cats.includes(browseCat)) return false;
@@ -1726,6 +1753,11 @@
       }
       // restore the unsent composer draft for wherever we landed
       input = readDraft(activeId);
+      const savedCatalog = await loadCatalog();
+      if (savedCatalog) {
+        catalog = savedCatalog.entries;
+        catalogUpdated = savedCatalog.updated;
+      }
       const m = await loadModel();
       if (m) selectedModel = m;
     } catch (e) {
@@ -2498,8 +2530,17 @@
           <button class="chip {browseCat === c ? 'sel' : ''}" data-testid="discover-chip" data-cat={c} onclick={() => (browseCat = c)}>{c === "all" ? "All" : c[0].toUpperCase() + c.slice(1)}</button>
         {/each}
       </div>
-      <p class="browse-count" data-testid="discover-count">{filteredCatalog.length} of {MODEL_CATALOG.length} models · catalog {CATALOG_UPDATED}</p>
-      {#each filteredCatalog as entry}
+      <p class="browse-count" data-testid="discover-count">{filteredCatalog.length} of {catalog.length} models · catalog {catalogUpdated}
+        {#if fetching}
+          <span class="fetch-progress" data-testid="catalog-fetch-progress">Fetching {fetching.done}/{fetching.total}…</span>
+        {:else}
+          <button class="mini-btn" data-testid="catalog-fetch-btn" onclick={fetchCatalog}>Fetch</button>
+        {/if}
+      </p>
+      {#if catalogError}
+        <p class="goto-error" data-testid="catalog-fetch-error">{catalogError}</p>
+      {/if}
+      {#each filteredCatalog.filter((e) => e.variants.length > 0) as entry}
         {@const picked = pickedVariant(entry.name, entry.variants[0].tag)}
         {@const fullName = `${entry.name}:${picked}`}
         {@const installed = entry.variants.some((v) => models.includes(`${entry.name}:${v.tag}`))}
@@ -2801,7 +2842,8 @@
   .chip { border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 12px; font-family: inherit; cursor: pointer; }
   .chip:hover { background: var(--hover); color: var(--text); }
   .chip.sel { background: var(--text); border-color: transparent; color: var(--bg); }
-  .browse-count { font-size: 12px; color: var(--muted); margin: 0; padding: 0 4px 8px 4px; }
+  .browse-count { font-size: 12px; color: var(--muted); margin: 0; padding: 0 4px 8px 4px; display: flex; align-items: center; gap: 8px; }
+  .fetch-progress { font-variant-numeric: tabular-nums; }
   .browse-card { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; margin: 0 0 8px 0; display: flex; flex-direction: column; gap: 6px; }
   .browse-head { display: flex; align-items: center; gap: 8px; }
   .browse-name { font-size: 13.5px; font-weight: 700; color: var(--text); }

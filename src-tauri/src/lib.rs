@@ -444,6 +444,37 @@ async fn ollama_delete_model(model: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Fetch a registry page as text (powers the Discover "Fetch" button).
+/// The browser cannot do this itself — ollama.com and registry.ollama.ai
+/// send no CORS headers — but the Rust backend has no such restriction.
+/// The URL is allowlisted to the public Ollama registry so the command
+/// cannot be abused as a generic proxy.
+#[tauri::command]
+async fn ollama_fetch_text(url: String) -> Result<String, String> {
+    const ALLOWED: [&str; 2] = [
+        "https://ollama.com/library",
+        "https://registry.ollama.ai/v2/library/",
+    ];
+    if !ALLOWED.iter().any(|p| url.starts_with(p)) {
+        return Err("refusing to fetch non-registry URL".to_string());
+    }
+    let res = reqwest::Client::new()
+        .get(&url)
+        .header("User-Agent", "vicuna-catalog-fetch/1.0")
+        .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+        .send()
+        .await
+        .map_err(|e| format!("registry fetch failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("fetch", status, &body));
+    }
+    res.text()
+        .await
+        .map_err(|e| format!("registry fetch failed: {e}"))
+}
+
 /// Where the `ollama` binary may live. GUI apps launched from Finder get a
 /// sparse PATH (`/usr/bin:/bin/...`), so a Homebrew install is invisible to
 /// a bare `"ollama"` lookup — probe the usual locations in order.
@@ -634,6 +665,7 @@ pub fn run() {
             ollama_generate_stream,
             ollama_pull_model,
             ollama_delete_model,
+            ollama_fetch_text,
             ollama_server_version,
             ollama_start_server,
             ollama_stop_server,

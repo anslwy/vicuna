@@ -1,4 +1,5 @@
 import type { ChatMsg } from "./ollama";
+import { validateOverride, type CatalogOverride } from "./library";
 
 export interface Chat {
   id: string;
@@ -12,6 +13,9 @@ export interface Chat {
 
 const LS_CHATS = "vicuna-chats";
 const LS_MODEL = "vicuna-model";
+/** Fetched Discover catalog override (see src/lib/library.ts). Bundled
+ *  catalog.ts stays the fallback; a successful Fetch persists here. */
+const LS_CATALOG = "vicuna-catalog";
 const DB_PATH = "sqlite:vicuna.db";
 
 /** Marker for a stream in flight. Written synchronously when a stream starts
@@ -143,6 +147,8 @@ interface Backend {
   saveChats(chats: Chat[]): Promise<void>;
   loadModel(): Promise<string | null>;
   saveModel(m: string): Promise<void>;
+  loadCatalog(): Promise<string | null>;
+  saveCatalog(json: string): Promise<void>;
 }
 
 function isTauri(): boolean {
@@ -182,6 +188,20 @@ const lsBackend: Backend = {
       localStorage.setItem(LS_MODEL, m);
     } catch {
       /* ignore */
+    }
+  },
+  async loadCatalog(): Promise<string | null> {
+    try {
+      return localStorage.getItem(LS_CATALOG);
+    } catch {
+      return null;
+    }
+  },
+  async saveCatalog(json: string): Promise<void> {
+    try {
+      localStorage.setItem(LS_CATALOG, json);
+    } catch {
+      /* storage full: fetched catalog just won't survive a restart */
     }
   }
 };
@@ -347,6 +367,18 @@ async function createSqliteBackend(): Promise<Backend> {
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('model', $1)",
         [m]
       );
+    },
+    async loadCatalog(): Promise<string | null> {
+      const rows = await db.select<{ value: string }[]>(
+        "SELECT value FROM meta WHERE key = 'catalog'"
+      );
+      return rows[0]?.value ?? null;
+    },
+    async saveCatalog(json: string): Promise<void> {
+      await db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('catalog', $1)",
+        [json]
+      );
     }
   };
 }
@@ -394,6 +426,28 @@ export function saveModel(m: string): Promise<void> {
   return backend.saveModel(m).catch((e) => {
     console.error("saveModel failed:", e);
   });
+}
+
+export async function loadCatalog(): Promise<CatalogOverride | null> {
+  try {
+    const raw = await backend.loadCatalog();
+    if (!raw) return null;
+    return validateOverride(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function saveCatalog(c: CatalogOverride): void {
+  const json = JSON.stringify(c);
+  try {
+    localStorage.setItem(LS_CATALOG, json);
+  } catch {
+    /* ignore */
+  }
+  if (isTauri()) {
+    backend.saveCatalog(json).catch((e) => console.error("saveCatalog failed:", e));
+  }
 }
 
 // ---- appearance prefs (theme + accent) ----
