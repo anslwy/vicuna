@@ -25,7 +25,7 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "" };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1 };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let input = $state("");
   let models = $state<string[]>(["muse-glimmer:30b-mlx"]);
@@ -491,7 +491,7 @@
   }
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel });
   }
 
   function setOllamaHost(text: string) {
@@ -1562,6 +1562,56 @@
     requestAnimationFrame(() => composerEl?.focus());
   }
 
+  // Desktop webview zoom (Cmd/Ctrl +/−/0). Plain browsers zoom natively and
+  // never reach the backend: the chord handler below returns early there so
+  // the browser default is untouched.
+  let zoomLevel = $state(initialPrefs.zoom);
+  async function applyZoom(factor: number) {
+    zoomLevel = Math.min(3, Math.max(0.5, factor));
+    persistPrefs();
+    if (!isTauriRuntime()) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      zoomLevel = await invoke<number>("zoom_apply", { factor: zoomLevel });
+    } catch {
+      // backend zoom unavailable: the persisted level still applies next launch
+    }
+  }
+  async function stepZoom(direction: "in" | "out" | "reset") {
+    if (!isTauriRuntime()) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      zoomLevel =
+        direction === "reset"
+          ? await invoke<number>("zoom_apply", { factor: 1 })
+          : await invoke<number>("zoom_step", { direction });
+      persistPrefs();
+    } catch {
+      // ignore: zoom stays where it was
+    }
+  }
+
+  // Cmd/Ctrl +/−/0 adjusts the desktop webview zoom (browsers do this natively)
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (!isTauriRuntime()) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "+" || k === "=") {
+        e.preventDefault();
+        void stepZoom("in");
+      } else if (k === "-" || k === "_") {
+        e.preventDefault();
+        void stepZoom("out");
+      } else if (k === "0") {
+        e.preventDefault();
+        void stepZoom("reset");
+      }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
   function setSidebar(open: boolean) {
     sidebarOpen = open;
     persistPrefs();
@@ -1608,6 +1658,8 @@
       stopWordsText = stopWordsToText(stopWords);
       ollamaBase = prefs.ollamaBase;
       setOllamaBase(ollamaBase);
+      zoomLevel = prefs.zoom;
+      if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();

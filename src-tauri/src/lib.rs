@@ -565,6 +565,56 @@ async fn ollama_stop_server(state: State<'_, OllamaServerState>) -> Result<(), S
     }
 }
 
+/// Window zoom level for Cmd/Ctrl +/−/0. Desktop shells don't zoom webviews
+/// on those keys the way browsers do natively, so the frontend catches the
+/// chord (Tauri only) and drives the webview zoom from here.
+struct ZoomState {
+    factor: Mutex<f64>,
+}
+
+fn clamp_zoom(f: f64) -> f64 {
+    f.clamp(0.5, 3.0)
+}
+
+#[tauri::command]
+async fn zoom_apply(
+    window: tauri::WebviewWindow,
+    state: State<'_, ZoomState>,
+    factor: f64,
+) -> Result<f64, String> {
+    let factor = clamp_zoom(factor);
+    window
+        .set_zoom(factor)
+        .map_err(|e| format!("zoom failed: {e}"))?;
+    state
+        .factor
+        .lock()
+        .map(|mut f| {
+            *f = factor;
+            *f
+        })
+        .map_err(|_| "zoom state poisoned".to_string())
+}
+
+#[tauri::command]
+async fn zoom_step(
+    window: tauri::WebviewWindow,
+    state: State<'_, ZoomState>,
+    direction: String,
+) -> Result<f64, String> {
+    let current = *state
+        .factor
+        .lock()
+        .map_err(|_| "zoom state poisoned".to_string())?;
+    let base = if current <= 0.0 { 1.0 } else { current };
+    let next = match direction.as_str() {
+        "in" => base * 1.15,
+        "out" => base / 1.15,
+        _ => 1.0,
+    };
+    zoom_apply(window, state, next).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -572,6 +622,9 @@ pub fn run() {
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_deep_link::init())
         .manage(OllamaServerState::default())
+        .manage(ZoomState {
+            factor: Mutex::new(1.0),
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             ollama_list_models,
@@ -583,7 +636,9 @@ pub fn run() {
             ollama_delete_model,
             ollama_server_version,
             ollama_start_server,
-            ollama_stop_server
+            ollama_stop_server,
+            zoom_apply,
+            zoom_step
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

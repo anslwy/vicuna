@@ -346,11 +346,14 @@ export interface Prefs {
   /** Custom Ollama endpoint for plain-browser mode ("" = default http://localhost:11434).
    *  The Tauri shell always uses its local backend and ignores this. */
   ollamaBase: string;
+  /** Desktop webview zoom factor (Cmd/Ctrl +/−/0). Plain browsers zoom
+   *  natively and ignore this. */
+  zoom: number;
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "" };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1 };
 const LS_PREFS = "vicuna-prefs";
 
 export function readLocalPrefs(): Prefs {
@@ -364,7 +367,8 @@ export function readLocalPrefs(): Prefs {
       fontSize: typeof p.fontSize === "number" && p.fontSize >= 12 && p.fontSize <= 24 ? p.fontSize : DEFAULT_PREFS.fontSize,
       sidebarOpen: typeof p.sidebarOpen === "boolean" ? p.sidebarOpen : DEFAULT_PREFS.sidebarOpen,
       stopWords: Array.isArray(p.stopWords) ? p.stopWords.filter((s): s is string => typeof s === "string") : [...DEFAULT_STOP_WORDS],
-      ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase
+      ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
+      zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom
     };
   } catch {
     return { ...DEFAULT_PREFS };
@@ -375,7 +379,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -395,6 +399,10 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
       }
     }
     if (r.key === "pref_ollama_base" && typeof r.value === "string") out.ollamaBase = r.value;
+    if (r.key === "pref_zoom" && !isNaN(Number(r.value))) {
+      const n = Number(r.value);
+      if (n >= 0.5 && n <= 3) out.zoom = n;
+    }
   }
   return out;
 }
@@ -408,6 +416,7 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_sidebar', $1)", [p.sidebarOpen ? "1" : "0"]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_stop_words', $1)", [JSON.stringify(p.stopWords)]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_ollama_base', $1)", [p.ollamaBase]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_zoom', $1)", [String(p.zoom)]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {
