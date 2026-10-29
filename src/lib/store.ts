@@ -19,6 +19,67 @@ const DB_PATH = "sqlite:vicuna.db";
  *  partial tokens themselves persist via the regular chat save. */
 const LS_PENDING = "vicuna-pending-stream";
 
+/** Unsent composer drafts, keyed by chat id (`__home__` when no session is
+ *  active). Plain localStorage even on desktop: sqlite owns sent history,
+ *  but the requirement is drafts survive a restart via localStorage. */
+const LS_DRAFTS = "vicuna-drafts";
+const HOME_DRAFT_KEY = "__home__";
+
+function draftKey(id: string | null): string {
+  return id ?? HOME_DRAFT_KEY;
+}
+
+export function readDrafts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LS_DRAFTS);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "string" && v.length > 0) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function readDraft(id: string | null): string {
+  try {
+    return readDrafts()[draftKey(id)] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function writeDraft(id: string | null, text: string): void {
+  try {
+    const key = draftKey(id);
+    if (!text) {
+      clearDraft(id);
+      return;
+    }
+    const all = readDrafts();
+    all[key] = text;
+    localStorage.setItem(LS_DRAFTS, JSON.stringify(all));
+  } catch {
+    /* storage full or unavailable: sent history is unaffected */
+  }
+}
+
+export function clearDraft(id: string | null): void {
+  try {
+    const key = draftKey(id);
+    const all = readDrafts();
+    if (!(key in all)) return;
+    delete all[key];
+    localStorage.setItem(LS_DRAFTS, JSON.stringify(all));
+  } catch {
+    /* ignore */
+  }
+}
+
 export interface PendingStream {
   chatId: string;
   index: number;

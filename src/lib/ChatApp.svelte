@@ -16,6 +16,9 @@
     writePendingStream,
     readPendingStream,
     clearPendingStream,
+    readDraft,
+    writeDraft,
+    clearDraft,
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
@@ -28,8 +31,8 @@
   const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1 };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let input = $state("");
-  let models = $state<string[]>(["muse-glimmer:30b-mlx"]);
-  let selectedModel = $state("muse-glimmer:30b-mlx");
+  let models = $state<string[]>(["gemma4:31b-cloud"]);
+  let selectedModel = $state("gemma4:31b-cloud");
   let modelOpen = $state(false);
   let modelQuery = $state("");
   let streaming = $state(false);
@@ -95,6 +98,17 @@
 
   const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
 
+  // unsent composer text persists per session (home = null key) so a
+  // restart restores exactly what was typed; the save is synchronous, so
+  // even a kill without beforeunload keeps the last keystroke
+  $effect(() => {
+    if (!ready) return;
+    const text = input;
+    const id = activeId;
+    if (text) writeDraft(id, text);
+    else clearDraft(id);
+  });
+
   function save() {
     void saveChats(chats);
     void saveModel(selectedModel);
@@ -134,6 +148,8 @@
   let unloading = false;
   function handleUnload() {
     unloading = true;
+    if (input) writeDraft(activeId, input);
+    else clearDraft(activeId);
     flushSave();
   }
 
@@ -149,7 +165,7 @@
       isPinned = true;
       editingIndex = null;
       editDraft = "";
-      input = "";
+      input = readDraft(draft.id);
       error = null;
       void goto(`/s/${draft.id}`);
       return;
@@ -165,7 +181,7 @@
     isPinned = true;
     editingIndex = null;
     editDraft = "";
-    input = "";
+    input = readDraft(c.id);
     error = null;
     save();
     void goto(`/s/${c.id}`);
@@ -182,6 +198,7 @@
     pendingMsgDelete = null;
     dropActiveDraft(id);
     activeId = id;
+    input = readDraft(id);
     isPinned = true;
     suppressReset = true;
     void goto(`/s/${id}`);
@@ -208,10 +225,12 @@
     dropActiveDraft(sid);
     if (sid && chats.some((c) => c.id === sid)) {
       activeId = sid;
+      input = readDraft(sid);
       isPinned = true;
       suppressReset = true;
     } else if (!sid) {
       activeId = null;
+      input = readDraft(null);
     } else {
       void goto("/");
     }
@@ -223,10 +242,12 @@
     streaming = false;
     ctxMenu = null;
     pendingDeleteId = null;
+    clearDraft(id);
     const remaining = chats.filter((c) => c.id !== id);
     chats = remaining;
     if (id === activeId) {
       activeId = null;
+      input = readDraft(null);
       save();
       void goto("/");
     } else {
@@ -679,6 +700,7 @@
     if (!id) return;
     if (ready && chats.some((c) => c.id === id)) {
       activeId = id;
+      input = readDraft(id);
       isPinned = true;
       void goto(`/s/${id}`);
     } else {
@@ -726,6 +748,7 @@
     if (!activeId || activeId === exceptId) return;
     const c = chats.find((x) => x.id === activeId);
     if (c && c.messages.length === 0) {
+      clearDraft(activeId);
       chats = chats.filter((x) => x.id !== activeId);
       save();
     }
@@ -745,6 +768,10 @@
       return false;
     });
     if (remaining.length !== chats.length) {
+      const keptIds = new Set(remaining.map((c) => c.id));
+      for (const c of chats) {
+        if (!keptIds.has(c.id)) clearDraft(c.id);
+      }
       chats = remaining;
       save();
     }
@@ -1400,6 +1427,7 @@
   async function send() {
     const text = input.trim();
     if ((!text && attachImages.length === 0) || streaming) return;
+    const sentFromId = activeId;
     let chat = chats.find((c) => c.id === activeId);
     let freshChat = false;
     const images = attachImages.length ? [...attachImages] : undefined;
@@ -1435,6 +1463,8 @@
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     }
     input = "";
+    clearDraft(sentFromId);
+    if (sentFromId !== chat.id) clearDraft(chat.id);
     attachImages = [];
     error = null;
 
@@ -1668,6 +1698,8 @@
       const empties = chats.filter((c) => c.messages.length === 0);
       if (empties.length > 1) {
         const keepId = empties.some((c) => c.id === sessionId) ? sessionId : empties[0].id;
+        const dropped = chats.filter((c) => c.messages.length === 0 && c.id !== keepId);
+        for (const d of dropped) clearDraft(d.id);
         chats = chats.filter((c) => c.messages.length > 0 || c.id === keepId);
         save();
       }
@@ -1692,6 +1724,8 @@
           void goto(`/s/${id}`);
         }
       }
+      // restore the unsent composer draft for wherever we landed
+      input = readDraft(activeId);
       const m = await loadModel();
       if (m) selectedModel = m;
     } catch (e) {
@@ -1709,6 +1743,7 @@
       const pm = pc?.messages[pending.index];
       if (pc && pm && pm.role === "assistant") {
         activeId = pc.id;
+        input = readDraft(pc.id);
         if (pending.model) {
           selectedModel = pending.model;
           void saveModel(pending.model);

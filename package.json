@@ -11,7 +11,8 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "desktop:dev": "tauri dev"
+    "desktop:dev": "tauri dev",
+    "catalog:refresh": "python3 scripts/refresh-catalog.py"
   },
   "license": "MIT",
   "dependencies": {
