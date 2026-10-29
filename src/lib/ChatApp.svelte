@@ -1749,6 +1749,20 @@
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
 
+  const isWindows = typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "");
+  /** Strip Rust's Windows verbatim prefix (`\\?\C:\...`, `\\?\UNC\...`) so
+   *  older stored sessions display cleanly. New values are already clean
+   *  (the backend strips before returning), this covers stored ones. */
+  function displayWorkspace(p: string): string {
+    if (p.startsWith("\\\\?\\UNC\\")) return "\\" + p.slice("\\\\?\\UNC\\".length);
+    if (p.startsWith("\\\\?\\")) return p.slice("\\\\?\\".length);
+    return p;
+  }
+  /** Final path segment on any platform (`/` and `\` separators). */
+  function workspaceBase(p: string): string {
+    return displayWorkspace(p).trim().split(/[/\\]/).filter(Boolean).pop() ?? "";
+  }
+
   async function validateWorkspace(path: string): Promise<string | null> {
     const p = path.trim();
     if (!p) return null;
@@ -1780,7 +1794,7 @@
         return;
       }
       const current = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
-      const answer = window.prompt("Workspace absolute path:", current || "/");
+      const answer = window.prompt("Workspace absolute path:", current || (isWindows ? "" : "/"));
       if (answer == null) return; // cancelled
       pendingWorkspace = answer.trim();
       if (composerMode === "work" && activeChat) activeChat.workspace = pendingWorkspace || null;
@@ -1789,10 +1803,13 @@
     }
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
+      // "/" is the Unix fresh-install default, not a valid Windows path —
+      // never hand it to the native dialog as a default folder.
+      const hint = pendingWorkspace.trim() || defaultWorkspace.trim();
       const picked = await open({
         directory: true,
         multiple: false,
-        defaultPath: pendingWorkspace.trim() || defaultWorkspace.trim() || undefined
+        defaultPath: hint && !(isWindows && hint === "/") ? hint : undefined
       });
       if (typeof picked !== "string" || !picked) return; // cancelled
       pendingWorkspace = picked;
@@ -2236,6 +2253,12 @@
       setOllamaBase(ollamaBase);
       defaultWorkspace = prefs.defaultWorkspace ?? "";
       pendingWorkspace = prefs.defaultWorkspace ?? "";
+      // "/" is the Unix fresh-install default; on Windows it is not an
+      // absolute path, so treat a stored "/" as unset (pick a folder).
+      if (isWindows && (defaultWorkspace === "/" || pendingWorkspace === "/")) {
+        defaultWorkspace = "";
+        pendingWorkspace = "";
+      }
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       // narrow screens start collapsed regardless of the saved preference
@@ -2393,9 +2416,9 @@
               {:else}
                 <span class="title">{c.title}</span>
                 {#if c.mode === "work"}
-                  {@const wsBase = (c.workspace ?? "").trim().split("/").filter(Boolean).pop() ?? ""}
+                  {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
-                    <span class="work-badge ws-badge" title={c.workspace}>
+                    <span class="work-badge ws-badge" title={displayWorkspace(c.workspace ?? "")}>
                       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                       <span>{wsBase}</span>
                     </span>
@@ -2506,7 +2529,7 @@
       {#if activeChat.mode === "work"}
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
-          <span class="work-path" title={activeChat.workspace ?? ""}>{activeChat.workspace ?? "no workspace"}</span>
+          <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
         </div>
       {/if}
       <div
@@ -2705,7 +2728,7 @@
           <input
             class="pull-input workspace-input"
             data-testid="workspace-input-active"
-            placeholder="/absolute/path/to/workspace"
+            placeholder={isWindows ? "C:\\path\\to\\workspace" : "/absolute/path/to/workspace"}
             value={pendingWorkspace}
             spellcheck={false}
             onfocus={() => (workspaceEditing = true)}
@@ -2744,8 +2767,8 @@
           <div class="spacer"></div>
           <button class="pill-btn" data-testid="attach-btn" aria-label="Attach image" onclick={pickFile}>+</button>
           {#if composerMode === "work"}
-            {@const wsPath = activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace}
-            {@const wsName = wsPath.trim() ? (wsPath.trim().split("/").filter(Boolean).pop() ?? wsPath.trim()) : ""}
+            {@const wsPath = displayWorkspace(activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace)}
+            {@const wsName = wsPath.trim() ? (workspaceBase(wsPath) || wsPath.trim()) : ""}
             <button
               class="model-pill ws-pill"
               data-testid="workspace-pill"
