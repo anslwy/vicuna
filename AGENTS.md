@@ -72,4 +72,4 @@ There is no test suite; verification is `npm run check`, `npm run build`
 - Always run `npm run check` (expect 0 errors; 2 pre-existing a11y/autofocus warnings are fine) and `npm run build` after touching UI/store/ollama code.
 - Prefer `edit` with minimal boundary over rewriting files. Never use `shell`/comments to talk to the user. Verify by executing, don't assert from memory.
 - No git history rewriting; working tree has had parallel edits before — read files before editing, don't assume contents.
-- Releases: `.github/workflows/release-dmg.yml` builds a universal (arm64+x86_64) DMG on every `main` push and attaches it to the rolling `latest` prerelease. Unsigned build — other Macs need right-click → Open on first launch.
+- Releases: `.github/workflows/release.yml` builds on every `main` push and attaches installers to the rolling `latest` prerelease: universal (arm64+x86_64) DMG for macOS, nsis setup.exe for Windows, AppImage + deb for Linux (ubuntu-22.04 runner for older glibc). All unsigned — macOS needs right-click → Open (or `xattr`) on first launch, Windows SmartScreen warns. macOS local equivalent: `scripts/build-dmg.sh --universal`.
