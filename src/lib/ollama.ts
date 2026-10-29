@@ -156,8 +156,18 @@ async function warmModel(name: string, keepAlive: string): Promise<void> {
   await res.json().catch(() => {});
 }
 
+export interface OllamaToolCall {
+  id?: string;
+  function: { index?: number; name: string; arguments: Record<string, any> };
+}
+
+export interface OllamaToolDef {
+  type: "function";
+  function: { name: string; description: string; parameters: Record<string, any> };
+}
+
 export interface ChatMsg {
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool";
   content: string;
   thinking?: string;
   thinkingOpen?: boolean;
@@ -170,6 +180,10 @@ export interface ChatMsg {
   genMs?: number;
   /** generation speed in tok/s from Ollama's eval stats (latest run) */
   genTps?: number;
+  /** native tool calls requested by the assistant (Ollama `tool_calls`) */
+  tool_calls?: OllamaToolCall[];
+  /** tool result target (Ollama `tool` role uses `tool_name`) */
+  tool_name?: string;
 }
 
 /** Raw base64 for Ollama: drop any `data:...;base64,` prefix. */
@@ -183,7 +197,9 @@ function toWireMessages(messages: ChatMsg[]) {
   return messages.map((m) => ({
     role: m.role,
     content: m.content,
-    ...(m.images?.length ? { images: m.images.map(toB64) } : {})
+    ...(m.images?.length ? { images: m.images.map(toB64) } : {}),
+    ...(m.tool_calls?.length ? { tool_calls: m.tool_calls } : {}),
+    ...(m.role === "tool" && m.tool_name ? { tool_name: m.tool_name } : {})
   }));
 }
 
@@ -194,7 +210,7 @@ function stripImages(messages: ChatMsg[]): ChatMsg[] {
 type ChatEvent =
   | { type: "token"; text: string }
   | { type: "think"; text: string }
-  | { type: "done"; done_reason?: string | null; eval_count?: number | null; eval_duration?: number | null };
+  | { type: "done"; done_reason?: string | null; eval_count?: number | null; eval_duration?: number | null; tool_calls?: OllamaToolCall[] | null };
 
 async function chatStreamViaBackend(
   model: string,
@@ -202,14 +218,15 @@ async function chatStreamViaBackend(
   onToken: (t: string) => void,
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
-  opts: { think?: boolean; temperature?: number; stop?: string[] }
-): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number }> {
+  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
+): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   const { invoke, Channel } = await tauri();
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   let doneReason = "";
   let evalCount = 0;
   let evalDurationNs = 0;
   const onEvent = new Channel<ChatEvent>();
+  let toolCalls: OllamaToolCall[] = [];
   onEvent.onmessage = (ev) => {
     if (signal?.aborted) return;
     if (ev.type === "token") onToken(ev.text);
@@ -218,6 +235,7 @@ async function chatStreamViaBackend(
       if (ev.done_reason) doneReason = ev.done_reason;
       if (typeof ev.eval_count === "number") evalCount = ev.eval_count;
       if (typeof ev.eval_duration === "number") evalDurationNs = ev.eval_duration;
+      if (Array.isArray(ev.tool_calls)) toolCalls = ev.tool_calls;
     }
   };
   const invokePromise = invoke<string>("ollama_chat_stream", {
@@ -226,11 +244,12 @@ async function chatStreamViaBackend(
     think: opts.think ?? true,
     temperature: opts.temperature ?? null,
     stop: opts.stop ?? null,
+    tools: opts.tools ?? null,
     onEvent
   });
   if (!signal) {
     const text = await invokePromise;
-    return { text, doneReason, evalCount, evalDurationNs };
+    return { text, doneReason, evalCount, evalDurationNs, toolCalls };
   }
   // Abort: stop rendering and surface AbortError; the backend request runs
   // to completion detached (documented limitation — no cancel propagation).
@@ -242,7 +261,7 @@ async function chatStreamViaBackend(
       });
     })
   ]);
-  return { text, doneReason, evalCount, evalDurationNs };
+  return { text, doneReason, evalCount, evalDurationNs, toolCalls };
 }
 
 async function chatStreamViaFetch(
@@ -251,8 +270,8 @@ async function chatStreamViaFetch(
   onToken: (t: string) => void,
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
-  opts: { think?: boolean; temperature?: number; stop?: string[] }
-): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number }> {
+  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
+): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   const options: Record<string, number | string[]> = { num_ctx: 32768 };
   // temperature only set when explicitly requested (continue uses low temp
   // to stay on the most likely next token); otherwise server default
@@ -264,7 +283,7 @@ async function chatStreamViaFetch(
     // num_ctx: long chats (stories, code) exceed Ollama's small default
     // window, which makes continued generations forget the middle and
     // diverge into generic wrap-ups. 32k fits comfortably on this machine.
-    body: JSON.stringify({ model, messages: toWireMessages(messages), stream: true, think: opts.think ?? true, options }),
+    body: JSON.stringify({ model, messages: toWireMessages(messages), stream: true, think: opts.think ?? true, options, ...(opts.tools?.length ? { tools: opts.tools } : {}) }),
     signal
   });
   if (!res.ok) {
@@ -278,7 +297,8 @@ async function chatStreamViaFetch(
     const thinking = data?.message?.thinking ?? "";
     if (thinking && onThink) onThink(thinking);
     onToken(content);
-    return { text: content, doneReason: "", evalCount: 0, evalDurationNs: 0 };
+    const toolCalls: OllamaToolCall[] = Array.isArray(data?.message?.tool_calls) ? normalizeToolCalls(data.message.tool_calls) : [];
+    return { text: content, doneReason: "", evalCount: 0, evalDurationNs: 0, toolCalls };
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -287,6 +307,7 @@ async function chatStreamViaFetch(
   let doneReason = "";
   let evalCount = 0;
   let evalDurationNs = 0;
+  let toolCalls: OllamaToolCall[] = [];
   const feed = (line: string) => {
     const l = line.trim();
     if (!l) return;
@@ -302,6 +323,8 @@ async function chatStreamViaFetch(
         full += piece;
         onToken(piece);
       }
+      const tc = obj?.message?.tool_calls;
+      if (Array.isArray(tc)) toolCalls.push(...normalizeToolCalls(tc));
     } catch {
       // ignore partial json
     }
@@ -315,7 +338,29 @@ async function chatStreamViaFetch(
     for (const line of lines) feed(line);
   }
   if (buf.trim()) feed(buf);
-  return { text: full, doneReason, evalCount, evalDurationNs };
+  return { text: full, doneReason, evalCount, evalDurationNs, toolCalls };
+}
+
+/** Ollama may return arguments as an object (or a JSON string on some
+ *  versions/models) — normalize to an object. */
+function normalizeToolCalls(raw: any[]): OllamaToolCall[] {
+  const out: OllamaToolCall[] = [];
+  for (const c of raw) {
+    const fn = c?.function;
+    if (!fn || typeof fn.name !== "string") continue;
+    let args: Record<string, any> = {};
+    if (fn.arguments && typeof fn.arguments === "object") args = fn.arguments as Record<string, any>;
+    else if (typeof fn.arguments === "string" && fn.arguments.trim()) {
+      try {
+        const p = JSON.parse(fn.arguments);
+        if (p && typeof p === "object") args = p as Record<string, any>;
+      } catch {
+        /* leave empty */
+      }
+    }
+    out.push({ id: typeof c.id === "string" ? c.id : undefined, function: { index: typeof fn.index === "number" ? fn.index : undefined, name: fn.name, arguments: args } });
+  }
+  return out;
 }
 
 export async function chatStream(
@@ -325,13 +370,13 @@ export async function chatStream(
   signal?: AbortSignal,
   onThink?: (t: string) => void,
   attempt = 0,
-  opts: { think?: boolean; temperature?: number; stop?: string[]; onImagesStripped?: () => void } = {}
-): Promise<{ text: string; evalCount: number; evalDurationNs: number }> {
+  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[]; onImagesStripped?: () => void } = {}
+): Promise<{ text: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   try {
-    const { text, doneReason, evalCount, evalDurationNs } = isTauriRuntime()
+    const { text, doneReason, evalCount, evalDurationNs, toolCalls } = isTauriRuntime()
       ? await chatStreamViaBackend(model, messages, onToken, signal, onThink, opts)
       : await chatStreamViaFetch(model, messages, onToken, signal, onThink, opts);
-    if (text === "" && doneReason === "load" && attempt < 3 && !signal?.aborted) {
+    if (text === "" && toolCalls.length === 0 && doneReason === "load" && attempt < 3 && !signal?.aborted) {
       // model was (re)loading instead of generating: the request triggered the
       // load, so waiting briefly and retrying generates normally
       await new Promise((r) => setTimeout(r, 2000));
@@ -339,7 +384,7 @@ export async function chatStream(
         return chatStream(model, messages, onToken, signal, onThink, attempt + 1, opts);
       }
     }
-    return { text, evalCount, evalDurationNs };
+    return { text, evalCount, evalDurationNs, toolCalls };
   } catch (e: unknown) {
     if (isVisionUnsupportedError(e)) {
       // text-only model: retry the same turn without images (the stripped
@@ -353,6 +398,12 @@ export async function chatStream(
       // plain (non-reasoning) models reject think:true outright: retry once
       // with thinking disabled instead of failing the turn
       return chatStream(model, messages, onToken, signal, onThink, 1, { ...opts, think: false });
+    }
+    if (attempt === 0 && isToolsUnsupportedError(e)) {
+      // model has no native tool support: retry once without tools so the
+      // caller can fall back to the ```tool fence parser
+      const { tools: _drop, ...rest } = opts;
+      return chatStream(model, messages, onToken, signal, onThink, 1, rest);
     }
     throw e;
   }
@@ -368,6 +419,11 @@ function isThinkUnsupportedError(e: unknown): boolean {
   return msg.includes("does not support thinking");
 }
 
+function isToolsUnsupportedError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("tool") && (msg.includes("not supported") || msg.includes("does not support") || msg.includes("unsupported"));
+}
+
 /**
  * Render a chat history as plain "Role: text" transcript lines, ending with
  * the partial assistant reply. Used as a raw /api/generate prompt so the
@@ -376,7 +432,7 @@ function isThinkUnsupportedError(e: unknown): boolean {
 export function chatToTranscript(messages: ChatMsg[]): string {
   return messages
     .map((m) => {
-      const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "System";
+      const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : m.role === "tool" ? "Tool" : "System";
       return `${who}: ${m.content}`;
     })
     .join("\n\n");

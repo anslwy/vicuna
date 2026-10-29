@@ -33,7 +33,12 @@ marked.use({
     code({ text, lang }: { text: string; lang?: string }) {
       let html: string;
       let cls = "hljs";
-      if (lang && hljs.getLanguage(lang)) {
+      if (text.length > 8000) {
+        // huge dumps (full-file reads pasted as fences): auto-detect costs
+        // ~100ms+ per render and re-runs on every streamed token — plain
+        // escaped text instead, highlighting buys nothing here
+        html = escapeHtml(text);
+      } else if (lang && hljs.getLanguage(lang)) {
         html = hljs.highlight(text, { language: lang }).value;
         cls += ` language-${escapeHtml(lang)}`;
       } else {

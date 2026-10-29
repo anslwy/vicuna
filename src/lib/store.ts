@@ -9,6 +9,10 @@ export interface Chat {
   forkedFrom?: { id: string; title: string } | null;
   /** index of the last forked message; the note renders right after it */
   forkFromIndex?: number | null;
+  /** chat = plain Ollama chat, work = workspace agent (tool loop) */
+  mode?: "chat" | "work";
+  /** canonical workspace root for work sessions (null/undefined = unset) */
+  workspace?: string | null;
 }
 
 const LS_CHATS = "vicuna-chats";
@@ -164,7 +168,13 @@ const lsBackend: Backend = {
   async loadChats(): Promise<Chat[]> {
     try {
       const raw = lsGet(LS_CHATS, LEGACY_LS_CHATS);
-      return raw ? (JSON.parse(raw) as Chat[]) : [];
+      const list = raw ? (JSON.parse(raw) as Chat[]) : [];
+      // normalize pre-work-mode sessions
+      return list.map((c) => ({
+        ...c,
+        mode: c.mode === "work" ? "work" : "chat",
+        workspace: c.workspace ?? null
+      }));
     } catch {
       return [];
     }
@@ -236,7 +246,7 @@ async function createSqliteBackend(): Promise<Backend> {
       fork_from_index INTEGER
     )`);
   // migrations for databases created before fork attribution existed
-  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT"]) {
+  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT"]) {
     try {
       await db.execute(`ALTER TABLE chats ADD COLUMN ${col}`);
     } catch {
@@ -306,11 +316,35 @@ async function createSqliteBackend(): Promise<Backend> {
     }
   }
 
+  // serialized + coalesced chat writer (see saveChats below)
+  let saveActive = false;
+  let queuedChats: Chat[] | null = null;
+  type SqlDb = {
+    execute(query: string, bindValues?: unknown[]): Promise<unknown>;
+  };
+  async function rewriteChats(db: SqlDb, chats: Chat[]): Promise<void> {
+    // full rewrite is simple and fast enough at this scale
+    await db.execute("DELETE FROM messages");
+    await db.execute("DELETE FROM chats");
+    for (const c of chats) {
+      await db.execute(
+        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null]
+      );
+      let i = 0;
+      for (const m of c.messages) {
+        await db.execute(
+          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null]
+        );
+      }
+    }
+  }
+
   return {
-    async loadChats(): Promise<Chat[]> {
-      const rows = await db.select<
-        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null }[]
-      >("SELECT id, title, created_at, forked_from, fork_from_index FROM chats ORDER BY created_at DESC");
+    async loadChats(): Promise<Chat[]> {      const rows = await db.select<
+        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null }[]
+      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace FROM chats ORDER BY created_at DESC");
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
@@ -325,6 +359,8 @@ async function createSqliteBackend(): Promise<Backend> {
           createdAt: r.created_at,
           forkedFrom: r.forked_from ? (JSON.parse(r.forked_from) as Chat["forkedFrom"]) : null,
           forkFromIndex: r.fork_from_index ?? null,
+          mode: r.mode === "work" ? "work" : "chat",
+          workspace: r.workspace ?? null,
           messages: msgs.map((m) => ({
             role: m.role as ChatMsg["role"],
             content: m.content,
@@ -339,21 +375,27 @@ async function createSqliteBackend(): Promise<Backend> {
       return chats;
     },
     async saveChats(chats: Chat[]): Promise<void> {
-      // full rewrite is simple and fast enough at this scale
-      await db.execute("DELETE FROM messages");
-      await db.execute("DELETE FROM chats");
-      for (const c of chats) {
-        await db.execute(
-          "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index) VALUES ($1, $2, $3, $4, $5)",
-          [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null]
-        );
-        let i = 0;
-        for (const m of c.messages) {
-          await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null]
-          );
+      // single-writer + coalescing: save() is fire-and-forget and streaming
+      // triggers it every ~2s, so overlapping full rewrites are the norm.
+      // Two interleaved DELETE/INSERT sequences corrupt the DB (UNIQUE + FK
+      // failures, and a kill mid-storm wipes history). At most one rewrite
+      // runs; late arrivals collapse into a single trailing write of the
+      // newest snapshot.
+      queuedChats = chats;
+      if (saveActive) return;
+      saveActive = true;
+      try {
+        while (queuedChats) {
+          const next = queuedChats;
+          queuedChats = null;
+          try {
+            await rewriteChats(db, next);
+          } catch (e) {
+            console.error("saveChats failed:", e);
+          }
         }
+      } finally {
+        saveActive = false;
       }
     },
     async loadModel(): Promise<string | null> {
@@ -464,11 +506,14 @@ export interface Prefs {
   /** Desktop webview zoom factor (Cmd/Ctrl +/−/0). Plain browsers zoom
    *  natively and ignore this. */
   zoom: number;
+  /** Last-used Work mode workspace (absolute path). Pre-fills the workspace
+   *  picker and "Continue in Work". */
+  defaultWorkspace: string;
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1 };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "/" };
 const LS_PREFS = "vicuna-prefs";
 
 export function readLocalPrefs(): Prefs {
@@ -483,7 +528,8 @@ export function readLocalPrefs(): Prefs {
       sidebarOpen: typeof p.sidebarOpen === "boolean" ? p.sidebarOpen : DEFAULT_PREFS.sidebarOpen,
       stopWords: Array.isArray(p.stopWords) ? p.stopWords.filter((s): s is string => typeof s === "string") : [...DEFAULT_STOP_WORDS],
       ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
-      zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom
+      zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom,
+      defaultWorkspace: typeof p.defaultWorkspace === "string" ? p.defaultWorkspace : DEFAULT_PREFS.defaultWorkspace
     };
   } catch {
     return { ...DEFAULT_PREFS };
@@ -494,7 +540,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -518,6 +564,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
       const n = Number(r.value);
       if (n >= 0.5 && n <= 3) out.zoom = n;
     }
+    if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = r.value;
   }
   return out;
 }
@@ -532,6 +579,7 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_stop_words', $1)", [JSON.stringify(p.stopWords)]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_ollama_base', $1)", [p.ollamaBase]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_zoom', $1)", [String(p.zoom)]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_default_workspace', $1)", [p.defaultWorkspace]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {

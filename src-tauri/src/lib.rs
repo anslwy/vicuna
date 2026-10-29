@@ -25,6 +25,10 @@ struct ChatMessage {
     content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +42,8 @@ enum ChatEvent {
         eval_count: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         eval_duration: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<serde_json::Value>>,
     },
 }
 
@@ -134,6 +140,7 @@ async fn ollama_chat_stream(
     think: Option<bool>,
     temperature: Option<f64>,
     stop: Option<Vec<String>>,
+    tools: Option<serde_json::Value>,
     on_event: Channel<ChatEvent>,
 ) -> Result<String, String> {
     let mut options = serde_json::Map::new();
@@ -145,15 +152,21 @@ async fn ollama_chat_stream(
         options.insert("stop".to_string(), serde_json::json!(s));
     }
     let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "think": think.unwrap_or(true),
+        "options": options,
+    });
+    if let Some(t) = tools {
+        if !t.is_null() {
+            body["tools"] = t;
+        }
+    }
     let res = client
         .post(format!("{OLLAMA_BASE}/api/chat"))
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-            "think": think.unwrap_or(true),
-            "options": options,
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("ollama chat failed: {e}"))?;
@@ -168,6 +181,7 @@ async fn ollama_chat_stream(
     let mut done_reason: Option<String> = None;
     let mut eval_count: Option<u64> = None;
     let mut eval_duration: Option<u64> = None;
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut client_gone = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("ollama chat failed: {e}"))?;
@@ -190,6 +204,9 @@ async fn ollama_chat_stream(
                     }
                     if eval_duration.is_none() {
                         eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
+                    }
+                    if let Some(tc) = obj.get("message").and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
+                        tool_calls.extend(tc.clone());
                     }
                     if let Some(t) = obj
                         .get("message")
@@ -246,6 +263,9 @@ async fn ollama_chat_stream(
             if eval_duration.is_none() {
                 eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
             }
+            if let Some(tc) = obj.get("message").and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
+                tool_calls.extend(tc.clone());
+            }
             if let Some(t) = obj
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -258,10 +278,12 @@ async fn ollama_chat_stream(
             }
         }
     }
+    let tool_calls_opt = if tool_calls.is_empty() { None } else { Some(tool_calls) };
     let _ = on_event.send(ChatEvent::Done {
         done_reason,
         eval_count,
-        eval_duration
+        eval_duration,
+        tool_calls: tool_calls_opt,
     });
     Ok(full)
 }
@@ -596,11 +618,355 @@ async fn ollama_stop_server(state: State<'_, OllamaServerState>) -> Result<(), S
     }
 }
 
+/// ---------- Work mode: workspace-scoped file + shell tools ----------
+///
+/// Minimal agent backend (Tauri desktop only — plain browsers have no FS).
+/// Every path is sandboxed to the session's workspace root: the root is
+/// canonicalized once, joined paths must stay under it, and `..` escapes are
+/// rejected. Shell commands run with cwd=root, a timeout, and capped output.
+
+fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(root);
+    if !p.is_absolute() {
+        return Err("workspace must be an absolute path".to_string());
+    }
+    let canon = p
+        .canonicalize()
+        .map_err(|_| "workspace folder not found".to_string())?;
+    if !canon.is_dir() {
+        return Err("workspace is not a folder".to_string());
+    }
+    Ok(canon)
+}
+
+/// Join a session-relative path onto a canonical root, rejecting escapes.
+/// Empty/`"."` resolves to the root itself.
+fn work_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    let rel = rel.trim();
+    if rel.is_empty() || rel == "." || rel == "./" {
+        return Ok(root.to_path_buf());
+    }
+    if std::path::Path::new(rel).is_absolute() {
+        return Err("absolute paths are not allowed — use workspace-relative paths".to_string());
+    }
+    let mut cur = root.to_path_buf();
+    for comp in std::path::Path::new(rel).components() {
+        use std::path::Component::*;
+        match comp {
+            Normal(s) => cur.push(s),
+            CurDir => {}
+            ParentDir => {
+                if !cur.pop() || !cur.starts_with(root) {
+                    return Err("path escapes the workspace".to_string());
+                }
+            }
+            _ => return Err("invalid path".to_string()),
+        }
+    }
+    if !cur.starts_with(root) {
+        return Err("path escapes the workspace".to_string());
+    }
+    Ok(cur)
+}
+
+/// Validate a workspace path: must exist and be a directory. Returns the
+/// canonical absolute path for display + session storage.
+#[tauri::command]
+async fn work_validate_root(path: String) -> Result<String, String> {
+    Ok(work_canonical_root(path.trim())?.to_string_lossy().to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkDirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
+/// List a workspace-relative directory (default: root). Deny hidden dirs
+/// are still listed — the model decides what matters.
+#[tauri::command]
+async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let dir = work_join(&canon, path.as_deref().unwrap_or(""))?;
+    if !dir.is_dir() {
+        return Err("not a folder".to_string());
+    }
+    let mut out: Vec<WorkDirEntry> = Vec::new();
+    let rd = std::fs::read_dir(&dir).map_err(|e| format!("cannot list folder: {e}"))?;
+    for ent in rd.take(500) {
+        let ent = ent.map_err(|e| format!("cannot list folder: {e}"))?;
+        let ft = ent.file_type().map_err(|e| format!("cannot list folder: {e}"))?;
+        let name = ent.file_name().to_string_lossy().to_string();
+        let full_path = ent.path();
+        let rel = full_path
+            .strip_prefix(&canon)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| full_path.to_string_lossy().to_string());
+        out.push(WorkDirEntry {
+            name,
+            path: rel,
+            is_dir: ft.is_dir(),
+            size: if ft.is_file() {
+                ent.metadata().ok().map(|m| m.len())
+            } else {
+                None
+            },
+        });
+    }
+    out.sort_by(|a, b| {
+        (b.is_dir as u8)
+            .cmp(&(a.is_dir as u8))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkFileContent {
+    path: String,
+    content: String,
+    truncated: bool,
+    size: u64,
+}
+
+/// Read a workspace-relative text file (cap ~64KB; binary smells rejected).
+#[tauri::command]
+async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    let size = meta.len();
+    let cap = max_bytes.unwrap_or(65536).clamp(1024, 262144) as usize;
+    let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
+    // reject obvious binaries (NUL byte in the head sample)
+    if bytes.iter().take(4096).any(|&b| b == 0) {
+        return Err("binary file — refusing to dump as text".to_string());
+    }
+    let truncated = bytes.len() > cap;
+    let slice = &bytes[..bytes.len().min(cap)];
+    Ok(WorkFileContent {
+        path: path.trim().to_string(),
+        content: String::from_utf8_lossy(slice).to_string(),
+        truncated,
+        size,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkGrepHit {
+    path: String,
+    line: usize,
+    text: String,
+}
+
+/// Substring search (case-insensitive) across workspace text files.
+/// Caps: 200 files scanned, 100 hits, 512KB per file, skips hidden dirs.
+#[tauri::command]
+async fn work_grep(root: String, pattern: String, include: Option<String>) -> Result<Vec<WorkGrepHit>, String> {
+    let needle = pattern.to_lowercase();
+    if needle.is_empty() || needle.len() > 200 {
+        return Err("empty or oversized search pattern".to_string());
+    }
+    let canon = work_canonical_root(root.trim())?;
+    let include = include.unwrap_or_default().to_lowercase();
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![canon.clone()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= 200 {
+            break;
+        }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd {
+            let ent = match ent {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = ent.path();
+            if p.is_dir() {
+                if matches!(name.as_str(), "node_modules" | "target" | "build" | ".git" | "dist") {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.is_file() {
+                if !include.is_empty() && !name.to_lowercase().contains(&include) {
+                    continue;
+                }
+                if ent.metadata().map(|m| m.len()).unwrap_or(0) > 524288 {
+                    continue;
+                }
+                files.push(p);
+                if files.len() >= 200 {
+                    break;
+                }
+            }
+        }
+    }
+    let mut hits: Vec<WorkGrepHit> = Vec::new();
+    for f in files {
+        if hits.len() >= 100 {
+            break;
+        }
+        let bytes = match std::fs::read(&f) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bytes.iter().take(1024).any(|&b| b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let rel = f
+            .strip_prefix(&canon)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .to_string();
+        for (i, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                hits.push(WorkGrepHit {
+                    path: rel.clone(),
+                    line: i + 1,
+                    text: line.chars().take(240).collect(),
+                });
+                if hits.len() >= 100 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Write (or overwrite) a workspace-relative text file, creating parents.
+/// Refuses to overwrite files larger than 1MB without an explicit read first
+/// — the agent should read before clobbering.
+#[tauri::command]
+async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
+    if content.len() > 524288 {
+        return Err("content too large (max ~512KB per write)".to_string());
+    }
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if full.is_dir() {
+        return Err("cannot overwrite a folder".to_string());
+    }
+    if let Some(parent) = full.parent() {
+        if !parent.starts_with(&canon) {
+            return Err("path escapes the workspace".to_string());
+        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folders: {e}"))?;
+    }
+    std::fs::write(&full, content.as_bytes()).map_err(|e| format!("cannot write file: {e}"))?;
+    Ok(path.trim().to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkExecResult {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    truncated: bool,
+}
+
+fn trunc_out(s: &str) -> (String, bool) {
+    const CAP: usize = 32768;
+    if s.len() > CAP {
+        (format!("{}\n…[truncated]", &s[..CAP]), true)
+    } else {
+        (s.to_string(), false)
+    }
+}
+
+/// Run a shell command with cwd=workspace root. Timeout default 30s (max
+/// 120s). Output capped at 32KB per stream. Destructive commands are the
+/// user's responsibility — Work mode is explicit opt-in per session.
+#[tauri::command]
+async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err("empty command".to_string());
+    }
+    if cmd.len() > 8000 {
+        return Err("command too long".to_string());
+    }
+    let canon = work_canonical_root(root.trim())?;
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000).clamp(1000, 120000));
+    #[cfg(windows)]
+    let child = tokio::process::Command::new("cmd")
+        .arg("/C")
+        .arg(cmd)
+        .current_dir(&canon)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run command: {e}"))?;
+    #[cfg(not(windows))]
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(&canon)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run command: {e}"))?;
+    // wait_with_output takes ownership, so keep the pid for the timeout kill
+    let pid = child.id();
+    let status = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    match status {
+        Err(_) => {
+            // timed out: the wait future (owning the child handle) is dropped,
+            // so kill by pid to avoid leaving the process running
+            if let Some(pid) = pid {
+                #[cfg(not(windows))]
+                let _ = tokio::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .output()
+                    .await;
+                #[cfg(windows)]
+                let _ = tokio::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output()
+                    .await;
+            }
+            Ok(WorkExecResult {
+                stdout: String::new(),
+                stderr: format!("timed out after {}s — process killed", timeout.as_secs()),
+                exit_code: None,
+                timed_out: true,
+                truncated: false,
+            })
+        }
+        Ok(Err(e)) => Err(format!("command failed: {e}")),
+        Ok(Ok(out)) => {
+            let (stdout, t1) = trunc_out(&String::from_utf8_lossy(&out.stdout));
+            let (stderr, t2) = trunc_out(&String::from_utf8_lossy(&out.stderr));
+            Ok(WorkExecResult {
+                stdout,
+                stderr,
+                exit_code: out.status.code(),
+                timed_out: false,
+                truncated: t1 || t2,
+            })
+        }
+    }
+}
+
 /// Window zoom level for Cmd/Ctrl +/−/0. Desktop shells don't zoom webviews
 /// on those keys the way browsers do natively, so the frontend catches the
 /// chord (Tauri only) and drives the webview zoom from here.
-struct ZoomState {
-    factor: Mutex<f64>,
+struct ZoomState {    factor: Mutex<f64>,
 }
 
 fn clamp_zoom(f: f64) -> f64 {
@@ -652,6 +1018,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(OllamaServerState::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),
@@ -669,9 +1036,108 @@ pub fn run() {
             ollama_server_version,
             ollama_start_server,
             ollama_stop_server,
+            work_validate_root,
+            work_list_dir,
+            work_read_file,
+            work_grep,
+            work_write_file,
+            work_exec,
             zoom_apply,
             zoom_step
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vicuna-work-test-{tag}-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn validate_rejects_missing_and_relative() {
+        assert!(work_canonical_root("/no/such/dir/xyz").is_err());
+        assert!(work_canonical_root("relative/path").is_err());
+        let d = tmp_root("validate");
+        assert!(work_canonical_root(d.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn join_rejects_escapes() {
+        let d = tmp_root("join");
+        let canon = work_canonical_root(d.to_str().unwrap()).unwrap();
+        assert!(work_join(&canon, "").unwrap() == canon);
+        assert!(work_join(&canon, "a/b/../c.txt").unwrap().starts_with(&canon));
+        assert!(work_join(&canon, "../../etc/passwd").is_err());
+        assert!(work_join(&canon, "/etc/passwd").is_err());
+    }
+
+    #[tokio::test]
+    async fn write_read_list_grep_roundtrip() {
+        let d = tmp_root("roundtrip");
+        let root = d.to_string_lossy().to_string();
+        work_write_file(root.clone(), "hello.py".into(), "print('hi')\n".into())
+            .await
+            .unwrap();
+        let entries = work_list_dir(root.clone(), None).await.unwrap();
+        assert!(entries.iter().any(|e| e.name == "hello.py" && !e.is_dir));
+        let content = work_read_file(root.clone(), "hello.py".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(content.content, "print('hi')\n");
+        assert!(!content.truncated);
+        let hits = work_grep(root.clone(), "print".into(), None).await.unwrap();
+        assert!(hits.iter().any(|h| h.path == "hello.py" && h.line == 1));
+        // outside-root access rejected at every entry point
+        assert!(work_read_file(root.clone(), "../outside.txt".into(), None)
+            .await
+            .is_err());
+    }
+
+    /// The exact flow the agent runs for "write a script, then run it".
+    #[tokio::test]
+    async fn write_python_then_run_and_capture() {
+        let d = tmp_root("fizzbuzz");
+        let root = d.to_string_lossy().to_string();
+        let script = r#"for i in range(1, 16):
+    s = ("Fizz" if i % 3 == 0 else "") + ("Buzz" if i % 5 == 0 else "")
+    print(s or i)
+"#;
+        work_write_file(root.clone(), "fizzbuzz.py".into(), script.into())
+            .await
+            .unwrap();
+        let res = work_exec(root.clone(), "python3 fizzbuzz.py".into(), Some(30000))
+            .await
+            .unwrap();
+        assert!(!res.timed_out);
+        assert_eq!(res.exit_code, Some(0));
+        let lines: Vec<&str> = res.stdout.lines().collect();
+        assert_eq!(lines.len(), 15);
+        assert_eq!(lines[2], "Fizz");
+        assert_eq!(lines[4], "Buzz");
+        assert_eq!(lines[14], "FizzBuzz");
+    }
+
+    #[tokio::test]
+    async fn exec_echo_and_timeout() {
+        let d = tmp_root("exec");
+        let root = d.to_string_lossy().to_string();
+        let res = work_exec(root.clone(), "echo hello-work".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(res.stdout.trim(), "hello-work");
+        assert_eq!(res.exit_code, Some(0));
+        let slow = work_exec(root, "sleep 5".into(), Some(1200)).await.unwrap();
+        assert!(slow.timed_out);
+    }
 }

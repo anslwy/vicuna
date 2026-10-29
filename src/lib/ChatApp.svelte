@@ -25,20 +25,43 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall } from "$lib/work";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1 };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "" };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
+  let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
+  /** mode + workspace picker for the session being started (home or empty draft) */
+  let pendingMode = $state<"chat" | "work">("chat");
+  let pendingWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
+  let workspaceError = $state<string | null>(null);
+  /** true while the in-thread workspace input is focused: keeps the picker
+   *  mounted while typing (it hides once a workspace is set) */
+  let workspaceEditing = $state(false);
+  /** visible "command running" indicator while a work tool executes */
+  let toolStatus = $state<{ chatId: string; label: string } | null>(null);
   let input = $state("");
   let models = $state<string[]>(["gemma4:31b-cloud"]);
   let selectedModel = $state("gemma4:31b-cloud");
   let modelOpen = $state(false);
   let modelQuery = $state("");
   let streaming = $state(false);
+  /** true for the whole Work turn, including tool dispatch + the wait for the
+   *  next round's first token — `streaming` only covers a single request */
+  let workRunning = $state(false);
+  let workChatId = $state<string | null>(null);
+  let workStop = false;
+  let workTurnSeq = 0;
+  /** prompts typed while a work turn is live: they join the context at the
+   *  next round (after the tool results), never as a parallel turn */
+  let queuedMsgs = $state<{ chatId: string; msg: ChatMsg }[]>([]);
+  /** first Esc arms interrupt, a second Esc within 2.5s stops the agent */
+  let escArmed = $state(false);
+  let escTimer: ReturnType<typeof setTimeout> | null = null;
   let continuing = $state(false);
   /** picked or pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
   let attachImages = $state<string[]>([]);
@@ -100,6 +123,14 @@
   }
 
   const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
+  // composer reflects the starter toggle while starting (home or empty draft);
+  // a thread with messages keeps its own mode
+  const composerMode = $derived(
+    !activeChat || activeChat.messages.length === 0 ? pendingMode : (activeChat.mode ?? "chat")
+  );
+  const queuedForActive = $derived(queuedMsgs.filter((q) => q.chatId === activeId));
+  /** a turn is live: either a single request or a whole Work agent turn */
+  const busy = $derived(streaming || workRunning);
 
   // unsent composer text persists per session (home = null key) so a
   // restart restores exactly what was typed; the save is synchronous, so
@@ -163,6 +194,8 @@
     // reuse the existing empty draft instead of stacking blank sessions
     const draft = chats.find((c) => c.messages.length === 0);
     if (draft) {
+      draft.mode = pendingMode;
+      if (pendingMode === "work") draft.workspace = pendingWorkspace || null;
       pruneEmptyDrafts(draft.id);
       activeId = draft.id;
       isPinned = true;
@@ -175,9 +208,11 @@
     }
     const c: Chat = {
       id: crypto.randomUUID(),
-      title: "New chat",
+      title: "New session",
       createdAt: Date.now(),
-      messages: []
+      messages: [],
+      mode: pendingMode,
+      workspace: pendingMode === "work" ? pendingWorkspace || null : null
     };
     chats = [c, ...chats];
     activeId = c.id;
@@ -208,6 +243,18 @@
   }
 
   // adopt URL changes that didn't come from a local action (back/forward).
+  // starter toggle follows the empty draft being viewed: opening a work
+  // draft shows Work + its workspace, home keeps the last toggle
+  $effect(() => {
+    if (!ready) return;
+    const c = activeChat;
+    workspaceEditing = false;
+    if (c && c.messages.length === 0) {
+      pendingMode = c.mode ?? "chat";
+      pendingWorkspace = c.workspace ?? defaultWorkspace ?? "";
+      workspaceError = null;
+    }
+  });
   // keyed on the URL itself, NOT on activeId: our own actions set activeId
   // first and navigate after, which must never be mistaken for external nav
   // (that misread aborted fresh streams and wiped the session).
@@ -539,7 +586,7 @@
   }
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace });
   }
 
   function setOllamaHost(text: string) {
@@ -805,7 +852,7 @@
   }
 
   function requestMsgDelete(i: number) {
-    if (streaming) return;
+    if (busy) return;
     ctxMenu = null;
     pendingMsgDelete = i;
   }
@@ -814,7 +861,7 @@
     const chat = chats.find((c) => c.id === activeId);
     const i = pendingMsgDelete;
     pendingMsgDelete = null;
-    if (!chat || i == null || streaming) return;
+    if (!chat || i == null || busy) return;
     const target = chat.messages[i];
     if (!target) return;
     // deleting a user message also removes the reply that follows it;
@@ -883,6 +930,17 @@
     { title: "Brainstorm ideas", prompt: "Give me ideas for a weekend project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>' },
     { title: "Summarize text", prompt: "Summarize this paragraph in two sentences:", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
     { title: "What can you do?", prompt: "What can you do?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
+  ];
+
+  // work starters: each one maps to a real Work-mode capability (list/read,
+  // grep, exec, write, sessions) so the cards demo what the agent can do
+  const WORK_SUGGESTIONS = [
+    { title: "Explore this folder", prompt: "List the files here and explain what this project is", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' },
+    { title: "Find in files", prompt: "Search the workspace for TODO comments and group them by file", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' },
+    { title: "Run a command", prompt: "Run `git status` and summarize what changed", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>' },
+    { title: "Write a file", prompt: "Create a README.md that explains this project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>' },
+    { title: "Search past chats", prompt: "Search my past chats for this project and summarize what we did", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>' },
+    { title: "What can you do?", prompt: "What can you do in Work mode?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
   ];
 
   function useSuggestion(prompt: string) {
@@ -1181,7 +1239,7 @@
 
   function startEdit(i: number) {
     const m = activeChat?.messages[i];
-    if (!m || streaming) return;
+    if (!m || busy) return;
     editingIndex = i;
     editDraft = m.content;
     editImages = [...(m.images ?? [])];
@@ -1271,7 +1329,7 @@
     }
     // editing own message: replace it, drop everything after, regenerate
     chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text, ...(images ? { images } : {}) }];
-    if (text && (chat.title === "New chat" || chat.title === "New Chat")) {
+    if (text && (chat.title === "New session" || chat.title === "New Session")) {
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
@@ -1294,7 +1352,7 @@
 
   function forkAt(i: number) {
     const c = chats.find((x) => x.id === activeId);
-    if (!c || streaming) return;
+    if (!c || busy) return;
     aborter?.abort();
     aborter = null;
     const fork: Chat = {
@@ -1316,11 +1374,12 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; onImagesStripped?: () => void } = {}) {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
     streaming = true;
     const ctrl = new AbortController();
     aborter = ctrl;
     let produced = false;
+    let generatedText = "";
     isPinned = true;
     // mark the in-flight stream synchronously: a refresh before settle
     // resumes from the persisted partial instead of losing the turn
@@ -1338,39 +1397,83 @@
     const wallStart = Date.now();
     let runEvalCount = 0;
     let runEvalDurationNs = 0;
+    let runToolCalls: import("$lib/ollama").OllamaToolCall[] = [];
+    // token batching: cloud models burst dozens of tokens per frame, and each
+    // state write re-renders + re-highlights the whole message — with multi-KB
+    // tool outputs in the transcript that cost grows per token until the UI
+    // stalls. Buffer ~120ms so renders stay flat regardless of burst rate.
+    let pendingTok = "";
+    let pendingTh = "";
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    function flushTokens() {
+      flushTimer = null;
+      if (!pendingTok && !pendingTh) return;
+      const tok = pendingTok;
+      const th = pendingTh;
+      pendingTok = "";
+      pendingTh = "";
+      const keep = captureStreamSel(index);
+      const c = chats.find((x) => x.id === chat.id);
+      if (c && c.messages[index]) {
+        const m = c.messages[index];
+        c.messages[index] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
+        chats = [...chats];
+      }
+      if (keep) void tick().then(() => restoreStreamSel(index, keep));
+      scrollBottom();
+      saveSoon();
+    }
+    function scheduleFlush() {
+      if (flushTimer) return;
+      flushTimer = setTimeout(flushTokens, 120);
+    }
+    // Ollama only ships tool-call args once complete, so a work round goes
+    // silent while the model generates them. Surface that instead of a
+    // dead-looking pause. Armed after the first token: before that, a slow
+    // first token is just latency, not a call.
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    function clearStall() {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    }
+    function dropStallHint() {
+      if (toolStatus?.chatId === chat.id && toolStatus.label === "Preparing tool call…") toolStatus = null;
+    }
+    function armStall() {
+      clearStall();
+      if (!opts.tools) return;
+      stallTimer = setTimeout(() => {
+        stallTimer = null;
+        if (!pendingTok && !pendingTh && !toolStatus) {
+          toolStatus = { chatId: chat.id, label: "Preparing tool call…" };
+        }
+      }, 1000);
+    }
     try {
       const onTok = (tok: string) => {
         produced = true;
-        const keep = captureStreamSel(index);
-        const c = chats.find((x) => x.id === chat.id);
-        if (c && c.messages[index]) {
-          const m = c.messages[index];
-          c.messages[index] = { role: "assistant", content: m.content + tok, thinking: m.thinking, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
-          chats = [...chats];
-        }
-        if (keep) void tick().then(() => restoreStreamSel(index, keep));
-        scrollBottom();
-        saveSoon();
+        generatedText += tok;
+        pendingTok += tok;
+        scheduleFlush();
+        dropStallHint();
+        armStall();
       };
       const onTh = (tok: string) => {
         produced = true;
-        const keep = captureStreamSel(index);
-        const c = chats.find((x) => x.id === chat.id);
-        if (c && c.messages[index]) {
-          const m = c.messages[index];
-          c.messages[index] = { role: "assistant", content: m.content, thinking: (m.thinking ?? "") + tok, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
-          chats = [...chats];
-        }
-        if (keep) void tick().then(() => restoreStreamSel(index, keep));
-        scrollBottom();
-        saveSoon();
+        pendingTh += tok;
+        scheduleFlush();
+        dropStallHint();
+        armStall();
       };
       if (opts.generatePrompt !== undefined) {
         await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
       } else {
-        const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
+        const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop, tools: opts.tools, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
         runEvalCount = res.evalCount;
         runEvalDurationNs = res.evalDurationNs;
+        runToolCalls = res.toolCalls ?? [];
       }
     } catch (err: any) {
       if (err?.name === "AbortError") {
@@ -1386,6 +1489,15 @@
     } finally {
       streaming = false;
       aborter = null;
+      clearStall();
+      dropStallHint();
+      // drop any scheduled flush and push the tail synchronously: the final
+      // content must be in state before stats/resume logic runs below
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      flushTokens();
       // record generation stats: wall time always, tok/s from the server's
       // eval counters when present (cloud APIs omit eval_duration — then
       // fall back to eval tokens over wall time so they still get a rate)
@@ -1411,12 +1523,13 @@
       if (!unloading) clearPendingStream();
       save();
       scrollBottom();
+      return { text: generatedText, toolCalls: runToolCalls };
     }
   }
 
   async function continueFrom(i: number) {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || streaming) return;
+    if (!chat || busy) return;
     if (i !== chat.messages.length - 1) return;
     const target = chat.messages[i];
     if (!target || target.role !== "assistant") return;
@@ -1437,7 +1550,7 @@
 
   async function regenerate(i: number) {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || streaming) return;
+    if (!chat || busy) return;
     if (i !== chat.messages.length - 1) return;
     const target = chat.messages[i];
     if (!target || target.role !== "assistant") return;
@@ -1448,16 +1561,65 @@
     const freshHistory: ChatMsg[] = chat.messages.map(toHistory);
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     chats = [...chats];
+    if ((chat.mode ?? "chat") === "work") {
+      // work threads re-run the agent, not a plain reply — and stopping the
+      // agent mid-run still leaves the (empty) placeholder resumable
+      if (!chat.workspace?.trim()) {
+        error = "Work mode needs a workspace folder — pick one with the folder pill, then regenerate.";
+        return;
+      }
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+      return;
+    }
     await streamInto(chat, chat.messages.length - 1, freshHistory, true);
   }
 
   async function send() {
     const text = input.trim();
-    if ((!text && attachImages.length === 0) || streaming) return;
+    if (!text && attachImages.length === 0) return;
+    if (streaming || workRunning) {
+      // work turns stay interactive: a prompt typed mid-run queues for the
+      // next round instead of being dropped or starting a parallel turn
+      const running = chats.find((c) => c.id === workChatId);
+      if (workRunning && workChatId === activeId && (running?.mode ?? "chat") === "work") {
+        queuePrompt(text, attachImages.length ? [...attachImages] : undefined);
+      }
+      return;
+    }
     const sentFromId = activeId;
     let chat = chats.find((c) => c.id === activeId);
     let freshChat = false;
     const images = attachImages.length ? [...attachImages] : undefined;
+    // effective mode: a pre-existing thread keeps its mode; a home send or an
+    // untouched empty draft adopts the starter toggle
+    const effectiveMode: "chat" | "work" = chat
+      ? (chat.messages.length === 0 ? pendingMode : (chat.mode ?? "chat"))
+      : pendingMode;
+    let workRoot: string | null = null;
+    if (effectiveMode === "work") {
+      // workspace required before the session begins
+      const rawWs = chat && chat.messages.length > 0 ? (chat.workspace ?? pendingWorkspace) : pendingWorkspace;
+      if (!rawWs?.trim()) {
+        workspaceError = "Pick a workspace folder first.";
+        error = "Work mode needs a workspace folder — set one above, then send.";
+        return;
+      }
+      try {
+        // desktop canonicalizes (must exist); browsers have no FS, so the
+        // raw path stands and file/shell tools report per-call — the
+        // vicuna-local tools (sessions, read_session) still work there
+        workRoot = isTauriRuntime() ? await canonicalWorkspace(rawWs) : rawWs.trim();
+      } catch (e: any) {
+        const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+        workspaceError = msg;
+        error = `Workspace invalid: ${msg}`;
+        return;
+      }
+      workspaceError = null;
+      defaultWorkspace = workRoot;
+      pendingWorkspace = workRoot;
+      persistPrefs();
+    }
     if (!chat) {
       // sending from home (or any stateless view): create the session inline.
       // navigation is deferred until the stream finishes, otherwise the
@@ -1466,7 +1628,7 @@
       // Svelte 5 caches proxied reads, so mutating the raw object after
       // prepending stays invisible until the first streamed token writes
       // through the proxy — the composer would look stuck on empty.
-      const titleSrc = text || (images ? "Image" : "New chat");
+      const titleSrc = text || (images ? "Image" : "New session");
       chat = {
         id: crypto.randomUUID(),
         title: titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : ""),
@@ -1474,7 +1636,9 @@
         messages: [
           { role: "user", content: text, ...(images ? { images } : {}) },
           { role: "assistant", content: "", thinking: "", model: selectedModel }
-        ]
+        ],
+        mode: effectiveMode,
+        workspace: effectiveMode === "work" ? workRoot : null
       };
       chats = [chat, ...chats];
       activeId = chat.id;
@@ -1482,9 +1646,13 @@
       freshChat = true;
       save();
     } else {
+      if (chat.messages.length === 0) {
+        chat.mode = effectiveMode;
+        if (effectiveMode === "work") chat.workspace = workRoot;
+      }
       chat.messages = [...chat.messages, { role: "user", content: text, ...(images ? { images } : {}) }];
-      if (chat.title === "New chat" || chat.title === "New Chat") {
-        const titleSrc = text || (images ? "Image" : "New chat");
+      if (chat.title === "New session" || chat.title === "New Session") {
+        const titleSrc = text || (images ? "Image" : "New session");
         chat.title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
       }
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
@@ -1495,16 +1663,62 @@
     attachImages = [];
     error = null;
 
-    // history excludes the trailing placeholder being generated
-    const history: ChatMsg[] = chat.messages.slice(0, -1).map(toHistory);
-    await streamInto(chat, chat.messages.length - 1, history, true);
+    if ((chat.mode ?? "chat") === "work" && chat.workspace) {
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+    } else {
+      // history excludes the trailing placeholder being generated
+      const history: ChatMsg[] = chat.messages.slice(0, -1).map(toHistory);
+      await streamInto(chat, chat.messages.length - 1, history, true);
+    }
     if (freshChat && activeId === chat.id) {
       // user stayed put: now reflect the session in the URL
       void goto(`/s/${chat.id}`);
     }
   }
 
+  function queuePrompt(text: string, images?: string[]) {
+    const chatId = activeId;
+    if (!chatId || (!text && !images?.length)) return;
+    queuedMsgs = [...queuedMsgs, { chatId, msg: { role: "user", content: text, ...(images ? { images } : {}) } }];
+    input = "";
+    clearDraft(chatId);
+    attachImages = [];
+    error = null;
+  }
+
+  /** drain the queued prompts for a chat (they are consumed at once) */
+  function takeQueued(chatId: string): ChatMsg[] {
+    const taken = queuedMsgs.filter((q) => q.chatId === chatId);
+    if (!taken.length) return [];
+    queuedMsgs = queuedMsgs.filter((q) => q.chatId !== chatId);
+    return taken.map((q) => q.msg);
+  }
+
+  function unqueue(index: number) {
+    queuedMsgs = queuedMsgs.filter((_, i) => i !== index);
+  }
+
+  /** work mode: Esc once arms the interrupt, Esc again within 2.5s stops it */
+  function onEscape() {
+    if (!workRunning && !streaming) return false;
+    if (!escArmed) {
+      escArmed = true;
+      if (escTimer) clearTimeout(escTimer);
+      escTimer = setTimeout(() => {
+        escArmed = false;
+        escTimer = null;
+      }, 2500);
+      return true;
+    }
+    if (escTimer) clearTimeout(escTimer);
+    escTimer = null;
+    escArmed = false;
+    stop();
+    return true;
+  }
+
   function stop() {
+    if (workRunning) workStop = true;
     aborter?.abort();
   }
 
@@ -1520,15 +1734,307 @@
   }
 
   // history entries keep attached images so regenerate/continue/resume
-  // resend the same picture instead of silently dropping it
+  // resend the same picture instead of silently dropping it; tool calls and
+  // tool names pass through for native agent histories
   function toHistory(m: ChatMsg): ChatMsg {
-    return m.images?.length
+    const base: ChatMsg = m.images?.length
       ? { role: m.role, content: m.content, images: [...m.images] }
       : { role: m.role, content: m.content };
+    if (m.tool_calls?.length) base.tool_calls = m.tool_calls;
+    if (m.tool_name) base.tool_name = m.tool_name;
+    return base;
   }
 
   function noteImagesStripped() {
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
+  }
+
+  async function validateWorkspace(path: string): Promise<string | null> {
+    const p = path.trim();
+    if (!p) return null;
+    if (!isTauriRuntime()) {
+      return "Workspace folders need the Vicuna desktop app — browsers can't access the filesystem.";
+    }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<string>("work_validate_root", { path: p });
+      return null;
+    } catch (e: any) {
+      return typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  async function canonicalWorkspace(path: string): Promise<string> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<string>("work_validate_root", { path: path.trim() });
+  }
+
+  /** Workspace pill (composer bar, work contexts): native folder picker on
+   *  desktop; manual prompt in plain browsers (no FS access for a dialog). */
+  async function pickWorkspace() {
+    if (!isTauriRuntime()) {
+      const el = document.querySelector<HTMLInputElement>("[data-testid=workspace-input-active]");
+      if (el) {
+        el.focus();
+        el.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      const current = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
+      const answer = window.prompt("Workspace absolute path:", current || "/");
+      if (answer == null) return; // cancelled
+      pendingWorkspace = answer.trim();
+      if (composerMode === "work" && activeChat) activeChat.workspace = pendingWorkspace || null;
+      workspaceEditing = false;
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: pendingWorkspace.trim() || defaultWorkspace.trim() || undefined
+      });
+      if (typeof picked !== "string" || !picked) return; // cancelled
+      pendingWorkspace = picked;
+      if (composerMode === "work" && activeChat) activeChat.workspace = picked;
+      workspaceError = await validateWorkspace(picked);
+      if (!workspaceError) {
+        defaultWorkspace = picked;
+        persistPrefs();
+      }
+    } catch (e: any) {
+      workspaceError = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  /** Work-mode agent loop via Ollama native tool calling.
+   *  Each round streams narration text into the live assistant message and
+   *  returns `tool_calls`; we execute them, append collapsed markdown results
+   *  for persistence, and feed proper `role: tool` messages back. The fence
+   *  parser remains as a fallback for models without tools support. */
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = []) {
+    const ctrl = aborter;
+    const turnId = ++workTurnSeq;
+    workRunning = true;
+    workChatId = chat.id;
+    workStop = false;
+    let curIndex = index;
+    let firstRound = true;
+    let gotNative = false;
+    // offset into the display message: only text streamed this turn is
+    // scanned for fences, so old executed calls never re-trigger
+    let checkedLen = chats.find((x) => x.id === chat.id)?.messages[index]?.content.length ?? 0;
+    const seen = new Set<string>();
+    const callKey = (c: { name: string; args: Record<string, any> }) =>
+      `${c.name}\n${JSON.stringify(c.args)}`;
+    // native history: proper tool roles for the model; display message holds
+    // narration + markdown results for persistence. seedContext carries hidden
+    // context (e.g. a continued chat transcript) never shown in this thread.
+    const baseHistory = chats.find((x) => x.id === chat.id)?.messages.slice(0, index).map(toHistory) ?? [];
+    let seed = seedContext;
+    if (!seed.length && chat.forkedFrom && chat.forkFromIndex == null) {
+      // continued thread regenerated (or re-run) without its original seed:
+      // rebuild it from the linked source so the agent keeps its context
+      const src = chats.find((x) => x.id === (chat.forkedFrom as { id: string }).id);
+      if (src) {
+        seed = [
+          ...src.messages.slice(-20).map(toHistory),
+          { role: "user", content: workspace ? `Continue the above in the workspace (${workspace}).` : "Continue the above in a workspace." }
+        ];
+      }
+    }
+    const native: ChatMsg[] = [
+      { role: "system", content: buildWorkSystemPrompt(workspace) },
+      ...seed,
+      ...baseHistory
+    ];
+    async function finalGeneration(note: string) {
+      // one last generation so the turn ends with a summary, not a fence.
+      // The nudge travels as an ephemeral user turn (never written to the
+      // message), so the persisted transcript stays clean.
+      const target = chats.find((x) => x.id === chat.id);
+      if (!target) return;
+      const history: ChatMsg[] = [...native, { role: "user", content: note }];
+      await streamInto(target, curIndex, history, false, { mode: "continue", tools: WORK_TOOLS as any });
+    }
+    while (true) {
+      if (workStop || ctrl?.signal.aborted) break;
+      // steering: prompts typed during the previous round join the context
+      // here — after the tool results, right before the next generation — and
+      // render as a user bubble followed by a fresh assistant bubble
+      const steering = takeQueued(chat.id);
+      if (steering.length) {
+        const c = chats.find((x) => x.id === chat.id);
+        if (c) {
+          for (const q of steering) {
+            native.push({ role: "user", content: q.content, ...(q.images ? { images: q.images } : {}) });
+            c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+          }
+          chats = [...chats];
+          curIndex = c.messages.length - 1;
+          checkedLen = 0;
+          scrollBottom();
+          saveSoon();
+        }
+      }
+      const cur = chats.find((x) => x.id === chat.id);
+      if (!cur?.messages[curIndex] || cur.messages[curIndex].role !== "assistant") break;
+      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: WORK_TOOLS as any });
+      firstRound = false;
+      if (workStop || ctrl?.signal.aborted) break;
+      // record this round's assistant turn natively (text + tool calls)
+      native.push({
+        role: "assistant",
+        content: newText,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+      });
+      let calls = toolCalls
+        .map((c) => nativeToWorkCall(c.function.name, c.function.arguments))
+        .filter((c): c is { name: string; args: Record<string, any> } => !!c);
+      if (calls.length) gotNative = true;
+      const live = chats.find((x) => x.id === chat.id)?.messages[curIndex];
+      const roundText = live ? live.content.slice(checkedLen) : "";
+      checkedLen = live?.content.length ?? checkedLen;
+      // fallback: model without tools support emits ```tool fences as text.
+      // Once native calls have been seen, text fences are never executed.
+      if (calls.length === 0 && !gotNative) {
+        const fenceCalls = parseToolCalls(roundText);
+        if (fenceCalls.length) calls = fenceCalls;
+      }
+      if (calls.length === 0) {
+        // No actual call this round: if the model wrote a call-shaped block,
+        // say so explicitly — otherwise hallucinated "callings" look exactly
+        // like executed ones. Display-only; never fed back to the model.
+        if (roundText && hasToolFence(roundText)) {
+          const c2 = chats.find((x) => x.id === chat.id);
+          if (c2?.messages[curIndex]) {
+            const m2 = c2.messages[curIndex];
+            c2.messages[curIndex] = { ...m2, content: m2.content + "\n\n> Not executed: the model wrote a tool block above that was not a valid call, so nothing ran." };
+            chats = [...chats];
+            checkedLen = c2.messages[curIndex].content.length;
+            saveSoon();
+          }
+        }
+        break;
+      }
+      const fresh = calls.filter((c) => !seen.has(callKey(c)));
+      for (const c of fresh) seen.add(callKey(c));
+      if (fresh.length === 0) {
+        // model is re-emitting finished work: don't re-run anything, give it
+        // one wrap-up generation so the turn ends with a summary
+        await finalGeneration(
+          "Those tool calls already ran — their results are in the transcript above. Do not repeat them. Wrap up with a summary and no new tool calls."
+        );
+        break;
+      }
+      for (const call of fresh) {
+        if (workStop || ctrl?.signal.aborted) break;
+        toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
+        // tag first: the call is known now, the result may take a while
+        const c1 = chats.find((x) => x.id === chat.id);
+        if (c1?.messages[curIndex]) {
+          const m1 = c1.messages[curIndex];
+          c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
+          chats = [...chats];
+          scrollBottom();
+        }
+        const out = await dispatchWorkTool(call, { workspace, chats });
+        if (toolStatus?.chatId === chat.id) toolStatus = null;
+        native.push({ role: "tool", content: out, tool_name: call.name });
+        const c2 = chats.find((x) => x.id === chat.id);
+        if (c2?.messages[curIndex]) {
+          const m2 = c2.messages[curIndex];
+          c2.messages[curIndex] = { ...m2, content: m2.content + formatToolCallTail(out) };
+          chats = [...chats];
+        }
+        scrollBottom();
+        saveSoon();
+      }
+      // results we appended are harness output, not model text: exclude them
+      // from next round's fence scan (tool output may itself contain fences)
+      checkedLen = chats.find((x) => x.id === chat.id)?.messages[curIndex]?.content.length ?? checkedLen;
+    }
+    toolStatus = null;
+    if (escTimer) {
+      clearTimeout(escTimer);
+      escTimer = null;
+    }
+    escArmed = false;
+    const aborted = workStop || !!ctrl?.signal.aborted;
+    // prompts that arrived after the last round: continue the agent with them
+    // (an aborted turn returns them to the composer instead)
+    const leftovers = turnId === workTurnSeq ? takeQueued(chat.id) : [];
+    if (leftovers.length) {
+      if (aborted) {
+        if (activeId === chat.id) {
+          input = [input.trim(), ...leftovers.map((q) => q.content.trim())].filter(Boolean).join("\n\n");
+          attachImages = [...attachImages, ...leftovers.flatMap((q) => q.images ?? [])];
+        }
+      } else {
+        const c = chats.find((x) => x.id === chat.id);
+        if (c) {
+          for (const q of leftovers) {
+            c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+          }
+          chats = [...chats];
+          saveSoon();
+          // hand off to a fresh turn; the inner call clears workRunning
+          await runWorkTurn(chat, c.messages.length - 1, workspace);
+          return;
+        }
+      }
+    }
+    // natural end or abort: no step cap — the loop above already exits when
+    // the model makes no calls, repeats finished work, or the user aborts
+    if (turnId === workTurnSeq) {
+      workRunning = false;
+      workChatId = null;
+    }
+  }
+
+  /** "Continue in Work": fork a chat transcript into a new work session rooted
+   *  at the default (last-used) workspace. The thread shows only
+   *  "Continue from chat [link]" followed by the assistant reply — the source
+   *  transcript travels as hidden seed context, never as a visible bubble. */
+  async function continueInWork(id: string) {
+    const src = chats.find((c) => c.id === id);
+    if (!src || streaming) return;
+    ctxMenu = null;
+    aborter?.abort();
+    aborter = null;
+    streaming = false;
+    const ws = defaultWorkspace || pendingWorkspace || "";
+    const seedContext: ChatMsg[] = [
+      ...src.messages.slice(-20).map(toHistory),
+      { role: "user", content: ws ? `Continue the above in the workspace (${ws}).` : "Continue the above in a workspace." }
+    ];
+    const fork: Chat = {
+      id: crypto.randomUUID(),
+      title: `${src.title} (work)`.slice(0, 40),
+      createdAt: Date.now(),
+      messages: [
+        { role: "assistant", content: "", thinking: "", model: selectedModel }
+      ],
+      mode: "work",
+      workspace: ws || null,
+      forkedFrom: { id: src.id, title: src.title },
+      forkFromIndex: null
+    };
+    chats = [fork, ...chats];
+    activeId = fork.id;
+    isPinned = true;
+    pendingMode = "work";
+    pendingWorkspace = ws;
+    clearDraft(id);
+    input = "";
+    error = null;
+    save();
+    void goto(`/s/${fork.id}`);
+    if (!ws) {
+      error = "Pick a workspace folder above the composer, then send a message to start.";
+      return;
+    }
+    await runWorkTurn(fork, fork.messages.length - 1, ws, seedContext);
   }
 
   // downscale pasted images: full screenshots blow up localStorage quotas
@@ -1669,6 +2175,19 @@
     return () => window.removeEventListener("keydown", h);
   });
 
+  // Esc twice stops a running Work turn; the first press only arms it. Open
+  // overlays own their Esc, so bail out when any of them is up.
+  $effect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
+      if (!workRunning) return;
+      if (onEscape()) e.preventDefault();
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  });
+
   function setSidebar(open: boolean) {
     sidebarOpen = open;
     persistPrefs();
@@ -1715,6 +2234,8 @@
       stopWordsText = stopWordsToText(stopWords);
       ollamaBase = prefs.ollamaBase;
       setOllamaBase(ollamaBase);
+      defaultWorkspace = prefs.defaultWorkspace ?? "";
+      pendingWorkspace = prefs.defaultWorkspace ?? "";
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       // narrow screens start collapsed regardless of the saved preference
@@ -1835,9 +2356,9 @@
       </div>
 
       <div class="side-actions">
-        <button class="newchat" data-testid="new-chat-btn" title="New chat ({isMac ? '⌘N' : 'Ctrl+N'})" onclick={newChat}>
+        <button class="newchat" data-testid="new-chat-btn" title="New ({isMac ? '⌘N' : 'Ctrl+N'})" onclick={newChat}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
-          <span>New Chat</span>
+          <span>New</span>
           <span class="kbd-hint">{isMac ? "⌘N" : "Ctrl+N"}</span>
         </button>
         <button class="goto" data-testid="goto-btn" title="Search chats ({isMac ? '⌘P' : 'Ctrl+P'})" onclick={openGoto}>
@@ -1871,6 +2392,17 @@
                 />
               {:else}
                 <span class="title">{c.title}</span>
+                {#if c.mode === "work"}
+                  {@const wsBase = (c.workspace ?? "").trim().split("/").filter(Boolean).pop() ?? ""}
+                  {#if wsBase}
+                    <span class="work-badge ws-badge" title={c.workspace}>
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                      <span>{wsBase}</span>
+                    </span>
+                  {:else}
+                    <span class="work-badge" title="Work session">Work</span>
+                  {/if}
+                {/if}
               {/if}
             </button>
           {/each}
@@ -1921,6 +2453,7 @@
         >
           <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
           <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
+          <button class="ctx-item" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
           <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
         </div>
       {/if}
@@ -1928,10 +2461,10 @@
   {/if}
 
   <main class="main">
-    {#snippet forkNote(title: string, sourceId: string)}
+    {#snippet forkNote(title: string, sourceId: string, prefix = "Forked from")}
       {@const source = chats.find((c) => c.id === sourceId)}
       <div class="fork-note" data-testid="fork-note">
-        <span>Forked from </span>
+        <span>{prefix} </span>
         {#if source}
           <button class="fork-link" data-testid="fork-source-link" onclick={() => selectChat(source.id)}>{title}</button>
         {:else}
@@ -1952,9 +2485,13 @@
 
     {#if !activeChat || activeChat.messages.length === 0}
       <div class="empty">
-        <h1 class="empty-title">How can I help you today?</h1>
+        <div class="seg mode-toggle" role="tablist" aria-label="Session mode" data-testid="mode-toggle">
+          <button class="seg-btn {pendingMode === 'chat' ? 'sel' : ''}" data-testid="mode-chat-btn" role="tab" onclick={() => { pendingMode = "chat"; workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}>Chat</button>
+          <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
+        </div>
+        <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
         <div class="suggest-grid" data-testid="empty-suggestions">
-          {#each SUGGESTIONS as s, idx}
+          {#each composerMode === "work" ? WORK_SUGGESTIONS : SUGGESTIONS as s, idx}
             <button class="suggest-card" data-testid="suggest-card" onclick={() => useSuggestion(s.prompt)}>
               <span class="suggest-text">
                 <span class="suggest-title">{s.title}</span>
@@ -1966,6 +2503,12 @@
         </div>
       </div>
     {:else}
+      {#if activeChat.mode === "work"}
+        <div class="work-banner" data-testid="work-banner">
+          <span class="work-badge">Work</span>
+          <span class="work-path" title={activeChat.workspace ?? ""}>{activeChat.workspace ?? "no workspace"}</span>
+        </div>
+      {/if}
       <div
         class="messages"
         bind:this={messagesEl}
@@ -1975,7 +2518,7 @@
         onscroll={onMessagesScroll}
       >
         {#if forkInfo && forkNoteIndex == null}
-          {@render forkNote(forkInfo.title, forkInfo.id)}
+          {@render forkNote(forkInfo.title, forkInfo.id, "Continue from chat")}
         {/if}
         {#each activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
@@ -2018,10 +2561,10 @@
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
                   {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
                 </button>
-                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={streaming} onclick={() => startEdit(i)}>
+                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={busy} onclick={() => startEdit(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                 </button>
-                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={streaming} onclick={() => requestMsgDelete(i)}>
+                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={busy} onclick={() => requestMsgDelete(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
               </div>
@@ -2030,6 +2573,10 @@
           {:else}
             {@const isLast = i === activeChat.messages.length - 1}
             {@const thinkingActive = streaming && isLast && !m.content && !continuing}
+            {@const isWorkMsg = (activeChat?.mode ?? "chat") === "work"}
+            <!-- work turns keep thinking collapsed between rounds, so the label
+                 stays shimmering for the whole turn, not just the first stream -->
+            {@const thinkingLive = (streaming || workRunning) && isLast && !continuing && (thinkingActive || isWorkMsg)}
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
@@ -2056,7 +2603,7 @@
               {:else}
               <div class="bubble asst">
               {#if m.thinking}
-                {@const expanded = thinkingActive || (m.thinkingOpen ?? false)}
+                {@const expanded = (thinkingActive && !isWorkMsg) || (m.thinkingOpen ?? false)}
                 <div class="thinking" data-testid="thinking-block">
                   <button
                     class="thinking-head"
@@ -2065,7 +2612,7 @@
                     onclick={() => { m.thinkingOpen = !expanded; chats = [...chats]; }}
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.7 1 1.5 1 2.5h6c0-1 .2-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>
-                    <span>{thinkingActive ? "Thinking..." : "Thinking"}</span>
+                    <span class={thinkingLive ? "thinking-label shimmer" : "thinking-label"}>{thinkingActive ? "Thinking..." : "Thinking"}</span>
                     <span class="chev">{expanded ? "▾" : "▸"}</span>
                   </button>
                   {#if expanded}
@@ -2078,26 +2625,30 @@
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
                   {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
                 </button>
-                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={streaming} onclick={() => startEdit(i)}>
+                <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={busy} onclick={() => startEdit(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                 </button>
                 {#if isLast}
                   {@const noContinue = isCloudModel(selectedModel)}
-                  <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for cloud models" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
-                  </button>
-                  <button class="act" data-testid="regen-btn" aria-label="Regenerate response" title="Regenerate" disabled={streaming} onclick={() => void regenerate(i)}>
+                  {@const isWork = (activeChat?.mode ?? "chat") === "work"}
+                  {#if !isWork}
+                    <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for cloud models" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                    </button>
+                  {/if}
+                  <button class="act" data-testid="regen-btn" aria-label="Regenerate response" title={isWork ? "Re-run agent" : "Regenerate"} disabled={busy} onclick={() => void regenerate(i)}>
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
                   </button>
                 {/if}
-                <button class="act" data-testid="fork-btn" aria-label="Fork chat from here" title="Fork" disabled={streaming} onclick={() => forkAt(i)}>
+                <button class="act" data-testid="fork-btn" aria-label="Fork chat from here" title="Fork" disabled={busy} onclick={() => forkAt(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="8" r="2.2"/><path d="M6 8.2v7.6"/><path d="M18 10.2c0 3.5-5 2.8-8.5 5.3"/></svg>
                 </button>
-                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={streaming} onclick={() => requestMsgDelete(i)}>
+                <button class="act" data-testid="msg-delete-btn" aria-label="Delete message" title="Delete" disabled={busy} onclick={() => requestMsgDelete(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
                 {#if m.model}
-                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{m.model}{#if m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
+                  {@const liveTurn = workRunning && workChatId === activeChat?.id && isLast}
+                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{m.model}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
                 {/if}
               </div>
             </div>
@@ -2114,8 +2665,32 @@
     {#if error}
       <div class="err" data-testid="error-box">{error}</div>
     {/if}
+    {#if toolStatus && toolStatus.chatId === activeId}
+      <div class="tool-status" data-testid="tool-status">
+        <span class="tool-status-label shimmer">{toolStatus.label}</span>
+      </div>
+    {/if}
 
     <div class="composer-wrap">
+      {#if queuedForActive.length}
+        <div class="queue-strip" data-testid="queue-strip">
+          {#each queuedMsgs as q, qi}
+            {#if q.chatId === activeId}
+              <div class="queue-chip">
+                <span class="queue-text">{q.msg.content || "Image"}</span>
+                <button class="queue-x" aria-label="Remove queued message" title="Remove from queue" onclick={() => unqueue(qi)}>×</button>
+              </div>
+            {/if}
+          {/each}
+          <span class="queue-hint">queued · joins at the next tool call</span>
+        </div>
+      {/if}
+      {#if streaming || workRunning}
+        <div class="stream-bar" data-testid="stream-bar" role="progressbar" aria-label="Working"><span></span></div>
+      {/if}
+      {#if escArmed}
+        <div class="esc-hint" data-testid="esc-hint">Esc again to interrupt</div>
+      {/if}
       {#if !isPinned}
         <button
           class="scroll-jump"
@@ -2123,6 +2698,25 @@
           aria-label="Scroll to bottom and resume auto-scroll"
           onclick={jumpToBottom}
         >↓</button>
+      {/if}
+      {#if activeChat?.mode === "work" && activeChat.messages.length > 0 && (!activeChat.workspace || workspaceEditing)}
+        <div class="work-composer-bar" data-testid="work-composer-bar">
+          <span class="work-badge">Work</span>
+          <input
+            class="pull-input workspace-input"
+            data-testid="workspace-input-active"
+            placeholder="/absolute/path/to/workspace"
+            value={pendingWorkspace}
+            spellcheck={false}
+            onfocus={() => (workspaceEditing = true)}
+            oninput={(e) => {
+              const v = (e.target as HTMLInputElement).value;
+              pendingWorkspace = v;
+              if (activeChat) activeChat.workspace = v || null;
+            }}
+            onblur={() => { workspaceEditing = false; void validateWorkspace(pendingWorkspace).then((e) => (workspaceError = e)); }}
+          />
+        </div>
       {/if}
       <div class="composer">
         {#if attachImages.length}
@@ -2139,7 +2733,7 @@
         {/if}
         <textarea
           data-testid="message-input"
-          placeholder="Send a message ( / to focus )"
+          placeholder={composerMode === "work" ? (workRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
           bind:this={composerEl}
           bind:value={input}
           onkeydown={onKey}
@@ -2149,6 +2743,20 @@
         <div class="composer-bar">
           <div class="spacer"></div>
           <button class="pill-btn" data-testid="attach-btn" aria-label="Attach image" onclick={pickFile}>+</button>
+          {#if composerMode === "work"}
+            {@const wsPath = activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace}
+            {@const wsName = wsPath.trim() ? (wsPath.trim().split("/").filter(Boolean).pop() ?? wsPath.trim()) : ""}
+            <button
+              class="model-pill ws-pill"
+              data-testid="workspace-pill"
+              title={wsPath.trim() ? `Workspace: ${wsPath.trim()} — click to change` : "Pick a workspace folder"}
+              aria-label="Pick workspace folder"
+              onclick={() => void pickWorkspace()}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span class="model-name">{wsName || "Workspace"}</span>
+            </button>
+          {/if}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
               <span class="model-name">{selectedModel}</span>
@@ -2177,7 +2785,10 @@
               </div>
             {/if}
           </div>
-          {#if streaming}
+          {#if workRunning}
+            <button class="send" data-testid="queue-btn" aria-label="Queue message" title="Queue for the next tool call" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
+            <button class="send streaming" data-testid="stop-btn" aria-label="Stop" title="Stop (Esc twice)" onclick={stop}>■</button>
+          {:else if streaming}
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
           {:else}
             <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
@@ -2316,7 +2927,7 @@
             onmousemove={() => (gotoSel = idx)}
           >
             <span class="search-ico"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg></span>
-            <span class="search-text"><span class="search-title">New chat</span></span>
+            <span class="search-text"><span class="search-title">New</span></span>
           </button>
         {:else}
           <button
@@ -2682,12 +3293,22 @@
   .confirm-ok:hover { background: var(--accent-hover); }
   .empty-hint { color: var(--faint); font-size: 13px; padding: 0 8px; }
   .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
+  .stream-bar { position: relative; height: 3px; border-radius: 999px; overflow: hidden; margin: 0 4px 8px 4px; background: var(--border); pointer-events: none; }
+  .stream-bar span { position: absolute; top: 0; bottom: 0; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: stream-slide 1.2s ease-in-out infinite; }
+  @keyframes stream-slide { from { left: -40%; } to { left: 100%; } }
+  .queue-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 4px 8px 4px; }
+  .queue-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; background: var(--hover-3); border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 6px 3px 10px; font-size: 12px; color: var(--muted); }
+  .queue-text { max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .queue-x { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+  .queue-x:hover { color: var(--text); }
+  .queue-hint { font-size: 11.5px; color: var(--faint); }
+  .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
   .collapsed-rail .icon-btn { width: 100%; padding: 8px 0; border-radius: 8px; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
   .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
   .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
-  .suggest-card { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 14px 14px 18px; cursor: pointer; }
+  .suggest-card { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 14px 14px 18px; cursor: pointer; min-width: 0; }
   .suggest-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); border-color: var(--accent); }
   .suggest-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .suggest-title { font-size: 15px; font-weight: 650; color: var(--text); }
@@ -2703,7 +3324,8 @@
   .answer { user-select: text; white-space: normal; }
   .col { display: flex; flex-direction: column; }
   .user-row .col { align-items: flex-end; }
-  .asst-row .col { align-items: flex-start; }
+  .asst-row .col { align-items: stretch; flex: 1; min-width: 0; }
+  .bubble.asst { width: 100%; box-sizing: border-box; min-width: 0; }
   .actions { display: flex; gap: 2px; margin-top: 6px; align-items: center; }
   .model-tag { font-size: 12px; color: var(--muted-2); margin-left: 6px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   .fork-note { display: flex; justify-content: center; align-items: baseline; gap: 4px; font-size: 13px; color: var(--muted-2); margin: 4px 0 8px 0; }
@@ -2719,6 +3341,8 @@
   .thinking { margin-bottom: 10px; }
   .thinking-head { display: flex; align-items: center; gap: 8px; font-size: 17px; font-weight: 500; color: var(--text); margin-bottom: 14px; background: transparent; border: none; padding: 0; cursor: pointer; font-family: inherit; text-align: left; }
   .thinking-head .chev { color: var(--muted); font-size: 13px; }
+  .shimmer { background: linear-gradient(90deg, var(--muted-2) 25%, var(--text) 50%, var(--muted-2) 75%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer-slide 1.4s linear infinite; }
+  @keyframes shimmer-slide { to { background-position: -200% 0; } }
   .thinking-body { color: var(--thinking); font-size: 15px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
   .answer:empty { display: none; }
   .typing { display: inline-flex; gap: 5px; align-items: center; padding: 8px 2px; }
@@ -2726,7 +3350,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -2738,6 +3362,13 @@
   .answer :global(code.inl.copied)::after { content: "Copied"; position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; font-size: 11.5px; font-weight: 500; padding: 3px 8px; border-radius: 6px; white-space: nowrap; pointer-events: none; }
   .answer :global(pre) { background: var(--code-bg); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; }
   .answer :global(pre code) { background: transparent; padding: 0; }
+  .answer :global(details.tool-result) { background: var(--code-bg); border-radius: 12px; margin: 8px 0; overflow: hidden; }
+  .answer :global(details.tool-result summary) { cursor: pointer; padding: 9px 12px; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted-2); list-style: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .answer :global(details.tool-result summary::-webkit-details-marker) { display: none; }
+  .answer :global(details.tool-result summary::before) { content: "▸ "; color: var(--muted); }
+  .answer :global(details.tool-result[open] summary::before) { content: "▾ "; }
+  .answer :global(details.tool-result summary:hover) { color: var(--text); }
+  .answer :global(details.tool-result pre) { margin: 0; border-radius: 0; border-top: 1px solid var(--border-2); background: transparent; }
   .answer :global(.hljs-keyword), .answer :global(.hljs-selector-tag) { color: var(--code-keyword); }
   .answer :global(.hljs-string), .answer :global(.hljs-regexp) { color: var(--code-string); }
   .answer :global(.hljs-comment), .answer :global(.hljs-quote) { color: var(--code-comment); font-style: italic; }
@@ -2761,6 +3392,8 @@
   .answer :global(.table-wrap) { overflow-x: auto; max-width: 100%; margin: 0 0 12px 0; }
   .answer :global(th), .answer :global(td) { border: 1px solid var(--border-2); padding: 6px 10px; font-size: 13.5px; }
   .err { max-width: 720px; margin: 0 auto; color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 12px; font-size: 13px; }
+  .tool-status { max-width: 860px; width: 100%; margin: 0 auto 8px auto; box-sizing: border-box; display: flex; align-items: center; gap: 8px; color: var(--muted-2); font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0 24px; }
+  .tool-status-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .composer-wrap { position: relative; padding: 12px 24px 22px 24px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
   .scroll-jump { position: absolute; top: -44px; left: 50%; transform: translateX(-50%); width: 44px; height: 36px; background: var(--card); border: 1px solid var(--border-3); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: pointer; font-size: 17px; line-height: 1; color: var(--text); z-index: 5; }
   .scroll-jump:hover { background: var(--composer); }
@@ -2869,6 +3502,19 @@
   .stopwords-input { width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--card); color: var(--text); font: inherit; font-size: 13px; line-height: 1.6; padding: 10px 12px; resize: vertical; outline: none; }
   .stopwords-input:focus { border-color: var(--accent); }
   .setting-note { font-size: 12px; color: var(--muted); }
+  .mode-toggle { margin-bottom: 18px; }
+  .mode-toggle .seg-btn { min-width: 90px; }
+  .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
+  .workspace-input { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
+  .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
+  .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 10px 24px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  .work-banner .work-badge { margin-left: 0; }
+  .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .work-composer-bar .work-badge { margin-left: 0; }
+  .work-composer-bar .workspace-input { flex: 1; min-width: 0; }
 
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
