@@ -1,5 +1,2 @@
-<script lang="ts">
-  import ChatApp from "$lib/ChatApp.svelte";
-</script>
-
-<ChatApp sessionId={null} />
+<!-- Home route: the app UI lives in +layout.svelte (single ChatApp instance)
+     so navigations only change the sessionId prop instead of remounting. -->

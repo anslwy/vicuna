@@ -1,6 +1,3 @@
-<script lang="ts">
-  import ChatApp from "$lib/ChatApp.svelte";
-  import { page } from "$app/state";
-</script>
-
-<ChatApp sessionId={page.params.id ?? null} />
+<!-- Per-session route: the app UI lives in +layout.svelte (single ChatApp
+     instance); the id reaches ChatApp as its sessionId prop. Unknown ids
+     redirect to `/` from inside ChatApp. -->
