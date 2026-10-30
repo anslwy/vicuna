@@ -1938,6 +1938,11 @@ where
     G: FnOnce(Option<i32>) + Send + 'static,
 {
     let canon = work_canonical_root(root.trim())?;
+    // `canonicalize()` returns extended-length paths on Windows
+    // (`\\?\C:\...`); spawning the shell there makes PowerShell render its
+    // prompt as `Microsoft.PowerShell.Core\FileSystem::\\?\C:\...`. The
+    // stripped path points at the same folder and prompts cleanly.
+    let cwd = work_display_string(&canon);
     let pty = portable_pty::native_pty_system();
     let pair = pty
         .openpty(term_size(cols, rows))
@@ -1960,7 +1965,7 @@ where
             c
         }
     };
-    cmd.cwd(&canon);
+    cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     let mut child = pair

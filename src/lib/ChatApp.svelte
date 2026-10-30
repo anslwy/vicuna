@@ -1641,7 +1641,7 @@
 
   async function saveEdit() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || streaming) return;
+    if (!chat || editingIndex == null || streaming || workRunning) return;
     const text = editDraft.trim();
     const images = editImages.length ? [...editImages] : undefined;
     if (!text && !images) return;
@@ -1670,6 +1670,17 @@
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
+    if ((chat.mode ?? "chat") === "work") {
+      // work threads re-run the agent, not a plain reply (mirrors regenerate)
+      if (!chat.workspace?.trim()) {
+        error = "Work mode needs a workspace folder — pick one with the folder pill, then regenerate.";
+        return;
+      }
+      chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+      chats = [...chats];
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+      return;
+    }
     const history: ChatMsg[] = [
       ...chat.messages.map(toHistory)
     ];
@@ -1698,10 +1709,16 @@
       createdAt: Date.now(),
       messages: JSON.parse(JSON.stringify(c.messages.slice(0, i + 1))),
       forkedFrom: { id: c.id, title: c.title },
-      forkFromIndex: i
+      forkFromIndex: i,
+      mode: c.mode ?? "chat",
+      workspace: c.workspace ?? null
     };
     chats = [fork, ...chats];
     activeId = fork.id;
+    // keep the starter toggle consistent with the fork (matters for empty
+    // forks; non-empty threads render from their own mode anyway)
+    pendingMode = fork.mode ?? "chat";
+    if (fork.workspace) pendingWorkspace = fork.workspace;
     isPinned = true;
     editingIndex = null;
     editDraft = "";
@@ -2433,11 +2450,70 @@
     if (!explorerEntries.length && !explorerLoading) void loadExplorer();
   }
 
-  function termTheme(): { background: string; foreground: string; cursor: string; selection: string } {
-    return theme === "dark"
-      ? { background: "#161616", foreground: "#e8e8e8", cursor: "#e8e8e8", selection: "rgba(255,255,255,.25)" }
-      : { background: "#f4f4f4", foreground: "#1a1a1a", cursor: "#1a1a1a", selection: "rgba(0,0,0,.15)" };
+  function termTheme(): Record<string, string> {
+    // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
+    // console (yellow prompt segments, white text), so the defaults that
+    // ship with xterm go unreadable on a light background. Both palettes
+    // keep the app's chrome bg/fg but remap every ANSI slot to stay legible.
+    if (theme === "dark") {
+      return {
+        background: "#161616",
+        foreground: "#e8e8e8",
+        cursor: "#e8e8e8",
+        selection: "rgba(255,255,255,.25)",
+        black: "#000000",
+        red: "#cd3131",
+        green: "#0dbc79",
+        yellow: "#e5e510",
+        blue: "#2472c8",
+        magenta: "#bc3fbc",
+        cyan: "#11a8cd",
+        white: "#e5e5e5",
+        brightBlack: "#666666",
+        brightRed: "#f14c4c",
+        brightGreen: "#23d18b",
+        brightYellow: "#f5f543",
+        brightBlue: "#3b8eea",
+        brightMagenta: "#d670d6",
+        brightCyan: "#29b8db",
+        brightWhite: "#ffffff"
+      };
+    }
+    return {
+      background: "#f4f4f4",
+      foreground: "#1a1a1a",
+      cursor: "#1a1a1a",
+      selection: "rgba(0,0,0,.15)",
+      black: "#000000",
+      red: "#b3261e",
+      green: "#0a7a42",
+      yellow: "#795e00",
+      blue: "#0a4fb3",
+      magenta: "#9a3a9a",
+      cyan: "#0a7a8a",
+      white: "#767676",
+      brightBlack: "#5a5a5a",
+      brightRed: "#d32f2f",
+      brightGreen: "#1a7f37",
+      brightYellow: "#8a6d00",
+      brightBlue: "#2563eb",
+      brightMagenta: "#d63384",
+      brightCyan: "#0a8a9a",
+      brightWhite: "#333333"
+    };
   }
+  // re-theme live terminals when the app theme flips (terminals are created
+  // once with the theme at open time, so existing tabs would go stale)
+  $effect(() => {
+    const t = termTheme();
+    for (const [, v] of termViews) {
+      try {
+        v.term.options.theme = t as never;
+      } catch {
+        /* terminal mid-dispose */
+      }
+    }
+  });
 
   /** fit the active terminal to its container and tell the pty the size */
   function fitSideTerm(key: string) {
@@ -4353,7 +4429,7 @@
             role="tab"
             aria-selected={t.key === activeSideTab}
             tabindex="0"
-            title={explorerRoot.trim() || t.title}
+            title={displayWorkspace(explorerRoot.trim()) || t.title}
             onkeydown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
@@ -5406,7 +5482,8 @@
   .new-tab-menu .ctx-item { display: flex; align-items: center; gap: 9px; }
   .side-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .side-view.hidden { display: none; }
-  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; }
+  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: #f4f4f4; }
+  :global(html[data-theme="dark"]) .term-wrap { background: #161616; }
   .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }
   .explorer-search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 0; }
   .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }
