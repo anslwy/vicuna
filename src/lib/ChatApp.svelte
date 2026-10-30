@@ -343,37 +343,20 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
-    // the composer box is global: New never touches the textbox
-    // reuse the existing empty draft instead of stacking blank sessions
-    const draft = chats.find((c) => c.messages.length === 0);
-    if (draft) {
-      draft.mode = pendingMode;
-      if (pendingMode === "work") draft.workspace = pendingWorkspace || null;
-      pruneEmptyDrafts(draft.id);
-      activeId = draft.id;
-      isPinned = true;
-      editingIndex = null;
-      editDraft = "";
-      error = null;
-      void goto(`/s/${draft.id}`);
-      return;
+    // the composer box is global: New never touches the textbox.
+    // No placeholder session is created: the sidebar stays unchanged and
+    // the session only appears once the first message is sent (send()
+    // builds it inline with the first message as its title).
+    if (chats.some((c) => c.messages.length === 0)) {
+      chats = chats.filter((c) => c.messages.length > 0);
+      save();
     }
-    const c: Chat = {
-      id: crypto.randomUUID(),
-      title: "New session",
-      createdAt: Date.now(),
-      messages: [],
-      mode: pendingMode,
-      workspace: pendingMode === "work" ? pendingWorkspace || null : null
-    };
-    chats = [c, ...chats];
-    activeId = c.id;
+    activeId = null;
     isPinned = true;
     editingIndex = null;
     editDraft = "";
     error = null;
-    save();
-    void goto(`/s/${c.id}`);
+    void goto("/");
   }
 
   function selectChat(id: string) {
@@ -771,6 +754,7 @@
     const q = searchQueryLow;
     if (!q) return chats.filter((c) => c.messages.length > 0).slice(0, 8);
     return chats.filter((c) => {
+      if (c.messages.length === 0) return false;
       if (c.title.toLowerCase().includes(q)) return true;
       if (c.id.toLowerCase().includes(q)) return true;
       return c.messages.some((m) => m.content.toLowerCase().includes(q));
@@ -974,25 +958,6 @@
     }
   }
 
-  // keep at most one empty draft: pressing New Chat repeatedly must not
-  // pile up blank sessions (also cleans up previously accumulated ones)
-  function pruneEmptyDrafts(keepId: string | null) {
-    let kept = false;
-    const remaining = chats.filter((c) => {
-      if (c.messages.length > 0) return true;
-      if (keepId !== null) return c.id === keepId;
-      if (!kept) {
-        kept = true;
-        return true;
-      }
-      return false;
-    });
-    if (remaining.length !== chats.length) {
-      chats = remaining;
-      save();
-    }
-  }
-
   function requestMsgDelete(i: number) {
     if (busy) return;
     ctxMenu = null;
@@ -1105,6 +1070,9 @@
     const week: Chat[] = [];
     const older: Chat[] = [];
     for (const c of chats) {
+      // empty drafts are never listed: a session appears only after the
+      // first message is sent
+      if (c.messages.length === 0) continue;
       if (c.createdAt >= startOfToday) today.push(c);
       else if (c.createdAt >= startOfYesterday) yesterday.push(c);
       else if (c.createdAt >= weekAgo) week.push(c);
@@ -3299,17 +3267,10 @@
       // reopen where the user left off (saved on every navigation); the
       // draft below then restores their unsent text into the composer
       const savedActive = await loadActiveChat();
-      // collapse previously accumulated empty drafts into one (prefer the
-      // session in the URL so a deep-linked blank draft isn't yanked away,
-      // else the session being restored)
-      const empties = chats.filter((c) => c.messages.length === 0);
-      if (empties.length > 1) {
-        const keepId = empties.some((c) => c.id === sessionId)
-          ? sessionId
-          : savedActive && empties.some((c) => c.id === savedActive)
-            ? savedActive
-            : empties[0].id;
-        chats = chats.filter((c) => c.messages.length > 0 || c.id === keepId);
+      // empty drafts are never listed: drop any persisted from older
+      // builds so a stale "New session" row can't linger in the sidebar
+      if (chats.some((c) => c.messages.length === 0)) {
+        chats = chats.filter((c) => c.messages.length > 0);
         save();
       }
       if (sessionId) {
@@ -3489,7 +3450,7 @@
           <div class="group-label">Older</div>
           {@render chatList(grouped.older)}
         {/if}
-        {#if chats.length === 0}
+        {#if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0}
           <div class="group-label">Today</div>
           <div class="empty-hint">No chats yet</div>
         {/if}
