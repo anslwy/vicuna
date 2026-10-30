@@ -273,15 +273,15 @@
     });
   })());
 
-  // unsent composer text persists per session (home = null key) so a
-  // restart restores exactly what was typed; the save is synchronous, so
-  // even a kill without beforeunload keeps the last keystroke
+  // the composer box is global and append-only across navigation: switching
+  // sessions or starting a new one never touches it. The text persists
+  // across restarts via one shared draft key; only sending (or the user
+  // clearing it by hand) empties it.
   $effect(() => {
     if (!ready) return;
     const text = input;
-    const id = activeId;
-    if (text) writeDraft(id, text);
-    else clearDraft(id);
+    if (text) writeDraft(null, text);
+    else clearDraft(null);
   });
 
   // remember where the user was so a restart reopens the session (and its
@@ -330,8 +330,8 @@
   let unloading = false;
   function handleUnload() {
     unloading = true;
-    if (input) writeDraft(activeId, input);
-    else clearDraft(activeId);
+    if (input) writeDraft(null, input);
+    else clearDraft(null);
     flushSave();
     // best-effort: don't orphan shells when the window closes
     for (const t of sideTabs) {
@@ -343,10 +343,7 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
-    // the text being typed moves to the new session instead of being wiped:
-    // New never clears the textbox
-    const carried = input;
-    const carriedFrom = activeId;
+    // the composer box is global: New never touches the textbox
     // reuse the existing empty draft instead of stacking blank sessions
     const draft = chats.find((c) => c.messages.length === 0);
     if (draft) {
@@ -357,8 +354,6 @@
       isPinned = true;
       editingIndex = null;
       editDraft = "";
-      input = carried || readDraft(draft.id);
-      if (carried && carriedFrom !== draft.id) clearDraft(carriedFrom);
       error = null;
       void goto(`/s/${draft.id}`);
       return;
@@ -376,8 +371,6 @@
     isPinned = true;
     editingIndex = null;
     editDraft = "";
-    input = carried;
-    if (carried && carriedFrom !== c.id) clearDraft(carriedFrom);
     error = null;
     save();
     void goto(`/s/${c.id}`);
@@ -394,7 +387,6 @@
     pendingMsgDelete = null;
     dropActiveDraft(id);
     activeId = id;
-    input = readDraft(id);
     isPinned = true;
     suppressReset = true;
     void goto(`/s/${id}`);
@@ -433,12 +425,10 @@
     dropActiveDraft(sid);
     if (sid && chats.some((c) => c.id === sid)) {
       activeId = sid;
-      input = readDraft(sid);
       isPinned = true;
       suppressReset = true;
     } else if (!sid) {
       activeId = null;
-      input = readDraft(null);
     } else {
       void goto("/");
     }
@@ -451,12 +441,10 @@
     streaming = false;
     ctxMenu = null;
     pendingDeleteId = null;
-    clearDraft(id);
     const remaining = chats.filter((c) => c.id !== id);
     chats = remaining;
     if (id === activeId) {
       activeId = null;
-      input = readDraft(null);
       save();
       void goto("/");
     } else {
@@ -933,7 +921,6 @@
     if (!id) return;
     if (ready && chats.some((c) => c.id === id)) {
       activeId = id;
-      input = readDraft(id);
       isPinned = true;
       void goto(`/s/${id}`);
     } else {
@@ -975,13 +962,13 @@
     renamingId = null;
   }
 
-  // an empty draft you navigate away from without sending anything is
-  // discarded instead of lingering in the list doing nothing
+  // an empty session you navigate away from without sending anything is
+  // discarded instead of lingering in the list doing nothing. The composer
+  // box is global and is never touched here.
   function dropActiveDraft(exceptId: string | null) {
     if (!activeId || activeId === exceptId) return;
     const c = chats.find((x) => x.id === activeId);
     if (c && c.messages.length === 0) {
-      clearDraft(activeId);
       chats = chats.filter((x) => x.id !== activeId);
       save();
     }
@@ -1001,10 +988,6 @@
       return false;
     });
     if (remaining.length !== chats.length) {
-      const keptIds = new Set(remaining.map((c) => c.id));
-      for (const c of chats) {
-        if (!keptIds.has(c.id)) clearDraft(c.id);
-      }
       chats = remaining;
       save();
     }
@@ -1852,8 +1835,7 @@
     }
     input = "";
     mention = null;
-    clearDraft(sentFromId);
-    if (sentFromId !== chat.id) clearDraft(chat.id);
+    clearDraft(null);
     attachImages = [];
     attachFiles = [];
     error = null;
@@ -1876,7 +1858,7 @@
     if (!chatId || (!text && !images?.length)) return;
     queuedMsgs = [...queuedMsgs, { chatId, msg: { role: "user", content: text, ...(images ? { images } : {}) } }];
     input = "";
-    clearDraft(chatId);
+    clearDraft(null);
     attachImages = [];
     error = null;
   }
@@ -3068,8 +3050,6 @@
     isPinned = true;
     pendingMode = "work";
     pendingWorkspace = ws;
-    clearDraft(id);
-    input = "";
     error = null;
     save();
     void goto(`/s/${fork.id}`);
@@ -3329,8 +3309,6 @@
           : savedActive && empties.some((c) => c.id === savedActive)
             ? savedActive
             : empties[0].id;
-        const dropped = chats.filter((c) => c.messages.length === 0 && c.id !== keepId);
-        for (const d of dropped) clearDraft(d.id);
         chats = chats.filter((c) => c.messages.length > 0 || c.id === keepId);
         save();
       }
@@ -3361,8 +3339,8 @@
           void goto(`/s/${id}`);
         }
       }
-      // restore the unsent composer draft for wherever we landed
-      input = readDraft(activeId);
+      // restore the unsent composer text (one global box, not per session)
+      input = readDraft(null);
       const savedCatalog = await loadCatalog();
       if (savedCatalog) {
         catalog = savedCatalog.entries;
@@ -3385,7 +3363,6 @@
       const pm = pc?.messages[pending.index];
       if (pc && pm && pm.role === "assistant") {
         activeId = pc.id;
-        input = readDraft(pc.id);
         if (pending.model) {
           selectedModel = pending.model;
           void saveModel(pending.model);
