@@ -26,6 +26,7 @@ WORKSPACE BOUNDARY (strict):
 - Use \`say\` to show the user any narration, answer, or explanation between tool calls. Its text is rendered as normal assistant prose. Never put narration inside another tool's arguments — the \`ask\` question must be only the question.
 
 Use the provided function tools to act — do not invent results, do not emit manual tool JSON.
+- Narrate BEFORE you act: every response that calls tools must open with one or two plain-text lines saying what you are about to do and why. The user sees only a small tool label, not your reasoning, so a silent chain of tool calls looks broken. If you cannot emit text alongside tool calls, make the first call \`say\` with that narration.
 - After a tool result arrives, continue reasoning and either call the next tool or answer.
 - When the task is done, answer normally with NO further tool calls.
 - Never repeat a tool call with the same name and arguments — the result is already in the transcript. Repeating finished work instead of summarizing is a failure.
@@ -598,6 +599,45 @@ export function formatAskRecord(question: string, answer: string, dismissed: boo
     ? `<span class="ask-log-dismissed">Dismissed</span>`
     : `<strong>Answer:</strong> ${escapeHtml(one(answer))}`;
   return `\n\n<div class="ask-log"><div class="ask-log-q">${q}</div><div class="ask-log-a">${a}</div></div>\n\n`;
+}
+
+/** One-line activity note for a tool call, shown as normal assistant prose
+ *  when the round had no narration of its own. Models that emit tool calls
+ *  with no text would otherwise leave a bare chain of collapsed tags, so the
+ *  harness speaks for them. Returns null for calls that own their display
+ *  (`ask`, `say`) or are unknown. */
+export function formatToolActivity(name: string, args: Record<string, any>): string | null {
+  const clean = (v: unknown, max = 80) =>
+    String(v ?? "").replace(/[\r\n`]+/g, " ").trim().slice(0, max) || null;
+  switch (name) {
+    case "list": {
+      const p = clean(args.path, 60);
+      return p && p !== "." ? `Looking through \`${p}\`…` : "Looking through the workspace…";
+    }
+    case "read": {
+      const p = clean(args.path, 60);
+      return p ? `Reading \`${p}\`…` : "Reading a file…";
+    }
+    case "grep": {
+      const q = clean(args.pattern, 60);
+      return q ? `Searching for "${q}"…` : "Searching the workspace…";
+    }
+    case "write": {
+      const p = clean(args.path, 60);
+      return p ? `Writing \`${p}\`…` : "Writing a file…";
+    }
+    case "exec": {
+      const c = clean(args.command, 80);
+      return c ? `Running \`${c}\`…` : "Running a command…";
+    }
+    case "sessions": return "Searching past chats…";
+    case "read_session": return "Reading a past session…";
+    case "read_upload": {
+      const n = clean(args.name, 60);
+      return n ? `Reading attached file \`${n}\`…` : "Reading an attached file…";
+    }
+    default: return null;
+  }
 }
 
 /** Head of a tool-result block, appended as soon as the call is known so the

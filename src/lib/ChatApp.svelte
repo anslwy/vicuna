@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatAskRecord, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -2916,10 +2916,20 @@
         toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
         // tag first: the call is known now, the result may take a while.
         // `ask` (live card) and `say` (normal prose) own their display.
+        // Silent rounds get a harness activity line before the tag so the
+        // user sees progress, not a bare chain of collapsed tool blocks.
+        // Fence-only text counts as silent: raw ```tool blocks are calls,
+        // not narration.
+        const roundProse = newText.replace(/```tool\s*\n[\s\S]*?\n?```/g, "").trim();
+        const roundSilent = roundProse === "" && !calls.some((c) => c.name === "say");
         const c1 = chats.find((x) => x.id === chat.id);
         if (!isAsk && !isSay && c1?.messages[curIndex]) {
           const m1 = c1.messages[curIndex];
-          c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
+          const activity = roundSilent ? formatToolActivity(call.name, call.args) : null;
+          c1.messages[curIndex] = {
+            ...m1,
+            content: m1.content + (activity ? `\n\n${activity}\n` : "") + formatToolCallHead(call.name, call.args)
+          };
           chats = [...chats];
           scrollBottom();
         }
