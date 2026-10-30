@@ -4730,7 +4730,7 @@
   .composer-backdrop :global(.mention-pill svg) { display: none; }
   :global(.bubble.user .mention-pill) { background: var(--accent); color: var(--accent-fg); border-radius: 999px; padding: 1px 9px 2px 7px; font-size: .92em; overflow-wrap: anywhere; }
   :global(.bubble.user .mention-pill svg) { vertical-align: -1.5px; margin-right: 4px; }
-  :global(.bubble.user .bubble-files) { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px; }
+  :global(.bubble.user .bubble-files) { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
   :global(.bubble.user .bubble-files:last-child) { margin-bottom: 0; }
   :global(.bubble.user .file-pill) { border: 1px solid color-mix(in srgb, var(--accent-fg) 30%, transparent); background: color-mix(in srgb, var(--accent-fg) 9%, var(--accent)); font-family: inherit; font-weight: inherit; line-height: inherit; text-align: left; cursor: pointer; }
   :global(.bubble.user .file-pill:hover) { background: color-mix(in srgb, var(--accent-fg) 17%, var(--accent)); }
