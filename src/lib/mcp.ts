@@ -103,6 +103,7 @@ export async function listMcpServers(): Promise<McpServerConfig[]> {
 }
 
 export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig[]> {
+  if (!isTauriRuntime()) throw new Error("Managing MCP servers needs the Vicuna desktop app.");
   const { invoke } = await tauri();
   return await invoke<McpServerConfig[]>("mcp_save_server", {
     config: {
@@ -119,6 +120,7 @@ export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig
 }
 
 export async function deleteMcpServer(id: string): Promise<McpServerConfig[]> {
+  if (!isTauriRuntime()) throw new Error("Managing MCP servers needs the Vicuna desktop app.");
   const { invoke } = await tauri();
   return await invoke<McpServerConfig[]>("mcp_delete_server", { id });
 }

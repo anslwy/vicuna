@@ -29,6 +29,7 @@
   } from "$lib/store";
   import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, type WorkTreeEntry } from "$lib/work";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
+  import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
@@ -193,7 +194,33 @@
   // the Work agent's native tool loop; chat mode never sees them.
   let mcpServers = $state<McpServerConfig[]>([]);
   let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
-  let mcpOp = $state<string | null>(null);
+  /** ids with a connection op in flight (connect/disconnect/refresh/sign-in,
+   *  or `builtin:<key>` while a Built-in Add saves). A single shared slot
+   *  used to drop every launch reconnect after the first, so only one
+   *  server ever came back after a restart — per-server tracking fixes it. */
+  let mcpBusy = $state<string[]>([]);
+  function mcpIsBusy(id: string): boolean {
+    return mcpBusy.includes(id);
+  }
+  function mcpMarkBusy(id: string) {
+    if (!mcpBusy.includes(id)) mcpBusy = [...mcpBusy, id];
+  }
+  function mcpUnmarkBusy(id: string) {
+    mcpBusy = mcpBusy.filter((x) => x !== id);
+  }
+  /** which popup tab is showing: the Built-in gallery or Custom servers */
+  let mcpView = $state<"builtin" | "custom">("builtin");
+  /** keyboard selection within the Built-in gallery */
+  let mcpBuiltinSel = $state(0);
+  /** one-click Add failure (desktop-only writes in a plain browser) */
+  let mcpBuiltinError = $state<string | null>(null);
+  /** search input: focused on open so arrows work immediately (the
+   *  `autofocus` attribute only applies on first page load, not for
+   *  dynamically mounted popups) */
+  let mcpSearchEl = $state<HTMLInputElement | null>(null);
+  $effect(() => {
+    if (mcpOpen) mcpSearchEl?.focus();
+  });
   /** server id waiting on the browser login redirect (label override) */
   let mcpAuthWait = $state<string | null>(null);
   let mcpOpen = $state(false);
@@ -219,6 +246,86 @@
     mcpServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
   );
   const mcpConnectedCount = $derived(Object.values(mcpLive).filter((l) => l.connected).length);
+  const builtinShown = $derived(
+    BUILT_IN_MCPS.filter(
+      (b) =>
+        b.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()) ||
+        b.blurb.toLowerCase().includes(mcpQuery.trim().toLowerCase())
+    )
+  );
+
+  /** installed config matching a Built-in entry (by name), if the user added it */
+  function builtinInstalled(b: BuiltinMcp): McpServerConfig | undefined {
+    return mcpServers.find((s) => s.name.toLowerCase() === b.name.toLowerCase());
+  }
+
+  /** status line for a Built-in row: mirrors mcpStatusOf for installed ones */
+  function builtinStatus(b: BuiltinMcp): { kind: "connected" | "disabled" | "error" | "idle" | "add"; label: string } {
+    const s = builtinInstalled(b);
+    if (!s) return { kind: "add", label: "+ Add" };
+    return mcpStatusOf(s);
+  }
+
+  /** one-click Add: writes the entry to vicuna.json and connects (an auth
+   *  failure flips the row to Sign in, same as Custom servers) */
+  async function addBuiltin(b: BuiltinMcp) {
+    if (builtinInstalled(b) || mcpIsBusy(`builtin:${b.key}`) || mcpIsBusy(b.name)) return;
+    mcpBuiltinError = null;
+    mcpMarkBusy(`builtin:${b.key}`);
+    try {
+      mcpServers = await saveMcpServer(builtinToConfig(b));
+    } catch (e: any) {
+      mcpUnmarkBusy(`builtin:${b.key}`);
+      mcpBuiltinError = e?.message ?? String(e);
+      return;
+    }
+    mcpUnmarkBusy(`builtin:${b.key}`);
+    await connectMcpServer(b.name);
+  }
+
+  /** primary row action for a Built-in: Add, Connect, or Sign in */
+  async function builtinPrimary(b: BuiltinMcp) {
+    const s = builtinInstalled(b);
+    if (!s) {
+      await addBuiltin(b);
+      return;
+    }
+    if (mcpLive[s.id]?.connected || !s.enabled) {
+      await toggleMcpServer(s.id);
+      return;
+    }
+    if (isAuthError(mcpLive[s.id]?.error)) {
+      await signInMcpServer(s.id);
+      return;
+    }
+    await toggleMcpServer(s.id);
+  }
+
+  /** arrow navigation shared by the popup container + search input */
+  function mcpMoveSel(delta: 1 | -1) {
+    if (mcpView === "builtin") {
+      mcpBuiltinSel = builtinShown.length ? (mcpBuiltinSel + delta + builtinShown.length) % builtinShown.length : 0;
+    } else {
+      mcpSel = mcpFiltered.length ? (mcpSel + delta + mcpFiltered.length) % mcpFiltered.length : 0;
+    }
+    // keep the selected row in view: the gallery is taller than the popup,
+    // so arrowing past the fold would otherwise move an invisible cursor
+    void tick().then(() => {
+      document.querySelector(".mcp-popup .mcp-row.sel")?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  /** Enter/Space on the selected row (both views; not while editing) */
+  function mcpActivateSelected() {
+    if (mcpShowForm) return;
+    if (mcpView === "builtin") {
+      const b = builtinShown[mcpBuiltinSel];
+      if (b) void builtinPrimary(b);
+    } else {
+      const s = mcpFiltered[mcpSel];
+      if (s) void toggleMcpServer(s.id);
+    }
+  }
 
   function mcpStatusOf(s: McpServerConfig): { kind: "connected" | "disabled" | "error" | "idle"; label: string } {
     const live = mcpLive[s.id];
@@ -230,7 +337,7 @@
       if (isAuthError(live.error)) return { kind: "error", label: "Sign in required →" };
       return { kind: "error", label: live.error.slice(0, 80) };
     }
-    if (mcpOp === s.id) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
+    if (mcpIsBusy(s.id)) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
     return { kind: "idle", label: "Disconnected ○" };
   }
 
@@ -255,8 +362,8 @@
 
   async function connectMcpServer(id: string) {
     const cfg = mcpServers.find((s) => s.id === id);
-    if (!cfg || mcpOp) return;
-    mcpOp = id;
+    if (!cfg || mcpIsBusy(id)) return;
+    mcpMarkBusy(id);
     mcpLive[id] = { connected: false, tools: [], error: null };
     try {
       const info = await connectMcpBackend(cfg);
@@ -264,7 +371,7 @@
     } catch (e: any) {
       mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
     } finally {
-      mcpOp = null;
+      mcpUnmarkBusy(id);
     }
   }
 
@@ -283,7 +390,7 @@
 
   async function toggleMcpServer(id: string) {
     const cfg = mcpServers.find((s) => s.id === id);
-    if (!cfg || mcpOp) return;
+    if (!cfg || mcpIsBusy(id)) return;
     if (mcpLive[id]?.connected) {
       await disconnectMcpServer(id);
       return;
@@ -296,16 +403,17 @@
     }
     if (!cfg.enabled) {
       // enabling a disabled server persists the flip, then connects
+      mcpMarkBusy(id);
       try {
-        mcpOp = id;
         const next = await saveMcpServer({ ...cfg, enabled: true });
         mcpServers = next;
-        mcpOp = null;
-        await connectMcpServer(id);
       } catch (e: any) {
-        mcpOp = null;
+        mcpUnmarkBusy(id);
         mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
+        return;
       }
+      mcpUnmarkBusy(id);
+      await connectMcpServer(id);
       return;
     }
     await connectMcpServer(id);
@@ -316,8 +424,8 @@
    *  A server that turns out to need no auth falls back to plain connect. */
   async function signInMcpServer(id: string) {
     const cfg = mcpServers.find((s) => s.id === id);
-    if (!cfg || mcpOp) return;
-    mcpOp = id;
+    if (!cfg || mcpIsBusy(id)) return;
+    mcpMarkBusy(id);
     mcpAuthWait = id;
     mcpLive[id] = { connected: false, tools: [], error: null };
     try {
@@ -335,34 +443,37 @@
       const msg = e?.message ?? String(e);
       if (msg.includes("does not require sign-in")) {
         mcpAuthWait = null;
-        mcpOp = null;
+        mcpUnmarkBusy(id);
         await connectMcpServer(id);
         return;
       }
       mcpLive[id] = { connected: false, tools: [], error: msg };
     } finally {
       mcpAuthWait = null;
-      mcpOp = null;
+      mcpUnmarkBusy(id);
     }
   }
 
   async function refreshMcpTools(id: string) {
     const cfg = mcpServers.find((s) => s.id === id);
-    if (!cfg || mcpOp) return;
-    mcpOp = id;
+    if (!cfg || mcpIsBusy(id)) return;
+    mcpMarkBusy(id);
     try {
       const tools = await listMcpServerTools(cfg);
       mcpLive[id] = { connected: true, tools, error: null };
     } catch (e: any) {
       mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
     } finally {
-      mcpOp = null;
+      mcpUnmarkBusy(id);
     }
   }
 
   function openMcpPopup() {
     mcpQuery = "";
     mcpSel = 0;
+    mcpBuiltinSel = 0;
+    mcpView = "builtin";
+    mcpBuiltinError = null;
     mcpShowForm = false;
     mcpFormError = null;
     mcpConfirmDelete = null;
@@ -4759,16 +4870,13 @@
             mcpOpen = false;
           } else if (e.key === "ArrowDown") {
             e.preventDefault();
-            mcpSel = mcpFiltered.length ? (mcpSel + 1) % mcpFiltered.length : 0;
+            mcpMoveSel(1);
           } else if (e.key === "ArrowUp") {
             e.preventDefault();
-            mcpSel = mcpFiltered.length ? (mcpSel - 1 + mcpFiltered.length) % mcpFiltered.length : 0;
+            mcpMoveSel(-1);
           } else if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
-            const s = mcpFiltered[mcpSel];
-            if (s && !mcpShowForm) {
-              e.preventDefault();
-              void toggleMcpServer(s.id);
-            }
+            e.preventDefault();
+            mcpActivateSelected();
           }
         }}
         tabindex="-1"
@@ -4777,13 +4885,39 @@
           <span class="mcp-title">MCP servers</span>
           <span class="mcp-esc">esc</span>
         </div>
+        <div class="seg mcp-tabs" role="tablist" aria-label="MCP server lists">
+          <button
+            class="seg-btn {mcpView === 'builtin' ? 'sel' : ''}"
+            data-testid="mcp-tab-builtin"
+            role="tab"
+            aria-selected={mcpView === "builtin"}
+            onclick={() => {
+              mcpView = "builtin";
+              mcpBuiltinSel = 0;
+              mcpBuiltinError = null;
+            }}
+          >Discover</button>
+          <button
+            class="seg-btn {mcpView === 'custom' ? 'sel' : ''}"
+            data-testid="mcp-tab-custom"
+            role="tab"
+            aria-selected={mcpView === "custom"}
+            onclick={() => {
+              mcpView = "custom";
+              mcpSel = 0;
+            }}
+          >Added</button>
+        </div>
         <input
           class="mcp-search"
           data-testid="mcp-search"
           placeholder="Search"
+          bind:this={mcpSearchEl}
           bind:value={mcpQuery}
-          oninput={() => (mcpSel = 0)}
-          autofocus
+          oninput={() => {
+            mcpSel = 0;
+            mcpBuiltinSel = 0;
+          }}
           spellcheck={false}
           onkeydown={(e) => {
             if (e.key === "Escape") {
@@ -4791,19 +4925,88 @@
               mcpOpen = false;
             } else if (e.key === "ArrowDown") {
               e.preventDefault();
-              mcpSel = mcpFiltered.length ? (mcpSel + 1) % mcpFiltered.length : 0;
+              e.stopPropagation();
+              mcpMoveSel(1);
             } else if (e.key === "ArrowUp") {
               e.preventDefault();
-              mcpSel = mcpFiltered.length ? (mcpSel - 1 + mcpFiltered.length) % mcpFiltered.length : 0;
-            } else if (e.key === "Enter" || e.key === " ") {
-              const s = mcpFiltered[mcpSel];
-              if (s && !mcpShowForm) {
-                e.preventDefault();
-                void toggleMcpServer(s.id);
-              }
+              e.stopPropagation();
+              mcpMoveSel(-1);
+            } else if (e.key === "Enter") {
+              // Space must type a space here — only Enter activates
+              e.preventDefault();
+              e.stopPropagation();
+              mcpActivateSelected();
             }
           }}
         />
+        {#if mcpView === "builtin"}
+        <div class="mcp-list builtin-list" data-testid="builtin-list" role="listbox" aria-label="Discover MCP servers">
+          {#each builtinShown as b, i (b.key)}
+            {@const st = builtinStatus(b)}
+            {@const installed = builtinInstalled(b)}
+            <div
+              class="mcp-row builtin-row {i === mcpBuiltinSel ? 'sel' : ''}"
+              data-testid="builtin-row"
+              data-name={b.name}
+              role="option"
+              aria-selected={i === mcpBuiltinSel}
+              tabindex="0"
+              title={b.blurb}
+              onclick={() => {
+                mcpBuiltinSel = i;
+                void builtinPrimary(b);
+              }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  mcpBuiltinSel = i;
+                  void builtinPrimary(b);
+                }
+              }}
+              onmousemove={() => {
+                if (mcpBuiltinSel !== i) mcpBuiltinSel = i;
+              }}
+            >
+              <span class="builtin-icon" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html b.icon}</svg></span>
+              <span class="builtin-info">
+                <span class="mcp-name">{b.name}</span>
+                <span class="builtin-blurb">{b.blurb}</span>
+              </span>
+              {#if st.kind === "add"}
+                <button
+                  class="builtin-add"
+                  data-testid="builtin-add-btn"
+                  data-name={b.name}
+                  disabled={mcpIsBusy(`builtin:${b.key}`) || mcpIsBusy(b.name)}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void builtinPrimary(b);
+                  }}
+                >{mcpIsBusy(`builtin:${b.key}`) ? "Adding…" : "+ Add"}</button>
+              {:else if st.kind === "error" && st.label === "Sign in required →"}
+                <button
+                  class="builtin-add"
+                  data-testid="builtin-signin-btn"
+                  data-name={b.name}
+                  disabled={installed ? mcpIsBusy(installed.id) : false}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    if (installed) void signInMcpServer(installed.id);
+                  }}
+                >Sign in →</button>
+              {:else}
+                <span class="mcp-status {st.kind}">{st.kind === "connected" && installed && mcpLive[installed.id]?.tools.length ? `${mcpLive[installed.id].tools.length} · ` : ""}{st.label}</span>
+              {/if}
+            </div>
+          {:else}
+            <div class="mcp-empty">No matches for “{mcpQuery.trim()}”.</div>
+          {/each}
+        </div>
+        {#if mcpBuiltinError}
+          <p class="goto-error" data-testid="builtin-error">{mcpBuiltinError}</p>
+        {/if}
+        {:else}
         <div class="mcp-list" data-testid="mcp-list" role="listbox" aria-label="MCP servers">
           {#each mcpFiltered as s, i (s.id)}
             {@const st = mcpStatusOf(s)}
@@ -4823,6 +5026,7 @@
               onkeydown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
+                  e.stopPropagation();
                   mcpSel = i;
                   void toggleMcpServer(s.id);
                 }
@@ -4962,25 +5166,27 @@
             </div>
           </div>
         {/if}
+        {/if}
         <div class="mcp-foot">
           <span class="mcp-hint">connect <span class="mcp-key">space</span></span>
           <span class="mcp-spacer"></span>
           {#if mcpShowForm}
             <span class="mcp-file">~/vicuna/config/vicuna.json</span>
-          {:else}
+          {:else if mcpView === "custom"}
             <button class="mcp-add" data-testid="mcp-add-btn" onclick={() => openMcpForm()}>+ custom</button>
             <button
               class="mcp-add"
               data-testid="mcp-refresh-btn"
               title="Re-list tools on connected servers"
-              disabled={mcpOp !== null}
+              disabled={mcpBusy.length > 0}
               onclick={() => {
                 for (const s of mcpServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
               }}
             >refresh</button>
+          {:else}
+            <span class="mcp-file">~/vicuna/config/vicuna.json</span>
           {/if}
         </div>
-        <div class="mcp-file-note">Stored in ~/vicuna/config/vicuna.json · same shape as opencode.json</div>
       </div>
     {/if}
   </main>
@@ -5194,7 +5400,6 @@
           {/each}
         {/if}
       </div>
-      <div class="explorer-foot">Click a file to @-mention it</div>
       {#if expNotice}
         <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
       {/if}
@@ -6085,7 +6290,6 @@
   .exp-size { flex-shrink: 0; font-size: 11px; color: var(--faint); }
   .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
   .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 44px; z-index: 8; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; }
-  .explorer-foot { padding: 8px 12px 12px 12px; font-size: 11.5px; color: var(--faint); border-top: 1px solid var(--border); }
   .mcp-btn { position: relative; }
   .mcp-dot { position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; }
   .mcp-backdrop { position: fixed; inset: 0; z-index: 60; border: none; background: rgba(0,0,0,.45); cursor: default; padding: 0; }
@@ -6095,6 +6299,22 @@
   .mcp-esc { font-size: 13px; color: var(--muted); }
   .mcp-search { width: 100%; box-sizing: border-box; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 17px; padding: 4px 2px 10px 2px; }
   .mcp-search::placeholder { color: var(--faint); }
+  .mcp-tabs { align-self: stretch; margin-bottom: 6px; }
+  .mcp-tabs .seg-btn { flex: 1; }
+  .mcp-tabs .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
+  .builtin-list { gap: 2px; }
+  .builtin-row { align-items: center; }
+  .builtin-icon { flex-shrink: 0; width: 32px; height: 32px; border-radius: 9px; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+  .mcp-row.sel .builtin-icon { background: rgba(255,255,255,.22); color: inherit; }
+  .builtin-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .builtin-info .mcp-name { font-size: 15px; }
+  .builtin-blurb { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-row.sel .builtin-blurb { color: inherit; opacity: .85; }
+  .builtin-add { flex-shrink: 0; border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 12px; font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+  .builtin-add:hover:not(:disabled) { background: var(--hover); }
+  .builtin-add:disabled { opacity: .5; cursor: default; }
+  .mcp-row.sel .builtin-add { border-color: currentColor; color: inherit; }
+  .mcp-row.sel .builtin-add:hover:not(:disabled) { background: rgba(255,255,255,.22); }
   .mcp-list { display: flex; flex-direction: column; }
   .mcp-row { display: flex; align-items: center; gap: 10px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 15.5px; padding: 5px 8px; border-radius: 8px; cursor: pointer; text-align: left; }
   .mcp-row.sel { background: var(--accent); color: var(--accent-fg); }
@@ -6128,7 +6348,6 @@
   .mcp-add:hover { background: var(--hover); color: var(--text); }
   .mcp-add:disabled { opacity: .5; cursor: default; }
   .mcp-file { font-size: 11.5px; color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .mcp-file-note { margin-top: 6px; font-size: 11.5px; color: var(--faint); }
 
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
