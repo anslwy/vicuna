@@ -32,6 +32,11 @@ Use the provided function tools to act — do not invent results, do not emit ma
 - Never repeat a tool call with the same name and arguments — the result is already in the transcript. Repeating finished work instead of summarizing is a failure.
 - Keep file reads targeted; prefer list/grep before reading big files.
 
+BACKGROUND COMMANDS (for slow work):
+- exec with {"background": true} starts a long command (tests, builds, long scripts) and returns a job id like bg-3 immediately — it does NOT wait.
+- Keep doing other useful work after starting one: read, grep, write, or start more jobs. Check progress with exec_status {"id": "bg-3"} (omit id to list all jobs); stop one with exec_kill {"id": "bg-3"}.
+- If you have nothing else to do while waiting, end your turn with a short status line and NO tool calls — you will be woken automatically with the job's result when it finishes. Do not poll in a tight loop.
+
 RESPONSE STYLE:
 - Briefly narrate what you are about to do before each tool call (one line), so the transcript reads naturally. If the model cannot emit normal text alongside tool calls, call \`say\` with that line instead.
 - End with a concise summary of what you did/found, with file paths and command output that matter.`;
@@ -96,13 +101,41 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands. Do not access paths outside the workspace without asking the user first.",
+      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands. Do not access paths outside the workspace without asking the user first. Pass background:true for slow commands (tests, builds) to run detached and keep working — you will be woken with the result.",
       parameters: {
         type: "object",
         required: ["command"],
         properties: {
           command: { type: "string", description: "shell command" },
-          timeout_ms: { type: "integer", description: "timeout 1000-120000ms, default 30000" }
+          timeout_ms: { type: "integer", description: "timeout 1000-120000ms, default 30000 (ignored when background is true)" },
+          background: { type: "boolean", description: "run detached in the background; returns a job id (bg-N) immediately" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "exec_status",
+      description: "Check a background exec job's output (or list all jobs when id is omitted). Returns captured stdout/stderr so far plus whether it is still running.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "background job id, e.g. bg-3; omit to list all jobs" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "exec_kill",
+      description: "Stop a running background exec job. Returns the latest captured output.",
+      parameters: {
+        type: "object",
+        required: ["id"],
+        properties: {
+          id: { type: "string", description: "background job id, e.g. bg-3" }
         }
       }
     }
@@ -462,6 +495,50 @@ export async function stageUploadFile(sessionId: string, fileName: string, base6
   return await invokeCmd<string>("upload_stage_file", { sessionId, fileName, base64 });
 }
 
+export interface BackgroundJobStatus {
+  id: string;
+  command: string;
+  running: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+}
+
+export interface BackgroundJobSummary {
+  id: string;
+  command: string;
+  running: boolean;
+  exit_code: number | null;
+}
+
+/** Poll one background exec job (desktop only). */
+export async function backgroundStatus(id: string): Promise<BackgroundJobStatus> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<BackgroundJobStatus>("work_exec_status", { id });
+}
+
+/** List background exec jobs (desktop only, no output payload). */
+export async function backgroundList(): Promise<BackgroundJobSummary[]> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<BackgroundJobSummary[]>("work_exec_list", {});
+}
+
+/** Render a background job snapshot the same shape as foreground exec. */
+export function formatBackgroundStatus(s: BackgroundJobStatus): string {
+  const parts: string[] = [];
+  if (s.stdout.trim()) parts.push(s.stdout);
+  if (s.stderr.trim()) parts.push(`[stderr]\n${s.stderr}`);
+  parts.push(s.running ? `[job ${s.id} still running]` : `[job ${s.id} exit ${s.exit_code}]`);
+  return parts.join("\n");
+}
+
+/** First `bg-N` id mentioned in a harness string, if any. */
+export function extractBackgroundId(text: string): string | null {
+  const m = text.match(/\bbg-\d+\b/);
+  return m ? m[0] : null;
+}
+
 /** Execute one tool call. Returns markdown for the transcript. */
 export async function dispatchWorkTool(
   call: WorkToolCall,
@@ -512,6 +589,14 @@ export async function dispatchWorkTool(
       case "exec": {
         if (!str(a.command)) return "Error: exec needs {\"command\": \"...\"}.";
         if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        if (a.background === true) {
+          try {
+            const id = await invokeCmd<string>("work_exec_start", { root: ctx.workspace, command: str(a.command) });
+            return `Started background job ${id} for: ${str(a.command)}\nUse exec_status with {"id": "${id}"} to check output; you will also be notified automatically when it finishes. Continue with other work meanwhile.`;
+          } catch (e: any) {
+            return `Error: ${e?.message ?? String(e)}`;
+          }
+        }
         const res = await invokeCmd<{ stdout: string; stderr: string; exit_code: number | null; timed_out: boolean; truncated: boolean }>(
           "work_exec", { root: ctx.workspace, command: str(a.command), timeoutMs: typeof a.timeout_ms === "number" ? a.timeout_ms : null }
         );
@@ -520,6 +605,33 @@ export async function dispatchWorkTool(
         if (res.stderr.trim()) parts.push(`[stderr]\n${res.stderr}`);
         parts.push(`[exit ${res.timed_out ? "timed out" : res.exit_code}]`);
         return parts.join("\n");
+      }
+      case "exec_status": {
+        if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        if (str(a.id)) {
+          try {
+            return formatBackgroundStatus(await backgroundStatus(str(a.id)));
+          } catch (e: any) {
+            return `Error: ${e?.message ?? String(e)}`;
+          }
+        }
+        try {
+          const jobs = await backgroundList();
+          if (jobs.length === 0) return "No background jobs.";
+          return jobs.map((j) => `${j.id} ${j.running ? "(running)" : `(exit ${j.exit_code})`} — ${j.command.slice(0, 120)}`).join("\n");
+        } catch (e: any) {
+          return `Error: ${e?.message ?? String(e)}`;
+        }
+      }
+      case "exec_kill": {
+        if (!str(a.id)) return "Error: exec_kill needs {\"id\": \"...\"}.";
+        if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        try {
+          const s = await invokeCmd<BackgroundJobStatus>("work_exec_kill", { id: str(a.id) });
+          return formatBackgroundStatus(s);
+        } catch (e: any) {
+          return `Error: ${e?.message ?? String(e)}`;
+        }
       }
       case "say": {
         const text = str(a.text).trim();
@@ -559,7 +671,7 @@ export async function dispatchWorkTool(
         return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
       }
       default:
-        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, sessions, read_session, read_upload, say, ask.`;
+        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
     }
   } catch (e: any) {
     return `Error: ${e?.message ?? String(e)}`;
@@ -578,6 +690,8 @@ function escapeHtml(s: string): string {
  *  running indicator. */
 export function toolLabel(name: string, args: Record<string, any>): string {
   const argSummary = name === "exec" ? String(args.command ?? "") :
+    name === "exec_status" ? String(args.id ?? "(list)") :
+    name === "exec_kill" ? String(args.id ?? "") :
     name === "read" || name === "write" || name === "list" ? String(args.path ?? ".") :
     name === "grep" ? String(args.pattern ?? "") :
     name === "sessions" ? String(args.query ?? "") :
@@ -628,7 +742,17 @@ export function formatToolActivity(name: string, args: Record<string, any>): str
     }
     case "exec": {
       const c = clean(args.command, 80);
-      return c ? `Running \`${c}\`…` : "Running a command…";
+      return args.background === true
+        ? c ? `Starting \`${c}\` in the background…` : "Starting a background command…"
+        : c ? `Running \`${c}\`…` : "Running a command…";
+    }
+    case "exec_status": {
+      const id = clean(args.id, 20);
+      return id ? `Checking background job ${id}…` : "Listing background jobs…";
+    }
+    case "exec_kill": {
+      const id = clean(args.id, 20);
+      return id ? `Stopping background job ${id}…` : "Stopping a background job…";
     }
     case "sessions": return "Searching past chats…";
     case "read_session": return "Reading a past session…";

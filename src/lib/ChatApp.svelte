@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, type WorkTreeEntry } from "$lib/work";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -2879,6 +2879,11 @@
     const seen = new Set<string>();
     const callKey = (c: { name: string; args: Record<string, any> }) =>
       `${c.name}\n${JSON.stringify(c.args)}`;
+    // background exec jobs started this turn: the model keeps working while
+    // they run; a finished job joins the transcript (drain below) and wakes
+    // the model only once its output is ready
+    const pendingBg = new Set<string>();
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     // native history: proper tool roles for the model; display message holds
     // narration + markdown results for persistence. seedContext carries hidden
     // context (e.g. a continued chat transcript) never shown in this thread.
@@ -2900,6 +2905,46 @@
       ...seed,
       ...baseHistory
     ];
+    // Move finished background jobs into the transcript: a `role: user`
+    // wake-up natively (orphan `role: tool` messages have no matching call)
+    // plus a collapsed result block for display. `skip` covers ids the model
+    // just polled itself — their output is already in the transcript.
+    async function injectBackgroundCompletions(skip?: Set<string>): Promise<boolean> {
+      if (pendingBg.size === 0) return false;
+      let injected = false;
+      for (const id of [...pendingBg]) {
+        if (skip?.has(id)) continue;
+        if (workStop || ctrl?.signal.aborted) break;
+        let s;
+        try {
+          s = await backgroundStatus(id);
+        } catch {
+          // browser fallback or a lost job: drop it so the turn can settle
+          pendingBg.delete(id);
+          continue;
+        }
+        if (s.running) continue;
+        pendingBg.delete(id);
+        const out = formatBackgroundStatus(s);
+        native.push({ role: "user", content: `Background job ${id} finished (\`${s.command}\`):\n${out}` });
+        const c2 = chats.find((x) => x.id === chat.id);
+        if (c2?.messages[curIndex]) {
+          const m2 = c2.messages[curIndex];
+          c2.messages[curIndex] = {
+            ...m2,
+            content: m2.content + formatToolResult("exec", { command: `${s.command} (${id})` }, out)
+          };
+          chats = [...chats];
+        }
+        injected = true;
+      }
+      if (injected) {
+        checkedLen = chats.find((x) => x.id === chat.id)?.messages[curIndex]?.content.length ?? checkedLen;
+        scrollBottom();
+        saveSoon();
+      }
+      return injected;
+    }
     async function finalGeneration(note: string) {
       // one last generation so the turn ends with a summary, not a fence.
       // The nudge travels as an ephemeral user turn (never written to the
@@ -2931,6 +2976,10 @@
       }
       const cur = chats.find((x) => x.id === chat.id);
       if (!cur?.messages[curIndex] || cur.messages[curIndex].role !== "assistant") break;
+      // background jobs that finished while the model worked elsewhere join
+      // the transcript here, so the next generation sees their output
+      await injectBackgroundCompletions();
+      if (workStop || ctrl?.signal.aborted) break;
       const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: WORK_TOOLS as any });
       firstRound = false;
       if (workStop || ctrl?.signal.aborted) break;
@@ -2966,6 +3015,29 @@
             checkedLen = c2.messages[curIndex].content.length;
             saveSoon();
           }
+        }
+        // No calls this round but background jobs still run: wait for the
+        // next one to finish, inject its result, and wake the model — so the
+        // LLM works on other things meanwhile and is only re-triggered once
+        // the background output is ready.
+        if (pendingBg.size > 0 && !workStop && !ctrl?.signal.aborted) {
+          toolStatus = { chatId: chat.id, label: "Waiting for background job…" };
+          let woke = false;
+          while (pendingBg.size > 0) {
+            if (workStop || ctrl?.signal.aborted) break;
+            // a queued user prompt interrupts the wait: handle it next round
+            if (queuedMsgs.some((q) => q.chatId === chat.id)) break;
+            await sleep(1000);
+            if (workStop || ctrl?.signal.aborted) break;
+            if (await injectBackgroundCompletions()) {
+              woke = true;
+              break;
+            }
+          }
+          if (toolStatus?.chatId === chat.id) toolStatus = null;
+          if (woke) continue;
+          // steered mid-wait: loop back around to the queue; otherwise settle
+          if (queuedMsgs.some((q) => q.chatId === chat.id)) continue;
         }
         break;
       }
@@ -3029,6 +3101,12 @@
           }
         });
         if (toolStatus?.chatId === chat.id) toolStatus = null;
+        if (call.name === "exec" && (call.args as any)?.background === true) {
+          // detached start: the job id joins the pending set so the turn can
+          // keep working and only wake the model once its output lands
+          const bgId = extractBackgroundId(out);
+          if (bgId) pendingBg.add(bgId);
+        }
         native.push({ role: "tool", content: out, tool_name: call.name });
         const c2 = chats.find((x) => x.id === chat.id);
         if (isSay) {
@@ -3064,6 +3142,19 @@
         }
         scrollBottom();
         saveSoon();
+      }
+      // explicit single-job polls that report a finished job settle it: the
+      // full output is already in the transcript, so the idle waiter and the
+      // top-of-round drain must not re-inject it
+      for (const call of fresh) {
+        const pid = typeof (call.args as any)?.id === "string" ? ((call.args as any).id as string).trim() : "";
+        if ((call.name === "exec_status" || call.name === "exec_kill") && pid && pendingBg.has(pid)) {
+          try {
+            if (!(await backgroundStatus(pid)).running) pendingBg.delete(pid);
+          } catch {
+            pendingBg.delete(pid);
+          }
+        }
       }
       // results we appended are harness output, not model text: exclude them
       // from next round's fence scan (tool output may itself contain fences)
