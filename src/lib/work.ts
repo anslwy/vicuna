@@ -31,6 +31,11 @@ Use the provided function tools to act — do not invent results, do not emit ma
 - When the task is done, answer normally with NO further tool calls.
 - Never repeat a tool call with the same name and arguments — the result is already in the transcript. Repeating finished work instead of summarizing is a failure.
 - Keep file reads targeted; prefer list/grep before reading big files.
+- Images: \`read\` is text-only and refuses binaries. To SEE a workspace picture
+  (png/jpg/webp/gif — e.g. a screenshot the user mentions), call \`view_image\`
+  with its path: the picture is fed to you as vision input alongside the tool
+  result, then describe/answer about what you actually see. Never claim you
+  cannot see images stored as files — list the folder and view them.
 
 BACKGROUND COMMANDS (for slow work):
 - exec with {"background": true} starts a long command (tests, builds, long scripts) and returns a job id like bg-3 immediately — it does NOT wait.
@@ -64,6 +69,18 @@ export const WORK_TOOLS = [
         type: "object",
         required: ["path"],
         properties: { path: { type: "string", description: "relative file path" } }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_image",
+      description: "View a workspace image file (png/jpg/webp/gif, 10MB cap). The picture is fed to you as vision input — use when the user mentions an image in the workspace or `list` shows an image file. Describe what you see afterwards.",
+      parameters: {
+        type: "object",
+        required: ["path"],
+        properties: { path: { type: "string", description: "relative image file path" } }
       }
     }
   },
@@ -539,6 +556,19 @@ export function extractBackgroundId(text: string): string | null {
   return m ? m[0] : null;
 }
 
+/** Split `view_image` vision payloads out of a tool result.
+ *  `dispatchWorkTool` embeds data URLs as `[[VICUNA_IMAGE:...]]` markers
+ *  (tool results are text-only); the caller strips them from the display/tool
+ *  transcript and re-feeds the pictures as Ollama `images[]`. */
+export function extractViewedImages(text: string): { clean: string; images: string[] } {
+  const images: string[] = [];
+  const clean = text.replace(/\[\[VICUNA_IMAGE:([\s\S]*?)\]\]/g, (_m, url: string) => {
+    if (url.startsWith("data:image/")) images.push(url);
+    return "";
+  }).trim();
+  return { clean, images };
+}
+
 /** Execute one tool call. Returns markdown for the transcript. */
 export async function dispatchWorkTool(
   call: WorkToolCall,
@@ -670,8 +700,25 @@ export async function dispatchWorkTool(
         );
         return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
       }
+      case "view_image": {
+        if (!str(a.path)) return "Error: view_image needs {\"path\": \"...\"}.";
+        if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        try {
+          const res = await invokeCmd<{ path: string; base64: string; mime: string; size: number }>(
+            "work_read_image", { root: ctx.workspace, path: str(a.path) }
+          );
+          const dataUrl = `data:${res.mime};base64,${res.base64}`;
+          // Marker carries the vision bytes out-of-band: runWorkTurn strips it
+          // from the display/tool transcript and re-feeds the picture as
+          // Ollama `images[]` on a following user message (tool results are
+          // text-only, so the bytes can't ride the tool message itself).
+          return `Viewed image ${res.path} (${res.size}B, ${res.mime}) — picture sent as vision input; describe what you see.\n[[VICUNA_IMAGE:${dataUrl}]]`;
+        } catch (e: any) {
+          return `Error: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+        }
+      }
       default:
-        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
+        return `Error: unknown tool "${call.name}". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
     }
   } catch (e: any) {
     return `Error: ${e?.message ?? String(e)}`;
@@ -692,7 +739,7 @@ export function toolLabel(name: string, args: Record<string, any>): string {
   const argSummary = name === "exec" ? String(args.command ?? "") :
     name === "exec_status" ? String(args.id ?? "(list)") :
     name === "exec_kill" ? String(args.id ?? "") :
-    name === "read" || name === "write" || name === "list" ? String(args.path ?? ".") :
+    name === "read" || name === "write" || name === "list" || name === "view_image" ? String(args.path ?? ".") :
     name === "grep" ? String(args.pattern ?? "") :
     name === "sessions" ? String(args.query ?? "") :
     name === "read_session" ? String(args.id ?? "") :
@@ -731,6 +778,10 @@ export function formatToolActivity(name: string, args: Record<string, any>): str
     case "read": {
       const p = clean(args.path, 60);
       return p ? `Reading \`${p}\`…` : "Reading a file…";
+    }
+    case "view_image": {
+      const p = clean(args.path, 60);
+      return p ? `Viewing \`${p}\`…` : "Viewing an image…";
     }
     case "grep": {
       const q = clean(args.pattern, 60);

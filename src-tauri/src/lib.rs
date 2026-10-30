@@ -940,7 +940,7 @@ async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> R
     let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
     // reject obvious binaries (NUL byte in the head sample)
     if bytes.iter().take(4096).any(|&b| b == 0) {
-        return Err("binary file — refusing to dump as text".to_string());
+        return Err("binary file — refusing to dump as text (use view_image for png/jpg/webp/gif)".to_string());
     }
     let truncated = bytes.len() > cap;
     let slice = &bytes[..bytes.len().min(cap)];
@@ -950,6 +950,57 @@ async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> R
         truncated,
         size,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkImageContent {
+    path: String,
+    base64: String,
+    mime: String,
+    size: u64,
+}
+
+/// Read a workspace image file for vision models (png/jpg/webp/gif, 10MB cap).
+/// Returns raw base64 — the frontend feeds it as Ollama `images[]` so the
+/// agent actually SEES the picture instead of getting a binary-dump error.
+#[tauri::command]
+async fn work_read_image(root: String, path: String) -> Result<WorkImageContent, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    let size = meta.len();
+    if size == 0 {
+        return Err("empty file".to_string());
+    }
+    if size > 10 * 1024 * 1024 {
+        return Err("image too large (max 10MB)".to_string());
+    }
+    let ext = full
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return Err("unsupported image type (png/jpg/webp/gif only) — use read for text files".to_string()),
+    };
+    let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
+    {
+        use base64::Engine as _;
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(WorkImageContent {
+            path: path.trim().to_string(),
+            base64,
+            mime: mime.to_string(),
+            size,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2572,6 +2623,7 @@ pub fn run() {
             upload_stage_file,
             upload_read_file,
             work_read_file,
+            work_read_image,
             work_grep,
             work_write_file,
             work_exec,
@@ -2756,6 +2808,30 @@ mod work_tests {
         assert_eq!(res.exit_code, Some(0));
         let slow = work_exec(root, "sleep 5".into(), Some(1200)).await.unwrap();
         assert!(slow.timed_out);
+    }
+
+    #[tokio::test]
+    async fn read_image_roundtrip_and_guardrails() {
+        let d = tmp_root("readimage");
+        let root = d.to_string_lossy().to_string();
+        // 1x1 transparent PNG
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(png_b64).unwrap();
+            std::fs::write(d.join("tiny.png"), &bytes).unwrap();
+        }
+        std::fs::write(d.join("note.txt"), "hello").unwrap();
+        let img = work_read_image(root.clone(), "tiny.png".into()).await.unwrap();
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(img.base64, png_b64);
+        // non-image extension rejected; escapes rejected
+        assert!(work_read_image(root.clone(), "note.txt".into()).await.is_err());
+        assert!(work_read_image(root.clone(), "../outside.png".into()).await.is_err());
+        // text reader now points binaries at view_image
+        std::fs::write(d.join("raw.bin"), [0u8, 1, 2, 3]).unwrap();
+        let err = work_read_file(root.clone(), "raw.bin".into(), None).await.unwrap_err();
+        assert!(err.contains("view_image"));
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, type WorkTreeEntry } from "$lib/work";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
@@ -3801,7 +3801,15 @@
           const bgId = extractBackgroundId(out);
           if (bgId) pendingBg.add(bgId);
         }
+        // `view_image` carries vision bytes as a marker (tool results are
+        // text-only): strip it from the transcript and re-feed the picture as
+        // Ollama `images[]` on a following user message so the model sees it.
+        const viewed = extractViewedImages(out);
+        if (viewed.images.length) out = viewed.clean;
         native.push({ role: "tool", content: out, tool_name: call.name });
+        if (viewed.images.length) {
+          native.push({ role: "user", content: `Image ${String((call.args as any)?.path ?? "")} shown above (vision input). Describe what you see and answer the user's question about it.`, images: viewed.images });
+        }
         const c2 = chats.find((x) => x.id === chat.id);
         if (isSay) {
           // display channel for models that emit tool calls only: the text
