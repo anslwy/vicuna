@@ -1106,6 +1106,7 @@
     }
     defaultWorkspace = canon;
     pendingWorkspace = canon;
+    pendingMode = "work";
     persistPrefs();
     const existing = chats.find(
       (c) => (c.mode ?? "chat") === "work" && c.workspace === canon && c.messages.length === 0
@@ -1114,6 +1115,7 @@
       activeId = existing.id;
       isPinned = true;
       error = null;
+      workspaceError = null;
       void goto(`/s/${existing.id}`);
       return;
     }
@@ -1133,6 +1135,7 @@
     activeId = chat.id;
     isPinned = true;
     error = null;
+    workspaceError = null;
     save();
     void goto(`/s/${chat.id}`);
   }
@@ -1964,10 +1967,11 @@
       }
     }
     const fullText = text + uploadNote;
-    // effective mode: a pre-existing thread keeps its mode; a home send or an
-    // untouched empty draft adopts the starter toggle
+    // effective mode: a pre-existing thread keeps its mode (including an
+    // untouched empty draft created with an explicit mode, e.g. via the
+    // `vicuna` CLI); only a home send falls back to the starter toggle
     const effectiveMode: "chat" | "work" = chat
-      ? (chat.messages.length === 0 ? pendingMode : (chat.mode ?? "chat"))
+      ? (chat.mode ?? (chat.messages.length === 0 ? pendingMode : "chat"))
       : pendingMode;
     let workRoot: string | null = null;
     if (effectiveMode === "work") {
