@@ -15,8 +15,16 @@ use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 
 const OLLAMA_BASE: &str = "http://localhost:11434";
+
+/// Windows: keep background children from flashing a console window on the
+/// user's screen (agent `exec`, its timeout killer, self-started
+/// `ollama serve`, pid kills). No-op on other platforms.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -560,12 +568,15 @@ async fn ollama_start_server(state: State<'_, OllamaServerState>) -> Result<Stri
     let mut child: Option<Child> = None;
     let mut spawn_err = String::from("no `ollama` binary tried");
     for bin in ollama_candidates() {
-        match Command::new(bin)
+        let mut serve = Command::new(bin);
+        serve
             .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        serve.creation_flags(CREATE_NO_WINDOW);
+        match serve.spawn()
         {
             Ok(c) => {
                 child = Some(c);
@@ -1091,6 +1102,7 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
         .current_dir(&canon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("cannot run command: {e}"))?;
     #[cfg(not(windows))]
@@ -1119,6 +1131,7 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
                 #[cfg(windows)]
                 let _ = tokio::process::Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/F"])
+                    .creation_flags(CREATE_NO_WINDOW)
                     .output()
                     .await;
             }
@@ -1198,6 +1211,7 @@ fn kill_pid(pid: u32) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 }
 
@@ -1223,9 +1237,12 @@ where
     let mut cmd = {
         #[cfg(windows)]
         {
-            let comspec =
-                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-            portable_pty::CommandBuilder::new(comspec)
+            // PowerShell from the start: nesting it under cmd garbles
+            // PSReadLine styling, and the agent never uses this shell
+            // anyway (it has `exec`, which stays on `cmd /C`).
+            let mut c = portable_pty::CommandBuilder::new("powershell.exe");
+            c.args(["-NoLogo"]);
+            c
         }
         #[cfg(not(windows))]
         {
