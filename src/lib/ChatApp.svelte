@@ -28,6 +28,7 @@
     type Chat
   } from "$lib/store";
   import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, type WorkTreeEntry } from "$lib/work";
+  import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -558,6 +559,12 @@
   let gotoSel = $state(0);
   let settingsOpen = $state(false);
   let settingsTab = $state<"general" | "models">("general");
+  /** Vicuna CLI launcher status (desktop only, loaded when Settings opens) */
+  let cliState = $state<CliStatus | null>(null);
+  let cliOp = $state<null | "load" | "install" | "uninstall">(null);
+  let cliError = $state<string | null>(null);
+  /** last install/uninstall outcome line (e.g. where it landed, PATH note) */
+  let cliNote = $state<string | null>(null);
   let runners = $state<RunningModel[]>([]);
   let runnersError = $state<string | null>(null);
   let modelOp = $state<string | null>(null);
@@ -600,6 +607,51 @@
   async function openSettings() {
     settingsTab = "general";
     settingsOpen = true;
+    void refreshCliStatus();
+  }
+
+  /** (Re)read the `vicuna` launcher status; silent unless it fails. */
+  async function refreshCliStatus() {
+    if (!isTauriRuntime() || cliOp) return;
+    cliOp = "load";
+    cliError = null;
+    try {
+      cliState = await cliStatus();
+    } catch (e: any) {
+      cliError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      cliOp = null;
+    }
+  }
+
+  async function installCliFlow() {
+    if (!isTauriRuntime() || cliOp) return;
+    cliOp = "install";
+    cliError = null;
+    try {
+      const res = await cliInstall();
+      cliState = await cliStatus();
+      cliNote = res.note || `Installed to ${res.location}.`;
+    } catch (e: any) {
+      cliError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      cliOp = null;
+    }
+  }
+
+  async function uninstallCliFlow() {
+    if (!isTauriRuntime() || cliOp) return;
+    cliOp = "uninstall";
+    cliError = null;
+    try {
+      const removed = await cliUninstall();
+      cliState = await cliStatus();
+      cliNote = `Removed ${removed}.`;
+    } catch (e: any) {
+      cliError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      cliOp = null;
+    }
   }
 
   async function openModelsTab() {
@@ -1003,9 +1055,11 @@
     void copyText(isTauriRuntime() ? `vicuna://s/${id}` : `${window.location.origin}/s/${id}`);
   }
 
-  // deep links (`vicuna://s/<id>`, e.g. pasted into a browser) land here via
+  // deep links (`vicuna://s/<id>`, e.g. pasted into a browser, and
+  // `vicuna://open?path=…` from the `vicuna` CLI launcher) land here via
   // the deep-link plugin; navigate once chats are loaded, stash until then
   let pendingDeepLinkId: string | null = null;
+  let pendingDeepLinkPath: string | null = null;
   function extractSessionId(urls: string[]): string | null {
     for (const u of urls) {
       const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -1017,15 +1071,70 @@
   function handleDeepLinkUrls(urls: string[] | null) {
     if (!urls?.length) return;
     const id = extractSessionId(urls);
-    if (!id) return;
-    if (ready && chats.some((c) => c.id === id)) {
-      activeId = id;
-      isPinned = true;
-      void goto(`/s/${id}`);
-    } else {
-      // initApp flushes this after load; unknown ids are dropped there
-      pendingDeepLinkId = id;
+    if (id) {
+      if (ready && chats.some((c) => c.id === id)) {
+        activeId = id;
+        isPinned = true;
+        void goto(`/s/${id}`);
+      } else {
+        // initApp flushes this after load; unknown ids are dropped there
+        pendingDeepLinkId = id;
+      }
+      return;
     }
+    const path = extractOpenPath(urls);
+    if (!path) return;
+    if (ready) void openWorkspacePath(path);
+    else pendingDeepLinkPath = path;
+  }
+
+  /** Open a folder from the `vicuna` CLI (`vicuna://open?path=…`): validate
+   *  it, make it the workspace, and raise a work session rooted there
+   *  (reusing an empty one when there is one). Never disturbs other
+   *  sessions' streams. */
+  async function openWorkspacePath(raw: string) {
+    const p = raw.trim();
+    if (!p || !isTauriRuntime()) return;
+    // links can arrive while hidden in the tray — come forward
+    void focusAppWindow();
+    let canon: string;
+    try {
+      canon = await canonicalWorkspace(p);
+    } catch (e: any) {
+      error = `Couldn't open "${p}": ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+      return;
+    }
+    defaultWorkspace = canon;
+    pendingWorkspace = canon;
+    persistPrefs();
+    const existing = chats.find(
+      (c) => (c.mode ?? "chat") === "work" && c.workspace === canon && c.messages.length === 0
+    );
+    if (existing) {
+      activeId = existing.id;
+      isPinned = true;
+      error = null;
+      void goto(`/s/${existing.id}`);
+      return;
+    }
+    // like New: don't pile up empty drafts
+    if (chats.some((c) => c.messages.length === 0)) {
+      chats = chats.filter((c) => c.messages.length > 0);
+    }
+    const chat: Chat = {
+      id: crypto.randomUUID(),
+      title: workspaceBase(canon).slice(0, 40) || "New session",
+      createdAt: Date.now(),
+      messages: [],
+      mode: "work",
+      workspace: canon
+    };
+    chats = [chat, ...chats];
+    activeId = chat.id;
+    isPinned = true;
+    error = null;
+    save();
+    void goto(`/s/${chat.id}`);
   }
 
   function startRename(id: string) {
@@ -3516,6 +3625,12 @@
           void goto(`/s/${id}`);
         }
       }
+      // app launched via `vicuna [path]`: raise a work session there
+      if (pendingDeepLinkPath) {
+        const p = pendingDeepLinkPath;
+        pendingDeepLinkPath = null;
+        await openWorkspacePath(p);
+      }
       // restore the unsent composer text (one global box, not per session)
       input = readDraft(null);
       const savedCatalog = await loadCatalog();
@@ -4696,6 +4811,26 @@
       <span class="setting-note">One per line. Use \n for newlines. Generation stops when the model outputs one of these.</span>
     </div>
     {#if isTauriRuntime()}
+      <div class="setting-stacked">
+        <span class="setting-label">Vicuna CLI</span>
+        <div class="browse-actions">
+          {#if cliState?.found && cliState.managed}
+            <button class="mini-btn" data-testid="cli-reinstall-btn" disabled={cliOp !== null} onclick={installCliFlow}>{cliOp === "install" ? "…" : "Reinstall"}</button>
+            <button class="mini-btn" data-testid="cli-uninstall-btn" disabled={cliOp !== null} onclick={uninstallCliFlow}>{cliOp === "uninstall" ? "…" : "Uninstall"}</button>
+          {:else}
+            <button class="mini-btn primary" data-testid="cli-install-btn" disabled={cliOp !== null} onclick={installCliFlow}>{cliOp === "install" ? "…" : "Install"}</button>
+          {/if}
+          {#if cliOp === "load"}<span class="setting-note">Checking…</span>{/if}
+        </div>
+        {#if cliState}
+          <span class="setting-note" data-testid="cli-status">
+            {#if cliState.found && cliState.managed}Installed: {cliState.found}{cliState.on_path ? "" : " (not on PATH yet — open a new terminal)"}{:else if cliState.found}Another `{cliState.exe_name}` already exists at {cliState.found} — Install writes to {cliState.install_dir}.{:else}Not installed — Install writes to {cliState.install_dir}.{/if}
+          </span>
+        {/if}
+        {#if cliNote}<span class="setting-note" data-testid="cli-note">{cliNote}</span>{/if}
+        {#if cliError}<p class="goto-error" data-testid="cli-error">{cliError}</p>{/if}
+        <span class="setting-note">Run `{cliState?.exe_name ?? "vicuna"} [path]` in a terminal to open that folder in Vicuna (default: current directory).</span>
+      </div>
       <div class="setting-row quit-row">
         <span class="setting-label">Quit Vicuna</span>
         <button class="mini-btn danger" data-testid="quit-app-btn" onclick={quitVicuna}>Quit Vicuna</button>

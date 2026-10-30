@@ -1455,6 +1455,352 @@ async fn work_exec_kill(id: String, state: State<'_, BgExecState>) -> Result<BgJ
     bg_kill(&state, &id)
 }
 
+/// ---------- Vicuna CLI launcher (Settings → General, desktop only) ----------
+///
+/// `vicuna [path]` opens a folder in the app: a tiny launcher script that
+/// opens a `vicuna://open?path=…` deep link (same scheme as Copy Link, so no
+/// config change is needed) via the OS opener. The frontend validates the
+/// path and raises a work session rooted there; no argument means the
+/// caller's current directory (the script defaults to `$PWD`/`%CD%`).
+/// Install location is a user-writable dir: first non-system PATH entry on
+/// unix (falling back to `~/.local/bin`), `%LOCALAPPDATA%\Vicuna\bin` on
+/// Windows (user PATH updated via the registry, no admin needed).
+
+/// Marker comment identifying a launcher this app installed (so status never
+/// claims a foreign `vicuna` binary as its own).
+const CLI_MARKER: &str = "Installed by Vicuna";
+
+/// POSIX launcher (macOS + Linux): resolve the arg (default `$PWD`), fully
+/// percent-encode it (python3 when present, portable `od` fallback — slashes
+/// included, the app decodes fully), open the link. `&` so the terminal
+/// doesn't hang on `xdg-open`.
+const CLI_UNIX_SCRIPT: &str = r#"#!/bin/sh
+# Installed by Vicuna (Settings > General > Vicuna CLI). Opens a folder in the Vicuna desktop app: `vicuna [path]` (default: current directory).
+p="${1:-$PWD}"
+case "$p" in
+  /*) abs="$p" ;;
+  \~/*) abs="$HOME/${p#\~/}" ;;
+  *) abs="$PWD/$p" ;;
+esac
+enc=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$abs" 2>/dev/null)
+if [ -z "$enc" ]; then
+  enc=$(printf '%s' "$abs" | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g')
+fi
+url="vicuna://open?path=$enc"
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$url" >/dev/null 2>&1 &
+else
+  open "$url" >/dev/null 2>&1 &
+fi
+"#;
+
+/// Windows launcher: `%~f1` resolves the arg to a full path (default `%CD%`),
+/// PowerShell percent-encodes it (batch can't), `start` opens the link.
+const CLI_WINDOWS_SCRIPT: &str = "@echo off\r\nrem Installed by Vicuna (Settings > General > Vicuna CLI). Opens a folder in the Vicuna desktop app: `vicuna [path]` (default: current directory).\r\nsetlocal\r\nset \"P=%~f1\"\r\nif \"%P%\"==\"\" set \"P=%CD%\"\r\nfor /f \"delims=\" %%E in ('powershell -NoProfile -NonInteractive -Command \"[uri]::EscapeDataString($env:P)\"') do set \"ENC=%%E\"\r\nstart \"\" \"vicuna://open?path=%ENC%\"\r\n";
+
+fn cli_exe_name() -> &'static str {
+    if cfg!(windows) { "vicuna.cmd" } else { "vicuna" }
+}
+
+fn cli_script_body() -> &'static str {
+    if cfg!(windows) { CLI_WINDOWS_SCRIPT } else { CLI_UNIX_SCRIPT }
+}
+
+/// PATH entries of this process (the user's PATH at launch).
+fn cli_path_dirs() -> Vec<std::path::PathBuf> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(sep)
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn cli_is_system_dir(d: &std::path::Path) -> bool {
+    matches!(
+        d.to_string_lossy().as_ref(),
+        "/bin" | "/sbin" | "/usr/bin" | "/usr/sbin" | "/System/Volumes/Data/bin"
+    )
+}
+
+fn cli_home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home))
+}
+
+/// Where a launcher would be installed. Unix: first non-system PATH entry
+/// (with `~/.local/bin` preferred when on PATH), else `~/.local/bin`.
+/// Windows: `%LOCALAPPDATA%\Vicuna\bin`.
+fn cli_install_dir() -> Result<std::path::PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let base = cli_home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
+        Ok(base.join("Vicuna").join("bin"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = cli_home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
+        let local = home.join(".local").join("bin");
+        let dirs = cli_path_dirs();
+        if dirs.iter().any(|d| d == &local) {
+            return Ok(local);
+        }
+        for d in dirs {
+            if d.is_absolute() && !cli_is_system_dir(&d) {
+                return Ok(d);
+            }
+        }
+        Ok(local)
+    }
+}
+
+fn cli_unix_fallback_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        cli_home_dir().map(|h| h.join(".local").join("bin"))
+    }
+}
+
+/// First dir holding the launcher name, if any.
+fn cli_scan_in(dirs: &[std::path::PathBuf], exe: &str) -> Option<std::path::PathBuf> {
+    for d in dirs {
+        let cand = d.join(exe);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn cli_scan(exe: &str) -> Option<std::path::PathBuf> {
+    cli_scan_in(&cli_path_dirs(), exe)
+}
+
+fn cli_is_managed(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(CLI_MARKER))
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CliStatus {
+    exe_name: String,
+    /// resolved `vicuna` on PATH, if any (managed or foreign)
+    found: Option<String>,
+    /// whether `found` is a launcher this app installed
+    managed: bool,
+    /// where Install would write
+    install_dir: String,
+    /// whether `install_dir` is on PATH (unix) / in the user PATH registry
+    /// (Windows, which the current process may predate — a fresh terminal
+    /// is authoritative)
+    on_path: bool,
+}
+
+fn cli_on_path(dir: &std::path::Path) -> bool {
+    if cli_path_dirs().iter().any(|d| d == dir) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // the installer updates HKCU PATH, which this process predates:
+        // ask the registry instead of trusting our own environment
+        if let Ok(out) = Command::new("reg")
+            .args(["query", r"HKCU\Environment", "/v", "Path"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                let needle = dir.to_string_lossy().to_lowercase().to_string();
+                return text.contains(&needle);
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn cli_status_inner() -> Result<CliStatus, String> {
+    let exe = cli_exe_name().to_string();
+    let found = cli_scan(&exe);
+    let managed = found.as_deref().map(cli_is_managed).unwrap_or(false);
+    let install_dir = cli_install_dir()?;
+    let on_path = cli_on_path(&install_dir);
+    Ok(CliStatus {
+        exe_name: exe,
+        found: found.map(|p| p.to_string_lossy().to_string()),
+        managed,
+        install_dir: install_dir.to_string_lossy().to_string(),
+        on_path,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CliInstallResult {
+    location: String,
+    on_path: bool,
+    note: String,
+}
+
+/// Write the launcher file into `dir` (creating it). Unix sets 0o755.
+fn cli_write_launcher(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.to_string_lossy()))?;
+    let dest = dir.join(cli_exe_name());
+    std::fs::write(&dest, cli_script_body())
+        .map_err(|e| format!("cannot write {}: {e}", dest.to_string_lossy()))?;
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot chmod {}: {e}", dest.to_string_lossy()))?;
+    }
+    Ok(dest)
+}
+
+/// Ensure `dir` is in the current user's PATH (Windows only — HKCU, no
+/// admin). Best-effort: returns whether the registry now contains it.
+#[cfg(windows)]
+fn cli_ensure_user_path(dir: &std::path::Path) -> bool {
+    if cli_on_path(dir) {
+        return true;
+    }
+    let dir_s = dir.to_string_lossy().to_string();
+    // .NET updates HKCU\Environment\Path without setx's truncation issues
+    // and broadcasts the change for new processes.
+    let ps = format!(
+        "$p=[Environment]::GetEnvironmentVariable('Path','User'); if($p -split ';' -notcontains '{}'){{ [Environment]::SetEnvironmentVariable('Path', ($p+';{}'), 'User') }}",
+        dir_s.replace('\'', "''"),
+        dir_s.replace('\'', "''")
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    cli_on_path(dir)
+}
+
+fn cli_install_inner() -> Result<CliInstallResult, String> {
+    let primary = cli_install_dir()?;
+    let dest = match cli_write_launcher(&primary) {
+        Ok(d) => (d, None),
+        Err(e) => {
+            // permission-denied on a PATH dir (e.g. /usr/local/bin owned by
+            // root): fall back to the user-local bin instead of failing
+            match cli_unix_fallback_dir() {
+                Some(fb) if fb != primary => {
+                    let d = cli_write_launcher(&fb).map_err(|e2| {
+                        format!("{e}. Fallback also failed ({}): {e2}", fb.to_string_lossy())
+                    })?;
+                    (d, Some(format!("{} is not writable, installed to {} instead.", primary.to_string_lossy(), fb.to_string_lossy())))
+                }
+                _ => return Err(e),
+            }
+        }
+    };
+    #[cfg(windows)]
+    let path_note = if cli_ensure_user_path(dest.0.parent().unwrap_or(&primary)) {
+        "Added to your user PATH — open a NEW terminal to use it."
+    } else {
+        "Could not update your user PATH automatically."
+    };
+    let on_path = cli_on_path(dest.0.parent().unwrap_or(&primary));
+    let mut note = dest.1.unwrap_or_default();
+    #[cfg(windows)]
+    {
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        note.push_str(path_note);
+    }
+    #[cfg(not(windows))]
+    {
+        if !on_path {
+            note = format!(
+                "{} is not on your PATH — add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile, then open a new terminal.",
+                dest.0.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+            );
+        } else if note.is_empty() {
+            note = "Run `vicuna [path]` in a terminal (default: current directory).".to_string();
+        }
+    }
+    Ok(CliInstallResult {
+        location: dest.0.to_string_lossy().to_string(),
+        on_path,
+        note,
+    })
+}
+
+/// Remove a launcher this app installed (the managed PATH hit, else our own
+/// install dir). Refuses foreign `vicuna` binaries.
+fn cli_uninstall_inner() -> Result<String, String> {
+    let exe = cli_exe_name();
+    if let Some(found) = cli_scan(exe) {
+        if cli_is_managed(&found) {
+            std::fs::remove_file(&found).map_err(|e| format!("cannot remove {}: {e}", found.to_string_lossy()))?;
+            return Ok(found.to_string_lossy().to_string());
+        }
+    }
+    let owned = cli_install_dir()?.join(exe);
+    if owned.is_file() {
+        if !cli_is_managed(&owned) {
+            return Err(format!("{} was not installed by Vicuna — refusing to remove it", owned.to_string_lossy()));
+        }
+        std::fs::remove_file(&owned).map_err(|e| format!("cannot remove {}: {e}", owned.to_string_lossy()))?;
+        return Ok(owned.to_string_lossy().to_string());
+    }
+    Err("no Vicuna-installed launcher found".to_string())
+}
+
+/// Report the `vicuna` launcher status (install location + PATH state).
+#[tauri::command]
+async fn cli_status() -> Result<CliStatus, String> {
+    cli_status_inner()
+}
+
+/// Install (or reinstall) the `vicuna` launcher script.
+#[tauri::command]
+async fn cli_install() -> Result<CliInstallResult, String> {
+    cli_install_inner()
+}
+
+/// Remove the launcher this app installed. Refuses foreign binaries.
+#[tauri::command]
+async fn cli_uninstall() -> Result<String, String> {
+    cli_uninstall_inner()
+}
+
+/// Bring the main window forward (CLI deep links arrive while hidden in the
+/// tray; the OS activates the app but doesn't un-hide the window).
+#[tauri::command]
+async fn show_main_window(app: AppHandle) -> Result<(), String> {
+    let w = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window".to_string())?;
+    w.show().map_err(|e| format!("cannot show window: {e}"))?;
+    w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
+    Ok(())
+}
+
 /// ---------- Interactive terminals (side-panel tabs, desktop only) ----------
 ///
 /// Each terminal tab owns a portable-pty pair rooted at the workspace: a
@@ -2064,6 +2410,10 @@ pub fn run() {
             work_exec_status,
             work_exec_list,
             work_exec_kill,
+            cli_status,
+            cli_install,
+            cli_uninstall,
+            show_main_window,
             term_spawn,
             term_write,
             term_resize,
@@ -2274,6 +2624,44 @@ mod work_tests {
         assert!(bg_start(&state, root.clone(), "   ".into()).await.is_err());
         assert!(bg_snapshot(&state, "bg-999999").is_err());
         assert!(bg_kill(&state, "bg-999999").is_err());
+    }
+
+    #[test]
+    fn cli_scripts_carry_marker_and_scheme() {
+        for script in [CLI_UNIX_SCRIPT, CLI_WINDOWS_SCRIPT] {
+            assert!(script.contains(CLI_MARKER), "installer must be recognizable");
+            assert!(script.contains("vicuna://open?path="), "must open the app via deep link");
+        }
+        // unix script defaults to the caller's directory when no arg is given
+        assert!(CLI_UNIX_SCRIPT.contains("${1:-$PWD}"));
+        assert!(CLI_WINDOWS_SCRIPT.contains("%CD%"));
+    }
+
+    #[test]
+    fn cli_write_scan_uninstall_roundtrip() {
+        let d = tmp_root("cli");
+        let dest = cli_write_launcher(&d).unwrap();
+        assert_eq!(dest.file_name().unwrap().to_str().unwrap(), cli_exe_name());
+        assert!(cli_is_managed(&dest));
+        // a foreign binary with the same name is never claimed or removed
+        let other = d.join("shadow");
+        std::fs::create_dir_all(&other).unwrap();
+        let foreign = other.join(cli_exe_name());
+        std::fs::write(&foreign, "echo not-vicuna\n").unwrap();
+        assert!(!cli_is_managed(&foreign));
+        std::fs::remove_file(&dest).unwrap();
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn cli_scan_finds_path_entries_in_order() {
+        let a = tmp_root("cli-scan-a");
+        let b = tmp_root("cli-scan-b");
+        std::fs::write(a.join(cli_exe_name()), CLI_MARKER).unwrap();
+        std::fs::write(b.join(cli_exe_name()), CLI_MARKER).unwrap();
+        let dirs = vec![a.clone(), b.clone()];
+        assert_eq!(cli_scan_in(&dirs, cli_exe_name()).unwrap(), a.join(cli_exe_name()));
+        assert!(cli_scan_in(&dirs, "no-such-launcher").is_none());
     }
 
     #[tokio::test]
