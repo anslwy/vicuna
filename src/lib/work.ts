@@ -23,6 +23,7 @@ WORKSPACE BOUNDARY (strict):
 - If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
 - Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
 - Use \`ask\` when a decision is genuinely needed (which approach/file/scope, or before anything destructive) instead of guessing. It shows buttons plus an "Other" free-text field and waits for the answer.
+- Use \`say\` to show the user any narration, answer, or explanation between tool calls. Its text is rendered as normal assistant prose. Never put narration inside another tool's arguments — the \`ask\` question must be only the question.
 
 Use the provided function tools to act — do not invent results, do not emit manual tool JSON.
 - After a tool result arrives, continue reasoning and either call the next tool or answer.
@@ -31,7 +32,7 @@ Use the provided function tools to act — do not invent results, do not emit ma
 - Keep file reads targeted; prefer list/grep before reading big files.
 
 RESPONSE STYLE:
-- Briefly narrate what you are about to do before each tool call (one line), so the transcript reads naturally.
+- Briefly narrate what you are about to do before each tool call (one line), so the transcript reads naturally. If the model cannot emit normal text alongside tool calls, call \`say\` with that line instead.
 - End with a concise summary of what you did/found, with file paths and command output that matter.`;
 }
 
@@ -108,13 +109,27 @@ export const WORK_TOOLS = [
   {
     type: "function",
     function: {
+      name: "say",
+      description: "Show a message to the user as normal assistant prose in the transcript. Use this for narration, answers, or explanations between tool calls — especially when the model can only emit tool calls. Put ONLY the message text here; never put narration inside another tool's arguments (e.g. the ask question must be just the question). The text is displayed immediately and is not shown as a tool block.",
+      parameters: {
+        type: "object",
+        required: ["text"],
+        properties: {
+          text: { type: "string", description: "markdown text to display to the user" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "ask",
-      description: "Ask the user a multiple-choice question and wait for their answer. Use when a decision is genuinely needed before continuing (approach, file, scope, or anything destructive). Provide 2-8 short options; the UI always adds an 'Other' free-text choice. Returns the chosen option or the typed answer.",
+      description: "Ask the user a multiple-choice question and wait for their answer. Use when a decision is genuinely needed before continuing (approach, file, scope, or anything destructive). Provide 2-8 short options; the UI always adds an 'Other' free-text choice. Returns the chosen option or the typed answer. If the user dismisses the question, the result says so — do not ask it again. Put ONLY the question in `question`; use `say` for any narration or your own reasoning before asking.",
       parameters: {
         type: "object",
         required: ["question", "options"],
         properties: {
-          question: { type: "string", description: "question text" },
+          question: { type: "string", description: "question text only — no narration or answers" },
           options: {
             type: "array",
             items: { type: "string" },
@@ -505,6 +520,11 @@ export async function dispatchWorkTool(
         parts.push(`[exit ${res.timed_out ? "timed out" : res.exit_code}]`);
         return parts.join("\n");
       }
+      case "say": {
+        const text = str(a.text).trim();
+        if (!text) return "Error: say needs non-empty text.";
+        return "Displayed to the user.";
+      }
       case "ask": {
         const question = str(a.question).trim();
         const options = Array.isArray(a.options)
@@ -538,7 +558,7 @@ export async function dispatchWorkTool(
         return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
       }
       default:
-        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, sessions, read_session, read_upload.`;
+        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, sessions, read_session, read_upload, say, ask.`;
     }
   } catch (e: any) {
     return `Error: ${e?.message ?? String(e)}`;
@@ -562,8 +582,22 @@ export function toolLabel(name: string, args: Record<string, any>): string {
     name === "sessions" ? String(args.query ?? "") :
     name === "read_session" ? String(args.id ?? "") :
     name === "read_upload" ? String(args.name ?? "") :
+    name === "say" ? String(args.text ?? "") :
     name === "ask" ? String(args.question ?? "") : JSON.stringify(args);
   return `${name} — ${argSummary.slice(0, 120)}`;
+}
+
+/** Visible record of an answered or dismissed `ask` card. Emitted as harness
+ *  HTML (not markdown prose) so the transcript reads as tool output — the old
+ *  `> Question/Answer` blockquote taught the model to imitate the format and
+ *  fabricate answers instead of calling the tool. */
+export function formatAskRecord(question: string, answer: string, dismissed: boolean): string {
+  const one = (s: string) => s.replace(/\s+/g, " ").trim();
+  const q = escapeHtml(one(question));
+  const a = dismissed
+    ? `<span class="ask-log-dismissed">Dismissed</span>`
+    : `<strong>Answer:</strong> ${escapeHtml(one(answer))}`;
+  return `\n\n<div class="ask-log"><div class="ask-log-q">${q}</div><div class="ask-log-a">${a}</div></div>\n\n`;
 }
 
 /** Head of a tool-result block, appended as soon as the call is known so the

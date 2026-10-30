@@ -639,6 +639,12 @@ fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
     if !canon.is_dir() {
         return Err("workspace is not a folder".to_string());
     }
+    // The filesystem root ("/", "C:\") would make every tool crawl the
+    // whole machine — including macOS TCC-protected spots (Documents,
+    // /Volumes network mounts) that re-prompt on every access. Refuse it.
+    if canon.parent().is_none() {
+        return Err("workspace cannot be the filesystem root — pick a project folder".to_string());
+    }
     Ok(canon)
 }
 
@@ -768,6 +774,9 @@ async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTre
         ".venv",
         "venv",
     ];
+    // Synthetic / system mounts: never legit project content, and on macOS
+    // touching /Volumes re-triggers the network-volume consent prompt.
+    const SKIP_SYSTEM: [&str; 6] = ["Volumes", "System", "private", "dev", "proc", "sys"];
     let mut out: Vec<WorkTreeEntry> = Vec::new();
     let mut stack = vec![(canon.clone(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -789,7 +798,7 @@ async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTre
             let name = ent.file_name().to_string_lossy().to_string();
             let p = ent.path();
             let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir && SKIP.contains(&name.as_str()) {
+            if is_dir && (SKIP.contains(&name.as_str()) || SKIP_SYSTEM.contains(&name.as_str())) {
                 continue;
             }
             let rel = p
@@ -966,7 +975,7 @@ async fn work_grep(root: String, pattern: String, include: Option<String>) -> Re
             }
             let p = ent.path();
             if p.is_dir() {
-                if matches!(name.as_str(), "node_modules" | "target" | "build" | ".git" | "dist") {
+                if matches!(name.as_str(), "node_modules" | "target" | "build" | ".git" | "dist" | "Volumes" | "System" | "private" | "dev" | "proc" | "sys") {
                     continue;
                 }
                 stack.push(p);
@@ -1631,6 +1640,8 @@ mod work_tests {
     fn validate_rejects_missing_and_relative() {
         assert!(work_canonical_root("/no/such/dir/xyz").is_err());
         assert!(work_canonical_root("relative/path").is_err());
+        // filesystem root would crawl TCC-protected spots on macOS
+        assert!(work_canonical_root("/").is_err());
         let d = tmp_root("validate");
         assert!(work_canonical_root(d.to_str().unwrap()).is_ok());
     }

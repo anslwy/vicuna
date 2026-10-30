@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatAskRecord, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -57,7 +57,7 @@
     options: string[];
     other: string;
     otherOpen: boolean;
-    resolve: (answer: string) => void;
+    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel") => void;
   } | null>(null);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
@@ -1904,7 +1904,9 @@
     explorerEntries = [];
     explorerError = null;
     const root = explorerRoot.trim();
-    if (!root) {
+    // "/" is never a valid workspace (backend refuses the filesystem root:
+    // crawling it hits macOS TCC-protected spots on every refresh).
+    if (!root || root === "/") {
       explorerError = "Pick a workspace folder first.";
       return;
     }
@@ -2154,7 +2156,7 @@
   // files for the mention popup come from the explorer tree; fetch on demand
   // (the panel may never have been opened in this session)
   $effect(() => {
-    if (mention && !explorerEntries.length && !explorerLoading && explorerRoot.trim() && isTauriRuntime()) {
+    if (mention && !explorerEntries.length && !explorerLoading && explorerRoot.trim() && explorerRoot.trim() !== "/" && isTauriRuntime()) {
       void loadExplorer();
     }
   });
@@ -2485,10 +2487,11 @@
   }
 
   // refresh the tree when the work root changes under an open panel
-  // (debounced: the workspace input updates per keystroke)
+  // (debounced: the workspace input updates per keystroke; "/" is never
+  // valid — older stored roots — so don't even debounce it)
   $effect(() => {
     const root = explorerRoot.trim();
-    if (!explorerOpen || root === lastExplorerRoot) return;
+    if (!explorerOpen || root === lastExplorerRoot || root === "/") return;
     lastExplorerRoot = root;
     if (explorerTimer) clearTimeout(explorerTimer);
     explorerTimer = setTimeout(() => void loadExplorer(), 400);
@@ -2522,24 +2525,26 @@
     return true;
   }
 
-  /** user answered a live ask card: persist a compact Q/A record in the
-   *  message, then resolve the blocked tool call with the answer */
+  /** user answered a live ask card: resolve the blocked tool call (the work
+   *  loop appends the visible record) */
   function answerAsk(value: string) {
     const a = pendingAsk;
     if (!a) return;
     pendingAsk = null;
-    const c = chats.find((x) => x.id === a.chatId);
-    const m = c?.messages[a.index];
-    if (c && m) {
-      const one = (s: string) => s.replace(/\s+/g, " ").trim();
-      c.messages[a.index] = {
-        ...m,
-        content: `${m.content}\n\n> **Question:** ${one(a.question)}\n>\n> **Answer:** ${one(value)}\n\n`
-      };
-      chats = [...chats];
-      saveSoon();
-    }
-    a.resolve(value);
+    a.resolve(value, "answer");
+    scrollBottom();
+  }
+
+  /** user dismissed the question without answering: tell the model so it
+   *  stops waiting and doesn't re-ask */
+  function dismissAsk() {
+    const a = pendingAsk;
+    if (!a) return;
+    pendingAsk = null;
+    a.resolve(
+      "User dismissed the question without answering. Do not ask it again — continue with your best judgment or explain what you need.",
+      "dismiss"
+    );
     scrollBottom();
   }
 
@@ -2549,7 +2554,7 @@
     const a = pendingAsk;
     if (!a) return;
     pendingAsk = null;
-    a.resolve(reason);
+    a.resolve(reason, "cancel");
   }
 
   function stop() {
@@ -2659,13 +2664,45 @@
     fileInput?.click();
   }
 
+  function decodeEntities(s: string): string {
+    return s
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+
+  /** Harness markup (collapsed tool blocks, ask records) is display-only.
+   *  Models that see it in their own history imitate the HTML instead of
+   *  calling tools, so history sends a compact plain-text form instead:
+   *  tool blocks drop out, ask records become prose. */
+  function stripHarnessMarkup(content: string): string {
+    return content
+      .replace(/<details class="tool-result">[\s\S]*?<\/details>/g, "")
+      .replace(
+        /<div class="ask-log">\s*<div class="ask-log-q">([\s\S]*?)<\/div>\s*<div class="ask-log-a">([\s\S]*?)<\/div>\s*<\/div>/g,
+        (_m, q: string, a: string) => {
+          const answer = /ask-log-dismissed/.test(a)
+            ? "dismissed the question"
+            : `answered: ${decodeEntities(a.replace(/<[^>]+>/g, "").replace(/^Answer:\s*/, ""))}`;
+          return `Asked the user: ${decodeEntities(q)} — they ${answer}.`;
+        }
+      )
+      .replace(/<details class="tool-result">[\s\S]*$/g, "")
+      .replace(/<div class="ask-log">[\s\S]*$/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
   // history entries keep attached images so regenerate/continue/resume
   // resend the same picture instead of silently dropping it; tool calls and
   // tool names pass through for native agent histories
   function toHistory(m: ChatMsg): ChatMsg {
+    const content = m.role === "assistant" ? stripHarnessMarkup(m.content) : m.content;
     const base: ChatMsg = m.images?.length
-      ? { role: m.role, content: m.content, images: [...m.images] }
-      : { role: m.role, content: m.content };
+      ? { role: m.role, content, images: [...m.images] }
+      : { role: m.role, content };
     if (m.tool_calls?.length) base.tool_calls = m.tool_calls;
     if (m.tool_name) base.tool_name = m.tool_name;
     return base;
@@ -2873,12 +2910,14 @@
       for (const call of fresh) {
         if (workStop || ctrl?.signal.aborted) break;
         const isAsk = call.name === "ask";
+        const isSay = call.name === "say";
         let askShown = false;
+        let askOutcome: "answer" | "dismiss" | "cancel" = "cancel";
         toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
         // tag first: the call is known now, the result may take a while.
-        // `ask` is the exception: the live card + Q/A record own the display.
+        // `ask` (live card) and `say` (normal prose) own their display.
         const c1 = chats.find((x) => x.id === chat.id);
-        if (!isAsk && c1?.messages[curIndex]) {
+        if (!isAsk && !isSay && c1?.messages[curIndex]) {
           const m1 = c1.messages[curIndex];
           c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
           chats = [...chats];
@@ -2891,7 +2930,18 @@
           askUser: (question, options) => {
             askShown = true;
             return new Promise<string>((resolve) => {
-              pendingAsk = { chatId: chat.id, index: curIndex, question, options, other: "", otherOpen: false, resolve };
+              pendingAsk = {
+                chatId: chat.id,
+                index: curIndex,
+                question,
+                options,
+                other: "",
+                otherOpen: false,
+                resolve: (answer, outcome) => {
+                  askOutcome = outcome;
+                  resolve(answer);
+                }
+              };
               requestAnimationFrame(() => scrollBottom());
             });
           }
@@ -2899,9 +2949,31 @@
         if (toolStatus?.chatId === chat.id) toolStatus = null;
         native.push({ role: "tool", content: out, tool_name: call.name });
         const c2 = chats.find((x) => x.id === chat.id);
-        if (isAsk && askShown) {
-          // the live card owned the display: answered → answerAsk appended the
-          // Q/A record; cancelled → nothing to leave behind
+        if (isSay) {
+          // display channel for models that emit tool calls only: the text
+          // becomes normal assistant prose, not a collapsed tool block
+          const text = String(call.args.text ?? "").trim();
+          if (text && !out.startsWith("Error:") && c2?.messages[curIndex]) {
+            const m2 = c2.messages[curIndex];
+            const sep = m2.content.trim() ? "\n\n" : "";
+            c2.messages[curIndex] = { ...m2, content: `${m2.content}${sep}${text}\n\n` };
+            chats = [...chats];
+          } else if (c2?.messages[curIndex]) {
+            const m2 = c2.messages[curIndex];
+            c2.messages[curIndex] = { ...m2, content: m2.content + formatToolCallHead(call.name, call.args) + formatToolCallTail(out) };
+            chats = [...chats];
+          }
+        } else if (isAsk && askShown) {
+          // visible harness record of the Q/A (or dismissal); a cancelled ask
+          // (Stop / chat deleted) leaves nothing behind
+          if (askOutcome !== "cancel" && c2?.messages[curIndex]) {
+            const m2 = c2.messages[curIndex];
+            c2.messages[curIndex] = {
+              ...m2,
+              content: m2.content + formatAskRecord(String(call.args.question ?? ""), out, askOutcome === "dismiss")
+            };
+            chats = [...chats];
+          }
         } else if (c2?.messages[curIndex]) {
           const m2 = c2.messages[curIndex];
           const head = isAsk ? formatToolCallHead(call.name, call.args) : "";
@@ -3222,9 +3294,10 @@
       setOllamaBase(ollamaBase);
       defaultWorkspace = prefs.defaultWorkspace ?? "";
       pendingWorkspace = prefs.defaultWorkspace ?? "";
-      // "/" is the Unix fresh-install default; on Windows it is not an
-      // absolute path, so treat a stored "/" as unset (pick a folder).
-      if (isWindows && (defaultWorkspace === "/" || pendingWorkspace === "/")) {
+      // "/" was the old fresh-install default and is no longer a valid
+      // workspace (backend refuses the filesystem root), so treat a
+      // stored "/" as unset (pick a folder).
+      if (defaultWorkspace === "/" || pendingWorkspace === "/") {
         defaultWorkspace = "";
         pendingWorkspace = "";
       }
@@ -3670,17 +3743,21 @@
                           }}
                         />
                         <button class="ask-send" type="submit" data-testid="ask-send" disabled={!pendingAsk.other.trim()}>Send</button>
+                        <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
                       </form>
                     {:else}
-                      <button
-                        class="ask-option ask-other-toggle"
-                        data-testid="ask-other"
-                        onclick={() => {
-                          if (!pendingAsk) return;
-                          pendingAsk.otherOpen = true;
-                          requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-testid="ask-input"]')?.focus());
-                        }}
-                      >Other…</button>
+                      <div class="ask-other ask-other-closed">
+                        <button
+                          class="ask-option ask-other-toggle"
+                          data-testid="ask-other"
+                          onclick={() => {
+                            if (!pendingAsk) return;
+                            pendingAsk.otherOpen = true;
+                            requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-testid="ask-input"]')?.focus());
+                          }}
+                        >Other…</button>
+                        <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
+                      </div>
                     {/if}
                   </div>
                 </div>
@@ -4748,6 +4825,10 @@
   .ask-option:hover { border-color: var(--accent); background: var(--hover-3); }
   .ask-other-toggle { color: var(--muted); border-style: dashed; }
   .ask-other { display: flex; gap: 6px; }
+  .ask-other-closed { align-items: stretch; }
+  .ask-other-toggle { flex: 1; width: auto; }
+  .ask-dismiss { border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 10px; padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+  .ask-dismiss:hover { color: var(--text); border-color: var(--border-3); background: var(--hover-3); }
   .ask-input { flex: 1; min-width: 0; border: 1px solid var(--border-2); border-radius: 10px; background: var(--bg); color: var(--text); padding: 7px 10px; font: inherit; font-size: 13.5px; }
   .ask-input:focus { outline: none; border-color: var(--accent); }
   .ask-send { border: none; border-radius: 10px; background: var(--accent); color: var(--accent-fg); padding: 0 13px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
@@ -4793,6 +4874,11 @@
   .answer :global(pre) { background: var(--code-bg); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; }
   .answer :global(pre code) { background: transparent; padding: 0; }
   .answer :global(details.tool-result) { background: var(--code-bg); border-radius: 12px; margin: 8px 0; overflow: hidden; }
+  .answer :global(.ask-log) { margin: 10px 0; padding: 9px 12px 10px; max-width: 560px; border-left: 3px solid var(--accent); border-radius: 0 10px 10px 0; background: var(--hover-3); }
+  .answer :global(.ask-log-q) { font-size: 13.5px; font-weight: 600; color: var(--text); line-height: 1.45; }
+  .answer :global(.ask-log-a) { margin-top: 3px; font-size: 13px; color: var(--muted); }
+  .answer :global(.ask-log-a strong) { color: var(--muted); font-weight: 600; }
+  .answer :global(.ask-log-dismissed) { font-style: italic; }
   .answer :global(details.tool-result summary) { cursor: pointer; padding: 9px 12px; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted-2); list-style: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .answer :global(details.tool-result summary::-webkit-details-marker) { display: none; }
   .answer :global(details.tool-result summary::before) { content: "▸ "; color: var(--muted); }

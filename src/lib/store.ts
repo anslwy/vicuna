@@ -575,18 +575,18 @@ export interface Prefs {
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "/" };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "" };
 const LS_PREFS = "vicuna-prefs";
 
 /** Normalize a stored workspace for the current platform: strip Rust's
  *  Windows verbatim prefix (`\\?\...`) left by older builds, and map the
- *  Unix fresh-install default ("/") to unset on Windows, where it is not
- *  an absolute path and validation would reject it. */
+ *  legacy fresh-install default ("/") to unset — the filesystem root is no
+ *  longer a valid workspace (it crawls TCC-protected spots on macOS). */
 export function normalizeStoredWorkspace(ws: string): string {
   let out = ws;
   if (out.startsWith("\\\\?\\UNC\\")) out = "\\" + out.slice("\\\\?\\UNC\\".length);
   else if (out.startsWith("\\\\?\\")) out = out.slice("\\\\?\\".length);
-  if (out === "/" && typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "")) out = "";
+  if (out === "/") out = "";
   return out;
 }
 
