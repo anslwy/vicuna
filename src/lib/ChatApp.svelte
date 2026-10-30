@@ -223,6 +223,11 @@
   });
   /** server id waiting on the browser login redirect (label override) */
   let mcpAuthWait = $state<string | null>(null);
+  /** github-only token prompt: sign-in failed with no open registration, so
+   *  ask for a PAT instead (with a link to generate one) */
+  let mcpPatFor = $state<string | null>(null);
+  let mcpPatToken = $state("");
+  let mcpPatError = $state<string | null>(null);
   let mcpOpen = $state(false);
   let mcpQuery = $state("");
   let mcpSel = $state(0);
@@ -236,6 +241,8 @@
     envText: "",
     url: "",
     headersText: "",
+    oauthId: "",
+    oauthSecret: "",
     enabled: true
   });
   let mcpFormError = $state<string | null>(null);
@@ -448,6 +455,13 @@
         return;
       }
       mcpLive[id] = { connected: false, tools: [], error: msg };
+      // github only: no open registration means the browser flow can never
+      // start — prompt for a personal access token instead of dead-ending
+      if (msg.includes("no open client registration") && /github/i.test(cfg?.name ?? "")) {
+        mcpPatFor = id;
+        mcpPatToken = "";
+        mcpPatError = null;
+      }
     } finally {
       mcpAuthWait = null;
       mcpUnmarkBusy(id);
@@ -494,6 +508,8 @@
         envText: existing.env ? JSON.stringify(existing.env, null, 2) : "",
         url: existing.url ?? "",
         headersText: existing.headers ? JSON.stringify(existing.headers, null, 2) : "",
+        oauthId: existing.oauth?.client_id ?? "",
+        oauthSecret: existing.oauth?.client_secret ?? "",
         enabled: existing.enabled
       };
       // does this server hold a browser login? (drives the Sign out row)
@@ -505,7 +521,7 @@
         .catch(() => {});
     } else {
       mcpEditingId = null;
-      mcpForm = { name: "", transport: "stdio", command: "", args: "", envText: "", url: "", headersText: "", enabled: true };
+      mcpForm = { name: "", transport: "stdio", command: "", args: "", envText: "", url: "", headersText: "", oauthId: "", oauthSecret: "", enabled: true };
     }
     mcpShowForm = true;
   }
@@ -523,6 +539,7 @@
       return;
     }
     const argParts = mcpForm.args.split(/\s+/).filter(Boolean);
+    const oauthId = mcpForm.oauthId.trim();
     const cfg: McpServerConfig = {
       id: (mcpEditingId ?? mcpForm.name.trim()),
       name: mcpForm.name.trim(),
@@ -531,6 +548,9 @@
       env: mcpForm.transport === "stdio" ? parseMcpStringMap(mcpForm.envText) : undefined,
       url: mcpForm.transport === "http" ? mcpForm.url.trim() : undefined,
       headers: mcpForm.transport === "http" ? parseMcpStringMap(mcpForm.headersText) : undefined,
+      oauth: mcpForm.transport === "http" && oauthId
+        ? { client_id: oauthId, ...(mcpForm.oauthSecret.trim() ? { client_secret: mcpForm.oauthSecret.trim() } : {}) }
+        : undefined,
       enabled: mcpForm.enabled
     };
     if (mcpServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
@@ -578,6 +598,51 @@
     }
     mcpHasLogin = false;
     delete mcpLive[id];
+  }
+
+  /** Open the token generation page (github-only PAT prompt). */
+  async function openTokenPage(e: MouseEvent) {
+    e.preventDefault();
+    const url = "https://github.com/settings/tokens/new";
+    if (isTauriRuntime()) {
+      try {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(url);
+        return;
+      } catch {
+        /* fall through to window.open */
+      }
+    }
+    window.open(url, "_blank", "noopener");
+  }
+
+  /** Save the pasted PAT into the server's Headers and connect. */
+  async function savePatAndConnect() {
+    const id = mcpPatFor;
+    const token = mcpPatToken.trim();
+    if (!id) return;
+    if (!token) {
+      mcpPatError = "Paste a token first.";
+      return;
+    }
+    const cfg = mcpServers.find((s) => s.id === id);
+    if (!cfg) {
+      mcpPatFor = null;
+      return;
+    }
+    try {
+      mcpServers = await saveMcpServer({
+        ...cfg,
+        headers: { ...(cfg.headers ?? {}), Authorization: `Bearer ${token}` }
+      });
+    } catch (e: any) {
+      mcpPatError = e?.message ?? String(e);
+      return;
+    }
+    mcpPatFor = null;
+    mcpPatToken = "";
+    mcpPatError = null;
+    await connectMcpServer(id);
   }
 
   // Tools offered to the Work model this turn: every connected + enabled
@@ -5149,6 +5214,23 @@
                 placeholder={'Headers JSON (optional) — e.g. {"Authorization": "Bearer …"}'}
                 bind:value={mcpForm.headersText}
               ></textarea>
+              <input
+                class="pull-input"
+                data-testid="mcp-oauth-id-input"
+                placeholder="OAuth client ID (optional — for servers without open registration)"
+                bind:value={mcpForm.oauthId}
+                spellcheck={false}
+              />
+              <input
+                class="pull-input"
+                data-testid="mcp-oauth-secret-input"
+                type="password"
+                placeholder="OAuth client secret (optional, rarely needed)"
+                bind:value={mcpForm.oauthSecret}
+                spellcheck={false}
+                autocomplete="off"
+              />
+              <span class="setting-note">Servers like GitHub only talk to pre-registered apps: create an OAuth App in the provider's developer settings with callback URL http://127.0.0.1/callback (any port works), then paste its client ID here — or use a personal access token in Headers above instead.</span>
             {/if}
             <label class="mcp-check"><input type="checkbox" data-testid="mcp-enabled-check" bind:checked={mcpForm.enabled} /> Connect automatically on launch</label>
             {#if mcpHasLogin}
@@ -5187,6 +5269,65 @@
             <span class="mcp-file">~/vicuna/config/vicuna.json</span>
           {/if}
         </div>
+        {#if mcpPatFor}
+          {@const patCfg = mcpServers.find((s) => s.id === mcpPatFor)}
+          <div
+            class="mcp-pat-veil"
+            data-testid="mcp-pat-modal"
+            role="dialog"
+            aria-label="GitHub personal access token"
+            tabindex="-1"
+            onkeydown={(e) => {
+              if (e.key === "Escape") {
+                e.stopPropagation();
+                mcpPatFor = null;
+              }
+            }}
+          >
+            <div class="mcp-pat-card">
+              <div class="mcp-pat-title">Connect {patCfg?.name ?? "GitHub"}</div>
+              <p class="mcp-pat-body">
+                This server only talks to pre-registered apps, so the browser
+                sign-in can't start. Paste a personal access token instead —
+                it will be saved to this server's Headers and used from now on.
+              </p>
+              <a
+                class="mcp-pat-link"
+                href="https://github.com/settings/tokens/new"
+                target="_blank"
+                rel="noreferrer"
+                onclick={(e) => void openTokenPage(e)}
+              >Generate a token on github.com →</a>
+              <p class="mcp-pat-body dim">Classic token with the <code>repo</code> scope (add <code>workflow</code> for Actions).</p>
+              <input
+                class="pull-input"
+                data-testid="mcp-pat-input"
+                type="password"
+                placeholder="ghp_… or github_pat_…"
+                bind:value={mcpPatToken}
+                spellcheck={false}
+                autocomplete="off"
+                onkeydown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void savePatAndConnect();
+                  } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                    // keep caret/selection motion local to the field
+                    e.stopPropagation();
+                  }
+                }}
+              />
+              {#if mcpPatError}
+                <p class="goto-error" data-testid="mcp-pat-error">{mcpPatError}</p>
+              {/if}
+              <div class="confirm-actions">
+                <button class="confirm-cancel" data-testid="mcp-pat-cancel-btn" onclick={() => (mcpPatFor = null)}>Cancel</button>
+                <button class="confirm-ok" data-testid="mcp-pat-save-btn" onclick={() => void savePatAndConnect()}>Save &amp; Connect</button>
+              </div>
+            </div>
+          </div>
+        {/if}
       </div>
     {/if}
   </main>
@@ -6348,6 +6489,14 @@
   .mcp-add:hover { background: var(--hover); color: var(--text); }
   .mcp-add:disabled { opacity: .5; cursor: default; }
   .mcp-file { font-size: 11.5px; color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .mcp-pat-veil { position: absolute; inset: 0; z-index: 5; border-radius: 14px; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
+  .mcp-pat-card { width: 100%; max-width: 380px; background: var(--bg); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.4); padding: 18px; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; }
+  .mcp-pat-title { font-size: 16px; font-weight: 800; }
+  .mcp-pat-body { margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--text-dim); }
+  .mcp-pat-body.dim { font-size: 12.5px; color: var(--muted); }
+  .mcp-pat-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
+  .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
+  .mcp-pat-link:hover { text-decoration: underline; }
 
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }

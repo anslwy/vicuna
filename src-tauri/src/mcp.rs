@@ -19,6 +19,19 @@ const MCP_VERSION: &str = "2024-11-05";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Static OAuth client credentials for servers without open dynamic
+/// client registration (e.g. your own GitHub OAuth App: github only issues
+/// tokens to pre-registered apps, so paste its client_id here and the
+/// browser sign-in uses it instead of registering). Stored in vicuna.json
+/// under the server entry as `oauth: {client_id, client_secret?}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OAuthCreds {
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+}
+
 /// Server config as stored in ~/vicuna/config/vicuna.json (opencode.json
 /// shape: `mcp` maps name → {command, type local/remote, url, env,
 /// enabled}). `transport` is "stdio" (spawn `command`) or "http" (POST
@@ -33,6 +46,8 @@ pub struct McpServerConfig {
     pub env: Option<HashMap<String, String>>,
     pub url: Option<String>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub oauth: Option<OAuthCreds>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -1080,39 +1095,50 @@ async fn oauth_protected(
     if as_meta.authorization_endpoint.is_empty() || as_meta.token_endpoint.is_empty() {
         return Err(format!("mcp: authorization server for '{}' lacks endpoints", cfg.name));
     }
-    // 4. dynamic client registration (public client + PKCE, no secret)
-    let reg = as_meta.registration_endpoint.ok_or_else(|| {
-        format!(
-            "mcp: '{0}' requires OAuth but its server offers no dynamic client registration",
-            cfg.name
-        )
-    })?;
-    let client = reqwest::Client::builder()
-        .timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| format!("mcp: {e}"))?;
-    let reg_res = client
-        .post(&reg)
-        .json(&serde_json::json!({
-            "redirect_uris": ["http://127.0.0.1/callback"],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-            "client_name": "Vicuna",
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("mcp: client registration with {reg} failed: {e}"))?;
-    if !reg_res.status().is_success() {
-        let snippet: String = reg_res.text().await.unwrap_or_default().chars().take(200).collect();
-        return Err(format!("mcp: client registration failed: {snippet}"));
-    }
-    let reg_body: serde_json::Value = reg_res.json().await.map_err(|e| format!("mcp: bad registration reply: {e}"))?;
-    let client_id = reg_body.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if client_id.is_empty() {
-        return Err("mcp: registration gave no client_id".to_string());
-    }
-    let client_secret = reg_body.get("client_secret").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // 4. client identity: a statically configured client_id wins (servers
+    //    like github only talk to pre-registered apps, so the user pastes
+    //    their own OAuth App's id); otherwise register dynamically.
+    let (client_id, client_secret) = match cfg.oauth.as_ref().map(|o| o.client_id.trim().to_string()).filter(|id| !id.is_empty()) {
+        Some(id) => (
+            id,
+            cfg.oauth.as_ref().and_then(|o| o.client_secret.clone()).filter(|s| !s.is_empty()),
+        ),
+        None => {
+            let reg = as_meta.registration_endpoint.ok_or_else(|| {
+                format!(
+                    "mcp: '{0}' needs OAuth but offers no open client registration (github works this way) — register your own OAuth App and paste its client_id into OAuth client ID via Custom → Edit, or use a personal access token in Headers instead",
+                    cfg.name
+                )
+            })?;
+            let client = reqwest::Client::builder()
+                .timeout(CONNECT_TIMEOUT)
+                .build()
+                .map_err(|e| format!("mcp: {e}"))?;
+            let reg_res = client
+                .post(&reg)
+                .json(&serde_json::json!({
+                    "redirect_uris": ["http://127.0.0.1/callback"],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                    "client_name": "Vicuna",
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("mcp: client registration with {reg} failed: {e}"))?;
+            if !reg_res.status().is_success() {
+                let snippet: String = reg_res.text().await.unwrap_or_default().chars().take(200).collect();
+                return Err(format!("mcp: client registration failed: {snippet}"));
+            }
+            let reg_body: serde_json::Value = reg_res.json().await.map_err(|e| format!("mcp: bad registration reply: {e}"))?;
+            let client_id = reg_body.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if client_id.is_empty() {
+                return Err("mcp: registration gave no client_id".to_string());
+            }
+            let client_secret = reg_body.get("client_secret").and_then(|v| v.as_str()).map(|s| s.to_string());
+            (client_id, client_secret)
+        }
+    };
     // 5. PKCE + loopback redirect, then open the system browser
     let verifier = random_b64url(32)?;
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -1320,6 +1346,21 @@ fn entry_to_config(name: &str, v: &serde_json::Value) -> Option<McpServerConfig>
             })
             .collect::<HashMap<String, String>>()
     });
+    let oauth = obj
+        .get("oauth")
+        .and_then(|o| o.as_object())
+        .and_then(|m| m.get("client_id").and_then(|v| v.as_str()))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .map(|client_id| OAuthCreds {
+            client_id,
+            client_secret: obj
+                .get("oauth")
+                .and_then(|o| o.as_object())
+                .and_then(|m| m.get("client_secret").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty()),
+        });
     let enabled = obj.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
     if transport == "stdio" && command.as_ref().map(|c| c.is_empty()).unwrap_or(true) {
         return None;
@@ -1335,6 +1376,7 @@ fn entry_to_config(name: &str, v: &serde_json::Value) -> Option<McpServerConfig>
         env,
         url,
         headers,
+        oauth,
         enabled,
     })
 }
@@ -1357,6 +1399,14 @@ fn config_to_entry(c: &McpServerConfig) -> serde_json::Value {
     }
     if let Some(h) = c.headers.as_ref().filter(|h| !h.is_empty()) {
         m.insert("headers".to_string(), serde_json::json!(h));
+    }
+    if let Some(o) = c.oauth.as_ref().filter(|o| !o.client_id.trim().is_empty()) {
+        let mut om = serde_json::Map::new();
+        om.insert("client_id".to_string(), serde_json::json!(o.client_id.trim()));
+        if let Some(s) = o.client_secret.as_ref().filter(|s| !s.is_empty()) {
+            om.insert("client_secret".to_string(), serde_json::json!(s));
+        }
+        m.insert("oauth".to_string(), serde_json::Value::Object(om));
     }
     m.insert("enabled".to_string(), serde_json::json!(c.enabled));
     serde_json::Value::Object(m)
@@ -1438,10 +1488,10 @@ fn save_file_server_in(
         name: name.to_string(),
         ..cfg.clone()
     };
-    // keep keys the UI doesn't manage (e.g. oauth tokens) when overwriting
-    // an existing entry; stale transport keys are dropped by rebuilding
-    // the known set from scratch first.
-    const KNOWN: [&str; 6] = ["type", "command", "env", "url", "headers", "enabled"];
+    // keep keys the UI doesn't manage (e.g. future extensions) when
+    // overwriting an existing entry; stale transport keys are dropped by
+    // rebuilding the known set from scratch first.
+    const KNOWN: [&str; 7] = ["type", "command", "env", "url", "headers", "oauth", "enabled"];
     let mut merged = config_to_entry(&stored);
     if let (Some(obj), Some(prev)) = (
         merged.as_object_mut(),
@@ -1494,6 +1544,7 @@ mod config_tests {
             env: None,
             url: None,
             headers: None,
+            oauth: None,
             enabled,
         }
     }
@@ -1514,6 +1565,7 @@ mod config_tests {
                 env: None,
                 url: Some("https://mcp.higgsfield.ai/mcp".to_string()),
                 headers: None,
+                oauth: None,
                 enabled: true,
             },
         )
@@ -1548,7 +1600,7 @@ mod config_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            r#"{"mcp": {"higgsfield": {"type": "remote", "url": "https://x", "enabled": true, "oauth": {"token": "abc"}}}}"#,
+            r#"{"mcp": {"higgsfield": {"type": "remote", "url": "https://x", "enabled": true, "oauth": {"token": "abc"}, "mystery": {"keep": "me"}}}}"#,
         )
         .unwrap();
         save_file_server_in(
@@ -1561,14 +1613,50 @@ mod config_tests {
                 env: None,
                 url: Some("https://mcp.higgsfield.ai/mcp".to_string()),
                 headers: None,
+                oauth: None,
                 enabled: false,
             },
         )
         .unwrap();
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw["mcp"]["higgsfield"]["oauth"]["token"], "abc");
+        // truly unknown keys survive; `oauth` is a managed key now, so a
+        // shapeless blob under it is dropped while real creds round-trip
+        // (see oauth_entry_roundtrip) instead of lingering as stale secrets
+        assert_eq!(raw["mcp"]["higgsfield"]["mystery"]["keep"], "me");
+        assert!(raw["mcp"]["higgsfield"].get("oauth").is_none());
         assert_eq!(raw["mcp"]["higgsfield"]["enabled"], false);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oauth_entry_roundtrip() {
+        let path = tmp_config("oauth");
+        let mut cfg = local("gh", &["x"], true);
+        cfg.transport = "http".to_string();
+        cfg.command = None;
+        cfg.url = Some("https://api.githubcopilot.com/mcp/".to_string());
+        cfg.oauth = Some(OAuthCreds {
+            client_id: "Iv1.abc123".to_string(),
+            client_secret: None,
+        });
+        save_file_server_in(&path, &cfg).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["mcp"]["gh"]["oauth"]["client_id"], "Iv1.abc123");
+        assert_eq!(raw["mcp"]["gh"]["type"], "remote");
+        let list = list_file_servers_in(&path).unwrap();
+        assert_eq!(list.len(), 1);
+        let back = &list[0];
+        assert_eq!(back.oauth.as_ref().map(|o| o.client_id.as_str()), Some("Iv1.abc123"));
+        assert!(back.oauth.as_ref().and_then(|o| o.client_secret.clone()).is_none());
+        // clearing the id drops the whole oauth block (no stale secret lingers)
+        let mut cleared = back.clone();
+        cleared.oauth = None;
+        save_file_server_in(&path, &cleared).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["mcp"]["gh"].get("oauth").is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1593,6 +1681,7 @@ mod config_tests {
                 env: None,
                 url: None,
                 headers: None,
+                oauth: None,
                 enabled: true,
             },
         )
@@ -1668,6 +1757,7 @@ mod oauth_tests {
             env: None,
             url: Some(url),
             headers: None,
+            oauth: None,
             enabled: true,
         }
     }
@@ -1682,6 +1772,7 @@ mod oauth_tests {
         query: &str,
         headers: &HashMap<String, String>,
         body: &[u8],
+        with_registration: bool,
     ) -> String {
         fn json(status: &str, extra: &str, payload: &str) -> String {
             format!(
@@ -1729,12 +1820,18 @@ mod oauth_tests {
                 "issuer": base,
                 "authorization_endpoint": format!("{base}/authorize"),
                 "token_endpoint": format!("{base}/token"),
-                "registration_endpoint": format!("{base}/register"),
             })
             .to_string();
-            return json("200 OK", "", &payload);
+            let mut payload_v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            if with_registration {
+                payload_v["registration_endpoint"] = serde_json::json!(format!("{base}/register"));
+            }
+            return json("200 OK", "", &payload_v.to_string());
         }
         if method == "POST" && path == "/register" {
+            if !with_registration {
+                return json("500 Internal Server Error", "", r#"{"error":"no_registration_here"}"#);
+            }
             return json("200 OK", "", r#"{"client_id":"test-client"}"#);
         }
         if method == "GET" && path == "/authorize" {
@@ -1806,10 +1903,10 @@ mod oauth_tests {
     // join() while the loopback accept task needs executor polling. A
     // single-thread runtime would starve it (production uses Tauri's
     // multi-thread runtime, so this is test-only).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn full_login_refresh_and_dead_grant() {
-        // bind here so we know the base URL (spawn_fake can't return it after
-        // moving the listener into the task)
+    /// Fake OAuth + MCP server on a loopback port. `with_registration`
+    /// controls whether the AS metadata advertises DCR (and whether
+    /// /register succeeds) — false simulates github-style servers.
+    async fn spawn_fake(with_registration: bool) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task_base = base.clone();
@@ -1859,11 +1956,17 @@ mod oauth_tests {
                     let parts: Vec<&str> = request.split_whitespace().collect();
                     let (method, target) = (parts.first().copied().unwrap_or(""), parts.get(1).copied().unwrap_or(""));
                     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-                    let resp = fake_route(&base, method, path, query, &headers, &body);
+                    let resp = fake_route(&base, method, path, query, &headers, &body, with_registration);
                     let _ = s.write_all(resp.as_bytes()).await;
                 });
             }
         });
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn full_login_refresh_and_dead_grant() {
+        let base = spawn_fake(true).await;
 
         let auth_path = tmp_auth("full");
         let cfg = test_cfg(format!("{base}/mcp"));
@@ -1940,6 +2043,39 @@ mod oauth_tests {
         let cfg = test_cfg(format!("{base}/mcp"));
         let err = oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap_err();
         assert!(err.contains("does not require sign-in"), "{err}");
+        std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_registration_error_guides_to_pat() {
+        // without static creds the same github-style server must fail with
+        // the exact markers the UI's PAT prompt matches on
+        let base = spawn_fake(false).await;
+        let auth_path = tmp_auth("nodcr");
+        let cfg = test_cfg(format!("{base}/mcp"));
+        let err = oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap_err();
+        assert!(err.contains("no open client registration"), "{err}");
+        assert!(err.contains("Custom \u{2192} Edit"), "{err}");
+        std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
+    }
+
+    // NOTE: multi_thread — same blocking-hook reason as the full dance above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn static_client_skips_registration() {
+        // AS metadata names no registration endpoint (github-style) and
+        // /register 500s: the only way to succeed is the static client_id.
+        let base = spawn_fake(false).await;
+        let auth_path = tmp_auth("static");
+        let mut cfg = test_cfg(format!("{base}/mcp"));
+        cfg.oauth = Some(OAuthCreds {
+            client_id: "static-client".to_string(),
+            client_secret: None,
+        });
+        oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap();
+        let map = read_auth_map_in(&auth_path);
+        let entry = map.get("fake").expect("token stored");
+        assert_eq!(entry.client_id, "static-client");
+        assert_eq!(entry.access_token, "test-access-1");
         std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
     }
 }

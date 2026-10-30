@@ -9,6 +9,11 @@
 
 import { isTauriRuntime } from "./ollama";
 
+export interface McpOAuthCreds {
+  client_id: string;
+  client_secret?: string;
+}
+
 export interface McpServerConfig {
   id: string;
   name: string;
@@ -18,6 +23,9 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  /** static OAuth client for servers without open registration
+   *  (e.g. your own GitHub OAuth App) — skips dynamic registration */
+  oauth?: McpOAuthCreds;
   enabled: boolean;
 }
 
@@ -114,6 +122,7 @@ export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig
       env: c.env ?? null,
       url: c.url ?? null,
       headers: c.headers ?? null,
+      oauth: c.oauth ?? null,
       enabled: c.enabled
     }
   });
@@ -147,6 +156,7 @@ export async function signInServer(c: McpServerConfig): Promise<McpServerInfo> {
       env: c.env ?? null,
       url: c.url ?? null,
       headers: c.headers ?? null,
+      oauth: c.oauth ?? null,
       enabled: c.enabled
     }
   });
@@ -178,6 +188,7 @@ export async function connectServer(c: McpServerConfig): Promise<McpServerInfo> 
         env: c.env ?? null,
         url: c.url ?? null,
         headers: c.headers ?? null,
+      oauth: c.oauth ?? null,
         enabled: c.enabled
       }
     });
