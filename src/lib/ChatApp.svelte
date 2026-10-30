@@ -4732,8 +4732,8 @@
   :global(.bubble.user .mention-pill svg) { vertical-align: -1.5px; margin-right: 4px; }
   :global(.bubble.user .bubble-files) { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px; }
   :global(.bubble.user .bubble-files:last-child) { margin-bottom: 0; }
-  :global(.bubble.user .file-pill) { border: 0; font-family: inherit; font-weight: inherit; line-height: inherit; text-align: left; cursor: pointer; }
-  :global(.bubble.user .file-pill:hover) { background: color-mix(in srgb, var(--accent-fg) 15%, var(--accent)); }
+  :global(.bubble.user .file-pill) { border: 1px solid color-mix(in srgb, var(--accent-fg) 30%, transparent); background: color-mix(in srgb, var(--accent-fg) 9%, var(--accent)); font-family: inherit; font-weight: inherit; line-height: inherit; text-align: left; cursor: pointer; }
+  :global(.bubble.user .file-pill:hover) { background: color-mix(in srgb, var(--accent-fg) 17%, var(--accent)); }
   :global(.bubble.user .file-pill:focus-visible) { outline: 2px solid var(--accent-fg); outline-offset: 1px; }
   .image-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
   .image-chip { position: relative; width: 64px; height: 64px; border-radius: 14px; overflow: hidden; background: var(--card); flex: none; }
