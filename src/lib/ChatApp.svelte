@@ -28,6 +28,7 @@
     type Chat
   } from "$lib/store";
   import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, type WorkTreeEntry } from "$lib/work";
+  import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
@@ -185,6 +186,318 @@
   let now = $state(Date.now());
   let workStop = false;
   let workTurnSeq = 0;
+  // ---- MCP servers (Work mode only) ----
+  // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
+  // file is the source of truth and the UI edits it via the backend.
+  // Connections are runtime-only in the Rust McpManager. Tools merge into
+  // the Work agent's native tool loop; chat mode never sees them.
+  let mcpServers = $state<McpServerConfig[]>([]);
+  let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
+  let mcpOp = $state<string | null>(null);
+  /** server id waiting on the browser login redirect (label override) */
+  let mcpAuthWait = $state<string | null>(null);
+  let mcpOpen = $state(false);
+  let mcpQuery = $state("");
+  let mcpSel = $state(0);
+  let mcpShowForm = $state(false);
+  let mcpEditingId = $state<string | null>(null);
+  let mcpForm = $state({
+    name: "",
+    transport: "stdio" as "stdio" | "http",
+    command: "",
+    args: "",
+    envText: "",
+    url: "",
+    headersText: "",
+    enabled: true
+  });
+  let mcpFormError = $state<string | null>(null);
+  let mcpConfirmDelete = $state<string | null>(null);
+  /** whether the server being edited has a stored OAuth login */
+  let mcpHasLogin = $state(false);
+  const mcpFiltered = $derived(
+    mcpServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
+  );
+  const mcpConnectedCount = $derived(Object.values(mcpLive).filter((l) => l.connected).length);
+
+  function mcpStatusOf(s: McpServerConfig): { kind: "connected" | "disabled" | "error" | "idle"; label: string } {
+    const live = mcpLive[s.id];
+    if (!s.enabled) return { kind: "disabled", label: "Disabled ○" };
+    if (live?.connected) return { kind: "connected", label: `Connected ✓` };
+    if (live?.error) {
+      // an auth failure is an invitation, not a dead end: selecting the
+      // row starts the browser sign-in flow (see toggleMcpServer)
+      if (isAuthError(live.error)) return { kind: "error", label: "Sign in required →" };
+      return { kind: "error", label: live.error.slice(0, 80) };
+    }
+    if (mcpOp === s.id) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
+    return { kind: "idle", label: "Disconnected ○" };
+  }
+
+  async function loadMcpServers() {
+    if (!isTauriRuntime()) {
+      mcpServers = [];
+      return;
+    }
+    try {
+      mcpServers = await listMcpServers();
+    } catch (e) {
+      console.error("mcp load failed:", e);
+      mcpServers = [];
+      return;
+    }
+    // reconnect launch-enabled servers (best-effort: failures surface as
+    // row errors in the popup instead of blocking startup)
+    for (const s of mcpServers) {
+      if (s.enabled) void connectMcpServer(s.id);
+    }
+  }
+
+  async function connectMcpServer(id: string) {
+    const cfg = mcpServers.find((s) => s.id === id);
+    if (!cfg || mcpOp) return;
+    mcpOp = id;
+    mcpLive[id] = { connected: false, tools: [], error: null };
+    try {
+      const info = await connectMcpBackend(cfg);
+      mcpLive[id] = { connected: true, tools: info.tools, error: null };
+    } catch (e: any) {
+      mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
+    } finally {
+      mcpOp = null;
+    }
+  }
+
+  async function disconnectMcpServer(id: string, silent = false) {
+    const cfg = mcpServers.find((s) => s.id === id);
+    try {
+      await disconnectMcpBackend(id, cfg?.transport ?? "stdio");
+    } catch (e: any) {
+      if (!silent) {
+        mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
+        return;
+      }
+    }
+    delete mcpLive[id];
+  }
+
+  async function toggleMcpServer(id: string) {
+    const cfg = mcpServers.find((s) => s.id === id);
+    if (!cfg || mcpOp) return;
+    if (mcpLive[id]?.connected) {
+      await disconnectMcpServer(id);
+      return;
+    }
+    // a server that failed with 401/403 isn't retried blindly — selecting
+    // it starts the browser sign-in flow instead (opencode parity)
+    if (isAuthError(mcpLive[id]?.error)) {
+      await signInMcpServer(id);
+      return;
+    }
+    if (!cfg.enabled) {
+      // enabling a disabled server persists the flip, then connects
+      try {
+        mcpOp = id;
+        const next = await saveMcpServer({ ...cfg, enabled: true });
+        mcpServers = next;
+        mcpOp = null;
+        await connectMcpServer(id);
+      } catch (e: any) {
+        mcpOp = null;
+        mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
+      }
+      return;
+    }
+    await connectMcpServer(id);
+  }
+
+  /** Browser sign-in for an OAuth-protected server (e.g. higgsfield).
+   *  Opens the system browser; the backend resolves once login completes.
+   *  A server that turns out to need no auth falls back to plain connect. */
+  async function signInMcpServer(id: string) {
+    const cfg = mcpServers.find((s) => s.id === id);
+    if (!cfg || mcpOp) return;
+    mcpOp = id;
+    mcpAuthWait = id;
+    mcpLive[id] = { connected: false, tools: [], error: null };
+    try {
+      const info = await signInMcpBackend(cfg);
+      mcpLive[id] = { connected: true, tools: info.tools, error: null };
+      // an explicit sign-in implies the user wants the server: enable it
+      if (!mcpServers.find((s) => s.id === id)?.enabled) {
+        try {
+          mcpServers = await saveMcpServer({ ...cfg, enabled: true });
+        } catch (e: any) {
+          error = e?.message ?? String(e);
+        }
+      }
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (msg.includes("does not require sign-in")) {
+        mcpAuthWait = null;
+        mcpOp = null;
+        await connectMcpServer(id);
+        return;
+      }
+      mcpLive[id] = { connected: false, tools: [], error: msg };
+    } finally {
+      mcpAuthWait = null;
+      mcpOp = null;
+    }
+  }
+
+  async function refreshMcpTools(id: string) {
+    const cfg = mcpServers.find((s) => s.id === id);
+    if (!cfg || mcpOp) return;
+    mcpOp = id;
+    try {
+      const tools = await listMcpServerTools(cfg);
+      mcpLive[id] = { connected: true, tools, error: null };
+    } catch (e: any) {
+      mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
+    } finally {
+      mcpOp = null;
+    }
+  }
+
+  function openMcpPopup() {
+    mcpQuery = "";
+    mcpSel = 0;
+    mcpShowForm = false;
+    mcpFormError = null;
+    mcpConfirmDelete = null;
+    mcpOpen = true;
+  }
+
+  function openMcpForm(existing?: McpServerConfig) {
+    mcpFormError = null;
+    mcpConfirmDelete = null;
+    mcpHasLogin = false;
+    if (existing) {
+      mcpEditingId = existing.id;
+      mcpForm = {
+        name: existing.name,
+        transport: existing.transport,
+        command: existing.command?.[0] ?? "",
+        args: (existing.command ?? []).slice(1).join(" "),
+        envText: existing.env ? JSON.stringify(existing.env, null, 2) : "",
+        url: existing.url ?? "",
+        headersText: existing.headers ? JSON.stringify(existing.headers, null, 2) : "",
+        enabled: existing.enabled
+      };
+      // does this server hold a browser login? (drives the Sign out row)
+      const checkId = existing.id;
+      void loginPresentBackend(existing.id)
+        .then((v) => {
+          if (mcpEditingId === checkId) mcpHasLogin = v;
+        })
+        .catch(() => {});
+    } else {
+      mcpEditingId = null;
+      mcpForm = { name: "", transport: "stdio", command: "", args: "", envText: "", url: "", headersText: "", enabled: true };
+    }
+    mcpShowForm = true;
+  }
+
+  function closeMcpForm() {
+    mcpShowForm = false;
+    mcpEditingId = null;
+    mcpFormError = null;
+  }
+
+  async function saveMcpForm() {
+    const err = validateMcpServer(mcpForm);
+    if (err) {
+      mcpFormError = err;
+      return;
+    }
+    const argParts = mcpForm.args.split(/\s+/).filter(Boolean);
+    const cfg: McpServerConfig = {
+      id: (mcpEditingId ?? mcpForm.name.trim()),
+      name: mcpForm.name.trim(),
+      transport: mcpForm.transport,
+      command: mcpForm.transport === "stdio" ? [mcpForm.command.trim(), ...argParts] : undefined,
+      env: mcpForm.transport === "stdio" ? parseMcpStringMap(mcpForm.envText) : undefined,
+      url: mcpForm.transport === "http" ? mcpForm.url.trim() : undefined,
+      headers: mcpForm.transport === "http" ? parseMcpStringMap(mcpForm.headersText) : undefined,
+      enabled: mcpForm.enabled
+    };
+    if (mcpServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
+      mcpFormError = "A server with that name already exists.";
+      return;
+    }
+    try {
+      await disconnectMcpServer(cfg.id, true);
+    } catch {
+      /* replacing the config drops the old connection */
+    }
+    try {
+      mcpServers = await saveMcpServer(cfg);
+    } catch (e: any) {
+      mcpFormError = e?.message ?? String(e);
+      return;
+    }
+    closeMcpForm();
+    if (cfg.enabled) void connectMcpServer(cfg.id);
+  }
+
+  async function deleteMcpServerEntry(id: string) {
+    if (mcpConfirmDelete !== id) {
+      mcpConfirmDelete = id;
+      return;
+    }
+    mcpConfirmDelete = null;
+    await disconnectMcpServer(id, true);
+    try {
+      mcpServers = await deleteMcpServer(id);
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+    }
+  }
+
+  /** Forget the stored browser login for the server being edited. */
+  async function signOutMcp() {
+    const id = mcpEditingId;
+    if (!id) return;
+    try {
+      await signOutMcpBackend(id);
+    } catch (e: any) {
+      mcpFormError = e?.message ?? String(e);
+      return;
+    }
+    mcpHasLogin = false;
+    delete mcpLive[id];
+  }
+
+  // Tools offered to the Work model this turn: every connected + enabled
+  // server's catalog, readable names, prefixed only when two servers collide.
+  // The route map translates the model's call back to (server, real name).
+  function assembleMcpTools(): { tools: import("$lib/ollama").OllamaToolDef[]; route: Map<string, { server: McpServerConfig; name: string }> } {
+    const tools: import("$lib/ollama").OllamaToolDef[] = [];
+    const route = new Map<string, { server: McpServerConfig; name: string }>();
+    const builtin = new Set(WORK_TOOLS.map((t) => t.function.name));
+    const seen = new Set<string>(builtin);
+    for (const s of mcpServers) {
+      const live = mcpLive[s.id];
+      if (!s.enabled || !live?.connected) continue;
+      for (const t of live.tools) {
+        let name = sanitizeToolName(t.name);
+        if (seen.has(name)) name = `${sanitizeToolName(s.name)}__${name}`;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        route.set(name, { server: s, name: t.name });
+        tools.push({
+          type: "function",
+          function: {
+            name,
+            description: t.description ? `${t.description} (via ${s.name})` : `${t.name} (via ${s.name})`,
+            parameters: (t.inputSchema as Record<string, any> | undefined) ?? { type: "object" }
+          }
+        });
+      }
+    }
+    return { tools, route };
+  }
   /** prompts typed while a work turn is live: they join the context at the
    *  next round (after the tool results), never as a parallel turn */
   let queuedMsgs = $state<{ chatId: string; msg: ChatMsg }[]>([]);
@@ -1641,7 +1954,7 @@
 
   async function saveEdit() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || streaming) return;
+    if (!chat || editingIndex == null || streaming || workRunning) return;
     const text = editDraft.trim();
     const images = editImages.length ? [...editImages] : undefined;
     if (!text && !images) return;
@@ -1670,6 +1983,17 @@
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
+    if ((chat.mode ?? "chat") === "work") {
+      // work threads re-run the agent, not a plain reply (mirrors regenerate)
+      if (!chat.workspace?.trim()) {
+        error = "Work mode needs a workspace folder — pick one with the folder pill, then regenerate.";
+        return;
+      }
+      chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+      chats = [...chats];
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+      return;
+    }
     const history: ChatMsg[] = [
       ...chat.messages.map(toHistory)
     ];
@@ -1698,10 +2022,16 @@
       createdAt: Date.now(),
       messages: JSON.parse(JSON.stringify(c.messages.slice(0, i + 1))),
       forkedFrom: { id: c.id, title: c.title },
-      forkFromIndex: i
+      forkFromIndex: i,
+      mode: c.mode ?? "chat",
+      workspace: c.workspace ?? null
     };
     chats = [fork, ...chats];
     activeId = fork.id;
+    // keep the starter toggle consistent with the fork (matters for empty
+    // forks; non-empty threads render from their own mode anyway)
+    pendingMode = fork.mode ?? "chat";
+    if (fork.workspace) pendingWorkspace = fork.workspace;
     isPinned = true;
     editingIndex = null;
     editDraft = "";
@@ -2433,11 +2763,70 @@
     if (!explorerEntries.length && !explorerLoading) void loadExplorer();
   }
 
-  function termTheme(): { background: string; foreground: string; cursor: string; selection: string } {
-    return theme === "dark"
-      ? { background: "#161616", foreground: "#e8e8e8", cursor: "#e8e8e8", selection: "rgba(255,255,255,.25)" }
-      : { background: "#f4f4f4", foreground: "#1a1a1a", cursor: "#1a1a1a", selection: "rgba(0,0,0,.15)" };
+  function termTheme(): Record<string, string> {
+    // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
+    // console (yellow prompt segments, white text), so the defaults that
+    // ship with xterm go unreadable on a light background. Both palettes
+    // keep the app's chrome bg/fg but remap every ANSI slot to stay legible.
+    if (theme === "dark") {
+      return {
+        background: "#161616",
+        foreground: "#e8e8e8",
+        cursor: "#e8e8e8",
+        selection: "rgba(255,255,255,.25)",
+        black: "#000000",
+        red: "#cd3131",
+        green: "#0dbc79",
+        yellow: "#e5e510",
+        blue: "#2472c8",
+        magenta: "#bc3fbc",
+        cyan: "#11a8cd",
+        white: "#e5e5e5",
+        brightBlack: "#666666",
+        brightRed: "#f14c4c",
+        brightGreen: "#23d18b",
+        brightYellow: "#f5f543",
+        brightBlue: "#3b8eea",
+        brightMagenta: "#d670d6",
+        brightCyan: "#29b8db",
+        brightWhite: "#ffffff"
+      };
+    }
+    return {
+      background: "#f4f4f4",
+      foreground: "#1a1a1a",
+      cursor: "#1a1a1a",
+      selection: "rgba(0,0,0,.15)",
+      black: "#000000",
+      red: "#b3261e",
+      green: "#0a7a42",
+      yellow: "#795e00",
+      blue: "#0a4fb3",
+      magenta: "#9a3a9a",
+      cyan: "#0a7a8a",
+      white: "#767676",
+      brightBlack: "#5a5a5a",
+      brightRed: "#d32f2f",
+      brightGreen: "#1a7f37",
+      brightYellow: "#8a6d00",
+      brightBlue: "#2563eb",
+      brightMagenta: "#d63384",
+      brightCyan: "#0a8a9a",
+      brightWhite: "#333333"
+    };
   }
+  // re-theme live terminals when the app theme flips (terminals are created
+  // once with the theme at open time, so existing tabs would go stale)
+  $effect(() => {
+    const t = termTheme();
+    for (const [, v] of termViews) {
+      try {
+        v.term.options.theme = t as never;
+      } catch {
+        /* terminal mid-dispose */
+      }
+    }
+  });
 
   /** fit the active terminal to its container and tell the pty the size */
   function fitSideTerm(key: string) {
@@ -3018,6 +3407,11 @@
       ...seed,
       ...baseHistory
     ];
+    // MCP tools (Work mode only): connected servers lend extra tools alongside
+    // the built-in workspace ones. Assembled once per turn; chat mode never
+    // sees them.
+    const mcp = assembleMcpTools();
+    const allTools = [...WORK_TOOLS, ...mcp.tools] as any;
     // Move finished background jobs into the transcript: a `role: user`
     // wake-up natively (orphan `role: tool` messages have no matching call)
     // plus a collapsed result block for display. `skip` covers ids the model
@@ -3065,7 +3459,7 @@
       const target = chats.find((x) => x.id === chat.id);
       if (!target) return;
       const history: ChatMsg[] = [...native, { role: "user", content: note }];
-      await streamInto(target, curIndex, history, false, { mode: "continue", tools: WORK_TOOLS as any });
+      await streamInto(target, curIndex, history, false, { mode: "continue", tools: allTools });
     }
     while (true) {
       if (workStop || ctrl?.signal.aborted) break;
@@ -3093,7 +3487,7 @@
       // the transcript here, so the next generation sees their output
       await injectBackgroundCompletions();
       if (workStop || ctrl?.signal.aborted) break;
-      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: WORK_TOOLS as any });
+      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: allTools });
       firstRound = false;
       if (workStop || ctrl?.signal.aborted) break;
       // record this round's assistant turn natively (text + tool calls)
@@ -3182,7 +3576,7 @@
         const c1 = chats.find((x) => x.id === chat.id);
         if (!isAsk && !isSay && c1?.messages[curIndex]) {
           const m1 = c1.messages[curIndex];
-          const activity = roundSilent ? formatToolActivity(call.name, call.args) : null;
+          const activity = roundSilent ? (formatToolActivity(call.name, call.args) ?? (mcp.route.has(call.name) ? `Using \`${call.name}\`…` : null)) : null;
           c1.messages[curIndex] = {
             ...m1,
             content: m1.content + (activity ? `\n\n${activity}\n` : "") + formatToolCallHead(call.name, call.args)
@@ -3190,7 +3584,17 @@
           chats = [...chats];
           scrollBottom();
         }
-        const out = await dispatchWorkTool(call, {
+        const mcpTarget = mcp.route.get(call.name);
+        let out: string;
+        if (mcpTarget) {
+          // MCP tool: route back to the real server + tool name
+          try {
+            out = await callMcpServerTool(mcpTarget.server, mcpTarget.name, call.args);
+          } catch (e: any) {
+            out = `Error: ${e?.message ?? String(e)}`;
+          }
+        } else {
+          out = await dispatchWorkTool(call, {
           workspace,
           chats,
           sessionId: chat.id,
@@ -3213,6 +3617,7 @@
             });
           }
         });
+        }
         if (toolStatus?.chatId === chat.id) toolStatus = null;
         if (call.name === "exec" && (call.args as any)?.background === true) {
           // detached start: the job id joins the pending set so the turn can
@@ -3525,6 +3930,11 @@
         e.preventDefault();
         return;
       }
+      if (mcpOpen) {
+        mcpOpen = false;
+        e.preventDefault();
+        return;
+      }
       if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
       if (!workRunning) return;
       if (onEscape()) e.preventDefault();
@@ -3644,6 +4054,7 @@
       }
       const m = await loadModel();
       if (m) selectedModel = m;
+      await loadMcpServers();
     } catch (e) {
       console.error("storage load failed:", e);
     } finally {
@@ -4268,6 +4679,19 @@
             <button class="icon-btn" data-testid="attach-btn" aria-label="Attach files" title="Attach files (images, documents, anything)" onclick={pickFile}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
             </button>
+            <button
+              class="icon-btn mcp-btn"
+              data-testid="mcp-btn"
+              aria-label="MCP servers"
+              title={mcpConnectedCount ? `MCP servers (${mcpConnectedCount} connected)` : "MCP servers"}
+              aria-pressed={mcpOpen}
+              onclick={openMcpPopup}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
+              {#if mcpConnectedCount}
+                <span class="mcp-dot" data-testid="mcp-dot">{mcpConnectedCount}</span>
+              {/if}
+            </button>
             {@const wsPath = displayWorkspace(activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace)}
             {@const wsName = wsPath.trim() ? (workspaceBase(wsPath) || wsPath.trim()) : ""}
             <button
@@ -4320,6 +4744,245 @@
         </div>
       </div>
     </div>
+    {#if mcpOpen}
+      <button class="mcp-backdrop" data-testid="mcp-backdrop" aria-label="Close MCP servers" onclick={() => (mcpOpen = false)} tabindex="-1"></button>
+      <!-- opencode-style MCP popup: search + server list + custom management.
+           Source of truth is ~/vicuna/config/vicuna.json (opencode.json shape). -->
+      <div
+        class="mcp-popup"
+        data-testid="mcp-popup"
+        role="dialog"
+        aria-label="MCP servers"
+        onkeydown={(e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            mcpOpen = false;
+          } else if (e.key === "ArrowDown") {
+            e.preventDefault();
+            mcpSel = mcpFiltered.length ? (mcpSel + 1) % mcpFiltered.length : 0;
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            mcpSel = mcpFiltered.length ? (mcpSel - 1 + mcpFiltered.length) % mcpFiltered.length : 0;
+          } else if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
+            const s = mcpFiltered[mcpSel];
+            if (s && !mcpShowForm) {
+              e.preventDefault();
+              void toggleMcpServer(s.id);
+            }
+          }
+        }}
+        tabindex="-1"
+      >
+        <div class="mcp-head">
+          <span class="mcp-title">MCP servers</span>
+          <span class="mcp-esc">esc</span>
+        </div>
+        <input
+          class="mcp-search"
+          data-testid="mcp-search"
+          placeholder="Search"
+          bind:value={mcpQuery}
+          oninput={() => (mcpSel = 0)}
+          autofocus
+          spellcheck={false}
+          onkeydown={(e) => {
+            if (e.key === "Escape") {
+              e.stopPropagation();
+              mcpOpen = false;
+            } else if (e.key === "ArrowDown") {
+              e.preventDefault();
+              mcpSel = mcpFiltered.length ? (mcpSel + 1) % mcpFiltered.length : 0;
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              mcpSel = mcpFiltered.length ? (mcpSel - 1 + mcpFiltered.length) % mcpFiltered.length : 0;
+            } else if (e.key === "Enter" || e.key === " ") {
+              const s = mcpFiltered[mcpSel];
+              if (s && !mcpShowForm) {
+                e.preventDefault();
+                void toggleMcpServer(s.id);
+              }
+            }
+          }}
+        />
+        <div class="mcp-list" data-testid="mcp-list" role="listbox" aria-label="MCP servers">
+          {#each mcpFiltered as s, i (s.id)}
+            {@const st = mcpStatusOf(s)}
+            {@const live = mcpLive[s.id]}
+            <div
+              class="mcp-row {i === mcpSel ? 'sel' : ''}"
+              data-testid="mcp-row"
+              data-name={s.name}
+              role="option"
+              aria-selected={i === mcpSel}
+              tabindex="0"
+              title={describeMcpServer(s)}
+              onclick={() => {
+                mcpSel = i;
+                void toggleMcpServer(s.id);
+              }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  mcpSel = i;
+                  void toggleMcpServer(s.id);
+                }
+              }}
+              onmousemove={() => {
+                if (mcpSel !== i) mcpSel = i;
+              }}
+            >
+              <span class="mcp-name">{s.name}</span>
+              <span class="mcp-tools-n">{live?.connected ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : ""}</span>
+              <span class="mcp-status {st.kind}">{st.label}</span>
+              <span class="mcp-row-actions">
+                <button
+                  class="mcp-mini"
+                  data-testid="mcp-edit-btn"
+                  data-name={s.name}
+                  title="Edit server"
+                  aria-label="Edit {s.name}"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    openMcpForm(s);
+                  }}
+                >✎</button>
+                {#if mcpConfirmDelete === s.id}
+                  <button
+                    class="mcp-mini danger"
+                    data-testid="mcp-confirm-delete-btn"
+                    data-name={s.name}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      void deleteMcpServerEntry(s.id);
+                    }}
+                  >Confirm?</button>
+                {:else}
+                  <button
+                    class="mcp-mini"
+                    data-testid="mcp-delete-btn"
+                    data-name={s.name}
+                    title="Delete server"
+                    aria-label="Delete {s.name}"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      void deleteMcpServerEntry(s.id);
+                    }}
+                  >×</button>
+                {/if}
+              </span>
+            </div>
+            {#if live?.error}
+              <div class="mcp-row-error" title={live.error}>{live.error.slice(0, 160)}</div>
+            {/if}
+          {:else}
+            <div class="mcp-empty">
+              {#if !isTauriRuntime()}
+                MCP servers need the Vicuna desktop app — browsers can't spawn local commands.
+              {:else}
+                No MCP servers yet — add one below, e.g. a local `lb mcp` for the live browser.
+              {/if}
+            </div>
+          {/each}
+        </div>
+        {#if mcpShowForm}
+          <div class="mcp-form" data-testid="mcp-form">
+            <input
+              class="pull-input"
+              data-testid="mcp-name-input"
+              placeholder="Name — e.g. live-browser"
+              bind:value={mcpForm.name}
+              spellcheck={false}
+            />
+            <div class="seg mcp-type" role="group" aria-label="Server type">
+              <button
+                class="seg-btn {mcpForm.transport === 'stdio' ? 'sel' : ''}"
+                data-testid="mcp-type-stdio"
+                onclick={() => (mcpForm.transport = "stdio")}
+              >Local command</button>
+              <button
+                class="seg-btn {mcpForm.transport === 'http' ? 'sel' : ''}"
+                data-testid="mcp-type-http"
+                onclick={() => (mcpForm.transport = "http")}
+              >Remote HTTP</button>
+            </div>
+            {#if mcpForm.transport === "stdio"}
+              <input
+                class="pull-input"
+                data-testid="mcp-command-input"
+                placeholder="Command — e.g. lb"
+                bind:value={mcpForm.command}
+                spellcheck={false}
+              />
+              <input
+                class="pull-input"
+                data-testid="mcp-args-input"
+                placeholder="Args, space-separated — e.g. mcp"
+                bind:value={mcpForm.args}
+                spellcheck={false}
+              />
+              <textarea
+                class="stopwords-input"
+                data-testid="mcp-env-input"
+                rows={2}
+                spellcheck={false}
+                placeholder={'Env JSON (optional) — e.g. {"KEY": "value"}'}
+                bind:value={mcpForm.envText}
+              ></textarea>
+              <span class="setting-note">Runs on this machine — desktop app only. Plain browsers can't spawn processes.</span>
+            {:else}
+              <input
+                class="pull-input"
+                data-testid="mcp-url-input"
+                placeholder="URL — e.g. https://example.com/mcp"
+                bind:value={mcpForm.url}
+                spellcheck={false}
+              />
+              <textarea
+                class="stopwords-input"
+                data-testid="mcp-headers-input"
+                rows={2}
+                spellcheck={false}
+                placeholder={'Headers JSON (optional) — e.g. {"Authorization": "Bearer …"}'}
+                bind:value={mcpForm.headersText}
+              ></textarea>
+            {/if}
+            <label class="mcp-check"><input type="checkbox" data-testid="mcp-enabled-check" bind:checked={mcpForm.enabled} /> Connect automatically on launch</label>
+            {#if mcpHasLogin}
+              <div class="mcp-loginrow" data-testid="mcp-login-row">
+                <span class="setting-note">Signed in via browser</span>
+                <button class="mini-btn" data-testid="mcp-signout-btn" onclick={() => void signOutMcp()}>Sign out</button>
+              </div>
+            {/if}
+            {#if mcpFormError}
+              <p class="goto-error" data-testid="mcp-form-error">{mcpFormError}</p>
+            {/if}
+            <div class="confirm-actions">
+              <button class="confirm-cancel" data-testid="mcp-cancel-btn" onclick={closeMcpForm}>Cancel</button>
+              <button class="confirm-ok" data-testid="mcp-save-btn" onclick={() => void saveMcpForm()}>Save</button>
+            </div>
+          </div>
+        {/if}
+        <div class="mcp-foot">
+          <span class="mcp-hint">connect <span class="mcp-key">space</span></span>
+          <span class="mcp-spacer"></span>
+          {#if mcpShowForm}
+            <span class="mcp-file">~/vicuna/config/vicuna.json</span>
+          {:else}
+            <button class="mcp-add" data-testid="mcp-add-btn" onclick={() => openMcpForm()}>+ custom</button>
+            <button
+              class="mcp-add"
+              data-testid="mcp-refresh-btn"
+              title="Re-list tools on connected servers"
+              disabled={mcpOp !== null}
+              onclick={() => {
+                for (const s of mcpServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
+              }}
+            >refresh</button>
+          {/if}
+        </div>
+        <div class="mcp-file-note">Stored in ~/vicuna/config/vicuna.json · same shape as opencode.json</div>
+      </div>
+    {/if}
   </main>
   {#if composerMode === "work"}
     <aside
@@ -4353,7 +5016,7 @@
             role="tab"
             aria-selected={t.key === activeSideTab}
             tabindex="0"
-            title={explorerRoot.trim() || t.title}
+            title={displayWorkspace(explorerRoot.trim()) || t.title}
             onkeydown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
@@ -5406,7 +6069,8 @@
   .new-tab-menu .ctx-item { display: flex; align-items: center; gap: 9px; }
   .side-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .side-view.hidden { display: none; }
-  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; }
+  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: #f4f4f4; }
+  :global(html[data-theme="dark"]) .term-wrap { background: #161616; }
   .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }
   .explorer-search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 0; }
   .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }
@@ -5422,6 +6086,49 @@
   .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
   .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 44px; z-index: 8; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; }
   .explorer-foot { padding: 8px 12px 12px 12px; font-size: 11.5px; color: var(--faint); border-top: 1px solid var(--border); }
+  .mcp-btn { position: relative; }
+  .mcp-dot { position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; }
+  .mcp-backdrop { position: fixed; inset: 0; z-index: 60; border: none; background: rgba(0,0,0,.45); cursor: default; padding: 0; }
+  .mcp-popup { position: fixed; z-index: 61; left: 50%; top: 16%; transform: translateX(-50%); width: min(560px, calc(100vw - 48px)); max-height: 70vh; overflow-y: auto; background: var(--bg); color: var(--text); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.4); padding: 18px 18px 12px 18px; box-sizing: border-box; }
+  .mcp-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+  .mcp-title { font-size: 17px; font-weight: 800; }
+  .mcp-esc { font-size: 13px; color: var(--muted); }
+  .mcp-search { width: 100%; box-sizing: border-box; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 17px; padding: 4px 2px 10px 2px; }
+  .mcp-search::placeholder { color: var(--faint); }
+  .mcp-list { display: flex; flex-direction: column; }
+  .mcp-row { display: flex; align-items: center; gap: 10px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 15.5px; padding: 5px 8px; border-radius: 8px; cursor: pointer; text-align: left; }
+  .mcp-row.sel { background: var(--accent); color: var(--accent-fg); }
+  .mcp-row.sel .mcp-status, .mcp-row.sel .mcp-tools-n, .mcp-row.sel .mcp-mini { color: inherit; opacity: .9; }
+  .mcp-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-tools-n { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .mcp-status { margin-left: auto; white-space: nowrap; font-size: 14.5px; }
+  .mcp-status.connected { color: var(--accent); }
+  .mcp-row.sel .mcp-status.connected { color: inherit; }
+  .mcp-status.disabled { color: var(--muted); }
+  .mcp-status.error { color: #d9732b; }
+  .mcp-status.idle { color: var(--muted); }
+  .mcp-row-actions { display: flex; align-items: center; gap: 2px; }
+  .mcp-mini { border: none; background: transparent; color: var(--faint); font-size: 13px; line-height: 1; width: 22px; height: 22px; border-radius: 6px; cursor: pointer; padding: 0; }
+  .mcp-mini:hover { background: rgba(127,127,127,.25); color: var(--text); }
+  .mcp-row.sel .mcp-mini:hover { background: rgba(255,255,255,.25); color: inherit; }
+  .mcp-mini.danger { width: auto; padding: 0 6px; font-size: 12px; }
+  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-empty { padding: 12px 8px; font-size: 13.5px; color: var(--muted); }
+  .mcp-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 2px 4px 2px; }
+  .mcp-type { align-self: stretch; }
+  .mcp-type .seg-btn { flex: 1; }
+  .mcp-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); cursor: pointer; }
+  .mcp-check input { accent-color: var(--accent); }
+  .mcp-loginrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .mcp-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding-top: 10px; font-size: 14px; color: var(--text); }
+  .mcp-hint { color: var(--text); }
+  .mcp-key { color: var(--faint); }
+  .mcp-spacer { flex: 1; }
+  .mcp-add { border: none; background: transparent; color: var(--muted-2); font: inherit; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 6px; }
+  .mcp-add:hover { background: var(--hover); color: var(--text); }
+  .mcp-add:disabled { opacity: .5; cursor: default; }
+  .mcp-file { font-size: 11.5px; color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .mcp-file-note { margin-top: 6px; font-size: 11.5px; color: var(--faint); }
 
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }

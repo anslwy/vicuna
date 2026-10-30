@@ -16,6 +16,7 @@ use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+pub mod mcp;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -1938,6 +1939,11 @@ where
     G: FnOnce(Option<i32>) + Send + 'static,
 {
     let canon = work_canonical_root(root.trim())?;
+    // `canonicalize()` returns extended-length paths on Windows
+    // (`\\?\C:\...`); spawning the shell there makes PowerShell render its
+    // prompt as `Microsoft.PowerShell.Core\FileSystem::\\?\C:\...`. The
+    // stripped path points at the same folder and prompts cleanly.
+    let cwd = work_display_string(&canon);
     let pty = portable_pty::native_pty_system();
     let pair = pty
         .openpty(term_size(cols, rows))
@@ -1960,7 +1966,7 @@ where
             c
         }
     };
-    cmd.cwd(&canon);
+    cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     let mut child = pair
@@ -2432,6 +2438,103 @@ async fn tray_set_status(
     )
 }
 
+/// ---------- MCP servers (Work mode only) ----------
+///
+/// Configs live in `~/vicuna/config/vicuna.json` (`mcp` map, opencode.json
+/// shape) — the file is the source of truth, the UI edits it. Connections
+/// are runtime-only in the McpManager (stdio children die on disconnect).
+
+#[tauri::command]
+async fn mcp_list_servers() -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::list_file_servers()
+}
+
+#[tauri::command]
+async fn mcp_save_server(config: mcp::McpServerConfig) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::save_file_server(&config)
+}
+
+#[tauri::command]
+async fn mcp_delete_server(id: String) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::delete_file_server(&id)
+}
+
+#[tauri::command]
+async fn mcp_connect(
+    config: mcp::McpServerConfig,
+    state: State<'_, mcp::McpManager>,
+) -> Result<mcp::McpServerInfo, String> {
+    state.connect(&config).await
+}
+
+#[tauri::command]
+async fn mcp_disconnect(id: String, state: State<'_, mcp::McpManager>) -> Result<(), String> {
+    state.disconnect(&id).await
+}
+
+#[tauri::command]
+async fn mcp_list_tools(
+    id: String,
+    state: State<'_, mcp::McpManager>,
+) -> Result<Vec<mcp::McpToolInfo>, String> {
+    state.list_tools(&id).await
+}
+
+#[tauri::command]
+async fn mcp_call_tool(
+    server_id: String,
+    tool: String,
+    args: serde_json::Value,
+    state: State<'_, mcp::McpManager>,
+) -> Result<mcp::McpCallResult, String> {
+    state.call_tool(&server_id, &tool, args).await
+}
+
+/// Browser sign-in for an OAuth-protected remote server: runs the PKCE
+/// authorize flow (system browser + loopback callback), persists tokens to
+/// auth.json, then connects. Errors when the server needs no auth.
+#[tauri::command]
+async fn mcp_signin(
+    app: AppHandle,
+    config: mcp::McpServerConfig,
+    state: State<'_, mcp::McpManager>,
+) -> Result<mcp::McpServerInfo, String> {
+    use tauri_plugin_opener::OpenerExt;
+    mcp::oauth_login(&config, |url| {
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|e| format!("mcp: cannot open browser for sign-in: {e}"))
+    })
+    .await?;
+    state.connect(&config).await
+}
+
+/// Forget the stored OAuth login and drop the connection, if any.
+#[tauri::command]
+async fn mcp_signout(id: String, state: State<'_, mcp::McpManager>) -> Result<(), String> {
+    // server names key the token store; resolve the id first
+    let name = mcp::list_file_servers()?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.name)
+        .unwrap_or(id.clone());
+    mcp::delete_auth(&name);
+    let _ = state.disconnect(&id).await;
+    Ok(())
+}
+
+/// Whether an OAuth login is stored for the server (drives the UI's
+/// "Signed in / Sign out" affordance).
+#[tauri::command]
+async fn mcp_login_present(id: String) -> Result<bool, String> {
+    let name = mcp::list_file_servers()?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.name)
+        .unwrap_or(id);
+    Ok(mcp::auth_present(&name))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2443,6 +2546,7 @@ pub fn run() {
         .manage(TermState::default())
         .manage(BgExecState::default())
         .manage(AppQuitState::default())
+        .manage(mcp::McpManager::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),
         })
@@ -2486,7 +2590,17 @@ pub fn run() {
             zoom_apply,
             zoom_step,
             quit_app,
-            tray_set_status
+            tray_set_status,
+            mcp_list_servers,
+            mcp_save_server,
+            mcp_delete_server,
+            mcp_connect,
+            mcp_disconnect,
+            mcp_list_tools,
+            mcp_call_tool,
+            mcp_signin,
+            mcp_signout,
+            mcp_login_present
         ])
         .setup(|app| {
             // System tray: closing the window hides here (streams keep
