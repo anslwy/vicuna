@@ -1506,7 +1506,9 @@ fn cli_script_body() -> &'static str {
     if cfg!(windows) { CLI_WINDOWS_SCRIPT } else { CLI_UNIX_SCRIPT }
 }
 
-/// PATH entries of this process (the user's PATH at launch).
+/// PATH entries of this process. GUI apps launched from Finder get a sparse
+/// system PATH, so this alone misses user bins like `~/.local/bin` — every
+/// consumer below works off `cli_all_path_dirs` (process + login shell).
 fn cli_path_dirs() -> Vec<std::path::PathBuf> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     std::env::var("PATH")
@@ -1515,6 +1517,53 @@ fn cli_path_dirs() -> Vec<std::path::PathBuf> {
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from)
         .collect()
+}
+
+/// PATH as the user's terminal sees it: probe `$SHELL -l` (profiles
+/// sourced). Best-effort with a short timeout — a slow/broken profile must
+/// never hang Settings. Windows doesn't need this (the registry check in
+/// `cli_on_path_in` covers it).
+#[cfg(not(windows))]
+async fn cli_shell_path_dirs() -> Vec<std::path::PathBuf> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let out = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new(&shell)
+            .args(["-l", "-c", "echo $PATH"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output(),
+    )
+    .await;
+    let Ok(Ok(out)) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    // profiles may print noise above: the PATH is the last non-empty line
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or("");
+    line
+        .split(':')
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Effective search path: process dirs first, then login-shell extras.
+fn cli_all_path_dirs(shell_dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out = cli_path_dirs();
+    for d in shell_dirs {
+        if !out.iter().any(|e| e == d) {
+            out.push(d.clone());
+        }
+    }
+    out
 }
 
 #[cfg(not(windows))]
@@ -1535,40 +1584,40 @@ fn cli_home_dir() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home))
 }
 
-/// Where a launcher would be installed. Unix: first non-system PATH entry
-/// (with `~/.local/bin` preferred when on PATH), else `~/.local/bin`.
-/// Windows: `%LOCALAPPDATA%\Vicuna\bin`.
-fn cli_install_dir() -> Result<std::path::PathBuf, String> {
+/// Where a launcher would be installed. Unix: first non-system entry of the
+/// effective PATH (with `~/.local/bin` preferred when on it), else
+/// `~/.local/bin`. Windows: `%LOCALAPPDATA%\Vicuna\bin`. Pure (no fs
+/// access) so tests can drive it without touching HOME/PATH.
+fn cli_install_dir_in(path_dirs: &[std::path::PathBuf], home: &std::path::Path) -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        let base = cli_home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
-        Ok(base.join("Vicuna").join("bin"))
+        let _ = path_dirs;
+        home.join("Vicuna").join("bin")
     }
     #[cfg(not(windows))]
     {
-        let home = cli_home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
         let local = home.join(".local").join("bin");
-        let dirs = cli_path_dirs();
-        if dirs.iter().any(|d| d == &local) {
-            return Ok(local);
+        if path_dirs.iter().any(|d| d == &local) {
+            return local;
         }
-        for d in dirs {
-            if d.is_absolute() && !cli_is_system_dir(&d) {
-                return Ok(d);
+        for d in path_dirs {
+            if d.is_absolute() && !cli_is_system_dir(d) {
+                return d.clone();
             }
         }
-        Ok(local)
+        local
     }
 }
 
-fn cli_unix_fallback_dir() -> Option<std::path::PathBuf> {
+fn cli_unix_fallback_dir_in(home: &std::path::Path) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
+        let _ = home;
         None
     }
     #[cfg(not(windows))]
     {
-        cli_home_dir().map(|h| h.join(".local").join("bin"))
+        Some(home.join(".local").join("bin"))
     }
 }
 
@@ -1583,8 +1632,8 @@ fn cli_scan_in(dirs: &[std::path::PathBuf], exe: &str) -> Option<std::path::Path
     None
 }
 
-fn cli_scan(exe: &str) -> Option<std::path::PathBuf> {
-    cli_scan_in(&cli_path_dirs(), exe)
+fn cli_scan(exe: &str, all_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    cli_scan_in(all_dirs, exe)
 }
 
 fn cli_is_managed(path: &std::path::Path) -> bool {
@@ -1602,14 +1651,14 @@ struct CliStatus {
     managed: bool,
     /// where Install would write
     install_dir: String,
-    /// whether `install_dir` is on PATH (unix) / in the user PATH registry
-    /// (Windows, which the current process may predate — a fresh terminal
-    /// is authoritative)
+    /// whether `install_dir` is on the effective PATH (process + login
+    /// shell; Windows also checks the user PATH registry, which the current
+    /// process may predate — a fresh terminal is authoritative)
     on_path: bool,
 }
 
-fn cli_on_path(dir: &std::path::Path) -> bool {
-    if cli_path_dirs().iter().any(|d| d == dir) {
+fn cli_on_path_in(dir: &std::path::Path, all_dirs: &[std::path::PathBuf]) -> bool {
+    if all_dirs.iter().any(|d| d == dir) {
         return true;
     }
     #[cfg(windows)]
@@ -1637,12 +1686,12 @@ fn cli_on_path(dir: &std::path::Path) -> bool {
     }
 }
 
-fn cli_status_inner() -> Result<CliStatus, String> {
+fn cli_status_inner(all_dirs: &[std::path::PathBuf], home: &std::path::Path) -> Result<CliStatus, String> {
     let exe = cli_exe_name().to_string();
-    let found = cli_scan(&exe);
+    let found = cli_scan(&exe, all_dirs);
     let managed = found.as_deref().map(cli_is_managed).unwrap_or(false);
-    let install_dir = cli_install_dir()?;
-    let on_path = cli_on_path(&install_dir);
+    let install_dir = cli_install_dir_in(all_dirs, home);
+    let on_path = cli_on_path_in(&install_dir, all_dirs);
     Ok(CliStatus {
         exe_name: exe,
         found: found.map(|p| p.to_string_lossy().to_string()),
@@ -1677,8 +1726,8 @@ fn cli_write_launcher(dir: &std::path::Path) -> Result<std::path::PathBuf, Strin
 /// Ensure `dir` is in the current user's PATH (Windows only — HKCU, no
 /// admin). Best-effort: returns whether the registry now contains it.
 #[cfg(windows)]
-fn cli_ensure_user_path(dir: &std::path::Path) -> bool {
-    if cli_on_path(dir) {
+fn cli_ensure_user_path(dir: &std::path::Path, all_dirs: &[std::path::PathBuf]) -> bool {
+    if cli_on_path_in(dir, all_dirs) {
         return true;
     }
     let dir_s = dir.to_string_lossy().to_string();
@@ -1696,17 +1745,17 @@ fn cli_ensure_user_path(dir: &std::path::Path) -> bool {
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-    cli_on_path(dir)
+    cli_on_path_in(dir, all_dirs)
 }
 
-fn cli_install_inner() -> Result<CliInstallResult, String> {
-    let primary = cli_install_dir()?;
+fn cli_install_inner(all_dirs: &[std::path::PathBuf], home: &std::path::Path) -> Result<CliInstallResult, String> {
+    let primary = cli_install_dir_in(all_dirs, home);
     let dest = match cli_write_launcher(&primary) {
         Ok(d) => (d, None),
         Err(e) => {
             // permission-denied on a PATH dir (e.g. /usr/local/bin owned by
             // root): fall back to the user-local bin instead of failing
-            match cli_unix_fallback_dir() {
+            match cli_unix_fallback_dir_in(home) {
                 Some(fb) if fb != primary => {
                     let d = cli_write_launcher(&fb).map_err(|e2| {
                         format!("{e}. Fallback also failed ({}): {e2}", fb.to_string_lossy())
@@ -1718,12 +1767,12 @@ fn cli_install_inner() -> Result<CliInstallResult, String> {
         }
     };
     #[cfg(windows)]
-    let path_note = if cli_ensure_user_path(dest.0.parent().unwrap_or(&primary)) {
+    let path_note = if cli_ensure_user_path(dest.0.parent().unwrap_or(&primary), all_dirs) {
         "Added to your user PATH — open a NEW terminal to use it."
     } else {
         "Could not update your user PATH automatically."
     };
-    let on_path = cli_on_path(dest.0.parent().unwrap_or(&primary));
+    let on_path = cli_on_path_in(dest.0.parent().unwrap_or(&primary), all_dirs);
     let mut note = dest.1.unwrap_or_default();
     #[cfg(windows)]
     {
@@ -1736,7 +1785,8 @@ fn cli_install_inner() -> Result<CliInstallResult, String> {
     {
         if !on_path {
             note = format!(
-                "{} is not on your PATH — add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile, then open a new terminal.",
+                "{} is not on your terminal PATH — add `export PATH=\"{}:$PATH\"` to your shell profile, then open a new terminal.",
+                dest.0.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
                 dest.0.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
             );
         } else if note.is_empty() {
@@ -1752,15 +1802,15 @@ fn cli_install_inner() -> Result<CliInstallResult, String> {
 
 /// Remove a launcher this app installed (the managed PATH hit, else our own
 /// install dir). Refuses foreign `vicuna` binaries.
-fn cli_uninstall_inner() -> Result<String, String> {
+fn cli_uninstall_inner(all_dirs: &[std::path::PathBuf], home: &std::path::Path) -> Result<String, String> {
     let exe = cli_exe_name();
-    if let Some(found) = cli_scan(exe) {
+    if let Some(found) = cli_scan(exe, all_dirs) {
         if cli_is_managed(&found) {
             std::fs::remove_file(&found).map_err(|e| format!("cannot remove {}: {e}", found.to_string_lossy()))?;
             return Ok(found.to_string_lossy().to_string());
         }
     }
-    let owned = cli_install_dir()?.join(exe);
+    let owned = cli_install_dir_in(all_dirs, home).join(exe);
     if owned.is_file() {
         if !cli_is_managed(&owned) {
             return Err(format!("{} was not installed by Vicuna — refusing to remove it", owned.to_string_lossy()));
@@ -1771,22 +1821,37 @@ fn cli_uninstall_inner() -> Result<String, String> {
     Err("no Vicuna-installed launcher found".to_string())
 }
 
+/// Effective CLI search path for this machine: process PATH plus whatever
+/// the user's login shell adds (Finder-launched apps miss user bins).
+async fn cli_env() -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), String> {
+    #[cfg(windows)]
+    let shell_dirs = Vec::new();
+    #[cfg(not(windows))]
+    let shell_dirs = cli_shell_path_dirs().await;
+    let all_dirs = cli_all_path_dirs(&shell_dirs);
+    let home = cli_home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
+    Ok((all_dirs, home))
+}
+
 /// Report the `vicuna` launcher status (install location + PATH state).
 #[tauri::command]
 async fn cli_status() -> Result<CliStatus, String> {
-    cli_status_inner()
+    let (all_dirs, home) = cli_env().await?;
+    cli_status_inner(&all_dirs, &home)
 }
 
 /// Install (or reinstall) the `vicuna` launcher script.
 #[tauri::command]
 async fn cli_install() -> Result<CliInstallResult, String> {
-    cli_install_inner()
+    let (all_dirs, home) = cli_env().await?;
+    cli_install_inner(&all_dirs, &home)
 }
 
 /// Remove the launcher this app installed. Refuses foreign binaries.
 #[tauri::command]
 async fn cli_uninstall() -> Result<String, String> {
-    cli_uninstall_inner()
+    let (all_dirs, home) = cli_env().await?;
+    cli_uninstall_inner(&all_dirs, &home)
 }
 
 /// Bring the main window forward (CLI deep links arrive while hidden in the
@@ -2662,6 +2727,51 @@ mod work_tests {
         let dirs = vec![a.clone(), b.clone()];
         assert_eq!(cli_scan_in(&dirs, cli_exe_name()).unwrap(), a.join(cli_exe_name()));
         assert!(cli_scan_in(&dirs, "no-such-launcher").is_none());
+    }
+
+    #[test]
+    fn cli_all_path_dirs_merges_without_dupes() {
+        let a = std::path::PathBuf::from("/usr/bin");
+        let b = std::path::PathBuf::from("/tmp/fake-home/.local/bin");
+        let merged = cli_all_path_dirs(&[a.clone(), b.clone()]);
+        // process PATH always contributes; shell extras append once each
+        assert!(merged.contains(&b));
+        assert_eq!(merged.iter().filter(|d| *d == &a).count(), 1);
+        assert_eq!(merged.iter().filter(|d| *d == &b).count(), 1);
+    }
+
+    /// The Finder-launch case: the app's own PATH is sparse system dirs, the
+    /// launcher lives in a home bin dir only the login shell sees — status
+    /// must still find it (no HOME/PATH env mutation: all explicit params).
+    #[tokio::test]
+    async fn cli_status_finds_launcher_outside_process_path() {
+        let home = tmp_root("cli-home");
+        let bindir = home.join(".local").join("bin");
+        let dest = cli_write_launcher(&bindir).unwrap();
+        // effective path as a Finder-launched app would see it: nothing of
+        // its own, only the login-shell dir (a bare slice — no process PATH,
+        // so the real environment can't leak into this test)
+        let all_dirs = vec![bindir.clone()];
+        let st = cli_status_inner(&all_dirs, &home).unwrap();
+        assert_eq!(st.found, Some(dest.to_string_lossy().to_string()));
+        assert!(st.managed);
+        assert!(st.on_path);
+        assert_eq!(st.install_dir, bindir.to_string_lossy().to_string());
+        // uninstall reaches it through the same effective path
+        let removed = cli_uninstall_inner(&all_dirs, &home).unwrap();
+        assert_eq!(removed, dest.to_string_lossy().to_string());
+        assert!(!dest.exists());
+    }
+
+    /// Login-shell probe is read-only and must see at least the system dirs.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cli_shell_path_probe_sees_system_dirs() {
+        let dirs = cli_shell_path_dirs().await;
+        assert!(
+            dirs.iter().any(|d| d == std::path::Path::new("/usr/bin") || d == std::path::Path::new("/bin")),
+            "login shell PATH should contain system dirs: {dirs:?}"
+        );
     }
 
     #[tokio::test]
