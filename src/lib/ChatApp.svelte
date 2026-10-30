@@ -48,6 +48,17 @@
   let workspaceEditing = $state(false);
   /** visible "command running" indicator while a work tool executes */
   let toolStatus = $state<{ chatId: string; label: string } | null>(null);
+  /** live multiple-choice question from the work agent (null when none is
+   *  pending). The turn blocks in dispatchWorkTool until the user answers. */
+  let pendingAsk = $state<{
+    chatId: string;
+    index: number;
+    question: string;
+    options: string[];
+    other: string;
+    otherOpen: boolean;
+    resolve: (answer: string) => void;
+  } | null>(null);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
   let explorerEntries = $state<WorkTreeEntry[]>([]);
@@ -434,6 +445,7 @@
   });
 
   function deleteChat(id: string) {
+    if (pendingAsk?.chatId === id) cancelPendingAsk("(the chat was deleted before answering)");
     aborter?.abort();
     aborter = null;
     streaming = false;
@@ -2510,8 +2522,39 @@
     return true;
   }
 
+  /** user answered a live ask card: persist a compact Q/A record in the
+   *  message, then resolve the blocked tool call with the answer */
+  function answerAsk(value: string) {
+    const a = pendingAsk;
+    if (!a) return;
+    pendingAsk = null;
+    const c = chats.find((x) => x.id === a.chatId);
+    const m = c?.messages[a.index];
+    if (c && m) {
+      const one = (s: string) => s.replace(/\s+/g, " ").trim();
+      c.messages[a.index] = {
+        ...m,
+        content: `${m.content}\n\n> **Question:** ${one(a.question)}\n>\n> **Answer:** ${one(value)}\n\n`
+      };
+      chats = [...chats];
+      saveSoon();
+    }
+    a.resolve(value);
+    scrollBottom();
+  }
+
+  /** dismiss a pending ask without an answer (stop / chat deleted) so the
+   *  awaiting work loop can unwind instead of hanging forever */
+  function cancelPendingAsk(reason: string) {
+    const a = pendingAsk;
+    if (!a) return;
+    pendingAsk = null;
+    a.resolve(reason);
+  }
+
   function stop() {
     if (workRunning) workStop = true;
+    cancelPendingAsk("(the user interrupted before answering)");
     aborter?.abort();
   }
 
@@ -2829,22 +2872,40 @@
       }
       for (const call of fresh) {
         if (workStop || ctrl?.signal.aborted) break;
+        const isAsk = call.name === "ask";
+        let askShown = false;
         toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
-        // tag first: the call is known now, the result may take a while
+        // tag first: the call is known now, the result may take a while.
+        // `ask` is the exception: the live card + Q/A record own the display.
         const c1 = chats.find((x) => x.id === chat.id);
-        if (c1?.messages[curIndex]) {
+        if (!isAsk && c1?.messages[curIndex]) {
           const m1 = c1.messages[curIndex];
           c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
           chats = [...chats];
           scrollBottom();
         }
-        const out = await dispatchWorkTool(call, { workspace, chats, sessionId: chat.id });
+        const out = await dispatchWorkTool(call, {
+          workspace,
+          chats,
+          sessionId: chat.id,
+          askUser: (question, options) => {
+            askShown = true;
+            return new Promise<string>((resolve) => {
+              pendingAsk = { chatId: chat.id, index: curIndex, question, options, other: "", otherOpen: false, resolve };
+              requestAnimationFrame(() => scrollBottom());
+            });
+          }
+        });
         if (toolStatus?.chatId === chat.id) toolStatus = null;
         native.push({ role: "tool", content: out, tool_name: call.name });
         const c2 = chats.find((x) => x.id === chat.id);
-        if (c2?.messages[curIndex]) {
+        if (isAsk && askShown) {
+          // the live card owned the display: answered → answerAsk appended the
+          // Q/A record; cancelled → nothing to leave behind
+        } else if (c2?.messages[curIndex]) {
           const m2 = c2.messages[curIndex];
-          c2.messages[curIndex] = { ...m2, content: m2.content + formatToolCallTail(out) };
+          const head = isAsk ? formatToolCallHead(call.name, call.args) : "";
+          c2.messages[curIndex] = { ...m2, content: m2.content + head + formatToolCallTail(out) };
           chats = [...chats];
         }
         scrollBottom();
@@ -3578,6 +3639,52 @@
                 </div>
               {/if}
               <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if streaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
+              {#if pendingAsk && pendingAsk.chatId === activeChat?.id && pendingAsk.index === i}
+                <div class="ask-card" data-testid="ask-card">
+                  <div class="ask-question">{pendingAsk.question}</div>
+                  <div class="ask-options">
+                    {#each pendingAsk.options as opt, oi}
+                      <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
+                    {/each}
+                    {#if pendingAsk.otherOpen}
+                      <form
+                        class="ask-other"
+                        onsubmit={(e) => {
+                          e.preventDefault();
+                          const v = pendingAsk?.other.trim() ?? "";
+                          if (v) answerAsk(v);
+                        }}
+                      >
+                        <input
+                          class="ask-input"
+                          data-testid="ask-input"
+                          bind:value={pendingAsk.other}
+                          placeholder="Type your answer…"
+                          aria-label="Custom answer"
+                          onkeydown={(e) => {
+                            if (e.key === "Escape") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              if (pendingAsk) pendingAsk.otherOpen = false;
+                            }
+                          }}
+                        />
+                        <button class="ask-send" type="submit" data-testid="ask-send" disabled={!pendingAsk.other.trim()}>Send</button>
+                      </form>
+                    {:else}
+                      <button
+                        class="ask-option ask-other-toggle"
+                        data-testid="ask-other"
+                        onclick={() => {
+                          if (!pendingAsk) return;
+                          pendingAsk.otherOpen = true;
+                          requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-testid="ask-input"]')?.focus());
+                        }}
+                      >Other…</button>
+                    {/if}
+                  </div>
+                </div>
+              {/if}
               <div class="actions">
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
                   {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
@@ -4634,6 +4741,17 @@
   .bubble.user { background: var(--accent); color: var(--accent-fg); }
   .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; white-space: normal; user-select: text; }
   .answer { user-select: text; white-space: normal; }
+  .ask-card { margin: 12px 0 2px; max-width: 560px; border: 1px solid var(--border-2); border-radius: 14px; background: var(--card); padding: 12px; }
+  .ask-question { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 10px; line-height: 1.45; }
+  .ask-options { display: flex; flex-direction: column; gap: 6px; }
+  .ask-option { width: 100%; text-align: left; border: 1px solid var(--border-2); background: var(--bg); color: var(--text); border-radius: 10px; padding: 8px 11px; font: inherit; font-size: 13.5px; cursor: pointer; }
+  .ask-option:hover { border-color: var(--accent); background: var(--hover-3); }
+  .ask-other-toggle { color: var(--muted); border-style: dashed; }
+  .ask-other { display: flex; gap: 6px; }
+  .ask-input { flex: 1; min-width: 0; border: 1px solid var(--border-2); border-radius: 10px; background: var(--bg); color: var(--text); padding: 7px 10px; font: inherit; font-size: 13.5px; }
+  .ask-input:focus { outline: none; border-color: var(--accent); }
+  .ask-send { border: none; border-radius: 10px; background: var(--accent); color: var(--accent-fg); padding: 0 13px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+  .ask-send:disabled { opacity: .45; cursor: default; }
   .col { display: flex; flex-direction: column; }
   .user-row .col { align-items: flex-end; }
   .asst-row .col { align-items: stretch; flex: 1; min-width: 0; }

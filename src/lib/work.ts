@@ -22,6 +22,7 @@ WORKSPACE BOUNDARY (strict):
 - Already granted exceptions: read_upload (files the user attached to this session) and sessions/read_session (past chats).
 - If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
 - Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
+- Use \`ask\` when a decision is genuinely needed (which approach/file/scope, or before anything destructive) instead of guessing. It shows buttons plus an "Other" free-text field and waits for the answer.
 
 Use the provided function tools to act — do not invent results, do not emit manual tool JSON.
 - After a tool result arrives, continue reasoning and either call the next tool or answer.
@@ -100,6 +101,25 @@ export const WORK_TOOLS = [
         properties: {
           command: { type: "string", description: "shell command" },
           timeout_ms: { type: "integer", description: "timeout 1000-120000ms, default 30000" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "ask",
+      description: "Ask the user a multiple-choice question and wait for their answer. Use when a decision is genuinely needed before continuing (approach, file, scope, or anything destructive). Provide 2-8 short options; the UI always adds an 'Other' free-text choice. Returns the chosen option or the typed answer.",
+      parameters: {
+        type: "object",
+        required: ["question", "options"],
+        properties: {
+          question: { type: "string", description: "question text" },
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "2-8 short choices"
+          }
         }
       }
     }
@@ -429,7 +449,13 @@ export async function stageUploadFile(sessionId: string, fileName: string, base6
 /** Execute one tool call. Returns markdown for the transcript. */
 export async function dispatchWorkTool(
   call: WorkToolCall,
-  ctx: { workspace: string; chats: Chat[]; sessionId?: string }
+  ctx: {
+    workspace: string;
+    chats: Chat[];
+    sessionId?: string;
+    /** render a multiple-choice card and wait for the user's answer */
+    askUser?: (question: string, options: string[]) => Promise<string>;
+  }
 ): Promise<string> {
   const a = call.args ?? {};
   const str = (v: unknown) => (typeof v === "string" ? v : "");
@@ -479,6 +505,18 @@ export async function dispatchWorkTool(
         parts.push(`[exit ${res.timed_out ? "timed out" : res.exit_code}]`);
         return parts.join("\n");
       }
+      case "ask": {
+        const question = str(a.question).trim();
+        const options = Array.isArray(a.options)
+          ? a.options
+              .filter((o: unknown): o is string => typeof o === "string" && o.trim().length > 0)
+              .map((o: string) => o.trim())
+          : [];
+        if (!question) return "Error: ask needs a non-empty question.";
+        if (options.length < 2) return "Error: ask needs at least 2 options.";
+        if (!ctx.askUser) return "Error: asking the user is not available here.";
+        return await ctx.askUser(question, options.slice(0, 8));
+      }
       case "sessions": {
         if (!str(a.query)) return "Error: sessions needs {\"query\": \"...\"}.";
         const hits = searchSessions(ctx.chats, str(a.query));
@@ -523,7 +561,8 @@ export function toolLabel(name: string, args: Record<string, any>): string {
     name === "grep" ? String(args.pattern ?? "") :
     name === "sessions" ? String(args.query ?? "") :
     name === "read_session" ? String(args.id ?? "") :
-    name === "read_upload" ? String(args.name ?? "") : JSON.stringify(args);
+    name === "read_upload" ? String(args.name ?? "") :
+    name === "ask" ? String(args.question ?? "") : JSON.stringify(args);
   return `${name} — ${argSummary.slice(0, 120)}`;
 }
 
