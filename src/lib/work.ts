@@ -17,6 +17,12 @@ export function buildWorkSystemPrompt(workspace: string): string {
 
 You can inspect and change ONLY files under that workspace, run shell commands there (cwd = workspace), and search the user's past Vicuna chat sessions.
 
+WORKSPACE BOUNDARY (strict):
+- The workspace is the limit of what you may touch on your own. Do not list, read, grep, write, or delete anything outside it — no parent folders, home directory, other projects, or system files — and do not run commands that reach outside it.
+- Already granted exceptions: read_upload (files the user attached to this session) and sessions/read_session (past chats).
+- If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
+- Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
+
 Use the provided function tools to act — do not invent results, do not emit manual tool JSON.
 - After a tool result arrives, continue reasoning and either call the next tool or answer.
 - When the task is done, answer normally with NO further tool calls.
@@ -87,7 +93,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands.",
+      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands. Do not access paths outside the workspace without asking the user first.",
       parameters: {
         type: "object",
         required: ["command"],
