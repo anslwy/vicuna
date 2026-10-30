@@ -145,6 +145,51 @@ export async function quitApp(): Promise<void> {
   const { invoke } = await tauri();
   await invoke("quit_app");
 }
+/**
+ * Architecture context window for a model via /api/show `model_info`
+ * (e.g. `gemma4.context_length: 262144`; cloud tags proxy through the
+ * local daemon). Cached per model; null when unknown (not pulled, or the
+ * arch reports no window) — callers fall back to 32768.
+ */
+const showCache = new Map<string, number | null>();
+
+/** Pick the `*.context_length` value out of an /api/show `model_info` map. */
+export function parseShowContextLength(modelInfo: unknown): number | null {
+  if (!modelInfo || typeof modelInfo !== "object" || Array.isArray(modelInfo)) return null;
+  let best: number | null = null;
+  for (const [k, v] of Object.entries(modelInfo as Record<string, unknown>)) {
+    if (k.endsWith(".context_length") && typeof v === "number" && Number.isFinite(v) && v > 0) {
+      if (best == null || v > best) best = v;
+    }
+  }
+  return best;
+}
+
+export async function modelContextLength(model: string): Promise<number | null> {
+  if (showCache.has(model)) return showCache.get(model) ?? null;
+  let len: number | null = null;
+  try {
+    if (isTauriRuntime()) {
+      const { invoke } = await tauri();
+      const info = await invoke<{ context_length?: number | null }>("ollama_model_show", { model });
+      len = typeof info?.context_length === "number" && info.context_length > 0 ? info.context_length : null;
+    } else {
+      const res = await fetch(`${ollamaBase()}/api/show`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        len = parseShowContextLength((data as Record<string, unknown>)?.model_info);
+      }
+    }
+  } catch {
+    len = null;
+  }
+  showCache.set(model, len);
+  return len;
+}
 /** Load a model into memory (or extend its residency). Generates a single
  *  throwaway token; uses the same context size as chat so follow-up chats
  *  don't trigger a reload. */

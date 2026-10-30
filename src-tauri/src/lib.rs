@@ -118,6 +118,53 @@ async fn ollama_list_running() -> Result<serde_json::Value, String> {
     Ok(data)
 }
 
+/// Model metadata for context management: reports the architecture's
+/// `*.context_length` from /api/show `model_info` (works for `:cloud`
+/// models too — the local daemon proxies). `None` when the model isn't
+/// available or reports no window; callers fall back to 32768.
+fn parse_show_context_length(model_info: &serde_json::Value) -> Option<u64> {
+    let map = model_info.as_object()?;
+    let mut best: Option<u64> = None;
+    for (k, v) in map {
+        if k.ends_with(".context_length") {
+            if let Some(n) = v.as_u64().filter(|&n| n > 0) {
+                if best.is_none_or(|b| n > b) {
+                    best = Some(n);
+                }
+            }
+        }
+    }
+    best
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelShowInfo {
+    context_length: Option<u64>,
+}
+
+#[tauri::command]
+async fn ollama_model_show(model: String) -> Result<ModelShowInfo, String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OLLAMA_BASE}/api/show"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|e| format!("ollama show failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(ollama_error("show", status, &body));
+    }
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("ollama show failed: {e}"))?;
+    Ok(ModelShowInfo {
+        context_length: data.get("model_info").and_then(parse_show_context_length),
+    })
+}
+
 /// Load/unload a model by generating one throwaway token with the given
 /// keep-alive. Same 32k ctx as chat so follow-ups don't trigger a reload.
 #[tauri::command]
@@ -127,8 +174,7 @@ async fn ollama_warm_model(model: String, keep_alive: String) -> Result<(), Stri
         .post(format!("{OLLAMA_BASE}/api/generate"))
         .json(&serde_json::json!({
             "model": model,
-            "prompt": "hi",
-            "stream": false,
+            "prompt": "hi",            "stream": false,
             "think": false,
             "keep_alive": keep_alive,
             "options": { "num_predict": 1, "num_ctx": 32768 }
@@ -2610,6 +2656,7 @@ pub fn run() {
             ollama_generate_stream,
             ollama_pull_model,
             ollama_delete_model,
+            ollama_model_show,
             ollama_fetch_text,
             ollama_server_version,
             ollama_start_server,
@@ -2832,6 +2879,18 @@ mod work_tests {
         std::fs::write(d.join("raw.bin"), [0u8, 1, 2, 3]).unwrap();
         let err = work_read_file(root.clone(), "raw.bin".into(), None).await.unwrap_err();
         assert!(err.contains("view_image"));
+    }
+
+    #[test]
+    fn show_context_length_picks_arch_window() {
+        let info = serde_json::json!({
+            "gptoss.context_length": 131072,
+            "gptoss.rope.scaling.original_context_length": 4096,
+            "general.architecture": "gptoss"
+        });
+        assert_eq!(parse_show_context_length(&info), Some(131072));
+        let empty = serde_json::json!({"general.architecture": "unknown"});
+        assert_eq!(parse_show_context_length(&empty), None);
     }
 
     #[tokio::test]

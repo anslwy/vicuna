@@ -556,6 +556,19 @@ export function extractBackgroundId(text: string): string | null {
   return m ? m[0] : null;
 }
 
+/** Rough token estimate for context budgeting: ~4 chars per token plus a
+ *  flat per-image vision cost. Conservative by design — the compaction
+ *  trigger sits at 70% of the window, so overcounting only compacts early. */
+export function estimateWorkTokens(messages: Array<{ content: string; images?: string[] }>): number {
+  let n = 0;
+  for (const m of messages) {
+    n += Math.ceil((m.content?.length ?? 0) / 4);
+    n += (m.images?.length ?? 0) * 1500;
+    n += 4; // role overhead
+  }
+  return n;
+}
+
 /** Split `view_image` vision payloads out of a tool result.
  *  `dispatchWorkTool` embeds data URLs as `[[VICUNA_IMAGE:...]]` markers
  *  (tool results are text-only); the caller strips them from the display/tool

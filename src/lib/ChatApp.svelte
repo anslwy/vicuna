@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
@@ -3590,7 +3590,7 @@
         ];
       }
     }
-    const native: ChatMsg[] = [
+    let native: ChatMsg[] = [
       { role: "system", content: buildWorkSystemPrompt(workspace) },
       ...seed,
       ...baseHistory
@@ -3604,6 +3604,64 @@
     // wake-up natively (orphan `role: tool` messages have no matching call)
     // plus a collapsed result block for display. `skip` covers ids the model
     // just polled itself — their output is already in the transcript.
+    // Context guard: the native transcript grows every round (assistant text,
+    // tool_calls, every tool result, bg completions, viewed images re-sent
+    // each round) against a fixed 32k num_ctx. Once the estimate passes 70%
+    // of the model's own window (via /api/show, 32768 fallback), summarize
+    // the oldest messages into one note and drop the raw prefix — otherwise
+    // the round fails outright and retries resend the same oversized history.
+    const COMPACT_FRACTION = 0.7;
+    const COMPACT_KEEP_TAIL = 20;
+    async function maybeCompactContext(): Promise<void> {
+      const win = (await modelContextLength(selectedModel)) ?? 32768;
+      if (estimateWorkTokens(native) <= win * COMPACT_FRACTION) return;
+      // cut at a user/system boundary so no assistant(tool_calls)/tool pair
+      // is split; the summary replaces everything after the system prompt.
+      let cut = Math.max(1, native.length - COMPACT_KEEP_TAIL);
+      while (cut < native.length && native[cut].role !== "user" && native[cut].role !== "system") cut++;
+      if (cut >= native.length - 2) return; // nothing safe to drop
+      const older = native.slice(1, cut);
+      const transcript = older
+        .map((m) => {
+          const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
+          return `${who}: ${m.content}${m.images?.length ? ` [${m.images.length} image(s) attached]` : ""}`;
+        })
+        .join("\n\n");
+      toolStatus = { chatId: chat.id, label: "Compacting context…" };
+      let summary = "";
+      try {
+        summary = await chatStream(
+          selectedModel,
+          [
+            { role: "system", content: "Summarize this agent transcript prefix concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter." },
+            { role: "user", content: transcript }
+          ],
+          () => {},
+          ctrl?.signal,
+          undefined,
+          0,
+          { think: false, temperature: 0.2 }
+        ).then((r) => r.text);
+      } catch {
+        summary = "";
+      } finally {
+        if (toolStatus?.chatId === chat.id) toolStatus = null;
+      }
+      if (workStop || ctrl?.signal.aborted || !summary.trim()) return;
+      native = [
+        native[0],
+        { role: "user", content: `Earlier in this turn, summarized to save context:\n${summary.trim()}` },
+        ...native.slice(cut)
+      ];
+      const c = chats.find((x) => x.id === chat.id);
+      if (c?.messages[curIndex]) {
+        const m = c.messages[curIndex];
+        c.messages[curIndex] = { ...m, content: `${m.content}\n\n> Context compacted: older tool output summarized.\n` };
+        chats = [...chats];
+        checkedLen = c.messages[curIndex].content.length;
+        saveSoon();
+      }
+    }
     async function injectBackgroundCompletions(skip?: Set<string>): Promise<boolean> {
       if (pendingBg.size === 0) return false;
       let injected = false;
@@ -3674,6 +3732,11 @@
       // background jobs that finished while the model worked elsewhere join
       // the transcript here, so the next generation sees their output
       await injectBackgroundCompletions();
+      if (workStop || ctrl?.signal.aborted) break;
+      // long turns outgrow the window: summarize the oldest prefix away
+      // before this round's request goes out (a failed round can't recover
+      // by retrying the same oversized history)
+      await maybeCompactContext();
       if (workStop || ctrl?.signal.aborted) break;
       const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: allTools });
       firstRound = false;
