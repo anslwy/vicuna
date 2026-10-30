@@ -5,7 +5,10 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -724,6 +727,158 @@ async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDir
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct WorkTreeEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    depth: usize,
+}
+
+/// Recursive workspace listing for the file explorer panel (flat, sorted
+/// by path). Skips dependency/build dirs; hidden files ARE included.
+/// Caps: depth 1-8 (default 4), 3000 entries.
+#[tauri::command]
+async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTreeEntry>, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let max_depth = max_depth.unwrap_or(4).clamp(1, 8);
+    const SKIP: [&str; 8] = [
+        "node_modules",
+        "target",
+        "build",
+        ".git",
+        "dist",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ];
+    let mut out: Vec<WorkTreeEntry> = Vec::new();
+    let mut stack = vec![(canon.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= 3000 {
+            break;
+        }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd {
+            if out.len() >= 3000 {
+                break;
+            }
+            let ent = match ent {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = ent.file_name().to_string_lossy().to_string();
+            let p = ent.path();
+            let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir && SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&canon)
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_else(|_| name.clone());
+            out.push(WorkTreeEntry {
+                name,
+                path: rel,
+                is_dir,
+                size: if is_dir {
+                    None
+                } else {
+                    ent.metadata().ok().map(|m| m.len())
+                },
+                depth,
+            });
+            if is_dir && depth + 1 < max_depth {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.path
+            .to_lowercase()
+            .cmp(&b.path.to_lowercase())
+    });
+    Ok(out)
+}
+
+/// Import a file dropped from the OS into the workspace (base64 bytes).
+/// Sandbox-checked like every other work_ entry point. 16MB cap.
+#[tauri::command]
+async fn work_import_file(root: String, path: String, base64: String) -> Result<String, String> {
+    const CAP: usize = 16 * 1024 * 1024;
+    let bytes = decode_base64(&base64).map_err(|_| "invalid file data".to_string())?;
+    if bytes.len() > CAP {
+        return Err("file too large (max 16MB)".to_string());
+    }
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if full.is_dir() {
+        return Err("cannot overwrite a folder".to_string());
+    }
+    if let Some(parent) = full.parent() {
+        if !parent.starts_with(&canon) {
+            return Err("path escapes the workspace".to_string());
+        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folders: {e}"))?;
+    }
+    std::fs::write(&full, &bytes).map_err(|e| format!("cannot write file: {e}"))?;
+    Ok(path.trim().to_string())
+}
+
+/// Minimal standard-alphabet base64 decoder (avoids a new dependency for
+/// the single import-file path). Rejects whitespace-tolerant input with
+/// bad characters or misplaced padding.
+fn decode_base64(s: &str) -> Result<Vec<u8>, ()> {
+    fn val(c: u8) -> Result<u8, ()> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(()),
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut sextets = [0u8; 4];
+        let mut pad = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                pad += 1;
+            } else {
+                if pad > 0 {
+                    return Err(());
+                }
+                sextets[i] = val(b)?;
+            }
+        }
+        if pad > 2 {
+            return Err(());
+        }
+        let n = ((sextets[0] as u32) << 18)
+            | ((sextets[1] as u32) << 12)
+            | ((sextets[2] as u32) << 6)
+            | (sextets[3] as u32);
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct WorkFileContent {
     path: String,
     content: String,
@@ -963,6 +1118,241 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
     }
 }
 
+/// ---------- Interactive terminals (side-panel tabs, desktop only) ----------
+///
+/// Each terminal tab owns a portable-pty pair rooted at the workspace: a
+/// reader thread streams output over the Channel, a waiter thread reports
+/// the exit code. Master/writer stay in the map for write/resize; kills go
+/// by pid so a stuck child is always reaped (best-effort, never fatal).
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum TermEvent {
+    Output { text: String },
+    Exit { code: Option<i32> },
+}
+
+struct TermHandle {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    pid: Option<u32>,
+}
+
+#[derive(Default)]
+struct TermState {
+    terms: Mutex<HashMap<String, TermHandle>>,
+    seq: AtomicU64,
+}
+
+static TERM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn term_size(cols: Option<u16>, rows: Option<u16>) -> portable_pty::PtySize {
+    portable_pty::PtySize {
+        rows: rows.unwrap_or(24).clamp(5, 200),
+        cols: cols.unwrap_or(80).clamp(20, 400),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+/// Kill by pid (unix kill -9 / windows taskkill). Best-effort.
+fn kill_pid(pid: u32) {
+    #[cfg(not(windows))]
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+}
+
+/// Spawn a login shell on a fresh pty rooted at `root`. The reader thread
+/// streams output until EOF; the waiter thread reports the exit code.
+/// Returns the handle (master + writer + pid for write/resize/kill).
+fn spawn_pty<F, G>(
+    root: &str,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    on_output: F,
+    on_exit: G,
+) -> Result<TermHandle, String>
+where
+    F: Fn(String) + Send + 'static,
+    G: FnOnce(Option<i32>) + Send + 'static,
+{
+    let canon = work_canonical_root(root.trim())?;
+    let pty = portable_pty::native_pty_system();
+    let pair = pty
+        .openpty(term_size(cols, rows))
+        .map_err(|e| format!("cannot open pty: {e}"))?;
+    let mut cmd = {
+        #[cfg(windows)]
+        {
+            let comspec =
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            portable_pty::CommandBuilder::new(comspec)
+        }
+        #[cfg(not(windows))]
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let mut c = portable_pty::CommandBuilder::new(shell);
+            c.args(["-l"]);
+            c
+        }
+    };
+    cmd.cwd(&canon);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("cannot spawn shell: {e}"))?;
+    drop(pair.slave);
+    let pid = child.process_id();
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("pty failed: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("pty failed: {e}"))?;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    on_output(String::from_utf8_lossy(&buf[..n]).to_string());
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        // signaled deaths (e.g. our kill -9) carry no status code
+        let code = child
+            .wait()
+            .ok()
+            .and_then(|s| {
+                if s.signal().is_some() {
+                    None
+                } else {
+                    Some(s.exit_code() as i32)
+                }
+            });
+        on_exit(code);
+    });
+    Ok(TermHandle {
+        master: pair.master,
+        writer: Mutex::new(writer),
+        pid,
+    })
+}
+
+/// Spawn a login shell rooted at the workspace. Output/exit stream back
+/// over the channel; returns the terminal id for write/resize/kill.
+#[tauri::command]
+async fn term_spawn(
+    root: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    state: State<'_, TermState>,
+    on_event: Channel<TermEvent>,
+) -> Result<String, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let id = format!("term-{}", TERM_SEQ.fetch_add(1, Ordering::Relaxed));
+    let ev = on_event.clone();
+    let ev2 = on_event;
+    let handle = spawn_pty(
+        &canon.to_string_lossy(),
+        cols,
+        rows,
+        move |text| {
+            if ev.send(TermEvent::Output { text }).is_err() {
+                // frontend went away; the reader loop keeps draining the
+                // pty until the shell exits (killed with the tab)
+            }
+        },
+        move |code| {
+            let _ = ev2.send(TermEvent::Exit { code });
+        },
+    )?;
+    state
+        .terms
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?
+        .insert(id.clone(), handle);
+    Ok(id)
+}
+
+/// Send keystrokes to a terminal.
+#[tauri::command]
+async fn term_write(id: String, data: String, state: State<'_, TermState>) -> Result<(), String> {
+    let terms = state
+        .terms
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?;
+    let h = terms
+        .get(id.trim())
+        .ok_or_else(|| "terminal closed".to_string())?;
+    let mut w = h
+        .writer
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?;
+    w.write_all(data.as_bytes())
+        .map_err(|e| format!("terminal write failed: {e}"))?;
+    w.flush()
+        .map_err(|e| format!("terminal write failed: {e}"))?;
+    Ok(())
+}
+
+/// Resize a terminal (columns × rows from the xterm fit addon).
+#[tauri::command]
+async fn term_resize(
+    id: String,
+    cols: u16,
+    rows: u16,
+    state: State<'_, TermState>,
+) -> Result<(), String> {
+    let terms = state
+        .terms
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?;
+    let h = terms
+        .get(id.trim())
+        .ok_or_else(|| "terminal closed".to_string())?;
+    h.master
+        .resize(term_size(Some(cols), Some(rows)))
+        .map_err(|e| format!("terminal resize failed: {e}"))?;
+    Ok(())
+}
+
+/// Kill a terminal's shell (by pid, best-effort) and drop the entry.
+#[tauri::command]
+async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String> {
+    let mut terms = state
+        .terms
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?;
+    let h = terms
+        .remove(id.trim())
+        .ok_or_else(|| "terminal closed".to_string())?;
+    drop(terms);
+    if let Some(pid) = h.pid {
+        kill_pid(pid);
+    }
+    Ok(())
+}
+
 /// Window zoom level for Cmd/Ctrl +/−/0. Desktop shells don't zoom webviews
 /// on those keys the way browsers do natively, so the frontend catches the
 /// chord (Tauri only) and drives the webview zoom from here.
@@ -1020,6 +1410,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(OllamaServerState::default())
+        .manage(TermState::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),
         })
@@ -1038,10 +1429,16 @@ pub fn run() {
             ollama_stop_server,
             work_validate_root,
             work_list_dir,
+            work_tree,
+            work_import_file,
             work_read_file,
             work_grep,
             work_write_file,
             work_exec,
+            term_spawn,
+            term_write,
+            term_resize,
+            term_kill,
             zoom_apply,
             zoom_step
         ])
@@ -1139,5 +1536,111 @@ mod work_tests {
         assert_eq!(res.exit_code, Some(0));
         let slow = work_exec(root, "sleep 5".into(), Some(1200)).await.unwrap();
         assert!(slow.timed_out);
+    }
+
+    #[tokio::test]
+    async fn tree_lists_nested_skips_build_dirs_and_import_roundtrips() {
+        let d = tmp_root("tree");
+        let root = d.to_string_lossy().to_string();
+        work_write_file(root.clone(), "src/main.py".into(), "print(1)\n".into())
+            .await
+            .unwrap();
+        work_write_file(root.clone(), ".hidden-note".into(), "hi\n".into())
+            .await
+            .unwrap();
+        work_write_file(root.clone(), "node_modules/dep/index.js".into(), "x\n".into())
+            .await
+            .unwrap();
+        let tree = work_tree(root.clone(), None).await.unwrap();
+        assert!(tree.iter().any(|e| e.path == "src/main.py" && !e.is_dir && e.depth == 1));
+        assert!(tree.iter().any(|e| e.path == ".hidden-note"));
+        assert!(!tree.iter().any(|e| e.path.starts_with("node_modules")));
+        let mut sorted = tree.clone();
+        sorted.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        assert_eq!(
+            tree.iter().map(|e| &e.path).collect::<Vec<_>>(),
+            sorted.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        // import: binary bytes survive base64, escapes rejected
+        let raw = vec![0u8, 1, 2, 255, 65, 66];
+        let b64 = {
+            const ALPH: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::new();
+            for c in raw.chunks(3) {
+                let n = (c[0] as u32) << 16
+                    | (*c.get(1).unwrap_or(&0) as u32) << 8
+                    | (*c.get(2).unwrap_or(&0) as u32);
+                s.push(ALPH[((n >> 18) & 63) as usize] as char);
+                s.push(ALPH[((n >> 12) & 63) as usize] as char);
+                s.push(if c.len() > 1 {
+                    ALPH[((n >> 6) & 63) as usize] as char
+                } else {
+                    '='
+                });
+                s.push(if c.len() > 2 {
+                    ALPH[(n & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+            s
+        };
+        work_import_file(root.clone(), "assets/blob.bin".into(), b64)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(d.join("assets/blob.bin")).unwrap(), raw);
+        assert!(work_import_file(root.clone(), "../evil.txt".into(), "aGk=".into())
+            .await
+            .is_err());
+        assert!(decode_base64("!!!").is_err());
+    }
+
+    /// Real pty roundtrip: spawn a login shell, run echo, read it back,
+    /// then kill and observe the exit event.
+    #[test]
+    fn pty_echo_roundtrip_and_kill() {
+        let d = tmp_root("pty");
+        let root = d.to_string_lossy().to_string();
+        let out = std::sync::Arc::new(Mutex::new(String::new()));
+        let out2 = out.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Option<i32>>();
+        let h = spawn_pty(
+            &root,
+            Some(80),
+            Some(24),
+            move |t| {
+                out2.lock().unwrap().push_str(&t);
+            },
+            move |c| {
+                let _ = tx.send(c);
+            },
+        )
+        .unwrap();
+        // login shells need a moment; then a marker roundtrips through echo
+        std::thread::sleep(Duration::from_secs(3));
+        {
+            let mut w = h.writer.lock().unwrap();
+            w.write_all(b"echo pty-marker-84135\n").unwrap();
+            w.flush().unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if out.lock().unwrap().contains("pty-marker-84135") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no echo from pty shell");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // kill by pid (same path term_kill uses) and expect the exit event
+        kill_pid(h.pid.expect("shell has a pid"));
+        let code = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no exit event after kill");
+        // SIGKILLed shells report no status code on unix
+        #[cfg(not(windows))]
+        assert_eq!(code, None);
+        #[cfg(windows)]
+        let _ = code;
     }
 }

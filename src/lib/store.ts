@@ -33,6 +33,10 @@ const LS_PENDING = "vicuna-pending-stream";
 const LS_DRAFTS = "vicuna-drafts";
 const HOME_DRAFT_KEY = "__home__";
 
+/** Last-open session, restored on launch so an unsent draft is right back
+ *  in the composer. localStorage everywhere (+ sqlite mirror on desktop). */
+const LS_ACTIVE_CHAT = "vicuna-active-chat";
+
 function draftKey(id: string | null): string {
   return id ?? HOME_DRAFT_KEY;
 }
@@ -153,6 +157,8 @@ interface Backend {
   saveModel(m: string): Promise<void>;
   loadCatalog(): Promise<string | null>;
   saveCatalog(json: string): Promise<void>;
+  loadActiveChat(): Promise<string | null>;
+  saveActiveChat(id: string | null): Promise<void>;
 }
 
 function isTauri(): boolean {
@@ -196,6 +202,21 @@ const lsBackend: Backend = {
   async saveModel(m: string): Promise<void> {
     try {
       localStorage.setItem(LS_MODEL, m);
+    } catch {
+      /* ignore */
+    }
+  },
+  async loadActiveChat(): Promise<string | null> {
+    try {
+      return localStorage.getItem(LS_ACTIVE_CHAT);
+    } catch {
+      return null;
+    }
+  },
+  async saveActiveChat(id: string | null): Promise<void> {
+    try {
+      if (id) localStorage.setItem(LS_ACTIVE_CHAT, id);
+      else localStorage.removeItem(LS_ACTIVE_CHAT);
     } catch {
       /* ignore */
     }
@@ -421,6 +442,22 @@ async function createSqliteBackend(): Promise<Backend> {
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('catalog', $1)",
         [json]
       );
+    },
+    async loadActiveChat(): Promise<string | null> {
+      const rows = await db.select<{ value: string }[]>(
+        "SELECT value FROM meta WHERE key = 'active_chat'"
+      );
+      return rows[0]?.value ?? null;
+    },
+    async saveActiveChat(id: string | null): Promise<void> {
+      if (!id) {
+        await db.execute("DELETE FROM meta WHERE key = 'active_chat'");
+        return;
+      }
+      await db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('active_chat', $1)",
+        [id]
+      );
     }
   };
 }
@@ -468,6 +505,31 @@ export function saveModel(m: string): Promise<void> {
   return backend.saveModel(m).catch((e) => {
     console.error("saveModel failed:", e);
   });
+}
+
+function validChatId(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && v.length < 200;
+}
+
+export async function loadActiveChat(): Promise<string | null> {
+  try {
+    const raw = await backend.loadActiveChat();
+    return validChatId(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveActiveChat(id: string | null): void {
+  try {
+    if (id) localStorage.setItem(LS_ACTIVE_CHAT, id);
+    else localStorage.removeItem(LS_ACTIVE_CHAT);
+  } catch {
+    /* ignore */
+  }
+  if (isTauri()) {
+    backend.saveActiveChat(id).catch((e) => console.error("saveActiveChat failed:", e));
+  }
 }
 
 export async function loadCatalog(): Promise<CatalogOverride | null> {

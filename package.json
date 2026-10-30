@@ -21,11 +21,13 @@
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-sql": "^2.6.0",
+    "@xterm/addon-fit": "^0.11.0",
     "dompurify": "^3.4.17",
     "highlight.js": "^11.12.0",
     "katex": "^0.18.10",
     "marked": "^18.1.2",
-    "marked-katex-extension": "^5.1.13"
+    "marked-katex-extension": "^5.1.13",
+    "xterm": "^5.3.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",

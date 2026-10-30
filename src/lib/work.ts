@@ -183,6 +183,92 @@ async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> 
   return await invoke<T>(cmd, args);
 }
 
+export interface WorkTreeEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number;
+  depth: number;
+}
+
+/** Recursive workspace listing for the explorer panel (desktop only). */
+export async function listWorkTree(root: string, maxDepth = 4): Promise<WorkTreeEntry[]> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<WorkTreeEntry[]>("work_tree", { root, maxDepth });
+}
+
+/** Import an OS-dropped file into the workspace (base64 bytes, desktop only). */
+export async function importWorkFile(root: string, path: string, base64: string): Promise<string> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<string>("work_import_file", { root, path, base64 });
+}
+
+/** Pure text splice for completing an @-mention: replaces the live query
+ *  (up to the next whitespace) with the picked path plus one trailing space.
+ *  `start`/`query` come from the mention query; caret is at end of query. */
+export function completeMentionText(
+  input: string,
+  start: number,
+  query: string,
+  path: string
+): { text: string; caret: number } {
+  const before = input.slice(0, start);
+  const tail = input.slice(start + 1 + query.length).replace(/^[^\s]*/, "");
+  const needsSpace = tail !== "" && !tail.startsWith(" ");
+  const sep = tail === "" || needsSpace ? " " : "";
+  return {
+    text: `${before}@${path}${sep}${tail}`,
+    caret: before.length + 1 + path.length + sep.length
+  };
+}
+
+export interface TermStreamEvent {
+  type: "output" | "exit";
+  text?: string;
+  code?: number | null;
+}
+
+/** Spawn an interactive shell rooted at the workspace (desktop only).
+ *  Output/exit stream through the callbacks; returns the terminal id. */
+export async function spawnTerm(
+  root: string,
+  cols: number,
+  rows: number,
+  onOutput: (text: string) => void,
+  onExit: (code: number | null) => void
+): Promise<string> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  const { invoke, Channel } = await import("@tauri-apps/api/core");
+  const ch = new Channel<TermStreamEvent>();
+  ch.onmessage = (ev) => {
+    if (ev.type === "output") onOutput(ev.text ?? "");
+    else if (ev.type === "exit") onExit(ev.code ?? null);
+  };
+  return await invoke<string>("term_spawn", { root, cols, rows, onEvent: ch });
+}
+
+/** Send keystrokes to a terminal (desktop only). */
+export async function writeTerm(id: string, data: string): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  await invokeCmd<void>("term_write", { id, data });
+}
+
+/** Resize a terminal (desktop only). */
+export async function resizeTerm(id: string, cols: number, rows: number): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  await invokeCmd<void>("term_resize", { id, cols, rows });
+}
+
+/** Kill a terminal's shell (desktop only, best-effort). */
+export async function killTerm(id: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    await invokeCmd<void>("term_kill", { id });
+  } catch {
+    /* already gone */
+  }
+}
+
 export interface SessionSearchHit {
   id: string;
   title: string;

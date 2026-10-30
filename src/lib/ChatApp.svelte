@@ -22,10 +22,14 @@
     readDraft,
     writeDraft,
     clearDraft,
+    loadActiveChat,
+    saveActiveChat,
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, importWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
+  import type { Terminal as XTerm } from "xterm";
+  import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -44,6 +48,87 @@
   let workspaceEditing = $state(false);
   /** visible "command running" indicator while a work tool executes */
   let toolStatus = $state<{ chatId: string; label: string } | null>(null);
+  /** file explorer side panel (work mode): lists the workspace tree */
+  let explorerOpen = $state(false);
+  let explorerEntries = $state<WorkTreeEntry[]>([]);
+  let explorerLoading = $state(false);
+  let explorerError = $state<string | null>(null);
+  let explorerQuery = $state("");
+  let collapsedDirs = $state<string[]>([]);
+  let explorerImporting = $state(false);
+  let explorerDropDir = $state<string | null>(null);
+  /** right-click menu on an explorer row: {x, y, path, isDir} */
+  let expCtx = $state<{ x: number; y: number; path: string; isDir: boolean } | null>(null);
+  /** explorer panel width (drag the left edge; in-memory only) */
+  let explorerWidth = $state(300);
+  let expResizing = $state(false);
+  /** side-panel tabs: one Files view max, any number of terminals */
+  interface SideTab {
+    key: string;
+    kind: "files" | "terminal";
+    title: string;
+    termId?: string;
+    dead?: boolean;
+    error?: string | null;
+  }
+  let sideTabs = $state<SideTab[]>([{ key: "files", kind: "files", title: "Files" }]);
+  let activeSideTab = $state("files");
+  let sideTabSeq = 1;
+  let newTabMenu = $state(false);
+  /** live xterm instances by tab key (non-reactive on purpose) */
+  const termViews = new Map<string, { term: XTerm; fit: XFitAddon; ro: ResizeObserver; resizeTimer: ReturnType<typeof setTimeout> | null }>();
+  let lastExplorerRoot = "";
+
+  const EXPLORER_MIN_W = 220;
+  const EXPLORER_DEFAULT_W = 300;
+
+  function clampExplorerWidth(w: number): number {
+    const maxW = Math.max(240, window.innerWidth - 360);
+    return Math.min(Math.max(EXPLORER_MIN_W, Math.round(w)), maxW);
+  }
+
+  /** drag the panel's left edge to resize (dragging left widens) */
+  function onExpResizeStart(e: PointerEvent) {
+    const handle = e.currentTarget as HTMLElement;
+    const startX = e.clientX;
+    const startW = explorerWidth;
+    expResizing = true;
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      /* mouse path still works via window listeners below */
+    }
+    const move = (ev: PointerEvent) => {
+      explorerWidth = clampExplorerWidth(startW + (startX - ev.clientX));
+    };
+    const up = () => {
+      expResizing = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+
+  function onExpResizeKey(e: KeyboardEvent) {
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      explorerWidth = clampExplorerWidth(explorerWidth + 10);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      explorerWidth = clampExplorerWidth(explorerWidth - 10);
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      explorerWidth = EXPLORER_DEFAULT_W;
+    }
+  }
+  let explorerTimer: ReturnType<typeof setTimeout> | null = null;
   let input = $state("");
   let models = $state<string[]>(["gemma4:31b-cloud"]);
   let selectedModel = $state("gemma4:31b-cloud");
@@ -69,6 +154,7 @@
   let aborter = $state<AbortController | null>(null);
   let messagesEl = $state<HTMLDivElement | null>(null);
   let composerEl = $state<HTMLTextAreaElement | null>(null);
+  let composerBackdrop = $state<HTMLDivElement | null>(null);
   let fileInput = $state<HTMLInputElement | null>(null);
   let editingIndex = $state<number | null>(null);
   let editDraft = $state("");
@@ -131,6 +217,29 @@
   const queuedForActive = $derived(queuedMsgs.filter((q) => q.chatId === activeId));
   /** a turn is live: either a single request or a whole Work agent turn */
   const busy = $derived(streaming || workRunning);
+  /** workspace the explorer panel shows: the thread's, else the pending one */
+  const explorerRoot = $derived(
+    activeChat && activeChat.messages.length > 0 && (activeChat.mode ?? "chat") === "work"
+      ? (activeChat.workspace ?? pendingWorkspace)
+      : pendingWorkspace
+  );
+  const explorerRootBase = $derived(
+    explorerRoot.trim().split("/").filter(Boolean).pop() ?? explorerRoot.trim()
+  );
+  /** tree rows honoring collapse + search (search flattens the hierarchy) */
+  const explorerVisible = $derived((() => {
+    const q = explorerQuery.trim().toLowerCase();
+    if (q) return explorerEntries.filter((e) => e.path.toLowerCase().includes(q));
+    const collapsed = new Set(collapsedDirs);
+    return explorerEntries.filter((e) => {
+      if (e.depth === 0) return true;
+      const parts = e.path.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        if (collapsed.has(parts.slice(0, i).join("/"))) return false;
+      }
+      return true;
+    });
+  })());
 
   // unsent composer text persists per session (home = null key) so a
   // restart restores exactly what was typed; the save is synchronous, so
@@ -141,6 +250,13 @@
     const id = activeId;
     if (text) writeDraft(id, text);
     else clearDraft(id);
+  });
+
+  // remember where the user was so a restart reopens the session (and its
+  // unsent draft) instead of always landing on a blank home
+  $effect(() => {
+    if (!ready) return;
+    saveActiveChat(activeId);
   });
 
   function save() {
@@ -185,12 +301,20 @@
     if (input) writeDraft(activeId, input);
     else clearDraft(activeId);
     flushSave();
+    // best-effort: don't orphan shells when the window closes
+    for (const t of sideTabs) {
+      if (t.termId) void killTerm(t.termId);
+    }
   }
 
   function newChat() {
     aborter?.abort();
     aborter = null;
     streaming = false;
+    // the text being typed moves to the new session instead of being wiped:
+    // New never clears the textbox
+    const carried = input;
+    const carriedFrom = activeId;
     // reuse the existing empty draft instead of stacking blank sessions
     const draft = chats.find((c) => c.messages.length === 0);
     if (draft) {
@@ -201,7 +325,8 @@
       isPinned = true;
       editingIndex = null;
       editDraft = "";
-      input = readDraft(draft.id);
+      input = carried || readDraft(draft.id);
+      if (carried && carriedFrom !== draft.id) clearDraft(carriedFrom);
       error = null;
       void goto(`/s/${draft.id}`);
       return;
@@ -219,7 +344,8 @@
     isPinned = true;
     editingIndex = null;
     editDraft = "";
-    input = readDraft(c.id);
+    input = carried;
+    if (carried && carriedFrom !== c.id) clearDraft(carriedFrom);
     error = null;
     save();
     void goto(`/s/${c.id}`);
@@ -1658,6 +1784,7 @@
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     }
     input = "";
+    mention = null;
     clearDraft(sentFromId);
     if (sentFromId !== chat.id) clearDraft(chat.id);
     attachImages = [];
@@ -1698,6 +1825,469 @@
     queuedMsgs = queuedMsgs.filter((_, i) => i !== index);
   }
 
+  function formatSize(n: number): string {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)}KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)}MB`;
+  }
+
+  /** (re)load the explorer tree for the current work root */
+  async function loadExplorer() {
+    explorerEntries = [];
+    explorerError = null;
+    const root = explorerRoot.trim();
+    if (!root) {
+      explorerError = "Pick a workspace folder first.";
+      return;
+    }
+    if (!isTauriRuntime()) {
+      explorerError = "File explorer needs the Vicuna desktop app.";
+      return;
+    }
+    explorerLoading = true;
+    try {
+      explorerEntries = await listWorkTree(root);
+    } catch (e: any) {
+      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      explorerLoading = false;
+    }
+  }
+
+  function toggleExplorer() {
+    explorerOpen = !explorerOpen;
+    if (explorerOpen) {
+      lastExplorerRoot = explorerRoot.trim();
+      void loadExplorer();
+      // the aside was display:none: xterm needs a re-fit now it has size
+      void tick().then(() => fitSideTerm(activeSideTab));
+    }
+  }
+
+  function toggleExplorerDir(path: string) {
+    collapsedDirs = collapsedDirs.includes(path)
+      ? collapsedDirs.filter((d) => d !== path)
+      : [...collapsedDirs, path];
+  }
+
+  /** clicking a file drops an @path reference into the composer */
+  function insertExplorerPath(path: string) {
+    input = input ? `${input.trimEnd()} @${path} ` : `@${path} `;
+    requestAnimationFrame(() => composerEl?.focus());
+  }
+
+  function escapeHtmlText(s: string): string {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  interface MentionToken {
+    start: number;
+    end: number;
+    core: string;
+  }
+
+  /** @path tokens in text: @ + non-space run at start/after whitespace (so
+   *  a@b.com stays plain), trailing [.,;:!?)] excluded. Shared by rendering,
+   *  caret snapping, and unit deletion so all three always agree. */
+  function findMentions(text: string): MentionToken[] {
+    const out: MentionToken[] = [];
+    const re = /(^|[\s(])(@[^\s]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const tok: string = m[2];
+      const tail = tok.match(/[.,;:!?)]+$/);
+      const core = tail ? tok.slice(0, -tail[0].length) : tok;
+      if (core.length <= 1) continue;
+      const start = m.index + m[1].length;
+      out.push({ start, end: start + core.length, core });
+    }
+    return out;
+  }
+
+  /** render @path mentions as green pills (ws-badge style) with a folder/file
+   *  icon. Scans the escaped text (entities contain no @/space/paren, so
+   *  boundaries match the raw text). Padding/margin cancel so the composer
+   *  backdrop aligns exactly with the transparent textarea text. */
+  function renderMentions(text: string): string {
+    const folderIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+    const fileIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+    const esc = escapeHtmlText(text);
+    const toks = findMentions(esc);
+    if (!toks.length) return esc;
+    let out = "";
+    let last = 0;
+    for (const t of toks) {
+      const name = t.core.slice(1).split("/").pop() ?? "";
+      const icon = name.includes(".") ? fileIcon : folderIcon;
+      out += esc.slice(last, t.start);
+      out += `<span class="mention-pill">${icon}<span>${esc.slice(t.start, t.end)}</span></span>`;
+      last = t.end;
+    }
+    return out + esc.slice(last);
+  }
+
+  /** snap a collapsed caret out of a mention interior (arrows/clicks treat
+   *  pills atomically: the caret rests before or after, never inside) */
+  function snapCaretOut(caret: number, dir: -1 | 0 | 1): number {
+    for (const t of findMentions(input)) {
+      if (caret > t.start && caret < t.end) {
+        if (dir !== 0) return dir < 0 ? t.start : t.end;
+        return caret - t.start <= t.end - caret ? t.start : t.end;
+      }
+    }
+    return caret;
+  }
+
+  function snapComposerCaret() {
+    const el = composerEl;
+    if (!el || el.selectionStart !== el.selectionEnd) return;
+    const caret = el.selectionStart ?? input.length;
+    const snapped = snapCaretOut(caret, 0);
+    if (snapped !== caret) {
+      requestAnimationFrame(() => {
+        composerEl?.setSelectionRange(snapped, snapped);
+        syncBackdropScroll();
+        refreshMentionMenu();
+      });
+    }
+  }
+
+  /** active @-mention query under the caret (work mode only) */
+  function activeMentionQuery(): { start: number; query: string } | null {
+    if (composerMode !== "work" || !explorerRoot.trim()) return null;
+    const el = composerEl;
+    const caret = el ? (el.selectionStart ?? input.length) : input.length;
+    if (el && el.selectionStart !== el.selectionEnd) return null;
+    // a caret strictly inside a completed mention is snapped out elsewhere,
+    // so anything matching here is a live query being typed
+    const m = input.slice(0, caret).match(/(^|[\s(])@([^\s]*)$/);
+    if (!m) return null;
+    return { start: caret - m[2].length - 1, query: m[2] };
+  }
+
+  /** @-mention popup state: anchor, query, ranked files, keyboard index */
+  let mention = $state<{ start: number; query: string; items: WorkTreeEntry[]; index: number } | null>(null);
+  /** caret arrived via an atomic arrow hop (not typing): unit-delete applies
+   *  even with the popup open. Cleared by any other key or text input. */
+  let caretHopped = false;
+  /** keydown consumed the popup (select/close/nav): skip the follow-up keyup
+   *  refresh, which would otherwise run on a stale caret and reopen it */
+  let popupKeyHandled = false;
+
+  /** recompute the mention popup from input + caret (input/click/keyup) */
+  function refreshMentionMenu() {
+    const q = activeMentionQuery();
+    if (!q) {
+      mention = null;
+      return;
+    }
+    const needle = q.query.toLowerCase();
+    const scored: { score: number; entry: WorkTreeEntry }[] = [];
+    for (const e of explorerEntries) {
+      const p = e.path.toLowerCase();
+      if (needle && !p.includes(needle)) continue;
+      const base = e.name.toLowerCase();
+      const score = !needle
+        ? (e.is_dir ? 1 : 0)
+        : base.startsWith(needle)
+          ? 0
+          : base.includes(needle)
+            ? 1
+            : p.startsWith(needle)
+              ? 2
+              : 3;
+      scored.push({ score, entry: e });
+    }
+    scored.sort((a, b) => a.score - b.score || a.entry.path.localeCompare(b.entry.path));
+    const items = scored.slice(0, 8).map((s) => s.entry);
+    const keepIndex = mention && mention.query === q.query ? mention.index : 0;
+    mention = { start: q.start, query: q.query, items, index: items.length ? Math.min(keepIndex, items.length - 1) : 0 };
+  }
+
+  /** complete the active mention with a picked file */
+  function pickMention(item: WorkTreeEntry) {
+    const m = mention;
+    mention = null;
+    caretHopped = false;
+    if (!m) return;
+    const { text, caret } = completeMentionText(input, m.start, m.query, item.path);
+    input = text;
+    requestAnimationFrame(() => {
+      composerEl?.setSelectionRange(caret, caret);
+      composerEl?.focus();
+      syncBackdropScroll();
+    });
+  }
+
+  // files for the mention popup come from the explorer tree; fetch on demand
+  // (the panel may never have been opened in this session)
+  $effect(() => {
+    if (mention && !explorerEntries.length && !explorerLoading && explorerRoot.trim() && isTauriRuntime()) {
+      void loadExplorer();
+    }
+  });
+
+  /** keep the composer backdrop scrolled with the textarea */
+  function syncBackdropScroll() {
+    const ta = composerEl;
+    const bd = composerBackdrop;
+    if (ta && bd) {
+      bd.scrollTop = ta.scrollTop;
+      bd.scrollLeft = ta.scrollLeft;
+    }
+  }
+
+  /** absolute FS path for opener-plugin calls (root is canonical absolute) */
+  function absExpPath(rel: string): string {
+    return `${explorerRoot.trim().replace(/\/+$/, "")}/${rel}`;
+  }
+
+  /** right-click a row: open the file context menu at the cursor (clamped) */
+  function openExpCtx(e: MouseEvent, path: string, isDir: boolean) {
+    e.preventDefault();
+    e.stopPropagation();
+    expCtx = {
+      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 240)),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 260)),
+      path,
+      isDir
+    };
+  }
+
+  function closeExpCtx() {
+    expCtx = null;
+  }
+
+  async function expOpenFile() {
+    const p = expCtx;
+    closeExpCtx();
+    if (!p || !isTauriRuntime()) return;
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(absExpPath(p.path));
+    } catch (e: any) {
+      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  async function expReveal() {
+    const p = expCtx;
+    closeExpCtx();
+    if (!p || !isTauriRuntime()) return;
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(absExpPath(p.path));
+    } catch (e: any) {
+      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  function expCopyMention() {
+    const p = expCtx;
+    closeExpCtx();
+    if (!p) return;
+    try {
+      void navigator.clipboard?.writeText(`@${p.path}`);
+    } catch {
+      explorerError = "Couldn't copy to clipboard.";
+    }
+  }
+
+  function expAddToChat() {
+    const p = expCtx;
+    closeExpCtx();
+    if (!p || p.isDir) return;
+    insertExplorerPath(p.path);
+  }
+
+  /** side-panel tabs: focus the Files view, creating it if closed */
+  function openSideExplorer() {
+    newTabMenu = false;
+    const existing = sideTabs.find((t) => t.kind === "files");
+    if (existing) {
+      activeSideTab = existing.key;
+    } else {
+      sideTabs = [...sideTabs, { key: "files", kind: "files", title: "Files" }];
+      activeSideTab = "files";
+    }
+    if (!explorerEntries.length && !explorerLoading) void loadExplorer();
+  }
+
+  function termTheme(): { background: string; foreground: string; cursor: string; selection: string } {
+    return theme === "dark"
+      ? { background: "#161616", foreground: "#e8e8e8", cursor: "#e8e8e8", selection: "rgba(255,255,255,.25)" }
+      : { background: "#f4f4f4", foreground: "#1a1a1a", cursor: "#1a1a1a", selection: "rgba(0,0,0,.15)" };
+  }
+
+  /** fit the active terminal to its container and tell the pty the size */
+  function fitSideTerm(key: string) {
+    const el = document.querySelector(`[data-term="${key}"]`);
+    if (!(el instanceof HTMLElement) || el.clientWidth === 0 || el.clientHeight === 0) return;
+    const v = termViews.get(key);
+    const t = sideTabs.find((x) => x.key === key);
+    if (!v || !t?.termId || t.dead) return;
+    try {
+      v.fit.fit();
+      const id = t.termId;
+      if (v.resizeTimer) clearTimeout(v.resizeTimer);
+      v.resizeTimer = setTimeout(() => {
+        void resizeTerm(id, v.term.cols, v.term.rows).catch(() => {});
+      }, 150);
+    } catch {
+      /* container hidden mid-switch */
+    }
+  }
+
+  /** open a Terminal tab rooted at the workspace (desktop only) */
+  async function openSideTerminal() {
+    newTabMenu = false;
+    const key = `term-${sideTabSeq++}`;
+    sideTabs = [...sideTabs, { key, kind: "terminal", title: explorerRootBase || "Terminal" }];
+    activeSideTab = key;
+    await tick();
+    if (!isTauriRuntime()) {
+      sideTabs = sideTabs.map((t) =>
+        t.key === key ? { ...t, error: "Terminal needs the Vicuna desktop app." } : t
+      );
+      return;
+    }
+    const root = explorerRoot.trim();
+    if (!root) {
+      sideTabs = sideTabs.map((t) =>
+        t.key === key ? { ...t, error: "Pick a workspace folder first." } : t
+      );
+      return;
+    }
+    try {
+      const [{ Terminal }, { FitAddon }] = await Promise.all([
+        import("xterm"),
+        import("@xterm/addon-fit")
+      ]);
+      await import("xterm/css/xterm.css");
+      const el = document.querySelector(`[data-term="${key}"]`);
+      if (!(el instanceof HTMLElement)) throw new Error("terminal view missing");
+      const term = new Terminal({
+        theme: termTheme(),
+        fontSize: 13,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        cursorBlink: true,
+        scrollback: 5000
+      });
+      const fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(el);
+      fit.fit();
+      const setTab = (patch: Partial<SideTab>) => {
+        sideTabs = sideTabs.map((t) => (t.key === key ? { ...t, ...patch } : t));
+      };
+      const termId = await spawnTerm(
+        root,
+        term.cols,
+        term.rows,
+        (text) => term.write(text),
+        (code) => {
+          setTab({ dead: true });
+          term.write(`\r\n[process exited${code == null ? "" : ` with code ${code}`} — close the tab or open a new one]`);
+        }
+      );
+      term.onData((d) => {
+        void writeTerm(termId, d).catch(() => {});
+      });
+      const ro = new ResizeObserver(() => fitSideTerm(key));
+      ro.observe(el);
+      termViews.set(key, { term, fit, ro, resizeTimer: null });
+      setTab({ termId });
+      term.focus();
+    } catch (e: any) {
+      sideTabs = sideTabs.map((t) =>
+        t.key === key ? { ...t, error: typeof e === "string" ? e : (e?.message ?? String(e)) } : t
+      );
+    }
+  }
+
+  /** close a side tab, killing its pty; never strand the active key */
+  function closeSideTab(key: string) {
+    const t = sideTabs.find((x) => x.key === key);
+    if (t?.termId) void killTerm(t.termId);
+    const v = termViews.get(key);
+    if (v) {
+      v.ro.disconnect();
+      if (v.resizeTimer) clearTimeout(v.resizeTimer);
+      try {
+        v.term.dispose();
+      } catch {
+        /* already gone */
+      }
+      termViews.delete(key);
+    }
+    sideTabs = sideTabs.filter((x) => x.key !== key);
+    if (activeSideTab === key) {
+      activeSideTab = sideTabs.length ? sideTabs[sideTabs.length - 1].key : "";
+      if (activeSideTab) void tick().then(() => fitSideTerm(activeSideTab));
+    }
+  }
+
+  function switchSideTab(key: string) {
+    activeSideTab = key;
+    const t = sideTabs.find((x) => x.key === key);
+    if (t?.kind === "terminal") {
+      void tick().then(() => {
+        fitSideTerm(key);
+        termViews.get(key)?.term.focus();
+      });
+    }
+  }
+
+  /** OS files dropped onto the panel are copied into the workspace */
+  async function importDroppedFiles(files: FileList | null, targetDir: string | null) {
+    const root = explorerRoot.trim();
+    if (!files || files.length === 0 || !root || !isTauriRuntime()) return;
+    explorerImporting = true;
+    explorerError = null;
+    try {
+      for (const f of Array.from(files)) {
+        if (f.size > 16 * 1024 * 1024) {
+          explorerError = `"${f.name}" is over 16MB — skipped.`;
+          continue;
+        }
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+          bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        }
+        await importWorkFile(root, targetDir ? `${targetDir}/${f.name}` : f.name, btoa(bin));
+      }
+      await loadExplorer();
+    } catch (e: any) {
+      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      explorerImporting = false;
+      explorerDropDir = null;
+    }
+  }
+
+  // refresh the tree when the work root changes under an open panel
+  // (debounced: the workspace input updates per keystroke)
+  $effect(() => {
+    const root = explorerRoot.trim();
+    if (!explorerOpen || root === lastExplorerRoot) return;
+    lastExplorerRoot = root;
+    if (explorerTimer) clearTimeout(explorerTimer);
+    explorerTimer = setTimeout(() => void loadExplorer(), 400);
+  });
+
+  // refresh the tree when an agent turn settles (files may have changed)
+  let wasWorkRunning = false;
+  $effect(() => {
+    if (wasWorkRunning && !workRunning && explorerOpen && !explorerLoading) {
+      void loadExplorer();
+    }
+    wasWorkRunning = workRunning;
+  });
+
   /** work mode: Esc once arms the interrupt, Esc again within 2.5s stops it */
   function onEscape() {
     if (!workRunning && !streaming) return false;
@@ -1723,9 +2313,99 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    const noMod = !e.metaKey && !e.ctrlKey && !e.altKey;
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") caretHopped = false;
+    // @-mention popup navigation (work mode): arrows move, Enter/Tab select,
+    // Esc closes. Plain arrows also hop over completed pills atomically.
+    if (mention) {
+      if (e.key === "ArrowDown" && noMod) {
+        e.preventDefault();
+        popupKeyHandled = true;
+        if (mention.items.length) mention.index = (mention.index + 1) % mention.items.length;
+        return;
+      }
+      if (e.key === "ArrowUp" && noMod) {
+        e.preventDefault();
+        popupKeyHandled = true;
+        if (mention.items.length) mention.index = (mention.index - 1 + mention.items.length) % mention.items.length;
+        return;
+      }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+        const item = mention.items[mention.index];
+        popupKeyHandled = true;
+        if (item) {
+          e.preventDefault();
+          pickMention(item);
+          return;
+        }
+        // no matches: dismiss and fall through to normal handling
+        mention = null;
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        popupKeyHandled = true;
+        mention = null;
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && noMod && !e.shiftKey) {
+      // pills are atomic: arrows hop over a whole mention instead of
+      // landing inside it (the caret rests before or after, never within)
+      const el = composerEl;
+      if (el && el.selectionStart === el.selectionEnd) {
+        const caret = el.selectionStart ?? input.length;
+        const dir = e.key === "ArrowLeft" ? -1 : 1;
+        let target: number | null = null;
+        for (const t of findMentions(input)) {
+          if (dir < 0 && caret === t.end) {
+            target = t.start;
+            break;
+          }
+          if (dir > 0 && caret === t.start) {
+            target = t.end;
+            break;
+          }
+          if (caret > t.start && caret < t.end) {
+            target = dir < 0 ? t.start : t.end;
+            break;
+          }
+        }
+        if (target != null) {
+          e.preventDefault();
+          caretHopped = true;
+          requestAnimationFrame(() => {
+            composerEl?.setSelectionRange(target, target);
+            syncBackdropScroll();
+            refreshMentionMenu();
+          });
+        }
+      }
+    } else if ((e.key === "Backspace" || e.key === "Delete") && noMod) {
+      // mentions delete as a unit: backspace at the end (or delete at the
+      // start) of an @path token removes the whole token at once. Skipped
+      // while the popup is open — that's a live query being typed, where
+      // backspace must eat characters one by one — unless the caret just
+      // arrow-hopped here, which is explicit navigation, not typing.
+      if (mention && !caretHopped) return;
+      const el = composerEl;
+      if (el && el.selectionStart === el.selectionEnd) {
+        const caret = el.selectionStart ?? input.length;
+        const tok = findMentions(input).find((t) =>
+          e.key === "Backspace" ? caret === t.end : caret === t.start
+        );
+        if (tok) {
+          e.preventDefault();
+          input = input.slice(0, tok.start) + input.slice(tok.end);
+          requestAnimationFrame(() => {
+            composerEl?.setSelectionRange(tok.start, tok.start);
+            composerEl?.focus();
+            syncBackdropScroll();
+          });
+        }
+      }
     }
   }
 
@@ -2180,6 +2860,16 @@
   $effect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (expCtx) {
+        closeExpCtx();
+        e.preventDefault();
+        return;
+      }
+      if (newTabMenu) {
+        newTabMenu = false;
+        e.preventDefault();
+        return;
+      }
       if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
       if (!workRunning) return;
       if (onEscape()) e.preventDefault();
@@ -2241,11 +2931,19 @@
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
+      // reopen where the user left off (saved on every navigation); the
+      // draft below then restores their unsent text into the composer
+      const savedActive = await loadActiveChat();
       // collapse previously accumulated empty drafts into one (prefer the
-      // session in the URL so a deep-linked blank draft isn't yanked away)
+      // session in the URL so a deep-linked blank draft isn't yanked away,
+      // else the session being restored)
       const empties = chats.filter((c) => c.messages.length === 0);
       if (empties.length > 1) {
-        const keepId = empties.some((c) => c.id === sessionId) ? sessionId : empties[0].id;
+        const keepId = empties.some((c) => c.id === sessionId)
+          ? sessionId
+          : savedActive && empties.some((c) => c.id === savedActive)
+            ? savedActive
+            : empties[0].id;
         const dropped = chats.filter((c) => c.messages.length === 0 && c.id !== keepId);
         for (const d of dropped) clearDraft(d.id);
         chats = chats.filter((c) => c.messages.length > 0 || c.id === keepId);
@@ -2258,6 +2956,12 @@
         } else {
           void goto("/");
         }
+      } else if (savedActive && chats.some((c) => c.id === savedActive)) {
+        // relaunch where you left off: navigate to the last session and let
+        // the route effect below activate it (setting activeId here directly
+        // would race it — the route still shows home at this point, so it
+        // would read that as an external nav home and wipe the restore)
+        void goto(`/s/${savedActive}`);
       } else {
         // home: no active session
         activeId = null;
@@ -2461,6 +3165,18 @@
   {/if}
 
   <main class="main">
+    {#if composerMode === "work"}
+      <button
+        class="icon-btn explorer-toggle-btn"
+        data-testid="explorer-toggle"
+        aria-label="Toggle file explorer"
+        title="File explorer"
+        aria-pressed={explorerOpen}
+        onclick={toggleExplorer}
+      >
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="12" y1="3" x2="12" y2="17"/></svg>
+      </button>
+    {/if}
     {#snippet forkNote(title: string, sourceId: string, prefix = "Forked from")}
       {@const source = chats.find((c) => c.id === sourceId)}
       <div class="fork-note" data-testid="fork-note">
@@ -2556,7 +3272,7 @@
                   {/each}
                 </div>
               {/if}
-              <div class="bubble user">{m.content}</div>
+              <div class="bubble user">{@html renderMentions(m.content)}</div>
               <div class="actions">
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
                   {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
@@ -2731,15 +3447,78 @@
             {/each}
           </div>
         {/if}
-        <textarea
-          data-testid="message-input"
-          placeholder={composerMode === "work" ? (workRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
-          bind:this={composerEl}
-          bind:value={input}
-          onkeydown={onKey}
-          onpaste={onPaste}
-          rows={1}
-        ></textarea>
+        <div class="composer-field">
+          <div class="composer-backdrop" data-testid="composer-backdrop" aria-hidden="true" bind:this={composerBackdrop}>{@html renderMentions(input)}</div>
+          <textarea
+            data-testid="message-input"
+            placeholder={composerMode === "work" ? (workRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
+            bind:this={composerEl}
+            bind:value={input}
+            onkeydown={onKey}
+            onpaste={onPaste}
+            onscroll={syncBackdropScroll}
+            oninput={() => {
+              caretHopped = false;
+              syncBackdropScroll();
+              refreshMentionMenu();
+            }}
+            onclick={() => {
+              caretHopped = false;
+              snapComposerCaret();
+              refreshMentionMenu();
+            }}
+            onkeyup={(e) => {
+              // keydown may have consumed the popup (select/close/nav) while
+              // the caret is still pre-action: skip that stale refresh
+              if (popupKeyHandled) {
+                popupKeyHandled = false;
+                return;
+              }
+              refreshMentionMenu();
+            }}
+            onblur={() => {
+              // picking a suggestion uses mousedown (no blur); any real
+              // blur means the user clicked away — close the popup
+              mention = null;
+            }}
+            rows={1}
+          ></textarea>
+        </div>
+        {#if mention && mention.items.length}
+          <div class="mention-menu" data-testid="mention-menu" role="listbox" aria-label="Mention a file">
+            {#each mention.items as item, i (item.path)}
+              <button
+                class="mention-item {i === mention.index ? 'sel' : ''}"
+                data-testid="mention-item"
+                role="option"
+                aria-selected={i === mention.index}
+                title={item.path}
+                onmousedown={(e) => {
+                  // before blur: keep focus in the composer
+                  e.preventDefault();
+                  pickMention(item);
+                }}
+                onmousemove={() => {
+                  if (mention && mention.index !== i) mention.index = i;
+                }}
+              >
+                {#if item.is_dir}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                {:else}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                {/if}
+                <span class="mention-path">{item.path}</span>
+                {#if item.size != null}
+                  <span class="exp-size">{formatSize(item.size)}</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+        {:else if mention}
+          <div class="mention-menu" data-testid="mention-menu">
+            <div class="mention-empty">No matching files</div>
+          </div>
+        {/if}
         <div class="composer-bar">
           <div class="spacer"></div>
           <button class="pill-btn" data-testid="attach-btn" aria-label="Attach image" onclick={pickFile}>+</button>
@@ -2797,7 +3576,241 @@
       </div>
     </div>
   </main>
+  {#if composerMode === "work"}
+    <aside
+      class="explorer {expResizing ? 'resizing' : ''}"
+      class:hidden={!explorerOpen}
+      data-testid="explorer"
+      style="width: {explorerWidth}px"
+      ondragover={(e) => e.preventDefault()}
+      ondragleave={() => (explorerDropDir = null)}
+      ondrop={(e) => {
+        e.preventDefault();
+        void importDroppedFiles(e.dataTransfer?.files ?? null, explorerDropDir);
+      }}
+    >
+      <div
+        class="exp-resize"
+        data-testid="explorer-resize"
+        role="slider"
+        aria-orientation="vertical"
+        aria-label="Resize side panel"
+        aria-valuenow={explorerWidth}
+        aria-valuemin={EXPLORER_MIN_W}
+        aria-valuemax={560}
+        tabindex="0"
+        title="Drag to resize · double-click to reset"
+        onpointerdown={onExpResizeStart}
+        ondblclick={() => (explorerWidth = EXPLORER_DEFAULT_W)}
+        onkeydown={onExpResizeKey}
+      ></div>
+      <div class="side-tabs" data-testid="side-tabs" role="tablist" aria-label="Side panel tabs">
+        {#each sideTabs as t (t.key)}
+          <div
+            class="side-tab {t.key === activeSideTab ? 'sel' : ''}"
+            data-testid="side-tab"
+            role="tab"
+            aria-selected={t.key === activeSideTab}
+            tabindex="0"
+            title={explorerRoot.trim() || t.title}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                switchSideTab(t.key);
+              } else if (e.key === "Delete" || e.key === "Backspace") {
+                e.preventDefault();
+                closeSideTab(t.key);
+              }
+            }}
+            onmousedown={(e) => {
+              // middle-click must not autoscroll; auxclick below closes
+              if (e.button === 1) e.preventDefault();
+            }}
+            onauxclick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                closeSideTab(t.key);
+              }
+            }}
+          >
+            <button
+              class="side-tab-label"
+              aria-label={t.kind === "files" ? "Files tab" : `${t.title} tab`}
+              onclick={() => switchSideTab(t.key)}
+            >
+              {#if t.kind === "files"}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              {:else}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+              {/if}
+              <span class="side-tab-title">{t.title}</span>
+            </button>
+            <button
+              class="side-tab-x"
+              data-testid="side-tab-close"
+              aria-label="Close {t.title} tab"
+              title="Close tab"
+              onclick={(e) => {
+                e.stopPropagation();
+                closeSideTab(t.key);
+              }}
+            >×</button>
+          </div>
+        {/each}
+        <button
+          class="icon-btn side-add"
+          data-testid="side-add"
+          aria-label="New panel tab"
+          title="New tab: Explorer or Terminal"
+          onclick={() => (newTabMenu = !newTabMenu)}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <div class="spacer"></div>
+        <button
+          class="icon-btn exp-btn"
+          data-testid="explorer-close"
+          aria-label="Close side panel"
+          title="Close panel"
+          onclick={() => (explorerOpen = false)}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+        {#if newTabMenu}
+          <button
+            class="ctx-backdrop"
+            data-testid="new-tab-backdrop"
+            aria-label="Close new tab menu"
+            onclick={() => (newTabMenu = false)}
+            tabindex="-1"
+          ></button>
+          <div class="ctx-menu new-tab-menu" data-testid="new-tab-menu">
+            <button class="ctx-item" data-testid="new-tab-explorer" onclick={openSideExplorer}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span>Explorer</span>
+            </button>
+            <button class="ctx-item" data-testid="new-tab-terminal" onclick={() => void openSideTerminal()}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+              <span>Terminal</span>
+            </button>
+          </div>
+        {/if}
+      </div>
+      {#if sideTabs.length === 0}
+        <div class="exp-empty">No tabs open — press + to add an Explorer or Terminal.</div>
+      {/if}
+      {#each sideTabs as t (t.key)}
+        <div class="side-view" class:hidden={t.key !== activeSideTab}>
+          {#if t.kind === "files"}
+            <div class="explorer-search">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              <input
+                class="explorer-search-input"
+                data-testid="explorer-search"
+                placeholder="Search files"
+                bind:value={explorerQuery}
+                spellcheck={false}
+              />
+              <button
+                class="icon-btn exp-btn"
+                data-testid="explorer-refresh"
+                aria-label="Refresh files"
+                title="Refresh"
+                disabled={explorerLoading}
+                onclick={() => void loadExplorer()}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+              </button>
+            </div>
+      <div class="explorer-list" data-testid="explorer-list">
+        {#if explorerLoading}
+          <div class="exp-empty">Loading…</div>
+        {:else if explorerError}
+          <div class="exp-empty">{explorerError}</div>
+        {:else if explorerVisible.length === 0}
+          <div class="exp-empty">{explorerQuery.trim() ? "No matching files." : "Empty folder."}</div>
+        {:else}
+          {#each explorerVisible as e (e.path)}
+            {#if e.is_dir}
+              {@const collapsed = collapsedDirs.includes(e.path)}
+              <button
+                class="exp-row exp-dir {explorerDropDir === e.path ? 'drop' : ''}"
+                style="padding-left: {10 + e.depth * 14}px"
+                data-testid="explorer-dir"
+                title={e.path}
+                onclick={() => toggleExplorerDir(e.path)}
+                oncontextmenu={(ev) => openExpCtx(ev, e.path, true)}
+                ondragover={(ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  explorerDropDir = e.path;
+                }}
+              >
+                <span class="exp-chev">{collapsed ? "▸" : "▾"}</span>
+                <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                <span class="exp-name">{e.name}</span>
+              </button>
+            {:else}
+              <button
+                class="exp-row exp-file"
+                style="padding-left: {10 + e.depth * 14}px"
+                data-testid="explorer-file"
+                title={e.path}
+                onclick={() => insertExplorerPath(e.path)}
+                oncontextmenu={(ev) => openExpCtx(ev, e.path, false)}
+              >
+                <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                <span class="exp-name">{e.name}</span>
+                {#if e.size != null}
+                  <span class="exp-size">{formatSize(e.size)}</span>
+                {/if}
+              </button>
+            {/if}
+          {/each}
+        {/if}
+      </div>
+      {#if explorerImporting}
+        <div class="explorer-foot" data-testid="explorer-importing">Importing files…</div>
+      {:else}
+        <div class="explorer-foot">Drop files here to import · click a file to @-mention it</div>
+      {/if}
+          {:else}
+            {#if t.error}
+              <div class="exp-empty">{t.error}</div>
+            {:else}
+              <div class="term-wrap" data-term={t.key} data-testid="terminal-view"></div>
+            {/if}
+          {/if}
+        </div>
+      {/each}
+    </aside>
+  {/if}
 </div>
+{#if expCtx}
+  <button
+    class="ctx-backdrop"
+    data-testid="explorer-menu-backdrop"
+    aria-label="Close file menu"
+    onclick={closeExpCtx}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      closeExpCtx();
+    }}
+    tabindex="-1"
+  ></button>
+  <div
+    class="ctx-menu"
+    data-testid="explorer-menu"
+    style="left: {expCtx.x}px; top: {expCtx.y}px;"
+  >
+    <button class="ctx-item" data-testid="explorer-open" onclick={() => void expOpenFile()}>Open</button>
+    <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
+    {#if !expCtx.isDir}
+      <button class="ctx-item" data-testid="explorer-copy-mention" onclick={expCopyMention}>Copy mention</button>
+      <button class="ctx-item" data-testid="explorer-add-chat" onclick={expAddToChat}>Add to chat</button>
+    {/if}
+  </div>
+{/if}
 {#if lightboxSrc}
   <button
     class="lightbox-backdrop"
@@ -3237,7 +4250,11 @@
     --pink: #f472b6;
   }
   :global(html, body) { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }
-  .app { display: flex; height: 100vh; background: var(--bg); }
+  .app { display: flex; height: 100vh; background: var(--bg); -webkit-user-select: none; user-select: none; }
+  /* native-app feel: chrome text isn't selectable; message content, code,
+     thinking, and every editable field opt back in below */
+  .answer, .bubble.user, .thinking-body { -webkit-user-select: text; user-select: text; }
+  textarea, input { -webkit-user-select: text; user-select: text; }
   .sidebar { width: 264px; min-width: 264px; padding: 10px 10px 20px 10px; display: flex; flex-direction: column; }
   .topbar { display: flex; align-items: center; justify-content: flex-end; padding: 2px 4px 12px 4px; }
   .icon-btn { background: transparent; border: none; cursor: pointer; color: var(--icon); padding: 4px; border-radius: 6px; }
@@ -3326,7 +4343,7 @@
   .user-row .col { align-items: flex-end; }
   .asst-row .col { align-items: stretch; flex: 1; min-width: 0; }
   .bubble.asst { width: 100%; box-sizing: border-box; min-width: 0; }
-  .actions { display: flex; gap: 2px; margin-top: 6px; align-items: center; }
+  .actions { display: flex; gap: 2px; margin-top: 6px; align-items: center; -webkit-user-select: none; user-select: none; }
   .model-tag { font-size: 12px; color: var(--muted-2); margin-left: 6px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   .fork-note { display: flex; justify-content: center; align-items: baseline; gap: 4px; font-size: 13px; color: var(--muted-2); margin: 4px 0 8px 0; }
   .fork-link { background: transparent; border: none; cursor: pointer; font: inherit; font-size: 13px; color: var(--link); padding: 0; text-decoration: underline; text-underline-offset: 2px; }
@@ -3398,7 +4415,18 @@
   .scroll-jump { position: absolute; top: -44px; left: 50%; transform: translateX(-50%); width: 44px; height: 36px; background: var(--card); border: 1px solid var(--border-3); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: pointer; font-size: 17px; line-height: 1; color: var(--text); z-index: 5; }
   .scroll-jump:hover { background: var(--composer); }
   .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
-  .composer textarea { width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; }
+  .composer textarea { position: relative; z-index: 1; width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: transparent; caret-color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; padding: 0; margin: 0; display: block; }
+  .composer-field { position: relative; }
+  .composer-backdrop { position: absolute; inset: 0; overflow: hidden; pointer-events: none; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; tab-size: 8; font-size: 15px; font-family: inherit; color: var(--text); padding: 0; }
+  /* global: injected by renderMentions() into {@html} regions, so runtime
+     HTML carries no svelte scoping class. Two variants: the composer backdrop
+     pill must add ZERO width (no icon, no padding delta, same font size) or
+     the drawn caret would drift from the real one; sent bubbles get the
+     full icon badge. */
+  .composer-backdrop :global(.mention-pill) { background: var(--accent); color: var(--accent-fg); border-radius: 6px; padding: 0 3px; margin: 0 -3px; }
+  .composer-backdrop :global(.mention-pill svg) { display: none; }
+  :global(.bubble.user .mention-pill) { background: var(--accent); color: var(--accent-fg); border-radius: 999px; padding: 1px 9px 2px 7px; font-size: .92em; overflow-wrap: anywhere; }
+  :global(.bubble.user .mention-pill svg) { vertical-align: -1.5px; margin-right: 4px; }
   .image-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
   .image-chip { position: relative; width: 64px; height: 64px; border-radius: 14px; overflow: hidden; background: var(--card); flex: none; }
   .image-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -3410,6 +4438,13 @@
   .lightbox-backdrop { position: fixed; inset: 0; z-index: 60; border: none; padding: 24px; box-sizing: border-box; background: rgba(0, 0, 0, 0.85); cursor: zoom-out; display: flex; align-items: center; justify-content: center; }
   .lightbox-backdrop img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; }
   .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-end; }
+  .mention-menu { position: absolute; bottom: calc(100% + 6px); left: 24px; width: min(420px, calc(100% - 48px)); z-index: 30; background: var(--card); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; max-height: 264px; overflow-y: auto; }
+  .mention-item { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; border: none; background: transparent; font: inherit; font-size: 13px; color: var(--text); padding: 7px 10px; border-radius: 10px; cursor: pointer; text-align: left; min-width: 0; }
+  .mention-item:hover { background: var(--hover-3); }
+  .mention-item.sel { background: var(--hover-3); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .mention-item svg { flex-shrink: 0; color: var(--muted-2); }
+  .mention-path { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .mention-empty { padding: 8px 12px; font-size: 13px; color: var(--muted); }
   .spacer { flex: 1; }
   .pill-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--card); cursor: pointer; font-size: 18px; color: var(--icon-dim); display: flex; align-items: center; justify-content: center; }
   .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
@@ -3509,12 +4544,50 @@
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 10px 24px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 10px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }
   .work-composer-bar .workspace-input { flex: 1; min-width: 0; }
+  .explorer-toggle-btn { position: absolute; top: 10px; right: 12px; z-index: 7; background: var(--bg); }
+  .explorer-toggle-btn[aria-pressed="true"] { color: var(--accent); }
+  .explorer { width: 300px; flex: 0 0 auto; border-left: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
+  .explorer.hidden { display: none; }
+  .explorer.resizing { user-select: none; }
+  .exp-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; cursor: ew-resize; z-index: 5; touch-action: none; }
+  .exp-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: transparent; transition: background .15s; }
+  .exp-resize:hover::after, .explorer.resizing .exp-resize::after { background: var(--accent); }
+  .exp-resize:focus-visible { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+  .exp-btn { width: 26px; height: 26px; }
+  .side-tabs { position: relative; display: flex; align-items: center; gap: 4px; padding: 10px 8px 8px 10px; border-bottom: 1px solid var(--border); }
+  .side-tab { display: flex; align-items: center; gap: 2px; min-width: 0; max-width: 150px; border: none; background: transparent; border-radius: 9px; padding: 3px 3px 3px 8px; cursor: pointer; color: var(--muted-2); }
+  .side-tab:hover { background: var(--hover-3); }
+  .side-tab.sel { background: var(--hover-3); color: var(--text); }
+  .side-tab-label { display: flex; align-items: center; gap: 6px; min-width: 0; border: none; background: transparent; color: inherit; font: inherit; font-size: 13px; padding: 2px 0; cursor: pointer; }
+  .side-tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .side-tab-x { flex-shrink: 0; border: none; background: transparent; color: var(--faint); font-size: 14px; line-height: 1; width: 20px; height: 20px; border-radius: 6px; cursor: pointer; padding: 0; }
+  .side-tab-x:hover { background: var(--hover); color: var(--text); }
+  .side-add { width: 26px; height: 26px; flex-shrink: 0; }
+  .new-tab-menu { position: absolute; left: 8px; top: calc(100% - 2px); z-index: 42; min-width: 160px; }
+  .new-tab-menu .ctx-item { display: flex; align-items: center; gap: 9px; }
+  .side-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .side-view.hidden { display: none; }
+  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; }
+  .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }
+  .explorer-search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 0; }
+  .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }
+  .exp-row { display: flex; align-items: center; gap: 7px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding-top: 5px; padding-bottom: 5px; padding-right: 8px; border-radius: 8px; cursor: pointer; text-align: left; min-width: 0; }
+  .exp-row:hover { background: var(--hover-3); }
+  .exp-row.drop { background: var(--hover-3); outline: 1.5px dashed var(--accent); }
+  .exp-chev { flex-shrink: 0; width: 12px; font-size: 10px; color: var(--muted); }
+  .exp-icon { flex-shrink: 0; color: var(--muted-2); }
+  .exp-dir .exp-icon { color: var(--accent); }
+  .exp-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .exp-file .exp-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .exp-size { flex-shrink: 0; font-size: 11px; color: var(--faint); }
+  .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
+  .explorer-foot { padding: 8px 12px 12px 12px; font-size: 11.5px; color: var(--faint); border-top: 1px solid var(--border); }
 
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
@@ -3525,6 +4598,7 @@
     .model-drop { width: 300px; max-width: calc(100vw - 48px); }
   .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
+    .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
     .confirm-card { width: calc(100vw - 32px); }
   }
 </style>
