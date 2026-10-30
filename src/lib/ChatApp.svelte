@@ -1939,6 +1939,16 @@
       .replace(/>/g, "&gt;");
   }
 
+  function escapeHtmlAttr(s: string): string {
+    return escapeHtmlText(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  /** join an upload dir and a relative file name with the dir's separator */
+  function joinUploadPath(dir: string, name: string): string {
+    const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+    return dir.replace(/[\\/]+$/, "") + sep + name;
+  }
+
   interface MentionToken {
     start: number;
     end: number;
@@ -1976,8 +1986,6 @@
    *  boundaries match the raw text). Padding/margin cancel so the composer
    *  backdrop aligns exactly with the transparent textarea text. */
   function renderMentions(text: string): string {
-    const folderIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
-    const fileIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
     const esc = escapeHtmlText(text);
     const toks = findMentions(esc);
     if (!toks.length) return esc;
@@ -1991,34 +1999,53 @@
     return out + esc.slice(last);
   }
 
-  /** user bubbles: @-mentions become pills, and a trailing attached-files
-   *  note collapses to file pills (raw text keeps the full note so the
-   *  agent still sees paths + tool instructions in history) */
+  /** user bubbles: @-mentions become pills, and attached-files notes collapse
+   *  to a clickable file list at the top of the bubble (raw text keeps the
+   *  full note so the agent still sees paths + tool instructions in history) */
   function renderUserMessage(text: string): string {
-    const re = /\[Attached files saved to [^\]]*? \(use the read_upload tool[^)]*\):\r?\n((?:[ \t]*-[ \t]+[^\r\n]*\r?\n?)+)\]/g;
-    let out = "";
-    let last = 0;
-    let m: RegExpExecArray | null;
-    let matched = false;
-    while ((m = re.exec(text)) !== null) {
-      matched = true;
-      out += renderMentions(text.slice(last, m.index).replace(/\s+$/, ""));
-      const names = [...m[1].matchAll(/^[ \t]*-[ \t]*(.+?)[ \t]*$/gm)]
-        .map((x) => x[1])
-        .filter((n) => n.length > 0);
-      if (!names.length) {
-        out += renderMentions(text.slice(m.index, m.index + m[0].length));
-      } else {
-        if (out) out += " ";
-        out += names
-          .map((n) => `<span class="mention-pill">${mentionFileIcon}<span>${escapeHtmlText(n)}</span></span>`)
-          .join(" ");
+    const re = /\[Attached files saved to ([^\]]*?) \(use the read_upload tool[^)]*\):\r?\n((?:[ \t]*-[ \t]+[^\r\n]*\r?\n?)+)\]/g;
+    const files: { name: string; path: string }[] = [];
+    const body = text.replace(re, (_full, dir: string, list: string) => {
+      for (const x of list.matchAll(/^[ \t]*-[ \t]*(.+?)[ \t]*$/gm)) {
+        const name = x[1];
+        if (name) files.push({ name, path: joinUploadPath(dir, name) });
       }
-      last = m.index + m[0].length;
-    }
-    if (!matched) return renderMentions(text);
-    return out + renderMentions(text.slice(last));
+      return "";
+    });
+    if (!files.length) return renderMentions(text);
+    const pills = files
+      .map(
+        (f) =>
+          `<button type="button" class="mention-pill file-pill" data-reveal-path="${escapeHtmlAttr(f.path)}" title="Reveal in Finder">${mentionFileIcon}<span>${escapeHtmlText(f.name)}</span></button>`
+      )
+      .join("");
+    const rest = renderMentions(body.replace(/^\s+/, "").replace(/\s+$/, ""));
+    return `<div class="bubble-files">${pills}</div>${rest}`;
   }
+
+  /** click a file pill in a user bubble → reveal it in Finder/Explorer */
+  async function onMessageClick(e: MouseEvent) {
+    const el = (e.target as HTMLElement | null)?.closest?.("[data-reveal-path]") as HTMLElement | null;
+    if (!el || !isTauriRuntime()) return;
+    const path = el.getAttribute("data-reveal-path");
+    if (!path) return;
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(path);
+    } catch (err: any) {
+      error = typeof err === "string" ? err : (err?.message ?? String(err));
+    }
+  }
+
+  // delegated (the pills are injected via {@html}); attached natively so the
+  // log container stays a plain non-interactive element
+  $effect(() => {
+    const el = messagesEl;
+    if (!el) return;
+    const handler = (e: MouseEvent) => void onMessageClick(e);
+    el.addEventListener("click", handler);
+    return () => el.removeEventListener("click", handler);
+  });
   /** snap a collapsed caret out of a mention interior (arrows/clicks treat
    *  pills atomically: the caret rests before or after, never inside) */
   function snapCaretOut(caret: number, dir: -1 | 0 | 1): number {
@@ -4703,6 +4730,11 @@
   .composer-backdrop :global(.mention-pill svg) { display: none; }
   :global(.bubble.user .mention-pill) { background: var(--accent); color: var(--accent-fg); border-radius: 999px; padding: 1px 9px 2px 7px; font-size: .92em; overflow-wrap: anywhere; }
   :global(.bubble.user .mention-pill svg) { vertical-align: -1.5px; margin-right: 4px; }
+  :global(.bubble.user .bubble-files) { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px; }
+  :global(.bubble.user .bubble-files:last-child) { margin-bottom: 0; }
+  :global(.bubble.user .file-pill) { border: 0; font-family: inherit; font-weight: inherit; line-height: inherit; text-align: left; cursor: pointer; }
+  :global(.bubble.user .file-pill:hover) { background: color-mix(in srgb, var(--accent-fg) 15%, var(--accent)); }
+  :global(.bubble.user .file-pill:focus-visible) { outline: 2px solid var(--accent-fg); outline-offset: 1px; }
   .image-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
   .image-chip { position: relative; width: 64px; height: 64px; border-radius: 14px; overflow: hidden; background: var(--card); flex: none; }
   .image-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
