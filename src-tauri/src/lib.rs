@@ -672,11 +672,27 @@ fn work_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, St
     Ok(cur)
 }
 
+/// Strip Rust's verbatim-path prefix for display + session storage.
+/// `canonicalize()` on Windows returns extended-length paths (`\\?\C:\...`
+/// or `\\?\UNC\server\...`); users should see `C:\...` / `\\server\...`.
+/// Non-Windows paths pass through untouched.
+fn work_display_string(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Validate a workspace path: must exist and be a directory. Returns the
-/// canonical absolute path for display + session storage.
+/// canonical absolute path for display + session storage (verbatim prefix
+/// stripped on Windows so the UI never shows `\\?\C:\...`).
 #[tauri::command]
 async fn work_validate_root(path: String) -> Result<String, String> {
-    Ok(work_canonical_root(path.trim())?.to_string_lossy().to_string())
+    Ok(work_display_string(&work_canonical_root(path.trim())?))
 }
 
 #[derive(Debug, Clone, Serialize)]

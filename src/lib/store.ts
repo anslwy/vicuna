@@ -578,10 +578,22 @@ export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "
 export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "/" };
 const LS_PREFS = "vicuna-prefs";
 
+/** Normalize a stored workspace for the current platform: strip Rust's
+ *  Windows verbatim prefix (`\\?\...`) left by older builds, and map the
+ *  Unix fresh-install default ("/") to unset on Windows, where it is not
+ *  an absolute path and validation would reject it. */
+export function normalizeStoredWorkspace(ws: string): string {
+  let out = ws;
+  if (out.startsWith("\\\\?\\UNC\\")) out = "\\" + out.slice("\\\\?\\UNC\\".length);
+  else if (out.startsWith("\\\\?\\")) out = out.slice("\\\\?\\".length);
+  if (out === "/" && typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "")) out = "";
+  return out;
+}
+
 export function readLocalPrefs(): Prefs {
   try {
     const raw = lsGet(LS_PREFS, LEGACY_LS_PREFS);
-    if (!raw) return { ...DEFAULT_PREFS };
+    if (!raw) return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
     const p = JSON.parse(raw) as Partial<Prefs>;
     return {
       theme: p.theme === "dark" ? "dark" : "light",
@@ -591,10 +603,10 @@ export function readLocalPrefs(): Prefs {
       stopWords: Array.isArray(p.stopWords) ? p.stopWords.filter((s): s is string => typeof s === "string") : [...DEFAULT_STOP_WORDS],
       ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
       zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom,
-      defaultWorkspace: typeof p.defaultWorkspace === "string" ? p.defaultWorkspace : DEFAULT_PREFS.defaultWorkspace
+      defaultWorkspace: typeof p.defaultWorkspace === "string" ? normalizeStoredWorkspace(p.defaultWorkspace) : normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace)
     };
   } catch {
-    return { ...DEFAULT_PREFS };
+    return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
   }
 }
 
@@ -626,7 +638,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
       const n = Number(r.value);
       if (n >= 0.5 && n <= 3) out.zoom = n;
     }
-    if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = r.value;
+    if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = normalizeStoredWorkspace(r.value);
   }
   return out;
 }
