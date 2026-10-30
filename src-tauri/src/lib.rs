@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
 
 const OLLAMA_BASE: &str = "http://localhost:11434";
 
@@ -1573,6 +1575,125 @@ async fn zoom_step(
     zoom_apply(window, state, next).await
 }
 
+/// Whether a window close is a real quit (tray / Settings) or just a hide.
+/// Closing the main window hides to the tray so streams keep running;
+/// only an explicit Quit sets this and lets the app (and everything it
+/// started) exit.
+#[derive(Default)]
+struct AppQuitState {
+    allow: Mutex<bool>,
+}
+
+/// Kill everything Vicuna started: a self-launched `ollama serve` plus all
+/// terminal ptys. Best-effort — never fails the quit path.
+fn shutdown_children(app: &AppHandle) {
+    if let Some(s) = app.try_state::<OllamaServerState>() {
+        if let Ok(mut g) = s.child.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    if let Some(s) = app.try_state::<TermState>() {
+        if let Ok(mut terms) = s.terms.lock() {
+            for (_, h) in terms.drain() {
+                if let Some(pid) = h.pid {
+                    kill_pid(pid);
+                }
+            }
+        }
+    }
+}
+
+fn allow_quit(app: &AppHandle) {
+    if let Some(s) = app.try_state::<AppQuitState>() {
+        if let Ok(mut g) = s.allow.lock() {
+            *g = true;
+        }
+    }
+}
+
+/// Explicit quit (tray menu / Settings button): kill everything Vicuna
+/// started, then exit. Window-close hides to the tray instead (see
+/// `on_window_event` below) so background streams survive.
+#[tauri::command]
+async fn quit_app(
+    app: AppHandle,
+    _ollama: State<'_, OllamaServerState>,
+    _terms: State<'_, TermState>,
+) -> Result<(), String> {
+    allow_quit(&app);
+    shutdown_children(&app);
+    app.exit(0);
+    Ok(())
+}
+
+/// Build the tray menu: a disabled live-session status line ("No running
+/// sessions" / "N running work session(s)"), a separator, Show / Quit —
+/// plus, while sessions run, a second separator and a disabled elapsed line
+/// ("32m 25s") under Quit. Rebuilt on every frontend report.
+fn tray_menu<R: Runtime>(
+    manager: &impl Manager<R>,
+    status: &str,
+    elapsed: Option<&str>,
+) -> tauri::Result<Menu<R>> {
+    let status_item = MenuItem::with_id(manager, "status", status, false, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(manager)?;
+    let show = MenuItem::with_id(manager, "show", "Show Vicuna", true, None::<&str>)?;
+    let quit = MenuItem::with_id(manager, "quit", "Quit Vicuna", true, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(manager)?;
+    let elapsed_item = match elapsed {
+        Some(e) => Some(MenuItem::with_id(manager, "elapsed", e, false, None::<&str>)?),
+        None => None,
+    };
+    let mut items: Vec<&dyn IsMenuItem<R>> = vec![
+        &status_item as &dyn IsMenuItem<R>,
+        &sep as &dyn IsMenuItem<R>,
+        &show as &dyn IsMenuItem<R>,
+        &quit as &dyn IsMenuItem<R>,
+    ];
+    if let Some(ref e) = elapsed_item {
+        items.push(&sep2 as &dyn IsMenuItem<R>);
+        items.push(e as &dyn IsMenuItem<R>);
+    }
+    Menu::with_items(manager, &items)
+}
+
+/// Refresh the tray menu (no-op when the tray is unavailable).
+fn refresh_tray_menu(app: &AppHandle, status: &str, elapsed: Option<&str>) -> Result<(), String> {
+    if let Some(tray) = app.tray_by_id("main") {
+        let menu =
+            tray_menu(app, status, elapsed).map_err(|e| format!("tray menu failed: {e}"))?;
+        tray.set_menu(Some(menu))
+            .map_err(|e| format!("tray menu failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Update the tray menu: status line plus, while sessions run, an elapsed
+/// line under Quit. The frontend owns streaming state, so it reports both
+/// whenever relevant. Best-effort: never fails a turn.
+#[tauri::command]
+async fn tray_set_status(
+    app: AppHandle,
+    status: String,
+    elapsed: Option<String>,
+) -> Result<(), String> {
+    let short: String = status.trim().chars().take(80).collect();
+    let elapsed: Option<String> = elapsed
+        .map(|e| e.trim().chars().take(20).collect::<String>())
+        .filter(|e| !e.is_empty());
+    refresh_tray_menu(
+        &app,
+        if short.is_empty() {
+            "No running sessions"
+        } else {
+            &short
+        },
+        elapsed.as_deref(),
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1582,6 +1703,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(OllamaServerState::default())
         .manage(TermState::default())
+        .manage(AppQuitState::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),
         })
@@ -1615,10 +1737,65 @@ pub fn run() {
             term_resize,
             term_kill,
             zoom_apply,
-            zoom_step
+            zoom_step,
+            quit_app,
+            tray_set_status
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            // System tray: closing the window hides here (streams keep
+            // running); only Quit exits. The menu opens on either click;
+            // Show reopens the window.
+            let menu = tray_menu(app, "No running sessions", None)?;
+            if let Some(icon) = app.default_window_icon().cloned() {
+                TrayIconBuilder::with_id("main")
+                    .icon(icon)
+                    .tooltip("Vicuna")
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            allow_quit(app);
+                            shutdown_children(app);
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Hide to the tray instead of quitting so the backend (streams,
+            // terminals, self-started ollama) survives a window close.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let allow = window
+                    .app_handle()
+                    .try_state::<AppQuitState>()
+                    .and_then(|s| s.allow.lock().ok().map(|g| *g))
+                    .unwrap_or(false);
+                if !allow {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // macOS dock click with the window hidden: reopen it.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

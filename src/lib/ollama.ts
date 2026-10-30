@@ -119,6 +119,32 @@ export async function stopServer(): Promise<void> {
   const { invoke } = await tauri();
   await invoke("ollama_stop_server");
 }
+
+/**
+ * Update the tray menu ("No running sessions" / "N running work session(s)",
+ * plus an elapsed line under Quit while sessions run). Best-effort: never
+ * fails a turn.
+ */
+export async function setTrayStatus(label: string, elapsed: string | null): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await tauri();
+    await invoke("tray_set_status", { status: label, elapsed });
+  } catch {
+    // tray is best-effort (e.g. Linux without a tray host)
+  }
+}
+
+/**
+ * Quit Vicuna from the UI (Settings → Quit). The window close button only
+ * hides to the tray — this is the real exit: the backend kills everything
+ * it started (self-launched ollama, terminals) and terminates.
+ */
+export async function quitApp(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { invoke } = await tauri();
+  await invoke("quit_app");
+}
 /** Load a model into memory (or extend its residency). Generates a single
  *  throwaway token; uses the same context size as chat so follow-up chats
  *  don't trigger a reload. */

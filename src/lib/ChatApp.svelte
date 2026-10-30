@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
@@ -165,10 +165,23 @@
   let modelOpen = $state(false);
   let modelQuery = $state("");
   let streaming = $state(false);
+  /** session id of the live chat-completion stream (null when idle). Together
+   *  with workRunning/workChatId this drives the sidebar shimmer so a
+   *  streaming session stays visible even when it isn't the open one. */
+  let streamingChatId = $state<string | null>(null);
+  /** wall-clock start of the live chat stream (null when idle): sidebar hover
+   *  shows elapsed time since the query started */
+  let streamingStartAt = $state<number | null>(null);
   /** true for the whole Work turn, including tool dispatch + the wait for the
    *  next round's first token — `streaming` only covers a single request */
   let workRunning = $state(false);
   let workChatId = $state<string | null>(null);
+  /** wall-clock start of the live Work turn (null when idle): sidebar hover
+   *  shows elapsed time since the task started */
+  let workStartAt = $state<number | null>(null);
+  /** ticking clock for live elapsed labels: advances once a second while a
+   *  turn is live so sidebar hover tooltips stay current */
+  let now = $state(Date.now());
   let workStop = false;
   let workTurnSeq = 0;
   /** prompts typed while a work turn is live: they join the context at the
@@ -250,6 +263,93 @@
   const queuedForActive = $derived(queuedMsgs.filter((q) => q.chatId === activeId));
   /** a turn is live: either a single request or a whole Work agent turn */
   const busy = $derived(streaming || workRunning);
+  /** sidebar shimmer: a session with a live chat stream or work turn */
+  function isSessionStreaming(id: string): boolean {
+    return (streaming && streamingChatId === id) || (workRunning && workChatId === id);
+  }
+  // live elapsed ("32m 25s", "1h 32m", "3d 2h") since the task/query started
+  function formatLiveElapsed(ms: number): string {
+    const totalS = Math.max(0, Math.floor(ms / 1000));
+    const s = totalS % 60;
+    const totalM = Math.floor(totalS / 60);
+    const m = totalM % 60;
+    const totalH = Math.floor(totalM / 60);
+    const h = totalH % 24;
+    const d = Math.floor(totalH / 24);
+    if (d > 0) return `${d}d ${h}h`;
+    if (totalH > 0) return `${totalH}h ${m}m`;
+    if (totalM > 0) return `${totalM}m ${s}s`;
+    return `${s}s`;
+  }
+  /** elapsed ms for a live session (work turn start wins between rounds);
+   *  null when the session isn't live. Reads `now` so hover tooltips tick. */
+  function liveElapsedMs(id: string): number | null {
+    if (workRunning && workChatId === id && workStartAt != null) return now - workStartAt;
+    if (streaming && streamingChatId === id && streamingStartAt != null) return now - streamingStartAt;
+    return null;
+  }
+  /** sidebar hover tooltip for a live session ("Working · 32m 25s") */
+  function liveTitle(id: string): string | undefined {
+    const ms = liveElapsedMs(id);
+    if (ms == null) return undefined;
+    const kind = workRunning && workChatId === id ? "Working" : "Streaming";
+    return `${kind} · ${formatLiveElapsed(ms)}`;
+  }
+  // advance the live clock while a turn runs so elapsed tooltips stay current
+  $effect(() => {
+    if (!streaming && !workRunning) return;
+    const t = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(t);
+  });
+  // keep the tray menu in sync with live sessions (desktop only; best-effort
+  // — a tray failure must never break a turn). Status line up top, elapsed
+  // line under Quit. Reports are throttled: idle/starting transitions send
+  // immediately, but running→running updates go out at most once per 60s —
+  // rebuilding the menu more often flashes an open menu (round boundaries
+  // alone can fire every few seconds on fast turns).
+  let lastTrayKey: string | null = null;
+  let lastTrayRunning = false;
+  let lastTraySentAt = 0;
+  $effect(() => {
+    if (!isTauriRuntime()) return;
+    // minute-bucket tick so long static turns still refresh, without per-second churn
+    const minuteBucket = Math.floor(now / 60000);
+    void minuteBucket;
+    const starts: number[] = [];
+    const ids = new Set<string>();
+    if (streaming && streamingChatId) {
+      ids.add(streamingChatId);
+      if (streamingStartAt != null) starts.push(streamingStartAt);
+    }
+    if (workRunning && workChatId) {
+      ids.add(workChatId);
+      if (workStartAt != null) starts.push(workStartAt);
+    }
+    const n = ids.size;
+    const at = Date.now();
+    const oldest = starts.length ? Math.min(...starts) : null;
+    const running = n > 0;
+    const status = !running
+      ? "No running sessions"
+      : `${n} running work session${n === 1 ? "" : "s"}`;
+    const elapsed = !running ? null : formatLiveElapsed(at - (oldest ?? at));
+    const key = `${status}\n${elapsed ?? ""}`;
+    if (key === lastTrayKey) return;
+    if (running && lastTrayRunning && at - lastTraySentAt < 60000) return;
+    lastTrayKey = key;
+    lastTrayRunning = running;
+    lastTraySentAt = at;
+    void setTrayStatus(status, elapsed);
+  });
+  async function quitVicuna() {
+    try {
+      await quitApp();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+    }
+  }
   /** workspace the explorer panel shows: the thread's, else the pending one */
   const explorerRoot = $derived(
     activeChat && activeChat.messages.length > 0 && (activeChat.mode ?? "chat") === "work"
@@ -343,6 +443,8 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
+    streamingChatId = null;
+    streamingStartAt = null;
     // the composer box is global: New never touches the textbox.
     // No placeholder session is created: the sidebar stays unchanged and
     // the session only appears once the first message is sent (send()
@@ -364,6 +466,8 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
+    streamingChatId = null;
+    streamingStartAt = null;
     editingIndex = null;
     editDraft = "";
     copiedKey = null;
@@ -401,6 +505,8 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
+    streamingChatId = null;
+    streamingStartAt = null;
     editingIndex = null;
     editDraft = "";
     copiedKey = null;
@@ -422,6 +528,15 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
+    if (streamingChatId === id) {
+      streamingChatId = null;
+      streamingStartAt = null;
+    }
+    if (workChatId === id) {
+      workChatId = null;
+      workRunning = false;
+      workStartAt = null;
+    }
     ctxMenu = null;
     pendingDeleteId = null;
     const remaining = chats.filter((c) => c.id !== id);
@@ -1486,6 +1601,8 @@
 
   async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
     streaming = true;
+    streamingChatId = chat.id;
+    streamingStartAt = Date.now();
     const ctrl = new AbortController();
     aborter = ctrl;
     let produced = false;
@@ -1598,6 +1715,10 @@
       }
     } finally {
       streaming = false;
+      if (streamingChatId === chat.id) {
+        streamingChatId = null;
+        streamingStartAt = null;
+      }
       aborter = null;
       clearStall();
       dropStallHint();
@@ -2747,6 +2868,7 @@
     const turnId = ++workTurnSeq;
     workRunning = true;
     workChatId = chat.id;
+    workStartAt = Date.now();
     workStop = false;
     let curIndex = index;
     let firstRound = true;
@@ -2982,6 +3104,7 @@
     if (turnId === workTurnSeq) {
       workRunning = false;
       workChatId = null;
+      workStartAt = null;
     }
   }
 
@@ -2996,6 +3119,8 @@
     aborter?.abort();
     aborter = null;
     streaming = false;
+    streamingChatId = null;
+    streamingStartAt = null;
     const ws = defaultWorkspace || pendingWorkspace || "";
     const seedContext: ChatMsg[] = [
       ...src.messages.slice(-20).map(toHistory),
@@ -3398,9 +3523,12 @@
       <div class="history">
         {#snippet chatList(items: Chat[])}
           {#each items as c (c.id)}
+            {@const live = isSessionStreaming(c.id)}
             <button
-              class="chat-item {c.id === activeId ? 'active' : ''}"
+              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''}"
               data-testid="chat-item"
+              data-streaming={live ? "true" : null}
+              title={live ? liveTitle(c.id) : undefined}
               onclick={() => selectChat(c.id)}
               oncontextmenu={(e) => openMenu(e, c.id)}
             >
@@ -3418,7 +3546,10 @@
                   onblur={commitRename}
                 />
               {:else}
-                <span class="title">{c.title}</span>
+                {#if live}<span class="stream-dot" aria-hidden="true"></span>{/if}
+                <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
+                {@const liveMs = live ? liveElapsedMs(c.id) : null}
+                {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
                 {#if c.mode === "work"}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
@@ -4473,6 +4604,13 @@
       ></textarea>
       <span class="setting-note">One per line. Use \n for newlines. Generation stops when the model outputs one of these.</span>
     </div>
+    {#if isTauriRuntime()}
+      <div class="setting-row quit-row">
+        <span class="setting-label">Quit Vicuna</span>
+        <button class="mini-btn danger" data-testid="quit-app-btn" onclick={quitVicuna}>Quit Vicuna</button>
+      </div>
+      <span class="setting-note">Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.</span>
+    {/if}
     {:else}
     <div class="model-manage-list" data-testid="model-manage-list">
       <div class="server-row" data-testid="ollama-server-row">
@@ -4719,6 +4857,11 @@
   .chat-item:hover { background: var(--hover-3); }
   .chat-item.active { background: var(--active-item); }
   .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .chat-item.streaming { background: var(--hover-3); }
+  .chat-item.streaming.active { background: var(--active-item); }
+  .stream-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; margin-right: 7px; animation: stream-pulse 1.2s ease-in-out infinite; }
+  @keyframes stream-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
+  .live-elapsed { flex-shrink: 0; margin-left: 8px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
   .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
@@ -4809,7 +4952,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -4983,6 +5126,7 @@
   .browse-variant { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 12.5px; font-family: inherit; padding: 5px 10px; }
   .browse-variant:focus { outline: none; border-color: var(--accent); }
   .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px 0; }
+  .quit-row { margin-top: 20px; margin-bottom: 6px; padding-top: 16px; border-top: 1px solid var(--border); }
   .setting-label { font-size: 14px; color: var(--text); }
   .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }
   .seg-btn { border: none; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--text-dim); padding: 6px 16px; border-radius: 9px; }
