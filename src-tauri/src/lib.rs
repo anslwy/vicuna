@@ -1369,6 +1369,152 @@ async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String
     Ok(())
 }
 
+/// Rename a file or directory within its own folder (same-directory rename).
+/// `new_name` is a bare name — slashes, `..`, and empties are rejected —
+/// so the result can never escape the workspace.
+#[tauri::command]
+async fn work_rename(root: String, path: String, new_name: String) -> Result<String, String> {
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if !full.exists() {
+        return Err("file not found".to_string());
+    }
+    let name = new_name.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+    {
+        return Err("invalid name".to_string());
+    }
+    let parent = full.parent().ok_or_else(|| "invalid path".to_string())?;
+    let dest = parent.join(name);
+    if !dest.starts_with(&canon) {
+        return Err("path escapes the workspace".to_string());
+    }
+    if dest.exists() {
+        return Err("a file with that name already exists".to_string());
+    }
+    std::fs::rename(&full, &dest).map_err(|e| format!("cannot rename: {e}"))?;
+    Ok(dest
+        .strip_prefix(&canon)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| dest.to_string_lossy().to_string()))
+}
+
+/// Delete a workspace file or directory (recursive for dirs). Refuses the
+/// workspace root itself. Symlinks are removed, never followed.
+#[tauri::command]
+async fn work_delete(root: String, path: String) -> Result<(), String> {
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if full == canon {
+        return Err("cannot delete the workspace root".to_string());
+    }
+    let meta = std::fs::symlink_metadata(&full).map_err(|_| "file not found".to_string())?;
+    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(&full).map_err(|e| format!("cannot delete folder: {e}"))?;
+    } else {
+        std::fs::remove_file(&full).map_err(|e| format!("cannot delete file: {e}"))?;
+    }
+    Ok(())
+}
+
+/// ---------- Session file uploads (composer attachments, desktop only) ----------
+///
+/// Dropped files are *copied* (never moved) into a per-session staging area
+/// under the user's home: `~/vicuna/uploads/<session-id>/<file name>`.
+/// This keeps project workspaces untouched (no git noise, no build or grep
+/// pollution) and works for chat sessions that have no workspace at all.
+/// The agent reaches staged files through `upload_read_file`, which is
+/// scoped to the calling session — never arbitrary absolute paths.
+
+fn uploads_home_dir() -> Result<std::path::PathBuf, String> {
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").map_err(|_| "cannot locate home folder".to_string())?;
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").map_err(|_| "cannot locate home folder".to_string())?;
+    Ok(std::path::PathBuf::from(home))
+}
+
+fn upload_session_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
+    let id = session_id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid session".to_string());
+    }
+    Ok(uploads_home_dir()?
+        .join("vicuna")
+        .join("uploads")
+        .join(id))
+}
+
+/// Copy an uploaded file into the session staging area. The name is flattened
+/// to its final component (no subdirectories, no escapes); existing files
+/// with the same name are overwritten, like `cp`. Returns the absolute path
+/// for the prompt note sent with the message.
+#[tauri::command]
+async fn upload_stage_file(session_id: String, file_name: String, base64: String) -> Result<String, String> {
+    const CAP: usize = 16 * 1024 * 1024;
+    let bytes = decode_base64(&base64).map_err(|_| "invalid file data".to_string())?;
+    if bytes.len() > CAP {
+        return Err("file too large (max 16MB)".to_string());
+    }
+    let name = std::path::Path::new(file_name.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && n.len() <= 255)
+        .ok_or_else(|| "invalid file name".to_string())?;
+    let dir = upload_session_dir(&session_id)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot stage upload: {e}"))?;
+    let dest = dir.join(name);
+    if !dest.starts_with(&dir) {
+        return Err("invalid file name".to_string());
+    }
+    std::fs::write(&dest, &bytes).map_err(|e| format!("cannot stage upload: {e}"))?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Read a staged session file as text (cap ~64KB; binaries rejected).
+/// Scoped to the calling session's upload dir — no absolute paths.
+#[tauri::command]
+async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileContent, String> {
+    let dir = upload_session_dir(&session_id)?;
+    let clean = std::path::Path::new(name.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .ok_or_else(|| "invalid file name".to_string())?;
+    let full = dir.join(clean);
+    if !full.starts_with(&dir) {
+        return Err("invalid file name".to_string());
+    }
+    let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    let size = meta.len();
+    let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
+    if bytes.iter().take(4096).any(|&b| b == 0) {
+        return Err("binary file — refusing to dump as text".to_string());
+    }
+    const CAP: usize = 65536;
+    let truncated = bytes.len() > CAP;
+    let slice = &bytes[..bytes.len().min(CAP)];
+    Ok(WorkFileContent {
+        path: clean.to_string(),
+        content: String::from_utf8_lossy(slice).to_string(),
+        truncated,
+        size,
+    })
+}
+
 /// Window zoom level for Cmd/Ctrl +/−/0. Desktop shells don't zoom webviews
 /// on those keys the way browsers do natively, so the frontend catches the
 /// chord (Tauri only) and drives the webview zoom from here.
@@ -1447,6 +1593,10 @@ pub fn run() {
             work_list_dir,
             work_tree,
             work_import_file,
+            work_rename,
+            work_delete,
+            upload_stage_file,
+            upload_read_file,
             work_read_file,
             work_grep,
             work_write_file,
@@ -1610,6 +1760,99 @@ mod work_tests {
             .await
             .is_err());
         assert!(decode_base64("!!!").is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_stage_and_read_roundtrip() {
+        let sid = format!("test-session-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let _ = std::fs::remove_dir_all(upload_session_dir(&sid).unwrap_or_default());
+        // stage
+        let abs = upload_stage_file(sid.clone(), "report.txt".into(), "aGVsbG8tdXBsb2Fk".into())
+            .await
+            .unwrap();
+        assert!(abs.contains(&sid));
+        assert!(abs.ends_with("report.txt"));
+        // read back through the session-scoped reader
+        let got = upload_read_file(sid.clone(), "report.txt".into()).await.unwrap();
+        assert_eq!(got.content, "hello-upload");
+        assert!(!got.truncated);
+        // traversal + bad ids rejected (never outside ~/vicuna/uploads/<id>/)
+        // traversal names flatten to their final component *inside* the
+        // session dir (never outside it); bare "..", "/", "" rejected
+        let p = upload_stage_file(sid.clone(), "../../evil.txt".into(), "aGk=".into())
+            .await
+            .unwrap();
+        assert!(p.contains(&sid) && p.ends_with("evil.txt"));
+        assert!(upload_read_file(sid.clone(), "evil.txt".into())
+            .await
+            .is_ok());
+        for bad in ["..", "/", ""] {
+            assert!(
+                upload_stage_file(sid.clone(), bad.into(), "aGk=".into())
+                    .await
+                    .is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // subdirectories flatten to the bare file name, still contained
+        let q = upload_stage_file(sid.clone(), "a/b.txt".into(), "aGk=".into())
+            .await
+            .unwrap();
+        assert!(q.contains(&sid) && q.ends_with("b.txt"));
+        assert!(upload_read_file("../other".into(), "report.txt".into())
+            .await
+            .is_err());
+        assert!(upload_read_file(sid.clone(), "missing.txt".into())
+            .await
+            .is_err());
+        // cleanup the temp session dir
+        let _ = std::fs::remove_dir_all(upload_session_dir(&sid).unwrap());
+    }
+
+    #[tokio::test]
+    async fn rename_delete_roundtrip_and_guardrails() {
+        let d = tmp_root("renamedel");
+        let root = d.to_string_lossy().to_string();
+        work_write_file(root.clone(), "sub/old.txt".into(), "x".into())
+            .await
+            .unwrap();
+        let p = work_rename(root.clone(), "sub/old.txt".into(), "new.txt".into())
+            .await
+            .unwrap();
+        assert!(p.ends_with("new.txt"));
+        assert!(work_read_file(root.clone(), "sub/new.txt".into(), None)
+            .await
+            .is_ok());
+        assert!(work_read_file(root.clone(), "sub/old.txt".into(), None)
+            .await
+            .is_err());
+        // rejects escapes, missing sources, slashed/off-root names, clashes
+        assert!(work_rename(root.clone(), "../evil.txt".into(), "x".into())
+            .await
+            .is_err());
+        assert!(work_rename(root.clone(), "missing.txt".into(), "x.txt".into())
+            .await
+            .is_err());
+        assert!(work_rename(root.clone(), "sub/new.txt".into(), "a/b.txt".into())
+            .await
+            .is_err());
+        assert!(work_rename(root.clone(), "sub/new.txt".into(), "sub/new.txt".into())
+            .await
+            .is_err());
+        work_write_file(root.clone(), "dir/f.txt".into(), "y".into())
+            .await
+            .unwrap();
+        work_delete(root.clone(), "dir".into()).await.unwrap();
+        assert!(work_read_file(root.clone(), "dir/f.txt".into(), None)
+            .await
+            .is_err());
+        work_write_file(root.clone(), "gone.txt".into(), "y".into())
+            .await
+            .unwrap();
+        work_delete(root.clone(), "gone.txt".into()).await.unwrap();
+        assert!(work_delete(root.clone(), ".".into()).await.is_err());
+        assert!(work_delete(root.clone(), "../outside".into()).await.is_err());
+        assert!(work_delete(root.clone(), "missing.txt".into()).await.is_err());
     }
 
     /// Real pty roundtrip: spawn a login shell, run echo, read it back,

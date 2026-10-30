@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, importWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, type WorkTreeEntry } from "$lib/work";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -55,10 +55,29 @@
   let explorerError = $state<string | null>(null);
   let explorerQuery = $state("");
   let collapsedDirs = $state<string[]>([]);
-  let explorerImporting = $state(false);
-  let explorerDropDir = $state<string | null>(null);
+  /** composer drop highlight + drag depth counter (flicker-free) */
+  let composerDropActive = $state(false);
+  let compDragDepth = 0;
   /** right-click menu on an explorer row: {x, y, path, isDir} */
   let expCtx = $state<{ x: number; y: number; path: string; isDir: boolean } | null>(null);
+  /** inline rename state: row path + draft (null when not renaming) */
+  let expRenaming = $state<string | null>(null);
+  let expRenameDraft = $state("");
+  /** two-step delete confirm: armed row path (null = unarmed) */
+  let expConfirmDelete = $state<string | null>(null);
+  /** transient action notice (open/reveal/rename/delete/import failures):
+   *  unlike explorerError it never replaces the file list */
+  let expNotice = $state<string | null>(null);
+  let expNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function flashExpNotice(msg: string) {
+    expNotice = msg;
+    if (expNoticeTimer) clearTimeout(expNoticeTimer);
+    expNoticeTimer = setTimeout(() => {
+      expNotice = null;
+      expNoticeTimer = null;
+    }, 4500);
+  }
   /** explorer panel width (drag the left edge; in-memory only) */
   let explorerWidth = $state(300);
   let expResizing = $state(false);
@@ -150,6 +169,9 @@
   let continuing = $state(false);
   /** picked or pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
   let attachImages = $state<string[]>([]);
+  /** composer file attachments (any type): staged to ~/vicuna/uploads/<session>/ on send */
+  let attachFiles = $state<{ id: number; name: string; size: number; file: File }[]>([]);
+  let attachFileSeq = 0;
   let error = $state<string | null>(null);
   let aborter = $state<AbortController | null>(null);
   let messagesEl = $state<HTMLDivElement | null>(null);
@@ -1701,12 +1723,16 @@
 
   async function send() {
     const text = input.trim();
-    if (!text && attachImages.length === 0) return;
+    if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
     if (streaming || workRunning) {
       // work turns stay interactive: a prompt typed mid-run queues for the
       // next round instead of being dropped or starting a parallel turn
       const running = chats.find((c) => c.id === workChatId);
       if (workRunning && workChatId === activeId && (running?.mode ?? "chat") === "work") {
+        if (attachFiles.length) {
+          error = "Wait for the turn to finish before sending files.";
+          return;
+        }
         queuePrompt(text, attachImages.length ? [...attachImages] : undefined);
       }
       return;
@@ -1715,6 +1741,36 @@
     let chat = chats.find((c) => c.id === activeId);
     let freshChat = false;
     const images = attachImages.length ? [...attachImages] : undefined;
+    // dropped files are staged per session *before* the user message is
+    // built, so the message can cite where they landed
+    const stagedId = chat?.id ?? crypto.randomUUID();
+    let uploadNote = "";
+    let firstUploadName: string | null = null;
+    if (attachFiles.length > 0) {
+      if (!isTauriRuntime()) {
+        error = "File uploads need the Vicuna desktop app — your files were kept.";
+        return;
+      }
+      if (attachFiles.length > 20) {
+        error = `Too many attached files (max 20, got ${attachFiles.length}) — remove some and resend.`;
+        return;
+      }
+      try {
+        const staged: string[] = [];
+        for (const a of attachFiles) {
+          if (a.file.size > 16 * 1024 * 1024) throw new Error(`"${a.name}" is over 16MB.`);
+          staged.push(await stageUploadFile(stagedId, a.name, await fileToBase64(a.file)));
+        }
+        const dir = staged[0].replace(/[/\\][^/\\]*$/, "");
+        const names = staged.map((s) => ` - ${s.slice(dir.length).replace(/^[/\\]/, "")}`);
+        firstUploadName = attachFiles[0].name;
+        uploadNote = `\n\n[Attached files saved to ${dir} (use the read_upload tool with the file NAME to read them):\n${names.join("\n")}]`;
+      } catch (e: any) {
+        error = typeof e === "string" ? e : (e?.message ?? String(e));
+        return;
+      }
+    }
+    const fullText = text + uploadNote;
     // effective mode: a pre-existing thread keeps its mode; a home send or an
     // untouched empty draft adopts the starter toggle
     const effectiveMode: "chat" | "work" = chat
@@ -1753,13 +1809,13 @@
       // Svelte 5 caches proxied reads, so mutating the raw object after
       // prepending stays invisible until the first streamed token writes
       // through the proxy — the composer would look stuck on empty.
-      const titleSrc = text || (images ? "Image" : "New session");
+      const titleSrc = text || (images ? "Image" : (firstUploadName ?? "New session"));
       chat = {
-        id: crypto.randomUUID(),
+        id: stagedId,
         title: titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : ""),
         createdAt: Date.now(),
         messages: [
-          { role: "user", content: text, ...(images ? { images } : {}) },
+          { role: "user", content: fullText, ...(images ? { images } : {}) },
           { role: "assistant", content: "", thinking: "", model: selectedModel }
         ],
         mode: effectiveMode,
@@ -1775,9 +1831,9 @@
         chat.mode = effectiveMode;
         if (effectiveMode === "work") chat.workspace = workRoot;
       }
-      chat.messages = [...chat.messages, { role: "user", content: text, ...(images ? { images } : {}) }];
+      chat.messages = [...chat.messages, { role: "user", content: fullText, ...(images ? { images } : {}) }];
       if (chat.title === "New session" || chat.title === "New Session") {
-        const titleSrc = text || (images ? "Image" : "New session");
+        const titleSrc = text || (images ? "Image" : (firstUploadName ?? "New session"));
         chat.title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
       }
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
@@ -1787,6 +1843,7 @@
     clearDraft(sentFromId);
     if (sentFromId !== chat.id) clearDraft(chat.id);
     attachImages = [];
+    attachFiles = [];
     error = null;
 
     if ((chat.mode ?? "chat") === "work" && chat.workspace) {
@@ -1906,6 +1963,14 @@
     return out;
   }
 
+  const mentionFolderIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+  const mentionFileIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+
+  function mentionIconFor(core: string): string {
+    const base = core.slice(1).split(/[/\\]/).pop() ?? "";
+    return base.includes(".") ? mentionFileIcon : mentionFolderIcon;
+  }
+
   /** render @path mentions as green pills (ws-badge style) with a folder/file
    *  icon. Scans the escaped text (entities contain no @/space/paren, so
    *  boundaries match the raw text). Padding/margin cancel so the composer
@@ -1919,15 +1984,41 @@
     let out = "";
     let last = 0;
     for (const t of toks) {
-      const name = t.core.slice(1).split(/[/\\]/).pop() ?? "";
-      const icon = name.includes(".") ? fileIcon : folderIcon;
       out += esc.slice(last, t.start);
-      out += `<span class="mention-pill">${icon}<span>${esc.slice(t.start, t.end)}</span></span>`;
+      out += `<span class="mention-pill">${mentionIconFor(t.core)}<span>${esc.slice(t.start, t.end)}</span></span>`;
       last = t.end;
     }
     return out + esc.slice(last);
   }
 
+  /** user bubbles: @-mentions become pills, and a trailing attached-files
+   *  note collapses to file pills (raw text keeps the full note so the
+   *  agent still sees paths + tool instructions in history) */
+  function renderUserMessage(text: string): string {
+    const re = /\[Attached files saved to [^\]]*? \(use the read_upload tool[^)]*\):\n((?:- [^\n]*\n?)+)\]/g;
+    let out = "";
+    let last = 0;
+    let m: RegExpExecArray | null;
+    let matched = false;
+    while ((m = re.exec(text)) !== null) {
+      matched = true;
+      out += renderMentions(text.slice(last, m.index).replace(/\s+$/, ""));
+      const names = [...m[1].matchAll(/^-\s*(.+?)\s*$/gm)]
+        .map((x) => x[1])
+        .filter((n) => n.length > 0);
+      if (!names.length) {
+        out += renderMentions(text.slice(m.index, m.index + m[0].length));
+      } else {
+        if (out) out += " ";
+        out += names
+          .map((n) => `<span class="mention-pill">${mentionFileIcon}<span>${escapeHtmlText(n)}</span></span>`)
+          .join(" ");
+      }
+      last = m.index + m[0].length;
+    }
+    if (!matched) return renderMentions(text);
+    return out + renderMentions(text.slice(last));
+  }
   /** snap a collapsed caret out of a mention interior (arrows/clicks treat
    *  pills atomically: the caret rests before or after, never inside) */
   function snapCaretOut(caret: number, dir: -1 | 0 | 1): number {
@@ -2049,6 +2140,7 @@
   function openExpCtx(e: MouseEvent, path: string, isDir: boolean) {
     e.preventDefault();
     e.stopPropagation();
+    expConfirmDelete = null;
     expCtx = {
       x: Math.max(8, Math.min(e.clientX, window.innerWidth - 240)),
       y: Math.max(8, Math.min(e.clientY, window.innerHeight - 260)),
@@ -2069,7 +2161,7 @@
       const { openPath } = await import("@tauri-apps/plugin-opener");
       await openPath(absExpPath(p.path));
     } catch (e: any) {
-      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+      flashExpNotice(`Couldn't open: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
   }
 
@@ -2081,7 +2173,7 @@
       const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
       await revealItemInDir(absExpPath(p.path));
     } catch (e: any) {
-      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
+      flashExpNotice(`Couldn't reveal: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
   }
 
@@ -2092,7 +2184,7 @@
     try {
       void navigator.clipboard?.writeText(`@${p.path}`);
     } catch {
-      explorerError = "Couldn't copy to clipboard.";
+      flashExpNotice("Couldn't copy to clipboard.");
     }
   }
 
@@ -2241,31 +2333,115 @@
     }
   }
 
-  /** OS files dropped onto the panel are copied into the workspace */
-  async function importDroppedFiles(files: FileList | null, targetDir: string | null) {
-    const root = explorerRoot.trim();
-    if (!files || files.length === 0 || !root || !isTauriRuntime()) return;
-    explorerImporting = true;
-    explorerError = null;
+  /** whether a drag carries OS files (vs. text selection etc.) */
+  function hasDroppedFiles(e: DragEvent): boolean {
+    const types = e.dataTransfer?.types;
+    return !!types && Array.from(types).includes("Files");
+  }
+
+  /** composer drop target highlight */
+  function onComposerDragEnter(e: DragEvent) {
+    if (!hasDroppedFiles(e)) return;
+    compDragDepth += 1;
+    composerDropActive = true;
+  }
+
+  function onComposerDragOver(e: DragEvent) {
+    e.preventDefault();
+  }
+
+  function onComposerDragLeave() {
+    compDragDepth = Math.max(0, compDragDepth - 1);
+    if (compDragDepth === 0) composerDropActive = false;
+  }
+
+  /** dropped files land as pending composer attachments: images join the
+   *  image pipeline, everything else becomes a per-session upload staged
+   *  under ~/vicuna/uploads/<id>/ when the message is sent */
+  async function onComposerDrop(e: DragEvent) {
+    e.preventDefault();
+    compDragDepth = 0;
+    composerDropActive = false;
+    const dt = e.dataTransfer;
+    if (!dt) return;
     try {
-      for (const f of Array.from(files)) {
-        if (f.size > 16 * 1024 * 1024) {
-          explorerError = `"${f.name}" is over 16MB — skipped.`;
-          continue;
-        }
-        const bytes = new Uint8Array(await f.arrayBuffer());
-        let bin = "";
-        for (let i = 0; i < bytes.length; i += 0x8000) {
-          bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-        }
-        await importWorkFile(root, targetDir ? `${targetDir}/${f.name}` : f.name, btoa(bin));
+      const entries = await collectDropEntries(dt);
+      if (!entries.length) return;
+      await ingestDroppedFiles(entries.map((en) => en.file));
+    } catch (err: any) {
+      error = typeof err === "string" ? err : (err?.message ?? String(err));
+    }
+  }
+
+  /** start inline rename of a row (menu closes first) */
+  function startExpRename(path: string, name: string) {
+    closeExpCtx();
+    expConfirmDelete = null;
+    expRenaming = path;
+    expRenameDraft = name;
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLInputElement>('[data-testid="explorer-rename"]');
+      if (el) {
+        el.focus();
+        el.select();
       }
+    });
+  }
+
+  function cancelExpRename() {
+    expRenaming = null;
+  }
+
+  /** menu wrappers: read expCtx now (template narrowing doesn't survive
+   *  the click closure) */
+  function renameFromMenu() {
+    const p = expCtx;
+    if (!p) return;
+    startExpRename(p.path, p.path.split(/[/\\]/).pop() ?? p.path);
+  }
+
+  function deleteFromMenu() {
+    const p = expCtx;
+    if (!p) return;
+    void requestExpDelete(p.path);
+  }
+
+  /** commit the inline rename (Enter/blur); errors keep the box open */
+  async function commitExpRename() {
+    const path = expRenaming;
+    if (path == null) return;
+    const name = expRenameDraft.trim();
+    expRenaming = null;
+    if (!name || name === path.split(/[/\\]/).pop()) return;
+    try {
+      await renameWorkFile(explorerRoot.trim(), path, name);
       await loadExplorer();
     } catch (e: any) {
-      explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
-    } finally {
-      explorerImporting = false;
-      explorerDropDir = null;
+      flashExpNotice(`Couldn't rename: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
+      expRenaming = path;
+      expRenameDraft = name;
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLInputElement>('[data-testid="explorer-rename"]')?.focus();
+      });
+    }
+  }
+
+  /** two-step delete: first click arms, second click runs (menu closes) */
+  async function requestExpDelete(path: string) {
+    if (expConfirmDelete !== path) {
+      expConfirmDelete = path;
+      return;
+    }
+    expConfirmDelete = null;
+    closeExpCtx();
+    try {
+      await deleteWorkFile(explorerRoot.trim(), path);
+      // drop stale collapse state under the deleted dir
+      const sep = (d: string) => d !== path && !d.startsWith(path + "/") && !d.startsWith(path + "\\");
+      collapsedDirs = collapsedDirs.filter(sep);
+      await loadExplorer();
+    } catch (e: any) {
+      flashExpNotice(`Couldn't delete: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
   }
 
@@ -2635,7 +2811,7 @@
           chats = [...chats];
           scrollBottom();
         }
-        const out = await dispatchWorkTool(call, { workspace, chats });
+        const out = await dispatchWorkTool(call, { workspace, chats, sessionId: chat.id });
         if (toolStatus?.chatId === chat.id) toolStatus = null;
         native.push({ role: "tool", content: out, tool_name: call.name });
         const c2 = chats.find((x) => x.id === chat.id);
@@ -2797,29 +2973,44 @@
     }
   }
 
+  /** shared ingest for picked/dropped files: images join the vision
+   *  attachments, everything else becomes a per-session staged upload */
+  async function ingestDroppedFiles(files: File[]) {
+    for (const f of files) {
+      if (f.type.startsWith("image/")) {
+        try {
+          attachImages = [...attachImages, await imageFileToDataUrl(f)];
+        } catch {
+          error = `Couldn't read image (${f.name || "unknown type"})`;
+        }
+        continue;
+      }
+      if (f.size > 16 * 1024 * 1024) {
+        error = `"${f.name}" is over 16MB — skipped.`;
+        continue;
+      }
+      if (attachFiles.length >= 20) {
+        error = "Too many attached files (max 20) — remove some first.";
+        break;
+      }
+      const base = f.name.split("/");
+      const name = base[base.length - 1] || f.name;
+      if (attachFiles.some((a) => a.name === name)) {
+        attachFiles = attachFiles.filter((a) => a.name !== name);
+      }
+      attachFileSeq += 1;
+      attachFiles = [...attachFiles, { id: attachFileSeq, name, size: f.size, file: f }];
+    }
+    autosizeComposer();
+    requestAnimationFrame(() => composerEl?.focus());
+  }
+
   async function onFile(e: Event) {
     const el = e.target as HTMLInputElement;
     const files = el.files ? [...el.files] : [];
     el.value = "";
     if (!files.length) return;
-    let skipped = 0;
-    for (const f of files) {
-      if (!f.type.startsWith("image/")) {
-        skipped++;
-        continue;
-      }
-      try {
-        attachImages = [...attachImages, await imageFileToDataUrl(f)];
-      } catch {
-        error = `Couldn't read image (${f.name || f.type || "unknown type"})`;
-        skipped++;
-      }
-    }
-    if (skipped > 0) {
-      error = `Skipped ${skipped} non-image file${skipped === 1 ? "" : "s"} — only images can be attached`;
-    }
-    autosizeComposer();
-    requestAnimationFrame(() => composerEl?.focus());
+    await ingestDroppedFiles(files);
   }
 
   // Desktop webview zoom (Cmd/Ctrl +/−/0). Plain browsers zoom natively and
@@ -3295,7 +3486,7 @@
                   {/each}
                 </div>
               {/if}
-              <div class="bubble user">{@html renderMentions(m.content)}</div>
+              <div class="bubble user">{@html renderUserMessage(m.content)}</div>
               <div class="actions">
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
                   {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
@@ -3457,7 +3648,24 @@
           />
         </div>
       {/if}
-      <div class="composer">
+      <div
+        class="composer {composerDropActive ? 'drop-active' : ''}"
+        role="group"
+        aria-label="Message composer — drop files here to attach them"
+        data-testid="composer"
+        ondragenter={(e) => {
+          if (e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files")) {
+            compDragDepth += 1;
+            composerDropActive = true;
+          }
+        }}
+        ondragover={(e) => e.preventDefault()}
+        ondragleave={() => {
+          compDragDepth = Math.max(0, compDragDepth - 1);
+          if (compDragDepth === 0) composerDropActive = false;
+        }}
+        ondrop={(e) => void onComposerDrop(e)}
+      >
         {#if attachImages.length}
           <div class="image-strip" data-testid="image-strip">
             {#each attachImages as img, k}
@@ -3466,6 +3674,18 @@
                   <img src={img} alt="" />
                 </button>
                 <button class="image-remove" aria-label="remove image {k + 1}" onclick={(e) => { e.stopPropagation(); attachImages = attachImages.filter((_, j) => j !== k); }}>×</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+        {#if attachFiles.length}
+          <div class="file-strip" data-testid="file-strip">
+            {#each attachFiles as f, k}
+              <div class="file-chip" data-testid="file-chip" title={f.name}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                <span class="file-name">{f.name}</span>
+                <span class="exp-size">{formatSize(f.size)}</span>
+                <button class="file-remove" aria-label="Remove attached file {f.name}" onclick={() => { attachFiles = attachFiles.filter((_, j) => j !== k); autosizeComposer(); }}>×</button>
               </div>
             {/each}
           </div>
@@ -3545,6 +3765,9 @@
         <div class="composer-bar">
           <div class="spacer"></div>
           {#if composerMode === "work"}
+            <button class="icon-btn" data-testid="attach-btn" aria-label="Attach files" title="Attach files (images, documents, anything)" onclick={pickFile}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
             {@const wsPath = displayWorkspace(activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace)}
             {@const wsName = wsPath.trim() ? (workspaceBase(wsPath) || wsPath.trim()) : ""}
             <button
@@ -3605,11 +3828,7 @@
       data-testid="explorer"
       style="width: {explorerWidth}px"
       ondragover={(e) => e.preventDefault()}
-      ondragleave={() => (explorerDropDir = null)}
-      ondrop={(e) => {
-        e.preventDefault();
-        void importDroppedFiles(e.dataTransfer?.files ?? null, explorerDropDir);
-      }}
+      ondrop={(e) => e.preventDefault()}
     >
       <div
         class="exp-resize"
@@ -3753,20 +3972,41 @@
           <div class="exp-empty">{explorerQuery.trim() ? "No matching files." : "Empty folder."}</div>
         {:else}
           {#each explorerVisible as e (e.path)}
-            {#if e.is_dir}
+            {#if expRenaming === e.path}
+              <div class="exp-row exp-renaming" style="padding-left: {10 + e.depth * 14}px">
+                {#if e.is_dir}
+                  <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1-2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                {:else}
+                  <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                {/if}
+                <input
+                  class="exp-rename"
+                  data-testid="explorer-rename"
+                  bind:value={expRenameDraft}
+                  aria-label="New name for {e.name}"
+                  onclick={(ev) => ev.stopPropagation()}
+                  onkeydown={(ev) => {
+                    if (ev.key === "Enter") {
+                      ev.preventDefault();
+                      void commitExpRename();
+                    } else if (ev.key === "Escape") {
+                      ev.preventDefault();
+                      ev.stopPropagation();
+                      cancelExpRename();
+                    }
+                  }}
+                  onblur={() => void commitExpRename()}
+                />
+              </div>
+            {:else if e.is_dir}
               {@const collapsed = collapsedDirs.includes(e.path)}
               <button
-                class="exp-row exp-dir {explorerDropDir === e.path ? 'drop' : ''}"
+                class="exp-row exp-dir"
                 style="padding-left: {10 + e.depth * 14}px"
                 data-testid="explorer-dir"
                 title={e.path}
                 onclick={() => toggleExplorerDir(e.path)}
                 oncontextmenu={(ev) => openExpCtx(ev, e.path, true)}
-                ondragover={(ev) => {
-                  ev.preventDefault();
-                  ev.stopPropagation();
-                  explorerDropDir = e.path;
-                }}
               >
                 <span class="exp-chev">{collapsed ? "▸" : "▾"}</span>
                 <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
@@ -3791,10 +4031,9 @@
           {/each}
         {/if}
       </div>
-      {#if explorerImporting}
-        <div class="explorer-foot" data-testid="explorer-importing">Importing files…</div>
-      {:else}
-        <div class="explorer-foot">Drop files here to import · click a file to @-mention it</div>
+      <div class="explorer-foot">Click a file to @-mention it</div>
+      {#if expNotice}
+        <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
       {/if}
           {:else}
             {#if t.error}
@@ -3827,6 +4066,13 @@
   >
     <button class="ctx-item" data-testid="explorer-open" onclick={() => void expOpenFile()}>Open</button>
     <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
+    <button class="ctx-item" data-testid="explorer-rename" onclick={renameFromMenu}>Rename</button>
+    <button
+      class="ctx-item {expCtx && expConfirmDelete === expCtx.path ? 'danger' : ''}"
+      data-testid="explorer-delete"
+      title={expCtx?.path ?? "Delete"}
+      onclick={deleteFromMenu}
+    >{expCtx && expConfirmDelete === expCtx.path ? "Confirm delete" : "Delete"}</button>
     {#if !expCtx.isDir}
       <button class="ctx-item" data-testid="explorer-copy-mention" onclick={expCopyMention}>Copy mention</button>
       <button class="ctx-item" data-testid="explorer-add-chat" onclick={expAddToChat}>Add to chat</button>
@@ -4225,7 +4471,7 @@
 {/if}
 {/if}
 
-<input type="file" bind:this={fileInput} hidden accept="image/*" multiple onchange={onFile} data-testid="file-input" />
+<input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
   :global(html) { color-scheme: light; }
@@ -4437,6 +4683,14 @@
   .scroll-jump { position: absolute; top: -44px; left: 50%; transform: translateX(-50%); width: 44px; height: 36px; background: var(--card); border: 1px solid var(--border-3); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.10); cursor: pointer; font-size: 17px; line-height: 1; color: var(--text); z-index: 5; }
   .scroll-jump:hover { background: var(--composer); }
   .composer { background: var(--composer); border-radius: 22px; padding: 12px 12px 10px 16px; }
+  .composer.drop-active { box-shadow: inset 0 0 0 1.5px var(--accent); }
+  .file-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 2px 10px 2px; }
+  .file-chip { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; padding: 6px 6px 6px 10px; font-size: 12.5px; color: var(--text); }
+  .file-chip svg { flex-shrink: 0; color: var(--muted-2); }
+  .file-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .file-chip .exp-size { flex-shrink: 0; }
+  .file-remove { flex-shrink: 0; border: none; background: var(--hover-3); color: var(--muted); cursor: pointer; font-size: 13px; line-height: 1; width: 20px; height: 20px; border-radius: 50%; padding: 0; }
+  .file-remove:hover { color: var(--text); }
   .composer textarea { position: relative; z-index: 1; width: 100%; box-sizing: border-box; border: none; background: transparent; resize: none; outline: none; font-size: 15px; font-family: inherit; color: transparent; caret-color: var(--text); overflow-x: hidden; overflow-y: auto; overflow-wrap: break-word; max-height: 200px; padding: 0; margin: 0; display: block; }
   .composer-field { position: relative; }
   .composer-backdrop { position: absolute; inset: 0; overflow: hidden; pointer-events: none; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; tab-size: 8; font-size: 15px; font-family: inherit; color: var(--text); padding: 0; }
@@ -4468,7 +4722,6 @@
   .mention-path { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .mention-empty { padding: 8px 12px; font-size: 13px; color: var(--muted); }
   .spacer { flex: 1; }
-  .pill-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--card); cursor: pointer; font-size: 18px; color: var(--icon-dim); display: flex; align-items: center; justify-content: center; }
   .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
   .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
   .model-pill-wrap { position: relative; }
@@ -4601,7 +4854,7 @@
   .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }
   .exp-row { display: flex; align-items: center; gap: 7px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding-top: 5px; padding-bottom: 5px; padding-right: 8px; border-radius: 8px; cursor: pointer; text-align: left; min-width: 0; }
   .exp-row:hover { background: var(--hover-3); }
-  .exp-row.drop { background: var(--hover-3); outline: 1.5px dashed var(--accent); }
+  .exp-rename { flex: 1; min-width: 0; font: inherit; font-size: 12.5px; color: var(--text); background: var(--bg); border: 1.5px solid var(--accent); border-radius: 6px; padding: 2px 6px; outline: none; }
   .exp-chev { flex-shrink: 0; width: 12px; font-size: 10px; color: var(--muted); }
   .exp-icon { flex-shrink: 0; color: var(--muted-2); }
   .exp-dir .exp-icon { color: var(--accent); }
@@ -4609,6 +4862,7 @@
   .exp-file .exp-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .exp-size { flex-shrink: 0; font-size: 11px; color: var(--faint); }
   .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
+  .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 44px; z-index: 8; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; }
   .explorer-foot { padding: 8px 12px 12px 12px; font-size: 11.5px; color: var(--faint); border-top: 1px solid var(--border); }
 
   @media (max-width: 700px) {

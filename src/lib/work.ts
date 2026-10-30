@@ -124,6 +124,20 @@ export const WORK_TOOLS = [
         }
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_upload",
+      description: "Read a text file the user attached to THIS session (by bare file name, e.g. \"report.pdf\"). Use for files listed in the [Attached files ...] note on the user message. 64KB cap.",
+      parameters: {
+        type: "object",
+        required: ["name"],
+        properties: {
+          name: { type: "string", description: "file name exactly as listed" }
+        }
+      }
+    }
   }
 ];
 
@@ -201,6 +215,97 @@ export async function listWorkTree(root: string, maxDepth = 4): Promise<WorkTree
 export async function importWorkFile(root: string, path: string, base64: string): Promise<string> {
   if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<string>("work_import_file", { root, path, base64 });
+}
+
+/** Rename a workspace file or folder within its own directory (desktop only).
+ *  Returns the new workspace-relative path. */
+export async function renameWorkFile(root: string, path: string, newName: string): Promise<string> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<string>("work_rename", { root, path, newName });
+}
+
+/** Delete a workspace file or folder (recursive, desktop only). */
+export async function deleteWorkFile(root: string, path: string): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  await invokeCmd<void>("work_delete", { root, path });
+}
+
+/** File/Blob → base64 (chunked, safe for large files). */
+export async function fileToBase64(file: Blob): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+export interface DroppedEntry {
+  path: string;
+  file: File;
+}
+
+function sanitizeRelPath(p: string): string {
+  return p
+    .split("/")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s !== "." && s !== "..")
+    .join("/");
+}
+
+/** Flatten a file/folder OS drop into workspace-relative {path, file} pairs.
+ *  Uses the FileSystem entry API when present (folders recurse, keeping
+ *  relative paths); falls back to the flat FileList otherwise. */
+export async function collectDropEntries(dt: DataTransfer): Promise<DroppedEntry[]> {
+  const out: DroppedEntry[] = [];
+  const items = dt.items ? Array.from(dt.items) : [];
+  const entries = items
+    .map((it) => {
+      try {
+        return it.kind === "file" ? it.webkitGetAsEntry() : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((e): e is FileSystemEntry => e != null);
+  if (!entries.length) {
+    for (const f of Array.from(dt.files ?? [])) {
+      const rel = sanitizeRelPath(f.name);
+      if (rel) out.push({ path: rel, file: f });
+    }
+    return out;
+  }
+  const readAll = (reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> =>
+    new Promise((resolve, reject) => {
+      const acc: FileSystemEntry[] = [];
+      const pump = () =>
+        reader.readEntries(
+          (batch) => {
+            if (!batch.length) {
+              resolve(acc);
+              return;
+            }
+            acc.push(...batch);
+            pump();
+          },
+          () => reject(new Error("cannot read folder"))
+        );
+      pump();
+    });
+  const fileOf = (e: FileSystemFileEntry): Promise<File> =>
+    new Promise((resolve, reject) => e.file(resolve, reject));
+  const walk = async (entry: FileSystemEntry, base: string): Promise<void> => {
+    if (entry.isFile) {
+      const f = await fileOf(entry as FileSystemFileEntry);
+      const rel = sanitizeRelPath(`${base}${f.name}`);
+      if (rel) out.push({ path: rel, file: f });
+    } else if (entry.isDirectory) {
+      const kids = await readAll((entry as FileSystemDirectoryEntry).createReader());
+      for (const kid of kids) await walk(kid, `${base}${entry.name}/`);
+    }
+  };
+  for (const e of entries) await walk(e, "");
+  return out;
 }
 
 /** Pure text splice for completing an @-mention: replaces the live query
@@ -307,10 +412,18 @@ export function readSession(chats: Chat[], id: string, limit = 30): string {
     msgs.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content.slice(0, 2000)}`).join("\n\n");
 }
 
+/** Stage a composer attachment for a session (desktop only). Returns the
+ *  absolute staged path for the prompt note. Files keep their bytes as-is
+ *  (just `cp` semantics) under ~/vicuna/uploads/<session-id>/. */
+export async function stageUploadFile(sessionId: string, fileName: string, base64: string): Promise<string> {
+  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  return await invokeCmd<string>("upload_stage_file", { sessionId, fileName, base64 });
+}
+
 /** Execute one tool call. Returns markdown for the transcript. */
 export async function dispatchWorkTool(
   call: WorkToolCall,
-  ctx: { workspace: string; chats: Chat[] }
+  ctx: { workspace: string; chats: Chat[]; sessionId?: string }
 ): Promise<string> {
   const a = call.args ?? {};
   const str = (v: unknown) => (typeof v === "string" ? v : "");
@@ -371,8 +484,17 @@ export async function dispatchWorkTool(
         const limit = typeof a.limit === "number" ? Math.min(100, Math.max(1, Math.round(a.limit))) : 30;
         return readSession(ctx.chats, str(a.id), limit);
       }
+      case "read_upload": {
+        if (!str(a.name)) return "Error: read_upload needs {\"name\": \"...\"}.";
+        if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        if (!ctx.sessionId) return "Error: no active session for uploads.";
+        const res = await invokeCmd<{ content: string; truncated: boolean; size: number }>(
+          "upload_read_file", { sessionId: ctx.sessionId, name: str(a.name) }
+        );
+        return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
+      }
       default:
-        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, sessions, read_session.`;
+        return `Error: unknown tool "${call.name}". Available: list, read, grep, write, exec, sessions, read_session, read_upload.`;
     }
   } catch (e: any) {
     return `Error: ${e?.message ?? String(e)}`;
@@ -394,7 +516,8 @@ export function toolLabel(name: string, args: Record<string, any>): string {
     name === "read" || name === "write" || name === "list" ? String(args.path ?? ".") :
     name === "grep" ? String(args.pattern ?? "") :
     name === "sessions" ? String(args.query ?? "") :
-    name === "read_session" ? String(args.id ?? "") : JSON.stringify(args);
+    name === "read_session" ? String(args.id ?? "") :
+    name === "read_upload" ? String(args.name ?? "") : JSON.stringify(args);
   return `${name} — ${argSummary.slice(0, 120)}`;
 }
 
