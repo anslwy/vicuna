@@ -400,6 +400,16 @@
     if (!cfg || mcpIsBusy(id)) return;
     if (mcpLive[id]?.connected) {
       await disconnectMcpServer(id);
+      // disconnecting is the disable preference: persist it so a restart
+      // won't reconnect everything the user just turned off
+      mcpMarkBusy(id);
+      try {
+        mcpServers = await saveMcpServer({ ...cfg, enabled: false });
+      } catch (e: any) {
+        error = e?.message ?? String(e);
+      } finally {
+        mcpUnmarkBusy(id);
+      }
       return;
     }
     // a server that failed with 401/403 isn't retried blindly — selecting
@@ -486,7 +496,9 @@
     mcpQuery = "";
     mcpSel = 0;
     mcpBuiltinSel = 0;
-    mcpView = "builtin";
+    // default to the Added list when the user has servers, Discover only
+    // when there is nothing to show there yet
+    mcpView = mcpServers.length ? "custom" : "builtin";
     mcpBuiltinError = null;
     mcpShowForm = false;
     mcpFormError = null;
