@@ -223,19 +223,18 @@
       ? (activeChat.workspace ?? pendingWorkspace)
       : pendingWorkspace
   );
-  const explorerRootBase = $derived(
-    explorerRoot.trim().split("/").filter(Boolean).pop() ?? explorerRoot.trim()
-  );
+  const explorerRootBase = $derived(workspaceBase(explorerRoot.trim()) || explorerRoot.trim());
   /** tree rows honoring collapse + search (search flattens the hierarchy) */
   const explorerVisible = $derived((() => {
     const q = explorerQuery.trim().toLowerCase();
     if (q) return explorerEntries.filter((e) => e.path.toLowerCase().includes(q));
     const collapsed = new Set(collapsedDirs);
+    const under = (path: string, dir: string) =>
+      path !== dir && (path.startsWith(dir + "/") || path.startsWith(dir + "\\"));
     return explorerEntries.filter((e) => {
       if (e.depth === 0) return true;
-      const parts = e.path.split("/");
-      for (let i = 1; i < parts.length; i++) {
-        if (collapsed.has(parts.slice(0, i).join("/"))) return false;
+      for (const d of collapsed) {
+        if (under(e.path, d)) return false;
       }
       return true;
     });
@@ -1920,7 +1919,7 @@
     let out = "";
     let last = 0;
     for (const t of toks) {
-      const name = t.core.slice(1).split("/").pop() ?? "";
+      const name = t.core.slice(1).split(/[/\\]/).pop() ?? "";
       const icon = name.includes(".") ? fileIcon : folderIcon;
       out += esc.slice(last, t.start);
       out += `<span class="mention-pill">${icon}<span>${esc.slice(t.start, t.end)}</span></span>`;
@@ -2042,7 +2041,8 @@
 
   /** absolute FS path for opener-plugin calls (root is canonical absolute) */
   function absExpPath(rel: string): string {
-    return `${explorerRoot.trim().replace(/\/+$/, "")}/${rel}`;
+    const root = displayWorkspace(explorerRoot.trim()).replace(/\/+$/, "");
+    return `${root}/${rel}`;
   }
 
   /** right-click a row: open the file context menu at the cursor (clamped) */
@@ -3544,7 +3544,6 @@
         {/if}
         <div class="composer-bar">
           <div class="spacer"></div>
-          <button class="pill-btn" data-testid="attach-btn" aria-label="Attach image" onclick={pickFile}>+</button>
           {#if composerMode === "work"}
             {@const wsPath = displayWorkspace(activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace)}
             {@const wsName = wsPath.trim() ? (workspaceBase(wsPath) || wsPath.trim()) : ""}
