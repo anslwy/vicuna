@@ -3,6 +3,8 @@ node_modules
 /build
 /.svelte-kit
 /package
+bridge/target/
+src-tauri/target/
 .env
 .env.*
 !.env.example

@@ -17,12 +17,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
 
-use super::mcp::McpManager;
-use super::work_agent::{
+use vicuna_lib::mcp::McpManager;
+use vicuna_lib::work_agent::{
     agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, run_loop, ChatSnapshot,
     McpRoute, TurnState, WorkAgentState, WorkAgentEvent,
 };
-use super::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage};
+use vicuna_lib::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage};
 
 const EVENT_CAP: usize = 2000;
 const BODY_CAP: u64 = 32 * 1024 * 1024;
@@ -164,92 +164,92 @@ async fn dispatch(
         }
         // ----- workspace validation / tools -----
         "work_validate_root" => {
-            Ok(serde_json::json!(super::work_validate_root(s("path")?).await?))
+            Ok(serde_json::json!(vicuna_lib::work_validate_root_logic(s("path")?).await?))
         }
         "work_list_dir" => {
             let path = arg_opt_str(args, "path");
-            Ok(serde_json::json!(super::work_list_dir_logic(s("root")?, path).await?))
+            Ok(serde_json::json!(vicuna_lib::work_list_dir_logic(s("root")?, path).await?))
         }
         "work_tree" => {
             let max = args.get("maxDepth").and_then(|v| v.as_u64()).map(|n| n as usize);
-            Ok(serde_json::json!(super::work_tree(s("root")?, max).await?))
+            Ok(serde_json::json!(vicuna_lib::work_tree_logic(s("root")?, max).await?))
         }
         "work_read_file" => {
             let max = args.get("maxBytes").and_then(|v| v.as_u64());
             Ok(serde_json::json!(
-                super::work_read_file_logic(s("root")?, s("path")?, max).await?
+                vicuna_lib::work_read_file_logic(s("root")?, s("path")?, max).await?
             ))
         }
         "work_read_image" => {
-            Ok(serde_json::json!(super::work_read_image_logic(s("root")?, s("path")?).await?))
+            Ok(serde_json::json!(vicuna_lib::work_read_image_logic(s("root")?, s("path")?).await?))
         }
         "work_grep" => {
             let include = arg_opt_str(args, "include");
             Ok(serde_json::json!(
-                super::work_grep_logic(s("root")?, s("pattern")?, include).await?
+                vicuna_lib::work_grep_logic(s("root")?, s("pattern")?, include).await?
             ))
         }
         "work_write_file" => {
             Ok(serde_json::json!(
-                super::work_write_file_logic(s("root")?, s("path")?, s("content")?).await?
+                vicuna_lib::work_write_file_logic(s("root")?, s("path")?, s("content")?).await?
             ))
         }
         "work_exec" => {
             let timeout = args.get("timeoutMs").and_then(|v| v.as_u64());
             Ok(serde_json::json!(
-                super::work_exec_logic(s("root")?, s("command")?, timeout).await?
+                vicuna_lib::work_exec_logic(s("root")?, s("command")?, timeout).await?
             ))
         }
         "work_exec_start" => {
-            Ok(serde_json::json!(super::bg_start(&st.bg, s("root")?, s("command")?).await?))
+            Ok(serde_json::json!(vicuna_lib::bg_start(&st.bg, s("root")?, s("command")?).await?))
         }
         "work_exec_status" => {
-            let r: BgJobStatus = super::bg_snapshot(&st.bg, &s("id")?)?;
+            let r: BgJobStatus = vicuna_lib::bg_snapshot(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
         }
         "work_exec_list" => {
-            let l: Vec<BgJobSummary> = super::bg_list(&st.bg)?;
+            let l: Vec<BgJobSummary> = vicuna_lib::bg_list(&st.bg)?;
             Ok(serde_json::json!(l))
         }
         "work_exec_kill" => {
-            let r: BgJobStatus = super::bg_kill(&st.bg, &s("id")?)?;
+            let r: BgJobStatus = vicuna_lib::bg_kill(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
         }
         "work_rename" => {
-            Ok(serde_json::json!(super::work_rename(s("root")?, s("path")?, s("newName")?).await?))
+            Ok(serde_json::json!(vicuna_lib::work_rename_logic(s("root")?, s("path")?, s("newName")?).await?))
         }
         "work_delete" => {
-            super::work_delete(s("root")?, s("path")?).await?;
+            vicuna_lib::work_delete_logic(s("root")?, s("path")?).await?;
             Ok(serde_json::Value::Null)
         }
         "work_import_file" => {
             Ok(serde_json::json!(
-                super::work_import_file(s("root")?, s("path")?, s("base64")?).await?
+                vicuna_lib::work_import_file_logic(s("root")?, s("path")?, s("base64")?).await?
             ))
         }
         "upload_stage_file" => {
             Ok(serde_json::json!(
-                super::upload_stage_file(s("sessionId")?, s("fileName")?, s("base64")?).await?
+                vicuna_lib::upload_stage_file_logic(s("sessionId")?, s("fileName")?, s("base64")?).await?
             ))
         }
         "upload_read_file" => {
             Ok(serde_json::json!(
-                super::upload_read_file_logic(s("sessionId")?, s("name")?).await?
+                vicuna_lib::upload_read_file_logic(s("sessionId")?, s("name")?).await?
             ))
         }
         // ----- MCP -----
-        "mcp_list_servers" => Ok(serde_json::json!(super::mcp::list_file_servers()?)),
+        "mcp_list_servers" => Ok(serde_json::json!(vicuna_lib::mcp::list_file_servers()?)),
         "mcp_save_server" => {
-            let cfg: super::mcp::McpServerConfig =
+            let cfg: vicuna_lib::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad config: {e}"))?;
-            Ok(serde_json::json!(super::mcp::save_file_server(&cfg)?))
+            Ok(serde_json::json!(vicuna_lib::mcp::save_file_server(&cfg)?))
         }
         "mcp_delete_server" => {
-            Ok(serde_json::json!(super::mcp::delete_file_server(&s("id")?)?))
+            Ok(serde_json::json!(vicuna_lib::mcp::delete_file_server(&s("id")?)?))
         }
         "mcp_connect" => {
-            let cfg: super::mcp::McpServerConfig =
+            let cfg: vicuna_lib::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad config: {e}"))?;
             Ok(serde_json::json!(st.mcp.connect(&cfg).await?))
@@ -267,28 +267,28 @@ async fn dispatch(
         }
         "mcp_signout" => {
             let id = s("id")?;
-            let name = super::mcp::list_file_servers()?
+            let name = vicuna_lib::mcp::list_file_servers()?
                 .into_iter()
                 .find(|cf| cf.id == id)
                 .map(|cf| cf.name)
                 .unwrap_or(id.clone());
-            super::mcp::delete_auth(&name);
+            vicuna_lib::mcp::delete_auth(&name);
             let _ = st.mcp.disconnect(&id).await;
             Ok(serde_json::Value::Null)
         }
         "mcp_login_present" => {
             let id = s("id")?;
-            let name = super::mcp::list_file_servers()?
+            let name = vicuna_lib::mcp::list_file_servers()?
                 .into_iter()
                 .find(|cf| cf.id == id)
                 .map(|cf| cf.name)
                 .unwrap_or(id);
-            Ok(serde_json::json!(super::mcp::auth_present(&name)))
+            Ok(serde_json::json!(vicuna_lib::mcp::auth_present(&name)))
         }
         "mcp_signin" => Err("browser sign-in needs the Vicuna desktop app".to_string()),
         // ----- registry fetch (no CORS in Rust) -----
         "ollama_fetch_text" => {
-            Ok(serde_json::json!(super::ollama_fetch_text(s("url")?).await?))
+            Ok(serde_json::json!(vicuna_lib::ollama_fetch_text_logic(s("url")?).await?))
         }
         _ => Err(format!("unknown bridge command {cmd}")),
     }
@@ -366,7 +366,7 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
     let _ = req.respond(json_resp(r#"{"ok":false,"error":"not found"}"#.to_string()));
 }
 
-/// Serve forever on 127.0.0.1:<port>. Called from the `bridge` binary.
+/// Serve forever on 127.0.0.1:<port>. Called from `main` below.
 pub fn run(port: u16) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -381,4 +381,12 @@ pub fn run(port: u16) {
         let h = rt.handle().clone();
         std::thread::spawn(move || handle(&h, &st, req));
     }
+}
+
+fn main() {
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1421);
+    run(port);
 }

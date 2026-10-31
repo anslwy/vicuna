@@ -1,0 +1,13 @@
+[package]
+name = "vicuna-bridge"
+version = "0.1.0"
+description = "Vicuna headless bridge: loopback HTTP for driving the real backend without the Tauri shell (dev/test only)"
+authors = ["you"]
+edition = "2024"
+
+[dependencies]
+vicuna_lib = { package = "vicuna", path = "../src-tauri" }
+tauri = { version = "2" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tiny_http = "0.12"
+serde_json = "1"

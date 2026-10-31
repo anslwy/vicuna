@@ -18,7 +18,6 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
 pub mod mcp;
 pub mod work_agent;
-pub mod bridge;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -556,8 +555,7 @@ async fn ollama_delete_model(model: String) -> Result<(), String> {
 /// The URL is allowlisted to the public Ollama registry so the command
 /// cannot be abused as a generic proxy. Bounded by a timeout: without one,
 /// a single stalled manifest pinned the Fetch progress at N-1/N indefinitely.
-#[tauri::command]
-async fn ollama_fetch_text(url: String) -> Result<String, String> {
+pub async fn ollama_fetch_text_logic(url: String) -> Result<String, String> {
     const ALLOWED: [&str; 2] = [
         "https://ollama.com/library",
         "https://registry.ollama.ai/v2/library/",
@@ -784,8 +782,7 @@ fn work_display_string(p: &std::path::Path) -> String {
 /// Validate a workspace path: must exist and be a directory. Returns the
 /// canonical absolute path for display + session storage (verbatim prefix
 /// stripped on Windows so the UI never shows `\\?\C:\...`).
-#[tauri::command]
-async fn work_validate_root(path: String) -> Result<String, String> {
+pub async fn work_validate_root_logic(path: String) -> Result<String, String> {
     Ok(work_display_string(&work_canonical_root(path.trim())?))
 }
 
@@ -836,19 +833,18 @@ pub async fn work_list_dir_logic(root: String, path: Option<String>) -> Result<V
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkTreeEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    size: Option<u64>,
-    depth: usize,
+pub struct WorkTreeEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+    pub depth: usize,
 }
 
 /// Recursive workspace listing for the file explorer panel (flat, sorted
 /// by path). Skips dependency/build dirs; hidden files ARE included.
 /// Caps: depth 1-8 (default 4), 3000 entries.
-#[tauri::command]
-async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTreeEntry>, String> {
+pub async fn work_tree_logic(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTreeEntry>, String> {
     let canon = work_canonical_root(root.trim())?;
     let max_depth = max_depth.unwrap_or(4).clamp(1, 8);
     const SKIP: [&str; 8] = [
@@ -918,8 +914,7 @@ async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTre
 
 /// Import a file dropped from the OS into the workspace (base64 bytes).
 /// Sandbox-checked like every other work_ entry point. 16MB cap.
-#[tauri::command]
-async fn work_import_file(root: String, path: String, base64: String) -> Result<String, String> {
+pub async fn work_import_file_logic(root: String, path: String, base64: String) -> Result<String, String> {
     const CAP: usize = 16 * 1024 * 1024;
     let bytes = decode_base64(&base64).map_err(|_| "invalid file data".to_string())?;
     if bytes.len() > CAP {
@@ -1317,6 +1312,44 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
 #[tauri::command]
 async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileContent, String> {
     upload_read_file_logic(session_id, name).await
+}
+
+// ---------- More command wrappers (same pattern: logic is pub + callable
+// headlessly, wrappers preserve the exact IPC names). These cover the
+// remaining backend surface the headless bridge drives.
+#[tauri::command]
+async fn work_validate_root(path: String) -> Result<String, String> {
+    work_validate_root_logic(path).await
+}
+
+#[tauri::command]
+async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTreeEntry>, String> {
+    work_tree_logic(root, max_depth).await
+}
+
+#[tauri::command]
+async fn work_rename(root: String, path: String, new_name: String) -> Result<String, String> {
+    work_rename_logic(root, path, new_name).await
+}
+
+#[tauri::command]
+async fn work_delete(root: String, path: String) -> Result<(), String> {
+    work_delete_logic(root, path).await
+}
+
+#[tauri::command]
+async fn work_import_file(root: String, path: String, base64: String) -> Result<String, String> {
+    work_import_file_logic(root, path, base64).await
+}
+
+#[tauri::command]
+async fn upload_stage_file(session_id: String, file_name: String, base64: String) -> Result<String, String> {
+    upload_stage_file_logic(session_id, file_name, base64).await
+}
+
+#[tauri::command]
+async fn ollama_fetch_text(url: String) -> Result<String, String> {
+    ollama_fetch_text_logic(url).await
 }
 
 /// ---------- Background exec jobs (work mode, desktop only) ----------
@@ -2273,8 +2306,7 @@ async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String
 /// Rename a file or directory within its own folder (same-directory rename).
 /// `new_name` is a bare name — slashes, `..`, and empties are rejected —
 /// so the result can never escape the workspace.
-#[tauri::command]
-async fn work_rename(root: String, path: String, new_name: String) -> Result<String, String> {
+pub async fn work_rename_logic(root: String, path: String, new_name: String) -> Result<String, String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join(&canon, &path)?;
     if !full.exists() {
@@ -2307,8 +2339,7 @@ async fn work_rename(root: String, path: String, new_name: String) -> Result<Str
 
 /// Delete a workspace file or directory (recursive for dirs). Refuses the
 /// workspace root itself. Symlinks are removed, never followed.
-#[tauri::command]
-async fn work_delete(root: String, path: String) -> Result<(), String> {
+pub async fn work_delete_logic(root: String, path: String) -> Result<(), String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join(&canon, &path)?;
     if full == canon {
@@ -2360,8 +2391,7 @@ fn upload_session_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
 /// to its final component (no subdirectories, no escapes); existing files
 /// with the same name are overwritten, like `cp`. Returns the absolute path
 /// for the prompt note sent with the message.
-#[tauri::command]
-async fn upload_stage_file(session_id: String, file_name: String, base64: String) -> Result<String, String> {
+pub async fn upload_stage_file_logic(session_id: String, file_name: String, base64: String) -> Result<String, String> {
     const CAP: usize = 16 * 1024 * 1024;
     let bytes = decode_base64(&base64).map_err(|_| "invalid file data".to_string())?;
     if bytes.len() > CAP {
