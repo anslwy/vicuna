@@ -2731,7 +2731,9 @@
       : pendingMode;
     let workRoot: string | null = null;
     if (effectiveMode === "work") {
-      // workspace required before the session begins
+      // workspace required before the session begins. Always canonicalized
+      // through the backend (Tauri or bridge) so a stale/missing folder
+      // fails fast here instead of per-tool mid-turn.
       const rawWs = chat && chat.messages.length > 0 ? (chat.workspace ?? pendingWorkspace) : pendingWorkspace;
       if (!rawWs?.trim()) {
         workspaceError = "Pick a workspace folder first.";
@@ -2739,10 +2741,10 @@
         return;
       }
       try {
-        // desktop canonicalizes (must exist); browsers have no FS, so the
-        // raw path stands and file/shell tools report per-call — the
-        // vicuna-local tools (sessions, read_session) still work there
-        workRoot = isTauriRuntime() ? await canonicalWorkspace(rawWs) : rawWs.trim();
+        // desktop canonicalizes (must exist); plain browsers validate through
+        // the bridge (same check, server-side). Without either backend the
+        // call below throws and the turn never starts.
+        workRoot = await canonicalWorkspace(rawWs);
       } catch (e: any) {
         const msg = typeof e === "string" ? e : (e?.message ?? String(e));
         workspaceError = msg;
