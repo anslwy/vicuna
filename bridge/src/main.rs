@@ -286,6 +286,16 @@ async fn dispatch(
             Ok(serde_json::json!(vicuna_lib::mcp::auth_present(&name)))
         }
         "mcp_signin" => Err("browser sign-in needs the Vicuna desktop app".to_string()),
+        // ----- in-app updates -----
+        "app_build_info" => Ok(vicuna_lib::app_build_info_logic().await?),
+        "github_latest_release" => Ok(vicuna_lib::github_latest_release_logic().await?),
+        "github_download_asset" => {
+            Ok(serde_json::json!(vicuna_lib::github_download_asset_logic(s("url")?, s("fileName")?).await?))
+        }
+        "bridge_open_path" => {
+            vicuna_lib::open_installer(&s("path")?)?;
+            Ok(serde_json::Value::Null)
+        }
         // ----- registry fetch (no CORS in Rust) -----
         "ollama_fetch_text" => {
             Ok(serde_json::json!(vicuna_lib::ollama_fetch_text_logic(s("url")?).await?))

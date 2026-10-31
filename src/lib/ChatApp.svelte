@@ -30,6 +30,7 @@
   import { buildWorkSystemPrompt, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, WORK_TOOLS, GOAL_DONE_TOOL, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, snapshotChats, type WorkTreeEntry, type WorkAgentEvent, type McpRoute } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
+  import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
@@ -51,6 +52,15 @@
   /** true while the in-thread workspace input is focused: keeps the picker
    *  mounted while typing (it hides once a workspace is set) */
   let workspaceEditing = $state(false);
+  /** browser-only workspace picker popup (plain browsers have no native
+   *  folder dialog — and no window.prompt: headless browsers auto-dismiss
+   *  it. Draft commits on Enter, discards on Esc/backdrop). */
+  let workspacePickerOpen = $state(false);
+  let workspaceDraft = $state("");
+  let workspacePickerInput = $state<HTMLInputElement | null>(null);
+  $effect(() => {
+    if (workspacePickerOpen) workspacePickerInput?.focus();
+  });
   /** visible "command running" indicator while a work tool executes */
   let toolStatus = $state<{ chatId: string; label: string } | null>(null);
   /** live multiple-choice question from the work agent (null when none is
@@ -1112,6 +1122,16 @@
   let cliError = $state<string | null>(null);
   /** last install/uninstall outcome line (e.g. where it landed, PATH note) */
   let cliNote = $state<string | null>(null);
+  /** In-app updates (Settings → App updates): current build age vs the
+   *  rolling `latest` prerelease; Update downloads the platform installer
+   *  to ~/Downloads and opens it. Works in Tauri and plain-browser-with-
+   *  bridge (see src/lib/update.ts + bridge). */
+  let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
+  let updateRelease = $state<ReleaseInfo | null>(null);
+  let updateOp = $state<null | "check" | "download">(null);
+  let updateError = $state<string | null>(null);
+  let updateNote = $state<string | null>(null);
+  let downloadedPath = $state<string | null>(null);
   let runners = $state<RunningModel[]>([]);
   let runnersError = $state<string | null>(null);
   let modelOp = $state<string | null>(null);
@@ -1159,6 +1179,72 @@
     settingsTab = "general";
     settingsOpen = true;
     void refreshCliStatus();
+    void refreshBuildInfo();
+  }
+
+  /** Read this build's version + baked timestamp (silent unless it fails:
+   *  the row shows "unavailable" instead). */
+  async function refreshBuildInfo() {
+    try {
+      buildInfo = await invokeOrBridge<{ version: string; builtAtUnix: number }>("app_build_info", {});
+    } catch {
+      buildInfo = null;
+    }
+  }
+
+  /** Fetch the rolling `latest` prerelease and decide by date. */
+  async function checkForUpdates() {
+    if (updateOp) return;
+    updateOp = "check";
+    updateError = null;
+    updateNote = null;
+    downloadedPath = null;
+    try {
+      updateRelease = await invokeOrBridge<ReleaseInfo>("github_latest_release", {});
+    } catch (e: any) {
+      updateError = typeof e === "string" ? e : (e?.message ?? String(e));
+      updateRelease = null;
+    } finally {
+      updateOp = null;
+    }
+  }
+
+  /** Download the platform installer to ~/Downloads and open it for the
+   *  user to run (unsigned builds can't self-replace, so the last step is
+   *  manual). Desktop opens via the opener plugin; plain browsers go
+   *  through the loopback bridge's system opener. */
+  async function applyUpdate() {
+    if (updateOp || !updateRelease) return;
+    const asset = pickAssetForPlatform(updateRelease.assets, currentPlatform());
+    if (!asset) {
+      updateError = `No installer for this platform in ${updateRelease.tag}. See the release page.`;
+      return;
+    }
+    updateOp = "download";
+    updateError = null;
+    updateNote = null;
+    try {
+      const path = await invokeOrBridge<string>("github_download_asset", {
+        url: asset.url,
+        fileName: asset.name
+      });
+      downloadedPath = path;
+      try {
+        if (isTauriRuntime()) {
+          const { openPath } = await import("@tauri-apps/plugin-opener");
+          await openPath(path);
+        } else {
+          await invokeOrBridge("bridge_open_path", { path });
+        }
+        updateNote = `Downloaded to ${path} — the installer should be opening now.`;
+      } catch {
+        updateNote = `Downloaded to ${path} — open it to install.`;
+      }
+    } catch (e: any) {
+      updateError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      updateOp = null;
+    }
   }
 
   /** (Re)read the `vicuna` launcher status; silent unless it fails. */
@@ -2715,6 +2801,10 @@
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
     if (compacting) return;
+    // an open workspace draft never outlives the send: committing first
+    // treats typed-then-sent as picked (the native dialog is modal, so
+    // desktop can never send mid-pick either)
+    if (workspacePickerOpen) await commitWorkspacePicker();
     if (streaming || workRunning) {
       // work turns stay interactive: a prompt typed mid-run queues for the
       // next round instead of being dropped or starting a parallel turn
@@ -4114,7 +4204,8 @@
   }
 
   /** Workspace pill (composer bar, work contexts): native folder picker on
-   *  desktop; manual prompt in plain browsers (no FS access for a dialog). */
+   *  desktop; inline popup form in plain browsers (no FS access for a
+   *  dialog, and no window.prompt — it auto-dismisses headlessly). */
   async function pickWorkspace() {
     if (!isTauriRuntime()) {
       const el = document.querySelector<HTMLInputElement>("[data-testid=workspace-input-active]");
@@ -4123,12 +4214,9 @@
         el.scrollIntoView({ block: "nearest" });
         return;
       }
-      const current = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
-      const answer = window.prompt("Workspace absolute path:", current || (isWindows ? "" : "/"));
-      if (answer == null) return; // cancelled
-      pendingWorkspace = answer.trim();
-      if (composerMode === "work" && activeChat) activeChat.workspace = pendingWorkspace || null;
-      workspaceEditing = false;
+      workspaceDraft = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
+      workspaceError = null;
+      workspacePickerOpen = true;
       return;
     }
     try {
@@ -4151,6 +4239,38 @@
       }
     } catch (e: any) {
       workspaceError = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  /** Discard the browser workspace-picker draft (Esc always cancels). */
+  function closeWorkspacePicker() {
+    workspacePickerOpen = false;
+  }
+
+  /** Backdrop click: commit a typed path, discard when empty. Split from
+   *  Esc (which cancels outright) so clicking Send right after typing
+   *  keeps the path instead of dropping it. */
+  function dismissWorkspacePicker() {
+    void commitWorkspacePicker();
+  }
+
+  /** Commit the browser workspace-picker draft: same assignment + validate
+   *  + persist-default flow as the desktop picker (empty draft = cancel).
+   *  The popup stays open on validation failure so the error is visible
+   *  next to the path it rejects. */
+  async function commitWorkspacePicker() {
+    const picked = workspaceDraft.trim();
+    if (!picked) {
+      workspacePickerOpen = false;
+      return;
+    }
+    pendingWorkspace = picked;
+    if (composerMode === "work" && activeChat) activeChat.workspace = picked || null;
+    workspaceError = await validateWorkspace(picked);
+    if (!workspaceError) {
+      defaultWorkspace = picked;
+      persistPrefs();
+      workspacePickerOpen = false;
     }
   }
 
@@ -5359,7 +5479,7 @@
     {/if}
 
     {#if error}
-      <div class="err" data-testid="error-box">{error}</div>
+      <div class="err" data-testid="error-box"><span>{error}</span><button type="button" class="err-x" data-testid="error-dismiss" aria-label="Dismiss error" title="Dismiss" onclick={() => (error = null)}>×</button></div>
     {/if}
     {#if toolStatus && toolStatus.chatId === activeId}
       <div class="tool-status" data-testid="tool-status">
@@ -5412,6 +5532,9 @@
             }}
             onblur={() => { workspaceEditing = false; void validateWorkspace(pendingWorkspace).then((e) => (workspaceError = e)); }}
           />
+          {#if workspaceError}
+            <div class="goto-error" data-testid="workspace-inline-error">{workspaceError}</div>
+          {/if}
         </div>
       {/if}
       <div
@@ -5594,6 +5717,39 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
               <span class="model-name">{wsName || "Workspace"}</span>
             </button>
+            {#if workspacePickerOpen && !isTauriRuntime()}
+              <span class="model-pill-wrap">
+                <button class="model-backdrop" data-testid="workspace-picker-backdrop" aria-label="Close workspace picker" onclick={dismissWorkspacePicker} tabindex="-1"></button>
+                <form
+                  class="model-drop workspace-picker-drop"
+                  data-testid="workspace-picker"
+                  onsubmit={(e) => {
+                    e.preventDefault();
+                    void commitWorkspacePicker();
+                  }}
+                >
+                  <div class="workspace-picker-label">Workspace absolute path</div>
+                  <input
+                    class="pull-input"
+                    data-testid="workspace-picker-input"
+                    placeholder={isWindows ? "C:\\path\\to\\workspace" : "/absolute/path/to/workspace"}
+                    bind:value={workspaceDraft}
+                    spellcheck={false}
+                    bind:this={workspacePickerInput}
+                    onkeydown={(e) => {
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        closeWorkspacePicker();
+                      }
+                    }}
+                  />
+                  {#if workspaceError}
+                    <div class="goto-error" data-testid="workspace-picker-error">{workspaceError}</div>
+                  {/if}
+                </form>
+              </span>
+            {/if}
           {/if}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
@@ -6576,6 +6732,40 @@
       ></textarea>
       <span class="setting-note">One per line. Use \n for newlines. Generation stops when the model outputs one of these.</span>
     </div>
+    <div class="setting-stacked">
+      <span class="setting-label">App updates</span>
+      <div class="browse-actions">
+        {#if buildInfo}
+          <span class="setting-note" data-testid="app-version">v{buildInfo.version} · built {formatBuildDate(buildInfo.builtAtUnix) || "date unknown"}</span>
+        {:else}
+          <span class="setting-note">Current version unknown.</span>
+        {/if}
+        <button class="mini-btn" data-testid="update-check-btn" disabled={updateOp !== null} onclick={checkForUpdates}>{updateOp === "check" ? "Checking…" : "Check for updates"}</button>
+      </div>
+      {#if updateRelease}
+        {@const platform = currentPlatform()}
+        {@const stamp = releaseTimestamp(updateRelease, platform)}
+        {@const behind = !buildInfo || isNewerRelease(stamp, buildInfo.builtAtUnix)}
+        {@const asset = pickAssetForPlatform(updateRelease.assets, platform)}
+        <span class="setting-note" data-testid="update-latest">Latest: {updateRelease.tag} · installer built {formatBuildDate(Math.floor(Date.parse(stamp) / 1000)) || "date unknown"}</span>
+        {#if behind && asset}
+          <div class="browse-actions">
+            <button class="mini-btn primary" data-testid="update-install-btn" disabled={updateOp !== null} onclick={applyUpdate}>{updateOp === "download" ? "Downloading…" : `Download ${asset.name} (${formatAssetSize(asset.size)})`}</button>
+            <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
+          </div>
+        {:else if behind}
+          <span class="setting-note">No installer for this platform in {updateRelease.tag} — see the release notes.</span>
+          <div class="browse-actions">
+            <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
+          </div>
+        {:else}
+          <span class="setting-note" data-testid="update-uptodate">You're up to date.</span>
+        {/if}
+      {/if}
+      {#if updateNote}<span class="setting-note" data-testid="update-note">{updateNote}</span>{/if}
+      {#if updateError}<p class="goto-error" data-testid="update-error">{updateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => (updateError = null)}>×</button></p>{/if}
+      <span class="setting-note">Compares your build date against the rolling <code>latest</code> prerelease and opens the downloaded installer for you to run.</span>
+    </div>
     {#if isTauriRuntime()}
       <div class="setting-stacked">
         <span class="setting-label">Vicuna CLI</span>
@@ -6991,7 +7181,10 @@
   .answer :global(table) { border-collapse: collapse; margin: 0; }
   .answer :global(.table-wrap) { overflow-x: auto; max-width: 100%; margin: 0 0 12px 0; }
   .answer :global(th), .answer :global(td) { border: 1px solid var(--border-2); padding: 6px 10px; font-size: 13.5px; }
-  .err { max-width: 720px; margin: 0 auto; color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 12px; font-size: 13px; }
+  .err { max-width: 720px; margin: 0 auto; color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 12px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .err span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .err-x { flex: none; border: 0; background: none; color: inherit; opacity: .6; font-size: 15px; line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+  .err-x:hover { opacity: 1; background: rgba(127,127,127,.25); }
   .tool-status { max-width: 860px; width: 100%; margin: 0 auto 8px auto; box-sizing: border-box; display: flex; align-items: center; gap: 8px; color: var(--muted-2); font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0 24px; }
   .tool-status-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .composer-wrap { position: relative; padding: 12px 24px 22px 24px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
@@ -7138,6 +7331,8 @@
   .mode-toggle .seg-btn { min-width: 90px; }
   .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
   .workspace-input { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .workspace-picker-drop { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .workspace-picker-label { font-size: 12px; color: var(--muted); }
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
