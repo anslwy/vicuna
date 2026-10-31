@@ -109,14 +109,20 @@ struct Connected {
 }
 
 pub struct McpManager {
-    inner: Mutex<HashMap<String, Connected>>,
+    inner: std::sync::Arc<Mutex<HashMap<String, Connected>>>,
 }
 
 impl Default for McpManager {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+}
+
+impl Clone for McpManager {
+    fn clone(&self) -> Self {
+        Self { inner: std::sync::Arc::clone(&self.inner) }
     }
 }
 

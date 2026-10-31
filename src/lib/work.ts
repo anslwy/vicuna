@@ -5,6 +5,7 @@
 
 import type { ChatMsg } from "./ollama";
 import { isTauriRuntime } from "./ollama";
+import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
 import type { Chat } from "./store";
 
 export interface WorkToolCall {
@@ -308,8 +309,9 @@ export function hasUnresolvedToolCall(fullText: string): boolean {
 }
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return await invoke<T>(cmd, args);
+  // Tauri IPC when shelled, loopback bridge when plain-browser-with-bridge,
+  // desktop-needed error otherwise (see src/lib/bridge.ts).
+  return await invokeOrBridge<T>(cmd, args);
 }
 
 export interface WorkTreeEntry {
@@ -320,28 +322,24 @@ export interface WorkTreeEntry {
   depth: number;
 }
 
-/** Recursive workspace listing for the explorer panel (desktop only). */
+/** Recursive workspace listing for the explorer panel (desktop or bridge). */
 export async function listWorkTree(root: string, maxDepth = 4): Promise<WorkTreeEntry[]> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<WorkTreeEntry[]>("work_tree", { root, maxDepth });
 }
 
-/** Import an OS-dropped file into the workspace (base64 bytes, desktop only). */
+/** Import an OS-dropped file into the workspace (base64 bytes, desktop or bridge). */
 export async function importWorkFile(root: string, path: string, base64: string): Promise<string> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<string>("work_import_file", { root, path, base64 });
 }
 
-/** Rename a workspace file or folder within its own directory (desktop only).
+/** Rename a workspace file or folder within its own directory (desktop or bridge).
  *  Returns the new workspace-relative path. */
 export async function renameWorkFile(root: string, path: string, newName: string): Promise<string> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<string>("work_rename", { root, path, newName });
 }
 
-/** Delete a workspace file or folder (recursive, desktop only). */
+/** Delete a workspace file or folder (recursive, desktop or bridge). */
 export async function deleteWorkFile(root: string, path: string): Promise<void> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   await invokeCmd<void>("work_delete", { root, path });
 }
 
@@ -527,11 +525,10 @@ export function readSession(chats: Chat[], id: string, limit = 30): string {
     msgs.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content.slice(0, 2000)}`).join("\n\n");
 }
 
-/** Stage a composer attachment for a session (desktop only). Returns the
+/** Stage a composer attachment for a session (desktop or bridge). Returns the
  *  absolute staged path for the prompt note. Files keep their bytes as-is
  *  (just `cp` semantics) under ~/vicuna/uploads/<session-id>/. */
 export async function stageUploadFile(sessionId: string, fileName: string, base64: string): Promise<string> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<string>("upload_stage_file", { sessionId, fileName, base64 });
 }
 
@@ -552,15 +549,13 @@ export interface BackgroundJobSummary {
   exit_code: number | null;
 }
 
-/** Poll one background exec job (desktop only). */
+/** Poll one background exec job (desktop or bridge). */
 export async function backgroundStatus(id: string): Promise<BackgroundJobStatus> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<BackgroundJobStatus>("work_exec_status", { id });
 }
 
-/** List background exec jobs (desktop only, no output payload). */
+/** List background exec jobs (desktop or bridge, no output payload). */
 export async function backgroundList(): Promise<BackgroundJobSummary[]> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   return await invokeCmd<BackgroundJobSummary[]>("work_exec_list", {});
 }
 
@@ -882,4 +877,133 @@ export function formatToolCallTail(output: string): string {
  *  Summary is plain text (no markdown inside <summary> renders). */
 export function formatToolResult(name: string, args: Record<string, any>, output: string): string {
   return formatToolCallHead(name, args) + formatToolCallTail(output);
+}
+
+// ---------- Rust work-agent turn client (src-tauri/src/work_agent.rs) ----------
+//
+// The agent rounds now live in the backend. These are thin transport helpers:
+// the frontend builds one turn request, mirrors the semantic event stream
+// into the chat bubble with the builders above, and answers `ask` + steering
+// through the commands below. Field names are snake_case to match the Rust
+// command signatures exactly.
+
+/** Semantic agent events, mirroring WorkAgentEvent (serde tag `type`,
+ *  lowercase variant names). */
+export type WorkAgentEvent =
+  | { type: "token"; text: string }
+  | { type: "think"; text: string }
+  | { type: "status"; label: string | null }
+  | { type: "roundstart"; mode: string }
+  | { type: "roundend"; gen_ms: number; gen_tps: number | null }
+  | { type: "displaynote"; text: string }
+  | { type: "queuedrained"; ids: string[]; messages: ChatMsg[] }
+  | { type: "toolstart"; name: string; args: Record<string, any> }
+  | { type: "toolend"; name: string; output: string }
+  | { type: "askrequest"; ask_id: string; question: string; options: string[] }
+  | { type: "bgcompleted"; job_id: string; command: string; output: string }
+  | { type: "contextcompacted"; note: string }
+  | { type: "done"; stopped: boolean }
+  | { type: "error"; message: string };
+
+/** Past-session search runs backend-side now: minimal snapshot (the agent
+ *  never sees full history, only what these tools return). */
+export interface ChatSnapshot {
+  id: string;
+  title: string;
+  mode: string;
+  messages: { role: string; content: string }[];
+}
+
+export function snapshotChats(chats: Chat[]): ChatSnapshot[] {
+  return chats.map((c) => ({
+    id: c.id,
+    title: c.title,
+    mode: c.mode ?? "chat",
+    messages: c.messages.map((m) => ({ role: m.role, content: m.content }))
+  }));
+}
+
+/** MCP name → (server, real tool) routing for the backend dispatcher. */
+export interface McpRoute {
+  server_id: string;
+  tool_name: string;
+}
+
+export interface WorkTurnParams {
+  model: string;
+  workspace: string;
+  messages: ChatMsg[];
+  think?: boolean | string;
+  tools?: unknown;
+  sessionId?: string;
+  goalText?: string | null;
+  goalPaused?: boolean;
+  chats: ChatSnapshot[];
+  mcpRoutes: Record<string, McpRoute>;
+  onEvent: (ev: WorkAgentEvent) => void;
+}
+
+/** Start a backend agent turn. Resolves with the turn id once the loop is
+ *  running; events stream through onEvent until done/error. Tauri IPC when
+ *  shelled, loopback bridge when plain-browser-with-bridge. */
+export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
+  const args = {
+    model: p.model,
+    workspace: p.workspace,
+    messages: p.messages,
+    think: p.think ?? true,
+    tools: p.tools ?? null,
+    sessionId: p.sessionId ?? null,
+    goalText: p.goalText ?? null,
+    goalPaused: p.goalPaused ?? true,
+    chats: p.chats,
+    mcpRoutes: p.mcpRoutes
+  };
+  if (isTauriRuntime()) {
+    const { invoke, Channel } = await import("@tauri-apps/api/core");
+    const ch = new Channel<WorkAgentEvent>();
+    ch.onmessage = (ev) => p.onEvent(ev);
+    return await invoke<string>("work_agent_start", { ...args, onEvent: ch });
+  }
+  const ch = new BridgeChannel();
+  ch.onmessage = (ev) => p.onEvent(ev as WorkAgentEvent);
+  try {
+    return await bridgeInvoke("work_agent_start", { ...args, onEvent: ch.marker() });
+  } catch (e) {
+    ch.stop();
+    throw e;
+  }
+}
+
+/** Interrupt a running turn (double-Esc, Stop, chat deleted). */
+export async function stopWorkAgentTurn(turnId: string): Promise<void> {
+  if (isTauriRuntime()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("work_agent_stop", { turnId });
+    return;
+  }
+  try {
+    await bridgeInvoke("work_agent_stop", { turnId });
+  } catch {
+    /* turn already gone (bridge down or settled) */
+  }
+}
+
+/** Queue a steering prompt into a live turn (joins at the next round). */
+export async function queueWorkAgentMsg(turnId: string, id: string, message: ChatMsg): Promise<void> {
+  await invokeCmd<void>("work_agent_queue", { turnId, id, message });
+}
+
+/** Drop a still-queued steering prompt (composer chip removed). */
+export async function removeWorkAgentMsg(turnId: string, id: string): Promise<void> {
+  try {
+    await invokeCmd<void>("work_agent_remove", { turnId, id });
+  } catch {
+    /* turn already gone */
+  }
+}
+
+/** Answer a live `ask` card (answer or dismissal text). */
+export async function answerWorkAgentAsk(turnId: string, askId: string, answer: string): Promise<void> {
+  await invokeCmd<void>("work_agent_answer", { turnId, askId, answer });
 }

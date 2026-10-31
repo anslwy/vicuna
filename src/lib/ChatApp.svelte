@@ -27,9 +27,10 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, toolLabel, WORK_TOOLS, GOAL_DONE_TOOL, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, WORK_TOOLS, GOAL_DONE_TOOL, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, snapshotChats, type WorkTreeEntry, type WorkAgentEvent, type McpRoute } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
-  import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
+  import { invokeOrBridge } from "$lib/bridge";
+  import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import type { Terminal as XTerm } from "xterm";
@@ -190,6 +191,9 @@
   let now = $state(Date.now());
   let workStop = false;
   let workTurnSeq = 0;
+  /** backend turn id of the live Rust agent loop (null when idle) — needed
+   *  for stop/steer/ask-answer routing while a turn runs */
+  let workTurnId: string | null = null;
   // ---- MCP servers (Work mode only) ----
   // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
   // file is the source of truth and the UI edits it via the backend.
@@ -352,10 +356,8 @@
   }
 
   async function loadMcpServers() {
-    if (!isTauriRuntime()) {
-      mcpServers = [];
-      return;
-    }
+    // listMcpServers resolves via Tauri, the loopback bridge, or [] when
+    // neither is present (plain browser with no backend has no servers).
     try {
       mcpServers = await listMcpServers();
     } catch (e) {
@@ -691,7 +693,7 @@
   }
   /** prompts typed while a work turn is live: they join the context at the
    *  next round (after the tool results), never as a parallel turn */
-  let queuedMsgs = $state<{ chatId: string; msg: ChatMsg }[]>([]);
+  let queuedMsgs = $state<{ chatId: string; id: string; msg: ChatMsg }[]>([]);
   /** first Esc arms interrupt, a second Esc within 2.5s stops the agent */
   let escArmed = $state(false);
   let escTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1064,6 +1066,7 @@
 
   function deleteChat(id: string) {
     if (pendingAsk?.chatId === id) cancelPendingAsk("(the chat was deleted before answering)");
+    if (workRunning && workChatId === id && workTurnId) void stopWorkAgentTurn(workTurnId).catch(() => {});
     aborter?.abort();
     aborter = null;
     streaming = false;
@@ -1075,6 +1078,7 @@
       workChatId = null;
       workRunning = false;
       workStartAt = null;
+      workTurnId = null;
     }
     ctxMenu = null;
     pendingDeleteId = null;
@@ -2699,10 +2703,6 @@
     let uploadNote = "";
     let firstUploadName: string | null = null;
     if (attachFiles.length > 0) {
-      if (!isTauriRuntime()) {
-        error = "File uploads need the Vicuna desktop app — your files were kept.";
-        return;
-      }
       if (attachFiles.length > 20) {
         error = `Too many attached files (max 20, got ${attachFiles.length}) — remove some and resend.`;
         return;
@@ -2814,7 +2814,10 @@
   function queuePrompt(text: string, images?: string[]) {
     const chatId = activeId;
     if (!chatId || (!text && !images?.length)) return;
-    queuedMsgs = [...queuedMsgs, { chatId, msg: { role: "user", content: text, ...(images ? { images } : {}) } }];
+    const id = crypto.randomUUID();
+    const msg: ChatMsg = { role: "user", content: text, ...(images ? { images } : {}) };
+    queuedMsgs = [...queuedMsgs, { chatId, id, msg }];
+    if (workTurnId) void queueWorkAgentMsg(workTurnId, id, msg).catch(() => {});
     input = "";
     clearDraft(null);
     attachImages = [];
@@ -2829,8 +2832,20 @@
     return taken.map((q) => q.msg);
   }
 
+  /** drop backend-confirmed steering messages (QueueDrained): they have
+   *  bubbles now, so only the unconfirmed tail stays queued */
+  function confirmQueuedDrained(ids: string[]) {
+    if (!ids.length) return;
+    const gone = new Set(ids);
+    queuedMsgs = queuedMsgs.filter((q) => !gone.has(q.id));
+  }
+
   function unqueue(index: number) {
+    const removed = queuedMsgs.filter((_, i) => i === index);
     queuedMsgs = queuedMsgs.filter((_, i) => i !== index);
+    for (const q of removed) {
+      if (workTurnId) void removeWorkAgentMsg(workTurnId, q.id).catch(() => {});
+    }
   }
 
   function formatSize(n: number): string {
@@ -2848,10 +2863,6 @@
     // crawling it hits macOS TCC-protected spots on every refresh).
     if (!root || root === "/") {
       explorerError = "Pick a workspace folder first.";
-      return;
-    }
-    if (!isTauriRuntime()) {
-      explorerError = "File explorer needs the Vicuna desktop app.";
       return;
     }
     explorerLoading = true;
@@ -3791,6 +3802,7 @@
 
   function stop() {
     if (workRunning) workStop = true;
+    if (workTurnId) void stopWorkAgentTurn(workTurnId).catch(() => {});
     cancelPendingAsk("(the user interrupted before answering)");
     aborter?.abort();
   }
@@ -4052,12 +4064,8 @@
   async function validateWorkspace(path: string): Promise<string | null> {
     const p = path.trim();
     if (!p) return null;
-    if (!isTauriRuntime()) {
-      return "Workspace folders need the Vicuna desktop app — browsers can't access the filesystem.";
-    }
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke<string>("work_validate_root", { path: p });
+      await invokeOrBridge<string>("work_validate_root", { path: p });
       return null;
     } catch (e: any) {
       return typeof e === "string" ? e : (e?.message ?? String(e));
@@ -4065,8 +4073,7 @@
   }
 
   async function canonicalWorkspace(path: string): Promise<string> {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<string>("work_validate_root", { path: path.trim() });
+    return await invokeOrBridge<string>("work_validate_root", { path: path.trim() });
   }
 
   /** Workspace pill (composer bar, work contexts): native folder picker on
@@ -4110,38 +4117,88 @@
     }
   }
 
-  /** Work-mode agent loop via Ollama native tool calling.
+  /** Work-mode agent loop, owned by the Rust backend (work_agent.rs).
    *  Each round streams narration text into the live assistant message and
-   *  returns `tool_calls`; we execute them, append collapsed markdown results
-   *  for persistence, and feed proper `role: tool` messages back. The fence
-   *  parser remains as a fallback for models without tools support. */
+   *  returns `tool_calls`; the backend executes them, and the frontend
+   *  mirrors the semantic event stream below into the bubble (collapsed
+   *  markdown results for persistence, ask cards, steering bubbles) exactly
+   *  like the old in-thread loop did. Settle paths (leftovers, follow-up
+   *  turns, goal retirement, stats) are unchanged. */
   async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = []) {
-    const ctrl = aborter;
     const turnId = ++workTurnSeq;
+    // No Tauri gate here: plain browsers drive the same flow through the
+    // loopback bridge (startWorkAgentTurn throws the desktop/bridge error
+    // when neither is present, and the catch below surfaces it).
     workRunning = true;
     workChatId = chat.id;
     workStartAt = Date.now();
     workStop = false;
     let curIndex = index;
-    let firstRound = true;
-    let gotNative = false;
-    // offset into the display message: only text streamed this turn is
-    // scanned for fences, so old executed calls never re-trigger
-    let checkedLen = chats.find((x) => x.id === chat.id)?.messages[index]?.content.length ?? 0;
-    const seen = new Set<string>();
-    const callKey = (c: { name: string; args: Record<string, any> }) =>
-      `${c.name}\n${JSON.stringify(c.args)}`;
-    // background exec jobs started this turn: the model keeps working while
-    // they run; a finished job joins the transcript (drain below) and wakes
-    // the model only once its output is ready
-    const pendingBg = new Set<string>();
-    // set by the `done` self-stop: skip remaining calls and settle the turn
-    let turnDone = false;
-    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-    // native history: proper tool roles for the model; display message holds
-    // narration + markdown results for persistence. seedContext carries hidden
-    // context (e.g. a continued chat transcript) never shown in this thread.
-    const baseHistory = compactedHistory(chats.find((x) => x.id === chat.id)?.messages.slice(0, index) ?? []);
+    // in-flight tool head (for say/ask/done display) + the ask answer the
+    // frontend itself sent (the record mirrors it once the result lands)
+    let pendingHead: { name: string; args: Record<string, any> } | null = null;
+    let askOutcome: "answer" | "dismiss" | null = null;
+    let askText = "";
+    // token batching: same ~120ms behavior the old loop had — every state
+    // write re-renders the whole message, so per-token writes go O(n²)
+    let pendingTok = "";
+    let pendingTh = "";
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    function flushTokens() {
+      flushTimer = null;
+      if (!pendingTok && !pendingTh) return;
+      const tok = pendingTok;
+      const th = pendingTh;
+      pendingTok = "";
+      pendingTh = "";
+      const keep = captureStreamSel(curIndex);
+      const c = chats.find((x) => x.id === chat.id);
+      if (c && c.messages[curIndex]) {
+        const m = c.messages[curIndex];
+        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
+        chats = [...chats];
+      }
+      if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
+      scrollBottom();
+      saveSoon();
+    }
+    function scheduleFlush() {
+      if (flushTimer) return;
+      flushTimer = setTimeout(flushTokens, 120);
+    }
+    // slow first-token pause while the model generates tool args (same
+    // "Preparing tool call…" stall hint the old rounds showed)
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    function clearStall() {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    }
+    function dropStallHint() {
+      if (toolStatus?.chatId === chat.id && toolStatus.label === "Preparing tool call…") toolStatus = null;
+    }
+    function armStall() {
+      clearStall();
+      stallTimer = setTimeout(() => {
+        stallTimer = null;
+        if (!pendingTok && !pendingTh && !toolStatus) {
+          toolStatus = { chatId: chat.id, label: "Preparing tool call…" };
+        }
+      }, 1000);
+    }
+    const live = () => chats.find((x) => x.id === chat.id);
+    function appendContent(s: string) {
+      const c = live();
+      if (!c?.messages[curIndex]) return;
+      const m = c.messages[curIndex];
+      c.messages[curIndex] = { ...m, content: m.content + s };
+      chats = [...chats];
+    }
+    // native history: proper tool roles for the model; the display message
+    // holds narration + markdown results for persistence. seedContext carries
+    // hidden context (e.g. a continued chat transcript) never shown here.
+    const baseHistory = compactedHistory(live()?.messages.slice(0, index) ?? []);
     let seed = seedContext;
     if (!seed.length && chat.forkedFrom && chat.forkFromIndex == null) {
       // continued thread regenerated (or re-run) without its original seed:
@@ -4154,518 +4211,269 @@
         ];
       }
     }
-    let native: ChatMsg[] = [
-      { role: "system", content: buildWorkSystemPrompt(workspace, chatGoal(chats.find((x) => x.id === chat.id))?.text ?? null) },
+    const startGoal = chatGoal(live());
+    const native: ChatMsg[] = [
+      { role: "system", content: buildWorkSystemPrompt(workspace, startGoal?.text ?? null) },
       ...seed,
       ...baseHistory
     ];
-    // goal mode (/goal): an unpaused objective keeps the turn alive past the
-    // point where the model would stop calling tools. At that exit, one
-    // ephemeral check goes into the native transcript (never persisted) and
-    // the loop runs another round — the model either keeps working or
-    // answers done with no calls, which ends the turn. A check already
-    // outstanding means it answered text twice: treat that as done.
-    const GOAL_CHECK_PREFIX = "Session goal check:";
-    function nativeAtGoalCheck(): boolean {
-      const last = native[native.length - 1];
-      return !!last && last.role === "user" && last.content.startsWith(GOAL_CHECK_PREFIX);
-    }
-    // MCP tools (Work mode only): connected servers lend extra tools alongside
-    // the built-in workspace ones. Assembled once per turn; chat mode never
-    // sees them.
+    // MCP tools (Work mode only): same assembly as before — connected
+    // servers lend extra tools alongside the built-in workspace ones.
     const mcp = assembleMcpTools();
-    // Goal Mode self-stop: `done` is offered only while an unpaused goal is
-    // set, so goal-free turns send byte-identical tools as before.
-    const goalAtStart = chatGoal(chats.find((x) => x.id === chat.id));
-    const allTools = [...WORK_TOOLS, ...(goalAtStart && !goalAtStart.paused ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
-    // Move finished background jobs into the transcript: a `role: user`
-    // wake-up natively (orphan `role: tool` messages have no matching call)
-    // plus a collapsed result block for display. `skip` covers ids the model
-    // just polled itself — their output is already in the transcript.
-    // Context guard: the native transcript grows every round (assistant text,
-    // tool_calls, every tool result, bg completions, viewed images re-sent
-    // each round). Once the estimate passes 70% of the model's own window
-    // (via /api/show, 32768 fallback), summarize the oldest messages into
-    // one note and drop the raw prefix — otherwise the round fails outright
-    // and retries resend the same oversized history. Two refinements keep
-    // this working when single outputs are huge (verified: one MCP dump
-    // blew a transcript 189K tokens past the window): the kept tail is
-    // sized to fit, not a fixed message count, and oversized tool outputs
-    // in it are stubbed oldest-first.
-    const COMPACT_FRACTION = 0.7;
-    const COMPACT_MIN_TAIL = 4;
-    // one summarizer call must itself fit comfortably in any window
-    const SUM_CHUNK_CHARS = 60000;
-    const SUM_MAX_CHUNKS = 6;
-    // consecutive rounds that produce nothing (no text, no calls) mean the
-    // transcript no longer fits even compacted — end the turn instead of
-    // spinning (or goal-nudging) forever on identical failures
-    let emptyRounds = 0;
-    function transcriptOf(msgs: ChatMsg[]): string {
-      return msgs.map((m) => {
-        const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
-        return `${who}: ${m.content}${m.images?.length ? ` [${m.images.length} image(s) attached]` : ""}`;
-      }).join("\n\n");
-    }
-    function chunkTranscript(t: string): string[] {
-      if (t.length <= SUM_CHUNK_CHARS) return [t];
-      const chunks: string[] = [];
-      let cur = "";
-      for (const p of t.split("\n\n")) {
-        if (cur && (cur + "\n\n" + p).length > SUM_CHUNK_CHARS) {
-          chunks.push(cur);
-          cur = p;
-        } else {
-          cur = cur ? cur + "\n\n" + p : p;
-        }
+    const allTools = [...WORK_TOOLS, ...(startGoal && !startGoal.paused ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
+    const routes: Record<string, McpRoute> = {};
+    for (const [k, v] of mcp.route) routes[k] = { server_id: v.server.id, tool_name: v.name };
+    const think = effectiveThink();
+
+    async function settle(stopped: boolean) {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
       }
-      if (cur) chunks.push(cur);
-      return chunks.length ? chunks : [t.slice(0, SUM_CHUNK_CHARS)];
-    }
-    async function summarizePieces(parts: string[]): Promise<string> {
-      // oldest pieces first; keep the most recent when there is too much
-      const use = parts.slice(-SUM_MAX_CHUNKS);
-      const out: string[] = [];
-      for (let i = 0; i < use.length; i++) {
-        if (workStop || ctrl?.signal.aborted) return "";
-        try {
-          const r = await chatStream(
-            selectedModel,
-            [
-              { role: "system", content: "Summarize this agent transcript excerpt concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter." },
-              { role: "user", content: (parts.length > use.length && i === 0 ? "[earliest history omitted to fit]\n\n" : "") + use[i] }
-            ],
-            () => {},
-            ctrl?.signal,
-            undefined,
-            0,
-            { think: false, temperature: 0.2 }
-          );
-          if (r.text.trim()) out.push(r.text.trim());
-        } catch {
-          return ""; // a failed chunk poisons the join: bail, stay uncompacted
-        }
+      flushTokens();
+      clearStall();
+      dropStallHint();
+      if (!unloading) clearPendingStream();
+      save();
+      if (escTimer) {
+        clearTimeout(escTimer);
+        escTimer = null;
       }
-      return out.join("\n\n");
-    }
-    async function maybeCompactContext(): Promise<void> {
-      const win = (await modelContextLength(selectedModel)) ?? 32768;
-      const toolsTokens = Math.ceil(JSON.stringify(allTools).length / 4);
-      const target = win * COMPACT_FRACTION;
-      const over = () => estimateWorkTokens(native) + toolsTokens - target;
-      if (over() <= 0) return;
-      // drop from the front (cut at a user/system boundary so no
-      // assistant(tool_calls)/tool pair is split), keeping at least a stub
-      // tail so the turn has something to continue from
-      let cut = 1;
-      const lastAllowed = native.length - COMPACT_MIN_TAIL;
-      for (let i = 1; i <= lastAllowed; i++) {
-        if (native[i].role !== "user" && native[i].role !== "system") continue;
-        cut = i;
-        const kept: ChatMsg[] = [native[0], ...native.slice(i)];
-        if (estimateWorkTokens(kept) + toolsTokens <= target) break;
-      }
-      const older = native.slice(1, cut);
-      let summary = "";
-      if (older.length) {
-        toolStatus = { chatId: chat.id, label: "Compacting context…" };
-        try {
-          summary = await summarizePieces(chunkTranscript(transcriptOf(older)));
-        } finally {
-          if (toolStatus?.chatId === chat.id) toolStatus = null;
-        }
-        if (workStop || ctrl?.signal.aborted) return;
-      }
-      const proposed: ChatMsg[] = [
-        native[0],
-        ...(summary ? [{ role: "user" as const, content: `Earlier in this turn, summarized to save context:\n${summary}` }] : []),
-        ...native.slice(cut)
-      ];
-      // the tail alone can still exceed the window (giant tool outputs):
-      // stub the oldest tool results until it fits — display copies stay
-      // intact, only the model's native history is trimmed
-      if (older.length && !summary) {
-        // summarizer failed on oversized input: without a summary the drop
-        // would lose context silently, so keep history and rely on stubbing
-        proposed.splice(1, 0, ...older);
-      }
-      for (let i = 1; i < proposed.length; i++) {
-        if (estimateWorkTokens(proposed) + toolsTokens <= target) break;
-        const m = proposed[i];
-        if (m.role === "tool" && m.content.length > 2000) {
-          proposed[i] = { ...m, content: `${m.content.slice(0, 2000)}\n\n[…output truncated to ${m.content.length} chars to fit context…]` };
-        }
-      }
-      if (estimateWorkTokens(proposed) + toolsTokens > target) return; // still won't fit: leave it, the breaker ends the turn
-      const changed = proposed.length !== native.length || proposed.some((m, i) => m !== native[i]);
-      native = proposed;
-      if (!changed) return;
-      const c = chats.find((x) => x.id === chat.id);
-      if (c?.messages[curIndex]) {
-        const m = c.messages[curIndex];
-        c.messages[curIndex] = { ...m, content: `${m.content}\n\n> Context compacted: older tool output summarized.\n` };
-        chats = [...chats];
-        checkedLen = c.messages[curIndex].content.length;
-        saveSoon();
-      }
-    }
-    async function injectBackgroundCompletions(skip?: Set<string>): Promise<boolean> {
-      if (pendingBg.size === 0) return false;
-      let injected = false;
-      for (const id of [...pendingBg]) {
-        if (skip?.has(id)) continue;
-        if (workStop || ctrl?.signal.aborted) break;
-        let s;
-        try {
-          s = await backgroundStatus(id);
-        } catch {
-          // browser fallback or a lost job: drop it so the turn can settle
-          pendingBg.delete(id);
-          continue;
-        }
-        if (s.running) continue;
-        pendingBg.delete(id);
-        const out = formatBackgroundStatus(s);
-        native.push({ role: "user", content: `Background job ${id} finished (\`${s.command}\`):\n${out}` });
-        const c2 = chats.find((x) => x.id === chat.id);
-        if (c2?.messages[curIndex]) {
-          const m2 = c2.messages[curIndex];
-          c2.messages[curIndex] = {
-            ...m2,
-            content: m2.content + formatToolResult("exec", { command: `${s.command} (${id})` }, out)
-          };
-          chats = [...chats];
-        }
-        injected = true;
-      }
-      if (injected) {
-        checkedLen = chats.find((x) => x.id === chat.id)?.messages[curIndex]?.content.length ?? checkedLen;
-        scrollBottom();
-        saveSoon();
-      }
-      return injected;
-    }
-    async function finalGeneration(note: string) {
-      // one last generation so the turn ends with a summary, not a fence.
-      // The nudge travels as an ephemeral user turn (never written to the
-      // message), so the persisted transcript stays clean.
-      const target = chats.find((x) => x.id === chat.id);
-      if (!target) return;
-      const history: ChatMsg[] = [...native, { role: "user", content: note }];
-      await streamInto(target, curIndex, history, false, { mode: "continue", tools: allTools, pinFollow: false });
-    }
-    while (true) {
-      if (workStop || ctrl?.signal.aborted) break;
-      // steering: prompts typed during the previous round join the context
-      // here — after the tool results, right before the next generation — and
-      // render as a user bubble followed by a fresh assistant bubble
-      const steering = takeQueued(chat.id);
-      if (steering.length) {
-        const c = chats.find((x) => x.id === chat.id);
-        if (c) {
-          for (const q of steering) {
-            native.push({ role: "user", content: q.content, ...(q.images ? { images: q.images } : {}) });
-            c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+      escArmed = false;
+      // prompts that arrived after the last round: continue the agent with them
+      // (an aborted turn returns them to the composer instead)
+      const aborted = workStop || stopped;
+      const leftovers = turnId === workTurnSeq ? takeQueued(chat.id) : [];
+      if (leftovers.length) {
+        if (aborted) {
+          if (activeId === chat.id) {
+            input = [input.trim(), ...leftovers.map((q) => q.content.trim())].filter(Boolean).join("\n\n");
+            attachImages = [...attachImages, ...leftovers.flatMap((q) => q.images ?? [])];
           }
-          chats = [...chats];
-          curIndex = c.messages.length - 1;
-          checkedLen = 0;
+        } else {
+          const c = live();
+          if (c) {
+            for (const q of leftovers) {
+              c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+            }
+            chats = [...chats];
+            save();
+            // hand off to a fresh turn; the inner call clears workRunning
+            await runWorkTurn(chat, c.messages.length - 1, workspace);
+            return;
+          }
+        }
+      }
+      // natural end or abort: no step cap — the backend loop already exits
+      // when the model makes no calls, repeats finished work, or stops
+      if (turnId === workTurnSeq) {
+        workRunning = false;
+        workChatId = null;
+        workStartAt = null;
+        workTurnId = null;
+      }
+    }
+
+    function handleEvent(ev: WorkAgentEvent) {
+      if (turnId !== workTurnSeq) return;
+      switch (ev.type) {
+        case "token":
+          pendingTok += ev.text;
+          scheduleFlush();
+          dropStallHint();
+          armStall();
+          break;
+        case "think":
+          pendingTh += ev.text;
+          scheduleFlush();
+          dropStallHint();
+          armStall();
+          break;
+        case "status":
+          if (ev.label) toolStatus = { chatId: chat.id, label: ev.label };
+          else if (toolStatus?.chatId === chat.id) toolStatus = null;
+          break;
+        case "roundstart":
+          // a generation round is in flight: persist the resume marker (same
+          // shape the old per-round streamInto wrote) so a refresh resumes it
+          writePendingStream({ chatId: chat.id, index: curIndex, mode: ev.mode as "fresh" | "continue", model: selectedModel, think });
+          save();
+          armStall();
+          break;
+        case "roundend": {
+          clearStall();
+          dropStallHint();
+          if (!unloading) clearPendingStream();
+          // per-round stats accumulate onto the live bubble (same math the
+          // old streamInto settle used: wall time always, server eval rate
+          // when present, eval tokens over wall time for cloud APIs)
+          const t = live();
+          const m = t?.messages[curIndex];
+          if (t && m && m.role === "assistant") {
+            t.messages[curIndex] = { ...m, genMs: (m.genMs ?? 0) + ev.gen_ms, genTps: ev.gen_tps ?? m.genTps };
+            chats = [...chats];
+          }
+          save();
+          break;
+        }
+        case "displaynote":
+          appendContent(ev.text);
           scrollBottom();
           saveSoon();
-        }
-      }
-      const cur = chats.find((x) => x.id === chat.id);
-      if (!cur?.messages[curIndex] || cur.messages[curIndex].role !== "assistant") break;
-      // background jobs that finished while the model worked elsewhere join
-      // the transcript here, so the next generation sees their output
-      await injectBackgroundCompletions();
-      if (workStop || ctrl?.signal.aborted) break;
-      // long turns outgrow the window: summarize the oldest prefix away
-      // before this round's request goes out (a failed round can't recover
-      // by retrying the same oversized history)
-      await maybeCompactContext();
-      if (workStop || ctrl?.signal.aborted) break;
-      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: allTools, pinFollow: false });
-      firstRound = false;
-      if (workStop || ctrl?.signal.aborted) break;
-      // record this round's assistant turn natively (text + tool calls)
-      native.push({
-        role: "assistant",
-        content: newText,
-        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
-      });
-      let calls = toolCalls
-        .map((c) => nativeToWorkCall(c.function.name, c.function.arguments))
-        .filter((c): c is { name: string; args: Record<string, any> } => !!c);
-      if (calls.length) gotNative = true;
-      const live = chats.find((x) => x.id === chat.id)?.messages[curIndex];
-      const roundText = live ? live.content.slice(checkedLen) : "";
-      checkedLen = live?.content.length ?? checkedLen;
-      // fallback: model without tools support emits ```tool fences as text.
-      // Once native calls have been seen, text fences are never executed.
-      if (calls.length === 0 && !gotNative) {
-        const fenceCalls = parseToolCalls(roundText);
-        if (fenceCalls.length) calls = fenceCalls;
-      }
-      if (calls.length === 0) {
-        // No actual call this round: if the model wrote a call-shaped block,
-        // say so explicitly — otherwise hallucinated "callings" look exactly
-        // like executed ones. Display-only; never fed back to the model.
-        if (roundText && hasToolFence(roundText)) {
-          const c2 = chats.find((x) => x.id === chat.id);
-          if (c2?.messages[curIndex]) {
-            const m2 = c2.messages[curIndex];
-            c2.messages[curIndex] = { ...m2, content: m2.content + "\n\n> Not executed: the model wrote a tool block above that was not a valid call, so nothing ran." };
+          break;
+        case "queuedrained": {
+          // steering prompts the backend just consumed: render each as a
+          // user bubble followed by a fresh assistant bubble, exactly like
+          // the old loop did at the top of the next round
+          confirmQueuedDrained(ev.ids);
+          const t = live();
+          if (t) {
+            for (const q of ev.messages) {
+              t.messages = [
+                ...t.messages,
+                { role: "user", content: q.content, ...(q.images ? { images: q.images } : {}) },
+                { role: "assistant", content: "", thinking: "", model: selectedModel }
+              ];
+            }
             chats = [...chats];
-            checkedLen = c2.messages[curIndex].content.length;
+            curIndex = t.messages.length - 1;
+            scrollBottom();
             saveSoon();
           }
+          break;
         }
-        // No calls this round but background jobs still run: wait for the
-        // next one to finish, inject its result, and wake the model — so the
-        // LLM works on other things meanwhile and is only re-triggered once
-        // the background output is ready.
-        if (pendingBg.size > 0 && !workStop && !ctrl?.signal.aborted) {
-          toolStatus = { chatId: chat.id, label: "Waiting for background job…" };
-          let woke = false;
-          while (pendingBg.size > 0) {
-            if (workStop || ctrl?.signal.aborted) break;
-            // a queued user prompt interrupts the wait: handle it next round
-            if (queuedMsgs.some((q) => q.chatId === chat.id)) break;
-            await sleep(1000);
-            if (workStop || ctrl?.signal.aborted) break;
-            if (await injectBackgroundCompletions()) {
-              woke = true;
-              break;
+        case "toolstart":
+          clearStall();
+          dropStallHint();
+          pendingHead = { name: ev.name, args: ev.args };
+          // `ask` (live card) and `say` (normal prose) own their display
+          if (ev.name === "ask" || ev.name === "say") break;
+          appendContent(formatToolCallHead(ev.name, ev.args));
+          scrollBottom();
+          break;
+        case "toolend": {
+          const head = pendingHead;
+          pendingHead = null;
+          const t = live();
+          if (ev.name === "say") {
+            // display channel for models that emit tool calls only: the text
+            // becomes normal assistant prose, not a collapsed tool block
+            const text = String(head?.args.text ?? "").trim();
+            if (text && !ev.output.startsWith("Error:") && t?.messages[curIndex]) {
+              const m = t.messages[curIndex];
+              const sep = m.content.trim() ? "\n\n" : "";
+              t.messages[curIndex] = { ...m, content: `${m.content}${sep}${text}\n\n` };
+              chats = [...chats];
+            } else if (t?.messages[curIndex]) {
+              const m = t.messages[curIndex];
+              t.messages[curIndex] = { ...m, content: m.content + formatToolCallHead(ev.name, head?.args ?? {}) + formatToolCallTail(ev.output) };
+              chats = [...chats];
+            }
+          } else if (ev.name === "ask") {
+            // visible harness record of the Q/A (or dismissal); a cancelled
+            // ask (Stop / chat deleted) emits no ToolEnd, so nothing lands
+            if ((askOutcome === "answer" || askOutcome === "dismiss") && t?.messages[curIndex]) {
+              const m = t.messages[curIndex];
+              t.messages[curIndex] = {
+                ...m,
+                content: m.content + formatAskRecord(String(head?.args.question ?? ""), askText, askOutcome === "dismiss")
+              };
+              chats = [...chats];
+            }
+            askOutcome = null;
+            askText = "";
+          } else {
+            if (t?.messages[curIndex]) {
+              const m = t.messages[curIndex];
+              t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) };
+              chats = [...chats];
+            }
+            if (ev.name === "done" && t && t.goal) {
+              // self-stop (goal mode): the model declared the objective met —
+              // retire the goal and settle the turn with no wrap-up
+              t.goal = null;
+              chats = [...chats];
             }
           }
-          if (toolStatus?.chatId === chat.id) toolStatus = null;
-          if (woke) continue;
-          // steered mid-wait: loop back around to the queue; otherwise settle
-          if (queuedMsgs.some((q) => q.chatId === chat.id)) continue;
-        }
-        // circuit breaker: two consecutive rounds that produce nothing (no
-        // text, no calls) mean the transcript no longer fits even compacted
-        // (or the model is stuck) — end the turn with a clear error instead
-        // of spinning, or goal-nudging, on identical failures forever
-        const roundEmpty = newText.trim() === "" && toolCalls.length === 0;
-        if (!workStop && !ctrl?.signal.aborted) {
-          emptyRounds = roundEmpty ? emptyRounds + 1 : 0;
-        } else {
-          emptyRounds = 0;
-        }
-        if (roundEmpty && emptyRounds >= 2) {
-          error = "The model returned empty responses twice in a row — the context likely no longer fits even after compaction. Try /compact or a shorter task.";
-          break;
-        }
-        // goal mode: the turn only ends on a met objective, not on a quiet
-        // round. The check rides the native transcript (never persisted);
-        // an unanswered check outstanding means done — settle.
-        const goal = chatGoal(chats.find((x) => x.id === chat.id));
-        if (goal && !goal.paused && !nativeAtGoalCheck()) {
-          const offerDone = (allTools as any[]).some((t) => t?.function?.name === "done");
-          native.push({
-            role: "user",
-            content: `${GOAL_CHECK_PREFIX} The session goal is: ${goal.text}\n${offerDone ? "If it is fully achieved, call `done` with a brief completion summary (no other tool calls). Otherwise keep working toward it (emit tool calls)." : "If it is fully achieved, reply with a brief completion summary and NO tool calls. Otherwise keep working toward it (emit tool calls)."}`
-          });
-          continue;
-        }
-        break;
-      }
-      const fresh = calls.filter((c) => !seen.has(callKey(c)));
-      for (const c of fresh) seen.add(callKey(c));
-      if (fresh.length === 0) {
-        // model is re-emitting finished work: don't re-run anything, give it
-        // one wrap-up generation so the turn ends with a summary
-        await finalGeneration(
-          "Those tool calls already ran — their results are in the transcript above. Do not repeat them. Wrap up with a summary and no new tool calls."
-        );
-        break;
-      }
-      for (const call of fresh) {
-        if (workStop || ctrl?.signal.aborted) break;
-        if (call.name === "done") {
-          // self-stop (goal mode): the model declares the objective met.
-          // Render the summary through the normal result pipeline, retire
-          // the goal, then settle the turn — no further rounds, no wrap-up.
-          const summary = typeof (call.args as any)?.summary === "string" && ((call.args as any).summary as string).trim()
-            ? ((call.args as any).summary as string).trim()
-            : "Done.";
-          const cDone = chats.find((x) => x.id === chat.id);
-          if (cDone?.messages[curIndex]) {
-            const mDone = cDone.messages[curIndex];
-            cDone.messages[curIndex] = { ...mDone, content: mDone.content + formatToolCallHead(call.name, call.args) + formatToolCallTail(summary) };
-            chats = [...chats];
-          }
-          if (cDone && cDone.goal) {
-            cDone.goal = null;
-            chats = [...chats];
-          }
-          native.push({ role: "tool", content: summary, tool_name: "done" });
           scrollBottom();
           saveSoon();
-          turnDone = true;
           break;
         }
-        const isAsk = call.name === "ask";
-        const isSay = call.name === "say";
-        let askShown = false;
-        let askOutcome: "answer" | "dismiss" | "cancel" = "cancel";
-        toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
-        // tag first: the call is known now, the result may take a while.
-        // `ask` (live card) and `say` (normal prose) own their display.
-        // Silent rounds show just the tool tag (the collapsed block below);
-        // the old prose activity line ("Running …"/"Using …") is gone: it
-        // duplicated the tag and models imitated it instead of calling tools.
-        // Fence-only text counts as silent: raw ```tool blocks are calls,
-        // not narration.
-        const c1 = chats.find((x) => x.id === chat.id);
-        if (!isAsk && !isSay && c1?.messages[curIndex]) {
-          const m1 = c1.messages[curIndex];
-          c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
-          chats = [...chats];
-          scrollBottom();
-        }
-        const mcpTarget = mcp.route.get(call.name);
-        let out: string;
-        if (mcpTarget) {
-          // MCP tool: route back to the real server + tool name
-          try {
-            out = await callMcpServerTool(mcpTarget.server, mcpTarget.name, call.args);
-          } catch (e: any) {
-            out = `Error: ${e?.message ?? String(e)}`;
-          }
-        } else {
-          out = await dispatchWorkTool(call, {
-          workspace,
-          chats,
-          sessionId: chat.id,
-          askUser: (question, options) => {
-            askShown = true;
-            return new Promise<string>((resolve) => {
-              pendingAsk = {
-                chatId: chat.id,
-                index: curIndex,
-                question,
-                options,
-                other: "",
-                otherOpen: false,
-                resolve: (answer, outcome) => {
-                  askOutcome = outcome;
-                  resolve(answer);
-                }
-              };
-              requestAnimationFrame(() => scrollBottom());
-            });
-          }
-        });
-        }
-        if (toolStatus?.chatId === chat.id) toolStatus = null;
-        if (call.name === "exec" && (call.args as any)?.background === true) {
-          // detached start: the job id joins the pending set so the turn can
-          // keep working and only wake the model once its output lands
-          const bgId = extractBackgroundId(out);
-          if (bgId) pendingBg.add(bgId);
-        }
-        // `view_image` carries vision bytes as a marker (tool results are
-        // text-only): strip it from the transcript and re-feed the picture as
-        // Ollama `images[]` on a following user message so the model sees it.
-        const viewed = extractViewedImages(out);
-        if (viewed.images.length) out = viewed.clean;
-        native.push({ role: "tool", content: out, tool_name: call.name });
-        if (viewed.images.length) {
-          native.push({ role: "user", content: `Image ${String((call.args as any)?.path ?? "")} shown above (vision input). Describe what you see and answer the user's question about it.`, images: viewed.images });
-        }
-        const c2 = chats.find((x) => x.id === chat.id);
-        if (isSay) {
-          // display channel for models that emit tool calls only: the text
-          // becomes normal assistant prose, not a collapsed tool block
-          const text = String(call.args.text ?? "").trim();
-          if (text && !out.startsWith("Error:") && c2?.messages[curIndex]) {
-            const m2 = c2.messages[curIndex];
-            const sep = m2.content.trim() ? "\n\n" : "";
-            c2.messages[curIndex] = { ...m2, content: `${m2.content}${sep}${text}\n\n` };
-            chats = [...chats];
-          } else if (c2?.messages[curIndex]) {
-            const m2 = c2.messages[curIndex];
-            c2.messages[curIndex] = { ...m2, content: m2.content + formatToolCallHead(call.name, call.args) + formatToolCallTail(out) };
-            chats = [...chats];
-          }
-        } else if (isAsk && askShown) {
-          // visible harness record of the Q/A (or dismissal); a cancelled ask
-          // (Stop / chat deleted) leaves nothing behind
-          if (askOutcome !== "cancel" && c2?.messages[curIndex]) {
-            const m2 = c2.messages[curIndex];
-            c2.messages[curIndex] = {
-              ...m2,
-              content: m2.content + formatAskRecord(String(call.args.question ?? ""), out, askOutcome === "dismiss")
+        case "bgcompleted": {
+          const t = live();
+          if (t?.messages[curIndex]) {
+            const m = t.messages[curIndex];
+            t.messages[curIndex] = {
+              ...m,
+              content: m.content + formatToolResult("exec", { command: `${ev.command} (${ev.job_id})` }, ev.output)
             };
             chats = [...chats];
           }
-        } else if (c2?.messages[curIndex]) {
-          const m2 = c2.messages[curIndex];
-          const head = isAsk ? formatToolCallHead(call.name, call.args) : "";
-          c2.messages[curIndex] = { ...m2, content: m2.content + head + formatToolCallTail(out) };
-          chats = [...chats];
-        }
-        scrollBottom();
-        saveSoon();
-      }
-      if (turnDone) break;
-      // explicit single-job polls that report a finished job settle it: the
-      // full output is already in the transcript, so the idle waiter and the
-      // top-of-round drain must not re-inject it
-      for (const call of fresh) {
-        const pid = typeof (call.args as any)?.id === "string" ? ((call.args as any).id as string).trim() : "";
-        if ((call.name === "exec_status" || call.name === "exec_kill") && pid && pendingBg.has(pid)) {
-          try {
-            if (!(await backgroundStatus(pid)).running) pendingBg.delete(pid);
-          } catch {
-            pendingBg.delete(pid);
-          }
-        }
-      }
-      // results we appended are harness output, not model text: exclude them
-      // from next round's fence scan (tool output may itself contain fences)
-      checkedLen = chats.find((x) => x.id === chat.id)?.messages[curIndex]?.content.length ?? checkedLen;
-    }
-    toolStatus = null;
-    if (escTimer) {
-      clearTimeout(escTimer);
-      escTimer = null;
-    }
-    escArmed = false;
-    const aborted = workStop || !!ctrl?.signal.aborted;
-    // prompts that arrived after the last round: continue the agent with them
-    // (an aborted turn returns them to the composer instead)
-    const leftovers = turnId === workTurnSeq ? takeQueued(chat.id) : [];
-    if (leftovers.length) {
-      if (aborted) {
-        if (activeId === chat.id) {
-          input = [input.trim(), ...leftovers.map((q) => q.content.trim())].filter(Boolean).join("\n\n");
-          attachImages = [...attachImages, ...leftovers.flatMap((q) => q.images ?? [])];
-        }
-      } else {
-        const c = chats.find((x) => x.id === chat.id);
-        if (c) {
-          for (const q of leftovers) {
-            c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
-          }
-          chats = [...chats];
+          scrollBottom();
           saveSoon();
-          // hand off to a fresh turn; the inner call clears workRunning
-          await runWorkTurn(chat, c.messages.length - 1, workspace);
-          return;
+          break;
         }
+        case "contextcompacted":
+          appendContent(`\n${ev.note}\n`);
+          scrollBottom();
+          saveSoon();
+          break;
+        case "askrequest":
+          askOutcome = null;
+          askText = "";
+          pendingAsk = {
+            chatId: chat.id,
+            index: curIndex,
+            question: ev.question,
+            options: ev.options,
+            other: "",
+            otherOpen: false,
+            resolve: (answer, outcome) => {
+              // cancel (Stop / chat deleted) needs no backend call: the stop
+              // path already unblocked the waiting tool with no record
+              if (outcome === "cancel") return;
+              askOutcome = outcome;
+              askText = answer;
+              const tid = workTurnId;
+              if (tid) void answerWorkAgentAsk(tid, ev.ask_id, answer).catch(() => {});
+              scrollBottom();
+            }
+          };
+          requestAnimationFrame(() => scrollBottom());
+          break;
+        case "done":
+          toolStatus = null;
+          void settle(ev.stopped);
+          break;
+        case "error":
+          error = ev.message;
+          toolStatus = null;
+          void settle(false);
+          break;
       }
     }
-    // natural end or abort: no step cap — the loop above already exits when
-    // the model makes no calls, repeats finished work, or the user aborts
-    if (turnId === workTurnSeq) {
-      workRunning = false;
-      workChatId = null;
-      workStartAt = null;
+
+    let agentTurn: string;
+    try {
+      agentTurn = await startWorkAgentTurn({
+        model: selectedModel,
+        workspace,
+        messages: native,
+        think,
+        tools: allTools,
+        sessionId: chat.id,
+        goalText: startGoal?.text ?? null,
+        goalPaused: startGoal?.paused ?? true,
+        chats: snapshotChats(chats),
+        mcpRoutes: routes,
+        onEvent: (ev) => handleEvent(ev)
+      });
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+      await settle(true);
+      return;
     }
+    workTurnId = agentTurn;
   }
 
   /** "Continue in Work": fork a chat transcript into a new work session rooted
@@ -6041,7 +5849,7 @@
               </span>
             </div>
             {#if live?.error}
-              <div class="mcp-row-error" title={live.error}>{live.error.slice(0, 160)}</div>
+              <div class="mcp-row-error" title={live.error}>{live.error}</div>
             {/if}
           {:else}
             <div class="mcp-empty">
@@ -7396,7 +7204,7 @@
   .mcp-mini:hover { background: rgba(127,127,127,.25); color: var(--text); }
   .mcp-row.sel .mcp-mini:hover { background: rgba(255,255,255,.25); color: inherit; }
   .mcp-mini.danger { width: auto; padding: 0 6px; font-size: 12px; }
-  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
   .mcp-empty { padding: 12px 8px; font-size: 13.5px; color: var(--muted); }
   .mcp-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 2px 4px 2px; }
   .mcp-type { align-self: stretch; }

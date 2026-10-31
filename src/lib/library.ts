@@ -2,9 +2,11 @@
 //
 // JS in a plain browser cannot do this itself — ollama.com and
 // registry.ollama.ai send no CORS headers — so the fetches go through the
-// `ollama_fetch_text` Tauri command (Rust has no CORS restriction; the URL
-// is allowlisted there). Outside Tauri this throws a friendly error.
+// `ollama_fetch_text` backend (Tauri IPC when shelled, loopback bridge in a
+// plain browser; Rust has no CORS restriction and the URL is allowlisted
+// there). With neither present this throws a friendly error.
 
+import { invokeOrBridge, bridgeAvailable } from "./bridge";
 import { isTauriRuntime } from "./ollama";
 import type { CatalogEntry } from "./catalog";
 
@@ -23,15 +25,19 @@ export interface CatalogOverride {
 }
 
 async function fetchText(url: string): Promise<string> {
-  if (isTauriRuntime()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<string>("ollama_fetch_text", { url });
+  try {
+    return await invokeOrBridge<string>("ollama_fetch_text", { url });
+  } catch (e) {
+    // plain browser without the bridge: attempted directly, but the
+    // registry sends no CORS headers so this fails — surfaced as a
+    // friendly note by the caller
+    if (/desktop app|bridge/i.test(e instanceof Error ? e.message : String(e))) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`registry fetch failed: ${res.status}`);
+      return await res.text();
+    }
+    throw e;
   }
-  // plain-browser fallback: attempted directly, but the registry sends no
-  // CORS headers so this fails — surfaced as a friendly note by the caller
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`registry fetch failed: ${res.status}`);
-  return await res.text();
 }
 
 function decodeEntities(s: string): string {
@@ -94,8 +100,8 @@ export async function refreshCatalog(
   current: CatalogEntry[],
   onProgress?: (done: number, total: number) => void
 ): Promise<CatalogOverride> {
-  if (!isTauriRuntime()) {
-    throw new Error("Live fetch needs the desktop app — the registry blocks browser requests (CORS).");
+  if (!isTauriRuntime() && !(await bridgeAvailable())) {
+    throw new Error("Live fetch needs the desktop app (or `cargo run --bin bridge`) — the registry blocks browser requests (CORS).");
   }
   const known = new Map(current.map((e) => [e.name, e]));
   let names = current.map((e) => e.name);

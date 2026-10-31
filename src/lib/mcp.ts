@@ -8,6 +8,7 @@
 // direct fetch.
 
 import { isTauriRuntime } from "./ollama";
+import { invokeOrBridge } from "./bridge";
 
 export interface McpOAuthCreds {
   client_id: string;
@@ -45,12 +46,6 @@ export interface McpServerInfo {
 export interface McpCallResult {
   content: string;
   is_error: boolean;
-}
-
-type TauriCore = typeof import("@tauri-apps/api/core");
-
-async function tauri(): Promise<TauriCore> {
-  return await import("@tauri-apps/api/core");
 }
 
 /** Human summary for the server row ("lb mcp" / "https://…/mcp"). */
@@ -102,18 +97,18 @@ export function parseStringMap(raw: string): Record<string, string> | undefined 
   return out;
 }
 
-/** All servers from ~/vicuna/config/vicuna.json (desktop only). */
+/** All servers from ~/vicuna/config/vicuna.json (desktop or bridge). */
 export async function listMcpServers(): Promise<McpServerConfig[]> {
-  if (!isTauriRuntime()) return [];
-  const { invoke } = await tauri();
-  const list = await invoke<McpServerConfig[]>("mcp_list_servers");
-  return Array.isArray(list) ? list : [];
+  try {
+    const list = await invokeOrBridge<McpServerConfig[]>("mcp_list_servers", {});
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig[]> {
-  if (!isTauriRuntime()) throw new Error("Managing MCP servers needs the Vicuna desktop app.");
-  const { invoke } = await tauri();
-  return await invoke<McpServerConfig[]>("mcp_save_server", {
+  return await invokeOrBridge<McpServerConfig[]>("mcp_save_server", {
     config: {
       id: c.name.trim(),
       name: c.name.trim(),
@@ -129,9 +124,7 @@ export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig
 }
 
 export async function deleteMcpServer(id: string): Promise<McpServerConfig[]> {
-  if (!isTauriRuntime()) throw new Error("Managing MCP servers needs the Vicuna desktop app.");
-  const { invoke } = await tauri();
-  return await invoke<McpServerConfig[]>("mcp_delete_server", { id });
+  return await invokeOrBridge<McpServerConfig[]>("mcp_delete_server", { id });
 }
 
 /** True when a backend error means "this server needs browser sign-in"
@@ -142,12 +135,11 @@ export function isAuthError(msg: string | null | undefined): boolean {
 }
 
 /** Browser sign-in for an OAuth-protected remote server. Opens the system
- *  browser; resolves with the connected server info once login completes
- *  (rejects on timeout/denial, or when the server needs no sign-in). */
+ *  browser (desktop only — the bridge has no window to open); resolves with
+ *  the connected server info once login completes (rejects on
+ *  timeout/denial, or when the server needs no sign-in). */
 export async function signInServer(c: McpServerConfig): Promise<McpServerInfo> {
-  if (!isTauriRuntime()) throw new Error("Browser sign-in needs the Vicuna desktop app.");
-  const { invoke } = await tauri();
-  return await invoke<McpServerInfo>("mcp_signin", {
+  return await invokeOrBridge<McpServerInfo>("mcp_signin", {
     config: {
       id: c.id,
       name: c.name,
@@ -164,34 +156,45 @@ export async function signInServer(c: McpServerConfig): Promise<McpServerInfo> {
 
 /** Forget the stored OAuth login and drop the connection, if any. */
 export async function signOutServer(id: string): Promise<void> {
-  if (!isTauriRuntime()) return;
-  const { invoke } = await tauri();
-  await invoke("mcp_signout", { id });
+  try {
+    await invokeOrBridge("mcp_signout", { id });
+  } catch {
+    // nothing held browser-side; bridge-down is a no-op too
+  }
 }
 
 /** Whether an OAuth login is stored for the server. */
 export async function loginPresent(id: string): Promise<boolean> {
-  if (!isTauriRuntime()) return false;
-  const { invoke } = await tauri();
-  return await invoke<boolean>("mcp_login_present", { id });
+  try {
+    return await invokeOrBridge<boolean>("mcp_login_present", { id });
+  } catch {
+    return false;
+  }
+}
+
+function mcpConfigArgs(c: McpServerConfig): Record<string, any> {
+  return {
+    config: {
+      id: c.id,
+      name: c.name,
+      transport: c.transport,
+      command: c.command ?? null,
+      env: c.env ?? null,
+      url: c.url ?? null,
+      headers: c.headers ?? null,
+      oauth: c.oauth ?? null,
+      enabled: c.enabled
+    }
+  };
 }
 
 export async function connectServer(c: McpServerConfig): Promise<McpServerInfo> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    return await invoke<McpServerInfo>("mcp_connect", {
-      config: {
-        id: c.id,
-        name: c.name,
-        transport: c.transport,
-        command: c.command ?? null,
-        env: c.env ?? null,
-        url: c.url ?? null,
-        headers: c.headers ?? null,
-      oauth: c.oauth ?? null,
-        enabled: c.enabled
-      }
-    });
+  try {
+    return await invokeOrBridge<McpServerInfo>("mcp_connect", mcpConfigArgs(c));
+  } catch (e) {
+    // Tauri errors surface as-is (row error / sign-in routing); browsers
+    // without a bridge fall back to the remote-only path below
+    if (isTauriRuntime()) throw e;
   }
   // plain browser: no process spawning — only remote servers can connect
   if (c.transport !== "http" || !c.url) {
@@ -202,32 +205,33 @@ export async function connectServer(c: McpServerConfig): Promise<McpServerInfo> 
 }
 
 export async function disconnectServer(id: string, _transport: "stdio" | "http"): Promise<void> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    await invoke("mcp_disconnect", { id });
-    return;
+  try {
+    await invokeOrBridge("mcp_disconnect", { id });
+  } catch {
+    // nothing held browser-side; bridge-down is a no-op too
   }
-  // nothing held browser-side
 }
 
 export async function listServerTools(c: McpServerConfig): Promise<McpTool[]> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    return await invoke<McpTool[]>("mcp_list_tools", { id: c.id });
+  try {
+    return await invokeOrBridge<McpTool[]>("mcp_list_tools", { id: c.id });
+  } catch (e) {
+    if (isTauriRuntime()) throw e;
   }
   if (c.transport !== "http" || !c.url) throw new Error("not connected");
   return await remoteRequest<McpTool[]>(c.url, c.headers ?? {}, "tools/list", {});
 }
 
 export async function callServerTool(c: McpServerConfig, tool: string, args: unknown): Promise<string> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    const res = await invoke<McpCallResult>("mcp_call_tool", {
+  try {
+    const res = await invokeOrBridge<McpCallResult>("mcp_call_tool", {
       serverId: c.id,
       tool,
       args: (args ?? {}) as Record<string, unknown>
     });
     return res.is_error ? `Tool error: ${res.content}` : res.content;
+  } catch (e) {
+    if (isTauriRuntime()) throw e;
   }
   if (c.transport !== "http" || !c.url) {
     throw new Error(`"${c.name}" is a local command server: use the Vicuna desktop app.`);

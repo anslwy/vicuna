@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Vicuna — minimal desktop chat client for Ollama"
 authors = ["you"]
 edition = "2024"
+# `src/bin/bridge.rs` adds a second binary (headless test bridge) — keep
+# bare `cargo run` (used by `tauri dev`/`tauri build`) resolving to the app.
+default-run = "vicuna"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -32,6 +35,7 @@ tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt",
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 portable-pty = "0.9.0"
+tiny_http = "0.12"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

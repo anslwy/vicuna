@@ -17,10 +17,12 @@ use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
 pub mod mcp;
+pub mod work_agent;
+pub mod bridge;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
-const OLLAMA_BASE: &str = "http://localhost:11434";
+pub const OLLAMA_BASE: &str = "http://localhost:11434";
 
 /// Windows: keep background children from flashing a console window on the
 /// user's screen (agent `exec`, its timeout killer, self-started
@@ -34,8 +36,8 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ChatMessage {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessage {
     role: String,
     content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,7 +124,7 @@ async fn ollama_list_running() -> Result<serde_json::Value, String> {
 /// `*.context_length` from /api/show `model_info` (works for `:cloud`
 /// models too — the local daemon proxies). `None` when the model isn't
 /// available or reports no window; callers fall back to 32768.
-fn parse_show_context_length(model_info: &serde_json::Value) -> Option<u64> {
+pub fn parse_show_context_length(model_info: &serde_json::Value) -> Option<u64> {
     let map = model_info.as_object()?;
     let mut best: Option<u64> = None;
     for (k, v) in map {
@@ -788,17 +790,16 @@ async fn work_validate_root(path: String) -> Result<String, String> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkDirEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    size: Option<u64>,
+pub struct WorkDirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
 }
 
 /// List a workspace-relative directory (default: root). Deny hidden dirs
 /// are still listed — the model decides what matters.
-#[tauri::command]
-async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
+pub async fn work_list_dir_logic(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
     let canon = work_canonical_root(root.trim())?;
     let dir = work_join(&canon, path.as_deref().unwrap_or(""))?;
     if !dir.is_dir() {
@@ -990,16 +991,15 @@ fn decode_base64(s: &str) -> Result<Vec<u8>, ()> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkFileContent {
-    path: String,
-    content: String,
-    truncated: bool,
-    size: u64,
+pub struct WorkFileContent {
+    pub path: String,
+    pub content: String,
+    pub truncated: bool,
+    pub size: u64,
 }
 
 /// Read a workspace-relative text file (cap ~64KB; binary smells rejected).
-#[tauri::command]
-async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
+pub async fn work_read_file_logic(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join(&canon, &path)?;
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
@@ -1024,18 +1024,17 @@ async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> R
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkImageContent {
-    path: String,
-    base64: String,
-    mime: String,
-    size: u64,
+pub struct WorkImageContent {
+    pub path: String,
+    pub base64: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 /// Read a workspace image file for vision models (png/jpg/webp/gif, 10MB cap).
 /// Returns raw base64 — the frontend feeds it as Ollama `images[]` so the
 /// agent actually SEES the picture instead of getting a binary-dump error.
-#[tauri::command]
-async fn work_read_image(root: String, path: String) -> Result<WorkImageContent, String> {
+pub async fn work_read_image_logic(root: String, path: String) -> Result<WorkImageContent, String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join(&canon, &path)?;
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
@@ -1075,16 +1074,15 @@ async fn work_read_image(root: String, path: String) -> Result<WorkImageContent,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkGrepHit {
-    path: String,
-    line: usize,
-    text: String,
+pub struct WorkGrepHit {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
 }
 
 /// Substring search (case-insensitive) across workspace text files.
 /// Caps: 200 files scanned, 100 hits, 512KB per file, skips hidden dirs.
-#[tauri::command]
-async fn work_grep(root: String, pattern: String, include: Option<String>) -> Result<Vec<WorkGrepHit>, String> {
+pub async fn work_grep_logic(root: String, pattern: String, include: Option<String>) -> Result<Vec<WorkGrepHit>, String> {
     let needle = pattern.to_lowercase();
     if needle.is_empty() || needle.len() > 200 {
         return Err("empty or oversized search pattern".to_string());
@@ -1167,8 +1165,7 @@ async fn work_grep(root: String, pattern: String, include: Option<String>) -> Re
 /// Write (or overwrite) a workspace-relative text file, creating parents.
 /// Refuses to overwrite files larger than 1MB without an explicit read first
 /// — the agent should read before clobbering.
-#[tauri::command]
-async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
+pub async fn work_write_file_logic(root: String, path: String, content: String) -> Result<String, String> {
     if content.len() > 524288 {
         return Err("content too large (max ~512KB per write)".to_string());
     }
@@ -1188,12 +1185,12 @@ async fn work_write_file(root: String, path: String, content: String) -> Result<
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkExecResult {
-    stdout: String,
-    stderr: String,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    truncated: bool,
+pub struct WorkExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub truncated: bool,
 }
 
 fn trunc_out(s: &str) -> (String, bool) {
@@ -1208,8 +1205,7 @@ fn trunc_out(s: &str) -> (String, bool) {
 /// Run a shell command with cwd=workspace root. Timeout default 30s (max
 /// 120s). Output capped at 32KB per stream. Destructive commands are the
 /// user's responsibility — Work mode is explicit opt-in per session.
-#[tauri::command]
-async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
+pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("empty command".to_string());
@@ -1282,6 +1278,47 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
     }
 }
 
+/// ---------- Tauri command wrappers (stable IPC names) ----------
+///
+/// The `*_logic` functions above hold the real implementation so the backend
+/// agent loop (work_agent.rs) can call them directly. These thin wrappers
+/// preserve the exact command names the frontend invokes — the IPC contract
+/// is unchanged.
+#[tauri::command]
+async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
+    work_list_dir_logic(root, path).await
+}
+
+#[tauri::command]
+async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
+    work_read_file_logic(root, path, max_bytes).await
+}
+
+#[tauri::command]
+async fn work_read_image(root: String, path: String) -> Result<WorkImageContent, String> {
+    work_read_image_logic(root, path).await
+}
+
+#[tauri::command]
+async fn work_grep(root: String, pattern: String, include: Option<String>) -> Result<Vec<WorkGrepHit>, String> {
+    work_grep_logic(root, pattern, include).await
+}
+
+#[tauri::command]
+async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
+    work_write_file_logic(root, path, content).await
+}
+
+#[tauri::command]
+async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
+    work_exec_logic(root, command, timeout_ms).await
+}
+
+#[tauri::command]
+async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileContent, String> {
+    upload_read_file_logic(session_id, name).await
+}
+
 /// ---------- Background exec jobs (work mode, desktop only) ----------
 ///
 /// Long commands (test suites, builds) run detached: `work_exec_start`
@@ -1291,22 +1328,22 @@ async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Re
 /// stream, like foreground exec) so polling mid-run shows progress.
 
 #[derive(Debug, Clone, Serialize)]
-struct BgJobStatus {
-    id: String,
-    command: String,
-    running: bool,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    truncated: bool,
+pub struct BgJobStatus {
+    pub id: String,
+    pub command: String,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct BgJobSummary {
-    id: String,
-    command: String,
-    running: bool,
-    exit_code: Option<i32>,
+pub struct BgJobSummary {
+    pub id: String,
+    pub command: String,
+    pub running: bool,
+    pub exit_code: Option<i32>,
 }
 
 struct BgJobRecord {
@@ -1321,7 +1358,7 @@ struct BgJobRecord {
 }
 
 #[derive(Default)]
-struct BgExecState {
+pub struct BgExecState {
     jobs: Mutex<HashMap<String, Arc<Mutex<BgJobRecord>>>>,
     seq: AtomicU64,
 }
@@ -1442,7 +1479,7 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
 }
 
 /// Plain (non-Tauri-State) start so unit tests can drive it directly.
-async fn bg_start(state: &BgExecState, root: String, command: String) -> Result<String, String> {
+pub async fn bg_start(state: &BgExecState, root: String, command: String) -> Result<String, String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("empty command".to_string());
@@ -1488,7 +1525,7 @@ async fn bg_start(state: &BgExecState, root: String, command: String) -> Result<
     Ok(id)
 }
 
-fn bg_snapshot(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
+pub fn bg_snapshot(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
     let rec = {
         let jobs = state
             .jobs
@@ -1511,7 +1548,7 @@ fn bg_snapshot(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
     })
 }
 
-fn bg_list(state: &BgExecState) -> Result<Vec<BgJobSummary>, String> {
+pub fn bg_list(state: &BgExecState) -> Result<Vec<BgJobSummary>, String> {
     let jobs = state
         .jobs
         .lock()
@@ -1531,7 +1568,7 @@ fn bg_list(state: &BgExecState) -> Result<Vec<BgJobSummary>, String> {
     Ok(out)
 }
 
-fn bg_kill(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
+pub fn bg_kill(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
     let pid = {
         let jobs = state
             .jobs
@@ -2347,8 +2384,7 @@ async fn upload_stage_file(session_id: String, file_name: String, base64: String
 
 /// Read a staged session file as text (cap ~64KB; binaries rejected).
 /// Scoped to the calling session's upload dir — no absolute paths.
-#[tauri::command]
-async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileContent, String> {
+pub async fn upload_read_file_logic(session_id: String, name: String) -> Result<WorkFileContent, String> {
     let dir = upload_session_dir(&session_id)?;
     let clean = std::path::Path::new(name.trim())
         .file_name()
@@ -2667,6 +2703,7 @@ pub fn run() {
         .manage(OllamaServerState::default())
         .manage(TermState::default())
         .manage(BgExecState::default())
+        .manage(work_agent::WorkAgentState::default())
         .manage(AppQuitState::default())
         .manage(mcp::McpManager::default())
         .manage(ZoomState {
@@ -2724,7 +2761,12 @@ pub fn run() {
             mcp_call_tool,
             mcp_signin,
             mcp_signout,
-            mcp_login_present
+            mcp_login_present,
+            work_agent::work_agent_start,
+            work_agent::work_agent_stop,
+            work_agent::work_agent_queue,
+            work_agent::work_agent_remove,
+            work_agent::work_agent_answer
         ])
         .setup(|app| {
             // System tray: closing the window hides here (streams keep
