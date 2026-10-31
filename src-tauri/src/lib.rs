@@ -552,7 +552,8 @@ async fn ollama_delete_model(model: String) -> Result<(), String> {
 /// The browser cannot do this itself — ollama.com and registry.ollama.ai
 /// send no CORS headers — but the Rust backend has no such restriction.
 /// The URL is allowlisted to the public Ollama registry so the command
-/// cannot be abused as a generic proxy.
+/// cannot be abused as a generic proxy. Bounded by a timeout: without one,
+/// a single stalled manifest pinned the Fetch progress at N-1/N indefinitely.
 #[tauri::command]
 async fn ollama_fetch_text(url: String) -> Result<String, String> {
     const ALLOWED: [&str; 2] = [
@@ -562,7 +563,10 @@ async fn ollama_fetch_text(url: String) -> Result<String, String> {
     if !ALLOWED.iter().any(|p| url.starts_with(p)) {
         return Err("refusing to fetch non-registry URL".to_string());
     }
-    let res = reqwest::Client::new()
+    let res = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("registry fetch failed: {e}"))?
         .get(&url)
         .header("User-Agent", "vicuna-catalog-fetch/1.0")
         .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")

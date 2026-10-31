@@ -11,8 +11,11 @@ import type { CatalogEntry } from "./catalog";
 const LIB = "https://ollama.com/library";
 const REG = "https://registry.ollama.ai";
 
-const HEADLINE = /^(latest|cloud|[0-9.]+[bm]|e[0-9]+b)(-[0-9.]+[bm]-cloud|-cloud)?$/i;
-const MAX_VARIANTS = 10;
+// Keep in sync with scripts/refresh-catalog.py (HEADLINE + MAX_VARIANTS):
+// the in-app Fetch rebuilds the override with these rules, so a skew here
+// silently drops variants the script ships (happened with -mlx).
+const HEADLINE = /^(latest|cloud|[0-9.]+[bm](-a[0-9.]+[bm])?|e[0-9]+b)(-[0-9.]+[bm]-cloud|-cloud|-mlx)?$/i;
+const MAX_VARIANTS = 16;
 
 export interface CatalogOverride {
   updated: string;
