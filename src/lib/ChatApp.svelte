@@ -2383,25 +2383,38 @@
     pendingSaveConfirm = false;
   }
 
-  // saving an edit drops everything after the message. Saving the last
-  // message is lossless; saving anywhere earlier asks first, and offers a
-  // fork so the original thread (and its progress) survives the edit.
+  // Regenerating drops everything after the message. Regenerating the last
+  // message is lossless; anywhere earlier asks first, and offers a fork so
+  // the original thread (and its progress) survives the edit. Save (both
+  // boxes) only rewrites that message in history — no confirm, no
+  // truncation, no model reply. Assistant edits never regenerate, so their
+  // box keeps Save / Fork & Save.
   let pendingSaveConfirm = $state(false);
+  let pendingSaveAction = $state<"regen" | "save">("regen");
   function saveOrConfirm() {
     const c = activeChat;
     if (!c || editingIndex == null || streaming) return;
     if (editingIndex >= c.messages.length - 1) {
       void saveEdit();
     } else {
+      pendingSaveAction = c.messages[editingIndex]?.role === "user" ? "regen" : "save";
       pendingSaveConfirm = true;
     }
+  }
+  // History-only Save never regenerates, so it applies directly with no
+  // confirm — it rewrites just that message and leaves everything after it.
+  function saveOnlyOrConfirm() {
+    const c = activeChat;
+    if (!c || editingIndex == null || streaming) return;
+    void saveEditOnly();
   }
   function cancelSaveConfirm() {
     pendingSaveConfirm = false;
   }
   function confirmSaveHere() {
     pendingSaveConfirm = false;
-    void saveEdit();
+    if (pendingSaveAction === "save") void saveEditOnly();
+    else void saveEdit();
   }
   async function forkAndSave() {
     const chat = chats.find((c) => c.id === activeId);
@@ -2424,6 +2437,36 @@
   }
   function closeLightbox() {
     lightboxSrc = null;
+  }
+
+  // History-only save: rewrite just the edited message, keep every other
+  // message in place — no truncation, no model reply. Then persist.
+  async function saveEditOnly() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat || editingIndex == null || streaming || workRunning) return;
+    const text = editDraft.trim();
+    const images = editImages.length ? [...editImages] : undefined;
+    if (!text && !images) return;
+    const target = chat.messages[editingIndex];
+    if (!target) {
+      cancelEdit();
+      return;
+    }
+    const updated = [...chat.messages];
+    if (target.role === "assistant") {
+      updated[editingIndex] = { ...target, content: text, images };
+    } else {
+      updated[editingIndex] = { role: "user", content: text, ...(images ? { images } : {}) };
+      if (text && (chat.title === "New session" || chat.title === "New Session")) {
+        chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
+      }
+    }
+    chat.messages = updated;
+    chats = [...chats];
+    cancelEdit();
+    isPinned = true;
+    save();
+    scrollBottom();
   }
 
   async function saveEdit() {
@@ -2481,7 +2524,9 @@
       cancelEdit();
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      saveOrConfirm();
+      const target = editingIndex != null ? activeChat?.messages[editingIndex] : undefined;
+      if (target?.role === "assistant") saveOnlyOrConfirm();
+      else saveOrConfirm();
     }
   }
 
@@ -5316,10 +5361,11 @@
                   {/if}
                   <textarea data-testid="edit-input" bind:value={editDraft} rows={Math.min(12, Math.max(3, editDraft.split("\n").length + 1))} onkeydown={onEditKey} onpaste={onEditPaste}></textarea>
                   <div class="edit-actions">
-                    <span class="edit-hint">Esc to cancel · ⌘↵ to save · paste images to attach</span>
+                    <span class="edit-hint">Esc to cancel · ⌘↵ to regenerate · paste images to attach</span>
                     <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
-                    <button class="edit-fork" data-testid="fork-save-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => void forkAndSave()}>Fork &amp; Save</button>
-                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOrConfirm()}>Save</button>
+                    <button class="edit-fork" data-testid="save-only-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOnlyOrConfirm()}>Save</button>
+                    <button class="edit-fork" data-testid="fork-save-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => void forkAndSave()}>Fork &amp; Regenerate</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOrConfirm()}>Regenerate</button>
                   </div>
                 </div>
               {:else}
@@ -5378,7 +5424,7 @@
                     <span class="edit-hint">Esc to cancel · ⌘↵ to save · paste images to attach</span>
                     <button class="edit-cancel" data-testid="cancel-edit-btn" onclick={cancelEdit}>Cancel</button>
                     <button class="edit-fork" data-testid="fork-save-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => void forkAndSave()}>Fork &amp; Save</button>
-                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOrConfirm()}>Save</button>
+                    <button class="edit-save" data-testid="save-edit-btn" disabled={editDraft.trim() === "" && editImages.length === 0} onclick={() => saveOnlyOrConfirm()}>Save</button>
                   </div>
                 </div>
               {:else}
@@ -6585,10 +6631,10 @@
     aria-modal="true"
     aria-label="Confirm save"
   >
-    <p class="confirm-text">Saving here will permanently remove the {saveAfterCount} message{saveAfterCount === 1 ? "" : "s"} after it.</p>
+    <p class="confirm-text">{pendingSaveAction === "regen" ? "Regenerating" : "Saving"} here will permanently remove the {saveAfterCount} message{saveAfterCount === 1 ? "" : "s"} after it.</p>
     <div class="confirm-actions">
       <button class="confirm-cancel" data-testid="cancel-edit-choice-btn" onclick={cancelSaveConfirm}>Cancel</button>
-      <button class="confirm-ok" data-testid="confirm-save-btn" onclick={confirmSaveHere}>Save here</button>
+      <button class="confirm-ok" data-testid="confirm-save-btn" onclick={confirmSaveHere}>{pendingSaveAction === "regen" ? "Regenerate here" : "Save here"}</button>
     </div>
   </div>
 {/if}
