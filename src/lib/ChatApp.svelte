@@ -1986,6 +1986,8 @@
     models.filter((m) => m.toLowerCase().includes(modelQuery.trim().toLowerCase()))
   );
 
+  const runningNames = $derived(new Set(runners.map((r) => r.name)));
+
   // manage tab: current chat's model first, then loaded models, then the rest
   const sortedManageModels = $derived.by(() => {
     const running = new Set(runners.map((r) => r.name));
@@ -5906,24 +5908,29 @@
                 />
                 <div class="model-list-drop">
                   {#each filteredModels as m}
-                    <button
-                      class="model-opt {m === selectedModel ? 'sel' : ''}"
-                      onclick={() => { selectedModel = m; modelOpen = false; save(); }}
-                    >{m}</button>
+                    <div class="model-opt-row {m === selectedModel ? 'sel' : ''}">
+                      <button
+                        class="model-opt"
+                        onclick={() => { selectedModel = m; modelOpen = false; save(); }}
+                      >{m}</button>
+                      {#if !isCloudModel(m)}
+                        {@const loaded = runningNames.has(m)}
+                        <button
+                          class="model-mem-btn"
+                          class:is-loaded={loaded}
+                          data-testid={loaded ? "menu-unload-model-btn" : "menu-load-model-btn"}
+                          data-name={m}
+                          title={loaded ? `Unload ${m}` : `Load ${m}`}
+                          aria-label={loaded ? `Unload ${m}` : `Load ${m}`}
+                          disabled={modelOp !== null || pulling !== null}
+                          onclick={(e) => { e.stopPropagation(); void toggleModelLoaded(m, loaded); }}
+                        ><span class="mem-ico" class:mem-spin={modelOp === m}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
+                      {/if}
+                    </div>
                   {:else}
                     <div class="no-match">No matches</div>
                   {/each}
                 </div>
-                {#if !isCloudModel(selectedModel) && runners.some((r) => r.name === selectedModel)}
-                  <div class="model-unload-foot">
-                    <button
-                      class="model-unload-btn"
-                      data-testid="unload-selected-model-btn"
-                      disabled={modelOp !== null || pulling !== null}
-                      onclick={() => void toggleModelLoaded(selectedModel, true)}
-                    >{modelOp === selectedModel ? "Unloading…" : `Unload ${selectedModel}`}</button>
-                  </div>
-                {/if}
               </div>
             {/if}
           </div>
@@ -7296,7 +7303,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } .mem-spin::after { animation: none; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -7408,10 +7415,19 @@
   .model-opt { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 18px; font-size: 17px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .model-opt:hover { background: var(--hover-3); }
   .model-opt.sel { background: var(--hover-3); }
-  .model-unload-foot { border-top: 1px solid var(--border); padding: 6px; }
-  .model-unload-btn { display: block; width: 100%; box-sizing: border-box; text-align: center; border: none; background: transparent; color: var(--muted); padding: 9px 18px; font-size: 14px; font-family: inherit; cursor: pointer; border-radius: 0 0 14px 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .model-unload-btn:hover:not(:disabled) { background: var(--hover-3); color: var(--text); }
-  .model-unload-btn:disabled { opacity: .6; cursor: default; }
+  .model-opt-row { display: flex; align-items: center; }
+  .model-opt-row:hover { background: var(--hover-3); }
+  .model-opt-row.sel { background: var(--hover-3); }
+  .model-opt-row .model-opt { flex: 1; min-width: 0; width: auto; padding-right: 6px; }
+  .model-opt-row .model-opt:hover { background: transparent; }
+  .model-mem-btn { flex-shrink: 0; display: flex; align-items: center; border: none; background: transparent; color: var(--muted); padding: 8px 14px 8px 8px; cursor: pointer; }
+  .model-mem-btn:hover:not(:disabled) { color: var(--text); }
+  .model-mem-btn.is-loaded { color: var(--accent); }
+  .model-mem-btn.is-loaded:hover:not(:disabled) { color: var(--accent); }
+  .model-mem-btn:disabled { opacity: .5; cursor: default; }
+  .mem-ico { position: relative; display: flex; align-items: center; justify-content: center; width: 21px; height: 21px; }
+  .mem-spin::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--border-strong); border-top-color: var(--accent); animation: mem-spin .8s linear infinite; }
+  @keyframes mem-spin { to { transform: rotate(360deg); } }
   .no-match { padding: 12px 18px; font-size: 14px; color: var(--muted); }
   .send { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--send-disabled); color: #fff; font-size: 18px; cursor: pointer; }
   .send:disabled { opacity: .8; cursor: default; }
