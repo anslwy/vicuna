@@ -1,11 +1,13 @@
 // In-app update helpers (Settings → App updates).
 //
 // The CI release workflow attaches installers to the rolling `latest`
-// prerelease on every main push, so the release *tag* never changes —
-// staleness is decided by date: the installed build's baked timestamp
-// (`VICUNA_BUILD_UNIX`, see src-tauri/build.rs) vs the release's
-// `published_at`. Pure functions only (unit-tested headlessly); the
-// ChatApp settings section owns the check/download/open flow.
+// prerelease on every main push, so the release *tag* never changes — and
+// neither does its `published_at` (`gh release upload --clobber` only swaps
+// assets). Staleness is therefore decided by date: the installed build's
+// baked timestamp (`VICUNA_BUILD_UNIX`, see src-tauri/build.rs) vs the
+// *platform installer asset's* upload time (see `releaseTimestamp`). Pure
+// functions only (unit-tested by scripts/check-update.mjs); the ChatApp
+// settings section owns the check/download/open flow.
 
 export interface ReleaseAsset {
   name: string;
