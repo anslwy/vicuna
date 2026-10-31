@@ -2,11 +2,11 @@
 
 <img width="1189" height="785" alt="image" src="https://github.com/user-attachments/assets/9aad0db5-8163-4362-9875-11677bf317b1" />
 
-Cross Platform Desktop Client for [Ollama](https://ollama.com).
-Your private assistant with chat and work mode.
+> Cross Platform ChatGPT-style Client built for [Ollama](https://ollama.com). Your private assistant with chat and work mode.
 
 Features:
 
+- Offline-first: Chat / work with your assistant without an internet connection. All sessions are also stored in your device offline.
 - Chat Mode: Suitable for general query with features like forking sessions, continuing from mid-sentence, editing user / assistant responses with/without triggering regeneration and more.
 - Work Mode: Designed to work autonomously to finish a task with features like built-in sidebar file explorer & terminal, MCP servers management and more.
 
