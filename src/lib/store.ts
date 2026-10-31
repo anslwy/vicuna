@@ -288,7 +288,7 @@ async function createSqliteBackend(): Promise<Backend> {
     `CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, idx)`
   );
   // databases created before these columns existed lack them
-  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL"]) {
+  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER"]) {
     try {
       await db.execute(`ALTER TABLE messages ADD COLUMN ${col}`);
     } catch {
@@ -316,8 +316,8 @@ async function createSqliteBackend(): Promise<Backend> {
         let i = 0;
         for (const m of c.messages) {
           await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null]
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null]
           );
         }
       }
@@ -355,8 +355,8 @@ async function createSqliteBackend(): Promise<Backend> {
       let i = 0;
       for (const m of c.messages) {
         await db.execute(
-          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null]
+          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null]
         );
       }
     }
@@ -369,9 +369,9 @@ async function createSqliteBackend(): Promise<Backend> {
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
-          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null }[]
+          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null; summary: number | null }[]
         >(
-          "SELECT role, content, thinking, model, images, gen_ms, gen_tps FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
+          "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
           [r.id]
         );
         chats.push({
@@ -389,7 +389,8 @@ async function createSqliteBackend(): Promise<Backend> {
           model: m.model || undefined,
           images: parseImages(m.images),
           genMs: typeof m.gen_ms === "number" ? m.gen_ms : undefined,
-          genTps: typeof m.gen_tps === "number" ? m.gen_tps : undefined
+          genTps: typeof m.gen_tps === "number" ? m.gen_tps : undefined,
+          summary: m.summary === 1 ? true : undefined
         }))
         });
       }

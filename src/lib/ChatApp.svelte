@@ -28,6 +28,7 @@
     type Chat
   } from "$lib/store";
   import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
+  import Tooltip from "$lib/Tooltip.svelte";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
@@ -178,6 +179,8 @@
   /** true for the whole Work turn, including tool dispatch + the wait for the
    *  next round's first token — `streaming` only covers a single request */
   let workRunning = $state(false);
+  /** manual compaction in flight (/compact): blocks sends + edits like a turn */
+  let compacting = $state(false);
   let workChatId = $state<string | null>(null);
   /** wall-clock start of the live Work turn (null when idle): sidebar hover
    *  shows elapsed time since the task started */
@@ -772,7 +775,7 @@
   );
   const queuedForActive = $derived(queuedMsgs.filter((q) => q.chatId === activeId));
   /** a turn is live: either a single request or a whole Work agent turn */
-  const busy = $derived(streaming || workRunning);
+  const busy = $derived(streaming || workRunning || compacting);
   /** sidebar shimmer: a session with a live chat stream or work turn */
   function isSessionStreaming(id: string): boolean {
     return (streaming && streamingChatId === id) || (workRunning && workChatId === id);
@@ -2300,7 +2303,7 @@
       return;
     }
     const history: ChatMsg[] = [
-      ...chat.messages.map(toHistory)
+      ...compactedHistory(chat.messages)
     ];
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     await streamInto(chat, chat.messages.length - 1, history, true);
@@ -2520,7 +2523,7 @@
     // of starting a fresh turn. No re-thinking and low temperature: no
     // fresh plans, no wandering. Custom stop words end the generation if
     // it tries to start a new turn ("User:" etc.).
-    const history: ChatMsg[] = chat.messages.slice(0, i + 1).map(toHistory);
+    const history: ChatMsg[] = compactedHistory(chat.messages.slice(0, i + 1));
     continuing = true;
     try {
       await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
@@ -2539,7 +2542,7 @@
     cancelEdit();
     // drop the old reply and generate fresh with the currently selected model
     chat.messages = [...chat.messages.slice(0, i)];
-    const freshHistory: ChatMsg[] = chat.messages.map(toHistory);
+    const freshHistory: ChatMsg[] = compactedHistory(chat.messages);
     chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
     chats = [...chats];
     if ((chat.mode ?? "chat") === "work") {
@@ -2555,9 +2558,87 @@
     await streamInto(chat, chat.messages.length - 1, freshHistory, true);
   }
 
+  /** /compact: summarize the older messages into one note and drop them,
+   *  freeing context without losing the thread. Same summarizer shape as
+   *  the automatic work-turn compaction, but it rewrites the persisted
+   *  transcript (the auto one only trims the ephemeral native history). */
+  async function compactSession() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat) {
+      error = "/compact needs a Work session — open one first.";
+      return;
+    }
+    if ((chat.mode ?? "chat") !== "work") {
+      error = "/compact is only available in Work sessions.";
+      return;
+    }
+    if (busy) return;
+    if (!chat.messages.length) {
+      error = "Nothing to compact — the session has no messages yet.";
+      return;
+    }
+    // model-visible transcript (drops anything already compacted): the UI
+    // keeps every message, only the model's context is trimmed
+    const visible = compactedHistory(chat.messages);
+    if (visible.length <= 1 && chat.messages.some((m) => m.summary)) {
+      error = "Already compacted — send more messages first.";
+      return;
+    }
+    const startLen = chat.messages.length;
+    const transcript = visible.map((h) => {
+      const who = h.role === "user" ? "User" : h.role === "assistant" ? "Assistant" : h.role === "tool" ? "Tool" : "System";
+      const imgs = h.images?.length ? ` [${h.images.length} image(s) attached]` : "";
+      return `${who}: ${h.content}${imgs}`;
+    }).join("\n\n");
+    compacting = true;
+    error = null;
+    let summary = "";
+    try {
+      const res = await chatStream(
+        selectedModel,
+        [
+          { role: "system", content: "Summarize this conversation transcript concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter." },
+          { role: "user", content: transcript }
+        ],
+        () => {},
+        undefined,
+        undefined,
+        0,
+        { think: false, temperature: 0.2 }
+      );
+      summary = res.text;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      compacting = false;
+    }
+    if (!summary.trim()) return;
+    const c = chats.find((x) => x.id === chat.id);
+    // messages moved under us (edit/delete raced the summary): bail instead
+    // of flagging a shifted transcript
+    if (!c || c.messages.length !== startLen) {
+      error = "Session changed during compaction — try again.";
+      return;
+    }
+    // visible divider + summary for the user; the flag is what trims the
+    // model's context (compactedHistory drops everything up to it). Any
+    // older summary loses its flag so only the latest boundary counts.
+    for (const m of c.messages) {
+      if (m.summary) m.summary = undefined;
+    }
+    c.messages = [
+      ...c.messages,
+      { role: "assistant", content: summary.trim(), model: selectedModel, summary: true }
+    ];
+    chats = [...chats];
+    save();
+    scrollBottom();
+  }
+
   async function send() {
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
+    if (compacting) return;
     if (streaming || workRunning) {
       // work turns stay interactive: a prompt typed mid-run queues for the
       // next round instead of being dropped or starting a parallel turn
@@ -2684,7 +2765,7 @@
       await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
     } else {
       // history excludes the trailing placeholder being generated
-      const history: ChatMsg[] = chat.messages.slice(0, -1).map(toHistory);
+      const history: ChatMsg[] = compactedHistory(chat.messages.slice(0, -1));
       await streamInto(chat, chat.messages.length - 1, history, true);
     }
     if (freshChat && activeId === chat.id) {
@@ -2981,6 +3062,62 @@
     if (mention && !explorerEntries.length && !explorerLoading && explorerRoot.trim() && explorerRoot.trim() !== "/" && isTauriRuntime()) {
       void loadExplorer();
     }
+  });
+
+  /** slash commands: like @-mentions but triggered by a leading "/" in an
+   *  otherwise empty composer (typing "/usr/…" filters, anything else hides).
+   *  Only /compact for now — the list shape leaves room for more. */
+  const SLASH_COMMANDS = [
+    { name: "compact", desc: "Summarize older messages into one note to free context" }
+  ];
+  let slash = $state<{ query: string; items: { name: string; desc: string }[]; index: number } | null>(null);
+
+  /** recompute the slash menu from the input (input/click/keyup/blur) */
+  function refreshSlashMenu() {
+    // work-only: /compact trims the agent's context, meaningless in chat
+    if (composerMode !== "work" || !input.startsWith("/") || input.includes("\n") || streaming || workRunning || compacting) {
+      slash = null;
+      return;
+    }
+    const q = input.slice(1).trim().toLowerCase();
+    const items = SLASH_COMMANDS.filter((c) => !q || c.name.startsWith(q));
+    slash = items.length ? { query: q, items, index: 0 } : null;
+  }
+
+  /** run the highlighted slash command, then clear the composer */
+  function runSlash() {
+    const cmd = slash?.items[slash.index]?.name;
+    slash = null;
+    if (!cmd) return;
+    input = "";
+    autosizeComposer();
+    composerEl?.focus();
+    if (cmd === "compact") void compactSession();
+  }
+
+  /** context window of the selected model for the usage ring (cached per
+   *  model via modelContextLength; 32768 fallback until it resolves) */
+  let ctxWindow = $state(32768);
+  async function refreshCtxWindow() {
+    const m = selectedModel;
+    const len = await modelContextLength(m).catch(() => null);
+    if (selectedModel !== m) return;
+    if (len) ctxWindow = len;
+  }
+  $effect(() => {
+    selectedModel;
+    void refreshCtxWindow();
+  });
+
+  /** usage for the Work header ring: system prompt + send-shaped history
+   *  over the model's window — the same fraction the auto-compact watches,
+   *  so the ring hitting ~70% explains a compaction */
+  const workCtx = $derived.by(() => {
+    const c = activeChat;
+    if (!c || (c.mode ?? "chat") !== "work") return null;
+    const used = estimateWorkTokens([{ content: buildWorkSystemPrompt(c.workspace ?? "") }, ...compactedHistory(c.messages)]);
+    const win = ctxWindow > 0 ? ctxWindow : 32768;
+    return { used, win, frac: Math.min(1, used / win) };
   });
 
   /** keep the composer backdrop scrolled with the textarea */
@@ -3447,6 +3584,29 @@
   function onKey(e: KeyboardEvent) {
     const noMod = !e.metaKey && !e.ctrlKey && !e.altKey;
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") caretHopped = false;
+    // slash-command menu (leading "/" in an empty composer): arrows move,
+    // Enter/Tab runs, Esc closes. Checked before @-mentions — input starting
+    // with "/" belongs to this menu.
+    if (slash) {
+      if ((e.key === "ArrowDown" || e.key === "ArrowUp") && noMod) {
+        e.preventDefault();
+        popupKeyHandled = true;
+        slash.index = (slash.index + (e.key === "ArrowDown" ? 1 : slash.items.length - 1)) % slash.items.length;
+        return;
+      }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+        e.preventDefault();
+        popupKeyHandled = true;
+        runSlash();
+        return;
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        popupKeyHandled = true;
+        slash = null;
+        return;
+      }
+    }
     // @-mention popup navigation (work mode): arrows move, Enter/Tab select,
     // Esc closes. Plain arrows also hop over completed pills atomically.
     if (mention) {
@@ -3589,6 +3749,19 @@
     return base;
   }
 
+  /** Model-visible transcript: everything from the latest compaction
+   *  summary onward. Older messages stay on screen for the user (under a
+   *  "Session compacted" divider) but never reach the model again — the
+   *  summary carries their context instead. No-op for threads never
+   *  compacted, so every history-building site uses this. */
+  function compactedHistory(messages: ChatMsg[]): ChatMsg[] {
+    let from = 0;
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].summary) from = i;
+    }
+    return messages.slice(from).map(toHistory);
+  }
+
   function noteImagesStripped() {
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
@@ -3697,7 +3870,7 @@
     // native history: proper tool roles for the model; display message holds
     // narration + markdown results for persistence. seedContext carries hidden
     // context (e.g. a continued chat transcript) never shown in this thread.
-    const baseHistory = chats.find((x) => x.id === chat.id)?.messages.slice(0, index).map(toHistory) ?? [];
+    const baseHistory = compactedHistory(chats.find((x) => x.id === chat.id)?.messages.slice(0, index) ?? []);
     let seed = seedContext;
     if (!seed.length && chat.forkedFrom && chat.forkFromIndex == null) {
       // continued thread regenerated (or re-run) without its original seed:
@@ -3705,7 +3878,7 @@
       const src = chats.find((x) => x.id === (chat.forkedFrom as { id: string }).id);
       if (src) {
         seed = [
-          ...src.messages.slice(-20).map(toHistory),
+          ...compactedHistory(src.messages.slice(-20)),
           { role: "user", content: workspace ? `Continue the above in the workspace (${workspace}).` : "Continue the above in a workspace." }
         ];
       }
@@ -4111,7 +4284,7 @@
     streamingStartAt = null;
     const ws = defaultWorkspace || pendingWorkspace || "";
     const seedContext: ChatMsg[] = [
-      ...src.messages.slice(-20).map(toHistory),
+      ...compactedHistory(src.messages.slice(-20)),
       { role: "user", content: ws ? `Continue the above in the workspace (${ws}).` : "Continue the above in a workspace." }
     ];
     const fork: Chat = {
@@ -4468,9 +4641,9 @@
           pm.thinking = "";
           chats = [...chats];
         }
-        const resumeHistory: ChatMsg[] = (
+        const resumeHistory: ChatMsg[] = compactedHistory(
           pending.mode === "continue" ? pc.messages.slice(0, pending.index + 1) : pc.messages.slice(0, pending.index)
-        ).map(toHistory);
+        );
         if (pending.mode === "continue") continuing = true;
         try {
           await streamInto(pc, pending.index, resumeHistory, false, {
@@ -4678,6 +4851,19 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
+          {#if workCtx}
+            {@const pct = Math.round(workCtx.frac * 100)}
+            <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
+              <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                <circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-2)" stroke-width="2.5" />
+                <circle cx="9" cy="9" r="7" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray={`${(workCtx.frac * 43.98).toFixed(1)} 44`} transform="rotate(-90 9 9)" />
+              </svg>
+              <span class="ctx-popup" data-testid="ctx-popup">
+                <span class="ctx-row"><span>Usage</span><span>{pct}%</span></span>
+                <span class="ctx-row"><span>Tokens</span><span>{workCtx.used.toLocaleString()}</span></span>
+              </span>
+            </span>
+          {/if}
         </div>
       {/if}
       <div
@@ -4749,6 +4935,11 @@
                  stays shimmering for the whole turn, not just the first stream -->
             {@const thinkingLive = (streaming || workRunning) && isLast && !continuing && (thinkingActive || isWorkMsg)}
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
+              {#if m.summary}
+                <div class="compact-div" data-testid="compact-divider">
+                  <Tooltip text="Messages above this line are no longer in context — the model only sees the summary below."><span>Session compacted</span></Tooltip>
+                </div>
+              {/if}
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
                   {#if editImages.length}
@@ -4995,11 +5186,13 @@
               caretHopped = false;
               syncBackdropScroll();
               refreshMentionMenu();
+              refreshSlashMenu();
             }}
             onclick={() => {
               caretHopped = false;
               snapComposerCaret();
               refreshMentionMenu();
+              refreshSlashMenu();
             }}
             onkeyup={(e) => {
               // keydown may have consumed the popup (select/close/nav) while
@@ -5009,16 +5202,42 @@
                 return;
               }
               refreshMentionMenu();
+              refreshSlashMenu();
             }}
             onblur={() => {
               // picking a suggestion uses mousedown (no blur); any real
               // blur means the user clicked away — close the popup
               mention = null;
+              slash = null;
             }}
             rows={1}
           ></textarea>
         </div>
-        {#if mention && mention.items.length}
+        {#if slash}
+          <div class="mention-menu" data-testid="slash-menu" role="listbox" aria-label="Commands">
+            {#each slash.items as item, i (item.name)}
+              <button
+                class="mention-item {i === slash.index ? 'sel' : ''}"
+                data-testid="slash-item"
+                role="option"
+                aria-selected={i === slash.index}
+                title={item.desc}
+                onmousedown={(e) => {
+                  // before blur: keep focus in the composer
+                  e.preventDefault();
+                  if (slash) slash.index = i;
+                  runSlash();
+                }}
+                onmousemove={() => {
+                  if (slash && slash.index !== i) slash.index = i;
+                }}
+              >
+                <span class="mention-path">/{item.name}</span>
+                <span class="slash-desc">{item.desc}</span>
+              </button>
+            {/each}
+          </div>
+        {:else if mention && mention.items.length}
           <div class="mention-menu" data-testid="mention-menu" role="listbox" aria-label="Mention a file">
             {#each mention.items as item, i (item.path)}
               <button
@@ -6523,6 +6742,7 @@
   .mention-item svg { flex-shrink: 0; color: var(--muted-2); }
   .mention-path { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .mention-empty { padding: 8px 12px; font-size: 13px; color: var(--muted); }
+  .slash-desc { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: var(--muted); text-align: right; }
   .spacer { flex: 1; }
   .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
   .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
@@ -6624,6 +6844,14 @@
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 10px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
+  .ctx-wrap { position: relative; margin-left: auto; display: inline-flex; cursor: default; }
+  .ctx-popup { display: none; position: absolute; right: 0; top: calc(100% + 8px); background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px 14px; z-index: 30; min-width: 170px; }
+  .ctx-wrap:hover .ctx-popup, .ctx-wrap:focus-within .ctx-popup { display: block; }
+  .ctx-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; color: var(--text); padding: 2px 0; font-variant-numeric: tabular-nums; }
+  .ctx-row span:first-child { color: var(--muted-2); }
+  .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
+  .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
+  .compact-div > span { white-space: nowrap; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }
