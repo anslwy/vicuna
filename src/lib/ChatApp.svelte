@@ -617,10 +617,9 @@
     delete mcpLive[id];
   }
 
-  /** Open the token generation page (github-only PAT prompt). */
-  async function openTokenPage(e: MouseEvent) {
-    e.preventDefault();
-    const url = "https://github.com/settings/tokens/new";
+  /** Open a URL outside the app: system browser on desktop (Tauri opener),
+   *  new tab in plain browsers. Never navigates the app webview itself. */
+  async function openExternal(url: string): Promise<void> {
     if (isTauriRuntime()) {
       try {
         const { openUrl } = await import("@tauri-apps/plugin-opener");
@@ -631,6 +630,12 @@
       }
     }
     window.open(url, "_blank", "noopener");
+  }
+
+  /** Open the token generation page (github-only PAT prompt). */
+  async function openTokenPage(e: MouseEvent) {
+    e.preventDefault();
+    await openExternal("https://github.com/settings/tokens/new");
   }
 
   /** Save the pasted PAT into the server's Headers and connect. */
@@ -2155,6 +2160,21 @@
     if (!el) return;
     const onClick = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null;
+      // external links in message prose (agent answers, pasted URLs): open
+      // in the system browser / a new tab instead of navigating the app
+      // webview itself (which strands the session with no way back). Links
+      // win over inline-code copy when code sits inside a link.
+      const a = t?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (a) {
+        const href = a.getAttribute("href") ?? "";
+        if (/^(https?:\/\/|mailto:)/i.test(href)) {
+          e.preventDefault();
+          void openExternal(href);
+          return;
+        }
+        // internal/app links (/#… routes, vicuna:// deep links): leave to
+        // the router and deep-link handlers below
+      }
       const btn = t?.closest?.("[data-copy-code]") as HTMLElement | null;
       if (btn) {
         const code = btn.closest(".codeblock")?.querySelector("code");
@@ -2185,7 +2205,22 @@
       });
     };
     el.addEventListener("click", onClick);
-    return () => el.removeEventListener("click", onClick);
+    // middle-clicks bypass `click`: route those the same way
+    const onAux = (e: MouseEvent) => {
+      if (e.button !== 1) return;
+      const t = e.target as HTMLElement | null;
+      const a = t?.closest?.("a[href]") as HTMLAnchorElement | null;
+      const href = a?.getAttribute("href") ?? "";
+      if (a && /^(https?:\/\/|mailto:)/i.test(href)) {
+        e.preventDefault();
+        void openExternal(href);
+      }
+    };
+    el.addEventListener("auxclick", onAux);
+    return () => {
+      el.removeEventListener("click", onClick);
+      el.removeEventListener("auxclick", onAux);
+    };
   });
 
   async function copyText(t: string): Promise<boolean> {

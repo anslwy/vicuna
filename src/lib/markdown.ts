@@ -30,6 +30,22 @@ marked.use({
     codespan({ text }: { text: string }) {
       return `<code class="inl">${escapeHtml(text)}</code>`;
     },
+    // links: external ones carry target/rel so they open outside the app
+    // even without JS (middle-click, no-JS contexts). The ChatApp click
+    // delegation on message containers is the primary route — it sends
+    // http(s)/mailto links to the system browser instead of navigating the
+    // app webview itself (which strands the session with no way back).
+    // Internal links (/#… routes, vicuna:// deep links) keep default
+    // behavior for the router / deep-link handlers.
+    link({ href, title, tokens }: { href: string; title?: string | null; tokens?: unknown[] }) {
+      const body = (this as unknown as { parser: { parseInline(t: unknown): string } }).parser.parseInline(tokens ?? []);
+      const safe = escapeHtml(href);
+      const t = title ? ` title="${escapeHtml(title)}"` : "";
+      if (/^(https?:\/\/|mailto:)/i.test(href)) {
+        return `<a href="${safe}"${t} target="_blank" rel="noopener noreferrer">${body}</a>`;
+      }
+      return `<a href="${safe}"${t}>${body}</a>`;
+    },
     code({ text, lang }: { text: string; lang?: string }) {
       let html: string;
       let cls = "hljs";
