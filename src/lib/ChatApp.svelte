@@ -1132,14 +1132,20 @@
   let updateError = $state<string | null>(null);
   let updateNote = $state<string | null>(null);
   let downloadedPath = $state<string | null>(null);
-  /** update errors fade like the main error box (a manual × also exists) */
+  /** update errors fade like the main error box (a manual × also exists);
+   *  same plain-timer shape as `errorTimer` above */
+  let updateErrorTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const msg = updateError;
+    if (updateErrorTimer) {
+      clearTimeout(updateErrorTimer);
+      updateErrorTimer = null;
+    }
     if (!msg) return;
-    const t = setTimeout(() => {
+    updateErrorTimer = setTimeout(() => {
+      updateErrorTimer = null;
       if (updateError === msg) updateError = null;
     }, 12000);
-    return () => clearTimeout(t);
   });
   let runners = $state<RunningModel[]>([]);
   let runnersError = $state<string | null>(null);
