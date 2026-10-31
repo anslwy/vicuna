@@ -1,5 +1,7 @@
 # Vicuna
 
+<img width="1189" height="785" alt="image" src="https://github.com/user-attachments/assets/9aad0db5-8163-4362-9875-11677bf317b1" />
+
 Cross Platform Desktop Client for [Ollama](https://ollama.com).
 Your private assistant with chat and work mode.
 
