@@ -1911,6 +1911,7 @@
   function toggleModel() {
     modelOpen = !modelOpen;
     if (modelOpen) modelQuery = "";
+    if (modelOpen) void refreshRunners();
   }
 
   // reasoning effort, next to the model picker: string think levels are
@@ -5913,6 +5914,16 @@
                     <div class="no-match">No matches</div>
                   {/each}
                 </div>
+                {#if !isCloudModel(selectedModel) && runners.some((r) => r.name === selectedModel)}
+                  <div class="model-unload-foot">
+                    <button
+                      class="model-unload-btn"
+                      data-testid="unload-selected-model-btn"
+                      disabled={modelOp !== null || pulling !== null}
+                      onclick={() => void toggleModelLoaded(selectedModel, true)}
+                    >{modelOp === selectedModel ? "Unloading…" : `Unload ${selectedModel}`}</button>
+                  </div>
+                {/if}
               </div>
             {/if}
           </div>
@@ -7397,6 +7408,10 @@
   .model-opt { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 18px; font-size: 17px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .model-opt:hover { background: var(--hover-3); }
   .model-opt.sel { background: var(--hover-3); }
+  .model-unload-foot { border-top: 1px solid var(--border); padding: 6px; }
+  .model-unload-btn { display: block; width: 100%; box-sizing: border-box; text-align: center; border: none; background: transparent; color: var(--muted); padding: 9px 18px; font-size: 14px; font-family: inherit; cursor: pointer; border-radius: 0 0 14px 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-unload-btn:hover:not(:disabled) { background: var(--hover-3); color: var(--text); }
+  .model-unload-btn:disabled { opacity: .6; cursor: default; }
   .no-match { padding: 12px 18px; font-size: 14px; color: var(--muted); }
   .send { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--send-disabled); color: #fff; font-size: 18px; cursor: pointer; }
   .send:disabled { opacity: .8; cursor: default; }
