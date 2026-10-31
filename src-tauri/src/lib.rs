@@ -66,8 +66,16 @@ enum ChatEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum GenerateEvent {
-    Token { text: String },
-    Done { done_reason: Option<String> },
+    Token {
+        text: String,
+    },
+    Done {
+        done_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval_duration: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +156,7 @@ struct ThinkingInfo {
 struct ModelShowInfo {
     context_length: Option<u64>,
     thinking: Option<ThinkingInfo>,
+    family: Option<String>,
 }
 
 #[tauri::command]
@@ -184,6 +193,12 @@ async fn ollama_model_show(model: String) -> Result<ModelShowInfo, String> {
                 default: t.get("default").cloned(),
             })
         }),
+        family: data
+            .get("details")
+            .and_then(|d| d.get("family"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string()),
     })
 }
 
@@ -371,8 +386,10 @@ async fn ollama_chat_stream(
     Ok(full)
 }
 
-/// Raw text completion (no chat template). Kept for parity with the old JS
-/// helper; Continue does NOT use this (see AGENTS.md).
+/// Raw text completion (no chat template). Continue on gemma-family models
+/// uses this with the family's own prompt prefill (src/lib/continue.ts) —
+/// their chat template closes the assistant turn, so /api/chat starts a new
+/// turn; every other Continue goes through /api/chat.
 #[tauri::command]
 async fn ollama_generate_stream(
     model: String,
@@ -415,6 +432,8 @@ async fn ollama_generate_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
     let mut done_reason: Option<String> = None;
+    let mut eval_count: Option<u64> = None;
+    let mut eval_duration: Option<u64> = None;
     let mut client_gone = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("ollama generate failed: {e}"))?;
@@ -430,6 +449,12 @@ async fn ollama_generate_stream(
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
                     if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
                         done_reason = Some(r.to_string());
+                    }
+                    if eval_count.is_none() {
+                        eval_count = obj.get("eval_count").and_then(|v| v.as_u64());
+                    }
+                    if eval_duration.is_none() {
+                        eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
                     }
                     if let Some(t) = obj.get("response").and_then(|v| v.as_str()) {
                         if !t.is_empty() {
@@ -459,6 +484,12 @@ async fn ollama_generate_stream(
             if let Some(r) = obj.get("done_reason").and_then(|v| v.as_str()) {
                 done_reason = Some(r.to_string());
             }
+            if eval_count.is_none() {
+                eval_count = obj.get("eval_count").and_then(|v| v.as_u64());
+            }
+            if eval_duration.is_none() {
+                eval_duration = obj.get("eval_duration").and_then(|v| v.as_u64());
+            }
             if let Some(t) = obj.get("response").and_then(|v| v.as_str()) {
                 if !t.is_empty() {
                     full.push_str(t);
@@ -467,7 +498,7 @@ async fn ollama_generate_stream(
             }
         }
     }
-    let _ = on_event.send(GenerateEvent::Done { done_reason });
+    let _ = on_event.send(GenerateEvent::Done { done_reason, eval_count, eval_duration });
     Ok(full)
 }
 

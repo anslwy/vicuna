@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
@@ -31,6 +31,7 @@
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
+  import { CONTINUE_MODES, buildRawContinuePrompt, isRunawayRepetition, normalizeContinueMode, normalizePromptStyle, promptStyleForFamily, stripRunawayTail, useRawContinue, type ContinueMode, type PromptStyle } from "$lib/continue";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
@@ -42,7 +43,7 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto" };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
   /** mode + workspace picker for the session being started (home or empty draft) */
@@ -1509,6 +1510,7 @@
   let stopWords = $state<string[]>([...initialPrefs.stopWords]);
   let stopWordsText = $state(stopWordsToText(initialPrefs.stopWords));
   let ollamaBase = $state(initialPrefs.ollamaBase);
+  let continueMode = $state<ContinueMode>(initialPrefs.continueMode);
 
   function stopWordsToText(list: string[]): string {
     return list.map((s) => s.replace(/\n/g, "\\n")).join("\n");
@@ -1568,8 +1570,13 @@
     persistPrefs();
   }
 
+  function setContinueMode(m: ContinueMode) {
+    continueMode = normalizeContinueMode(m);
+    persistPrefs();
+  }
+
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode });
   }
 
   function setOllamaHost(text: string) {
@@ -2472,14 +2479,17 @@
   async function saveEdit() {
     const chat = chats.find((c) => c.id === activeId);
     if (!chat || editingIndex == null || streaming || workRunning) return;
-    const text = editDraft.trim();
+    const trimmed = editDraft.trim();
     const images = editImages.length ? [...editImages] : undefined;
-    if (!text && !images) return;
+    if (!trimmed && !images) return;
     const target = chat.messages[editingIndex];
     if (!target) {
       cancelEdit();
       return;
     }
+    // replies keep the exact text: trailing whitespace is meaningful when
+    // continuing ("Yo! How's " must not collapse into "Yo! How's")
+    const text = target.role === "assistant" ? editDraft : trimmed;
     if (target.role === "assistant") {
       // editing a reply: replace it in place and drop everything after,
       // no regeneration (use Continue to extend it)
@@ -2560,7 +2570,7 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; rawStyle?: PromptStyle; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
     streaming = true;
     streamingChatId = chat.id;
     streamingStartAt = Date.now();
@@ -2586,10 +2596,19 @@
       model: selectedModel,
       think,
       temperature: opts.temperature,
-      stop: opts.stop
+      stop: opts.stop,
+      rawStyle: opts.rawStyle
     });
     save();
     scrollBottom();
+    // raw Continue can overrun the turn on some builds (see
+    // isRunawayRepetition): remember the partial so a cut keeps only the
+    // clean continuation
+    const startContent = chats.find((x) => x.id === chat.id)?.messages[index]?.content ?? "";
+    let runawayCut = false;
+    // the continuation continues the existing text: drop a duplicated
+    // boundary space so "How's " + " it" doesn't render as a double space
+    let firstTok = true;
     const wallStart = Date.now();
     let runEvalCount = 0;
     let runEvalDurationNs = 0;
@@ -2650,11 +2669,22 @@
     try {
       const onTok = (tok: string) => {
         produced = true;
+        if (firstTok) {
+          firstTok = false;
+          if (/[ \t]$/.test(startContent)) tok = tok.replace(/^[ \t]+/, "");
+        }
         generatedText += tok;
         pendingTok += tok;
         scheduleFlush();
         dropStallHint();
         armStall();
+        // raw Continue can overrun a finished turn into a short phrase
+        // repeated forever (verified on MLX gemma4 builds); cut the stream
+        // instead of persisting kilobytes of "owns owns owns"
+        if (opts.generatePrompt !== undefined && !runawayCut && isRunawayRepetition(generatedText)) {
+          runawayCut = true;
+          ctrl.abort();
+        }
       };
       const onTh = (tok: string) => {
         produced = true;
@@ -2664,7 +2694,9 @@
         armStall();
       };
       if (opts.generatePrompt !== undefined) {
-        await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
+        const res = await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
+        runEvalCount = res.evalCount;
+        runEvalDurationNs = res.evalDurationNs;
       } else {
         const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think, temperature: opts.temperature, stop: opts.stop, tools: opts.tools, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
         runEvalCount = res.evalCount;
@@ -2698,6 +2730,16 @@
         flushTimer = null;
       }
       flushTokens();
+      // a cut raw continuation keeps only the text before the repeated run
+      if (runawayCut) {
+        generatedText = stripRunawayTail(generatedText);
+        const cc = chats.find((x) => x.id === chat.id);
+        const cm = cc?.messages[index];
+        if (cc && cm && cm.role === "assistant") {
+          cc.messages[index] = { ...cm, content: startContent + generatedText };
+          chats = [...chats];
+        }
+      }
       // record generation stats: wall time always, tok/s from the server's
       // eval counters when present (cloud APIs omit eval_duration — then
       // fall back to eval tokens over wall time so they still get a rate)
@@ -2733,16 +2775,42 @@
     if (i !== chat.messages.length - 1) return;
     const target = chat.messages[i];
     if (!target || target.role !== "assistant") return;
+    // Continue generates with the selected model: cloud models can't append
+    // (raw /api/generate returns empty, native starts a new turn), so refuse
+    // both routes here even if this is called outside the disabled button.
+    if (isCloudModel(selectedModel)) return;
     error = null;
-    // Continue via /api/chat: resend the history ending with the partial
-    // reply as-is so the model carries on exactly where it stopped instead
-    // of starting a fresh turn. No re-thinking and low temperature: no
-    // fresh plans, no wandering. Custom stop words end the generation if
-    // it tries to start a new turn ("User:" etc.).
     const history: ChatMsg[] = compactedHistory(chat.messages.slice(0, i + 1));
+    // Two ways to extend a reply. Native /api/chat resends the partial as
+    // the last assistant message — works for models that append, but gemma's
+    // chat template closes the assistant turn, so the model starts a fresh
+    // greeting instead. Raw /api/generate prefills the family's own prompt
+    // format, ending inside the model turn, so the model carries on exactly
+    // where the text stopped. Raw needs a known format and can't carry
+    // images; everything else falls back to native.
+    let style: PromptStyle | null = null;
+    if (continueMode !== "native" && !history.some((m) => m.images?.length)) {
+      style = promptStyleForFamily(await modelFamily(selectedModel));
+      if (!useRawContinue(continueMode, style)) style = null;
+    }
+    const raw = style ? buildRawContinuePrompt(history, style) : null;
     continuing = true;
     try {
-      await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
+      if (raw && style) {
+        await streamInto(chat, i, history, false, {
+          generatePrompt: raw.prompt,
+          rawStyle: style,
+          think: false,
+          temperature: 0.2,
+          stop: [...stopWords, ...raw.stop],
+          mode: "continue"
+        });
+      } else {
+        // Native reflection: no re-thinking and low temperature so it appends
+        // instead of planning a new turn. Custom stop words end generation if
+        // it tries to start one ("User:" etc.).
+        await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
+      }
     } finally {
       continuing = false;
     }
@@ -4977,6 +5045,7 @@
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
+      continueMode = normalizeContinueMode(prefs.continueMode);
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
@@ -5069,12 +5138,19 @@
           pending.mode === "continue" ? pc.messages.slice(0, pending.index + 1) : pc.messages.slice(0, pending.index)
         );
         if (pending.mode === "continue") continuing = true;
+        // raw Continue resumes through /api/generate: rebuild the prefilled
+        // prompt from the persisted partial (the marker carries the style
+        // because the family lookup could differ offline)
+        const resumeStyle = normalizePromptStyle(pending.rawStyle);
+        const rawResume = resumeStyle ? buildRawContinuePrompt(resumeHistory, resumeStyle) : null;
         try {
           await streamInto(pc, pending.index, resumeHistory, false, {
             think: pending.think,
             temperature: pending.temperature,
-            stop: pending.stop,
-            mode: pending.mode
+            stop: rawResume ? [...new Set([...(pending.stop ?? []), ...rawResume.stop])] : pending.stop,
+            mode: pending.mode,
+            generatePrompt: rawResume?.prompt,
+            rawStyle: pending.rawStyle
           });
         } finally {
           continuing = false;
@@ -6779,6 +6855,19 @@
         spellcheck={false}
       />
       <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. For remote access use the https tailscale URL. The Tauri shell always uses its local Ollama.</span>
+    </div>
+    <div class="setting-stacked">
+      <span class="setting-label">Continue method</span>
+      <div class="seg" data-testid="continue-mode">
+        {#each CONTINUE_MODES as m}
+          <button
+            class="seg-btn {continueMode === m.id ? 'sel' : ''}"
+            data-testid="continue-mode-{m.id}"
+            onclick={() => setContinueMode(m.id)}
+          >{m.label}</button>
+        {/each}
+      </div>
+      <span class="setting-note"><strong>Raw prompt</strong> (default) prefills the model's own prompt through /api/generate with raw:true — works for gemma4/gemma2/3 and falls back to native chat for other families. <strong>Auto</strong> uses the raw prompt for gemma4 only — its chat template closes the assistant turn, so native Continue starts a fresh greeting — and native chat otherwise. <strong>Native chat</strong> always resends the partial through /api/chat. Threads with images always use native chat, cloud models can't continue at all, and a raw continuation is cut off if the build degenerates into repetition.</span>
     </div>
     <div class="setting-stacked">
       <span class="setting-label">Stop words <span class="setting-hint">· applied when continuing a reply</span></span>

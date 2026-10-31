@@ -1,5 +1,6 @@
 import type { ChatMsg } from "./ollama";
 import { validateOverride, type CatalogOverride } from "./library";
+import { normalizeContinueMode, type ContinueMode, type PromptStyle } from "./continue";
 
 export interface Chat {
   id: string;
@@ -106,6 +107,10 @@ export interface PendingStream {
   think?: boolean | string;
   temperature?: number;
   stop?: string[];
+  /** set when the resume must go through raw /api/generate (Continue on a
+   *  model whose chat template closes the assistant turn): the prompt is
+   *  rebuilt from this style + the persisted partial. */
+  rawStyle?: PromptStyle;
 }
 
 export function writePendingStream(p: PendingStream): void {
@@ -581,11 +586,15 @@ export interface Prefs {
    *  "auto" sends think:true (server default), otherwise the level verbatim.
    *  Ignored for boolean-only / non-thinking models. */
   thinkLevel: string;
+  /** How Continue extends a reply: "raw" (default — prefill the family's own
+   *  prompt through /api/generate where the format is known), "auto" (raw
+   *  only for gemma4, native otherwise), or "native" (always /api/chat). */
+  continueMode: ContinueMode;
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto" };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" };
 const LS_PREFS = "vicuna-prefs";
 
 /** Normalize a stored workspace for the current platform: strip Rust's
@@ -614,7 +623,8 @@ export function readLocalPrefs(): Prefs {
       ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
       zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom,
       defaultWorkspace: typeof p.defaultWorkspace === "string" ? normalizeStoredWorkspace(p.defaultWorkspace) : normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace),
-      thinkLevel: typeof p.thinkLevel === "string" && p.thinkLevel.length > 0 ? p.thinkLevel : DEFAULT_PREFS.thinkLevel
+      thinkLevel: typeof p.thinkLevel === "string" && p.thinkLevel.length > 0 ? p.thinkLevel : DEFAULT_PREFS.thinkLevel,
+      continueMode: normalizeContinueMode(p.continueMode)
     };
   } catch {
     return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
@@ -625,7 +635,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level', 'pref_continue_mode')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -651,6 +661,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
     }
     if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = normalizeStoredWorkspace(r.value);
     if (r.key === "pref_think_level" && typeof r.value === "string" && r.value.length > 0) out.thinkLevel = r.value;
+    if (r.key === "pref_continue_mode") out.continueMode = normalizeContinueMode(r.value);
   }
   return out;
 }
@@ -667,6 +678,7 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_zoom', $1)", [String(p.zoom)]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_default_workspace', $1)", [p.defaultWorkspace]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_think_level', $1)", [p.thinkLevel]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_continue_mode', $1)", [p.continueMode]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {

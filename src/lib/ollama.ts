@@ -191,6 +191,44 @@ export async function modelContextLength(model: string): Promise<number | null> 
   return len;
 }
 
+/** Model architecture family (e.g. "gemma4", "qwen3_5") from /api/show
+ *  `details.family` — Continue uses it to pick a raw prompt format. Cached
+ *  per model; null when unknown. */
+const showFamilyCache = new Map<string, string | null>();
+
+export function parseShowFamily(details: unknown): string | null {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const family = (details as Record<string, unknown>).family;
+  return typeof family === "string" && family.trim() ? family.trim() : null;
+}
+
+export async function modelFamily(model: string): Promise<string | null> {
+  if (!model) return null;
+  if (showFamilyCache.has(model)) return showFamilyCache.get(model) ?? null;
+  let family: string | null = null;
+  try {
+    if (isTauriRuntime()) {
+      const { invoke } = await tauri();
+      const info = await invoke<{ family?: string | null }>("ollama_model_show", { model });
+      family = typeof info?.family === "string" && info.family.trim() ? info.family.trim() : null;
+    } else {
+      const res = await fetch(`${ollamaBase()}/api/show`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        family = parseShowFamily((data as Record<string, unknown>)?.details);
+      }
+    }
+  } catch {
+    family = null;
+  }
+  showFamilyCache.set(model, family);
+  return family;
+}
+
 /** Reasoning-effort support for one model: string levels (e.g. gpt-oss's
  *  low/medium/high, qwen3.8's xhigh, deepseek's max) plus the server default,
  *  or null when the model only takes boolean think / doesn't think at all.
@@ -581,7 +619,7 @@ export function chatToTranscript(messages: ChatMsg[]): string {
 
 type GenerateEvent =
   | { type: "token"; text: string }
-  | { type: "done"; done_reason?: string | null };
+  | { type: "done"; done_reason?: string | null; eval_count?: number | null; eval_duration?: number | null };
 
 /**
  * Raw text completion via /api/generate (no chat template applied).
@@ -596,17 +634,23 @@ export async function generateStream(
   onThink?: (t: string) => void,
   attempt = 0,
   opts: { temperature?: number; stop?: string[] } = {}
-): Promise<string> {
+): Promise<{ text: string; evalCount: number; evalDurationNs: number }> {
   void onThink;
   if (isTauriRuntime()) {
     const { invoke, Channel } = await tauri();
     if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     let doneReason = "";
+    let evalCount = 0;
+    let evalDurationNs = 0;
     const onEvent = new Channel<GenerateEvent>();
     onEvent.onmessage = (ev) => {
       if (signal?.aborted) return;
       if (ev.type === "token") onToken(ev.text);
-      else if (ev.type === "done" && ev.done_reason) doneReason = ev.done_reason;
+      else if (ev.type === "done") {
+        if (ev.done_reason) doneReason = ev.done_reason;
+        if (typeof ev.eval_count === "number") evalCount = ev.eval_count;
+        if (typeof ev.eval_duration === "number") evalDurationNs = ev.eval_duration;
+      }
     };
     const invokePromise = invoke<string>("ollama_generate_stream", {
       model,
@@ -631,7 +675,7 @@ export async function generateStream(
         return generateStream(model, prompt, onToken, signal, onThink, attempt + 1, opts);
       }
     }
-    return text;
+    return { text, evalCount, evalDurationNs };
   }
   const options: Record<string, number> = { num_ctx: 32768 };
   if (opts.temperature !== undefined) options.temperature = opts.temperature;
@@ -662,19 +706,27 @@ export async function generateStream(
     const data = await res.json();
     const content: string = data?.response ?? "";
     if (content) onToken(content);
-    return content;
+    return {
+      text: content,
+      evalCount: typeof data?.eval_count === "number" ? data.eval_count : 0,
+      evalDurationNs: typeof data?.eval_duration === "number" ? data.eval_duration : 0
+    };
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   let full = "";
   let doneReason = "";
+  let evalCount = 0;
+  let evalDurationNs = 0;
   const feed = (line: string) => {
     const l = line.trim();
     if (!l) return;
     try {
       const obj = JSON.parse(l);
       if (typeof obj?.done_reason === "string") doneReason = obj.done_reason;
+      if (typeof obj?.eval_count === "number") evalCount = obj.eval_count;
+      if (typeof obj?.eval_duration === "number") evalDurationNs = obj.eval_duration;
       const piece: string = obj?.response ?? "";
       if (piece) {
         full += piece;
@@ -699,7 +751,7 @@ export async function generateStream(
       return generateStream(model, prompt, onToken, signal, onThink, attempt + 1, opts);
     }
   }
-  return full;
+  return { text: full, evalCount, evalDurationNs };
 }
 
 export interface PullProgress {
