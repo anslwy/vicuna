@@ -7,10 +7,11 @@
 Features:
 
 - Offline-first: Chat / work with your assistant without an internet connection. All sessions are also stored in your device offline.
+- Remote Ollama Host: Dynamically change the Ollama host to your own GPU server for a more powerful model.
 - Chat Mode: Suitable for general query with features like forking sessions, continuing from mid-sentence, editing user / assistant responses with/without triggering regeneration and more.
 - Work Mode: Designed to work autonomously to finish a task with features like built-in sidebar file explorer & terminal, MCP servers management and more.
 
-## Download
+## Download (Windows / MacOS / Linux)
 https://github.com/anslwy/vicuna/releases
 
 ## Prerequisites
@@ -20,7 +21,7 @@ https://github.com/anslwy/vicuna/releases
 - Node 18+ and npm (for development)
 - Rust toolchain (for development)
 
-## Run it
+## Development
 
 ```sh
 npm install
