@@ -758,8 +758,17 @@ export async function dispatchWorkTool(
           return `Error: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
         }
       }
-      default:
+      default: {
+        // unknown tool: point shell-shaped mistakes at exec — models often
+        // invent `sed`/`grep`/… instead of using it. This stays a normal
+        // round (the error goes back as the tool result) so the agent refines
+        // the call instead of the turn dying.
+        const maybeCmd = (call.args as any)?.command;
+        if (typeof maybeCmd === "string" && maybeCmd.trim()) {
+          return `Error: unknown tool "${call.name}". There is no ${call.name} tool — run shell commands with exec instead, e.g. {"command": ${JSON.stringify(maybeCmd.trim())}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
+        }
         return `Error: unknown tool "${call.name}". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
+      }
     }
   } catch (e: any) {
     return `Error: ${e?.message ?? String(e)}`;

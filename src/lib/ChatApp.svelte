@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, GOAL_DONE_TOOL, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, toolLabel, WORK_TOOLS, GOAL_DONE_TOOL, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
@@ -702,6 +702,32 @@
   let attachFiles = $state<{ id: number; name: string; size: number; file: File }[]>([]);
   let attachFileSeq = 0;
   let error = $state<string | null>(null);
+  /** auto-clear delay for the error box (ms): command notices flash by
+   *  fast, real failures linger long enough to read — nothing squats until
+   *  restart anymore. Plain holder (not $state) so reading it here doesn't
+   *  re-trigger this effect; flashNotice() lowers it for its own message. */
+  const errorCfg = { ttl: 12000 };
+  let errorTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const msg = error;
+    if (errorTimer) {
+      clearTimeout(errorTimer);
+      errorTimer = null;
+    }
+    if (!msg) return;
+    const ttl = errorCfg.ttl;
+    errorCfg.ttl = 12000;
+    errorTimer = setTimeout(() => {
+      errorTimer = null;
+      if (error === msg) error = null;
+    }, ttl);
+    return () => {
+      if (errorTimer) {
+        clearTimeout(errorTimer);
+        errorTimer = null;
+      }
+    };
+  });
   let aborter = $state<AbortController | null>(null);
   let messagesEl = $state<HTMLDivElement | null>(null);
   let composerEl = $state<HTMLTextAreaElement | null>(null);
@@ -2563,30 +2589,34 @@
     await streamInto(chat, chat.messages.length - 1, freshHistory, true);
   }
 
-  /** /compact: summarize the older messages into one note and drop them,
-   *  freeing context without losing the thread. Same summarizer shape as
-   *  the automatic work-turn compaction, but it rewrites the persisted
-   *  transcript (the auto one only trims the ephemeral native history). */
+  /** /compact: append a flagged summary of the model-visible transcript.
+   *  The UI keeps every message; only future model context is trimmed. */
   async function compactSession() {
     const chat = chats.find((c) => c.id === activeId);
+    // command feedback (not a failure): the global error auto-clear picks it
+    // up with a short fuse — real inference errors below get the longer one
+    const flashNotice = (text: string) => {
+      errorCfg.ttl = 6000;
+      error = text;
+    };
     if (!chat) {
-      error = "/compact needs a Work session — open one first.";
+      flashNotice("/compact needs a Work session — open one first.");
       return;
     }
     if ((chat.mode ?? "chat") !== "work") {
-      error = "/compact is only available in Work sessions.";
+      flashNotice("/compact is only available in Work sessions.");
       return;
     }
     if (busy) return;
     if (!chat.messages.length) {
-      error = "Nothing to compact — the session has no messages yet.";
+      flashNotice("Nothing to compact — the session has no messages yet.");
       return;
     }
     // model-visible transcript (drops anything already compacted): the UI
     // keeps every message, only the model's context is trimmed
     const visible = compactedHistory(chat.messages);
     if (visible.length <= 1 && chat.messages.some((m) => m.summary)) {
-      error = "Already compacted — send more messages first.";
+      flashNotice("Already compacted — send more messages first.");
       return;
     }
     const startLen = chat.messages.length;
@@ -2597,6 +2627,7 @@
     }).join("\n\n");
     compacting = true;
     error = null;
+    toolStatus = { chatId: chat.id, label: "Compacting context…" };
     let summary = "";
     try {
       const res = await chatStream(
@@ -2616,13 +2647,14 @@
       error = e instanceof Error ? e.message : String(e);
     } finally {
       compacting = false;
+      if (toolStatus?.chatId === chat.id) toolStatus = null;
     }
     if (!summary.trim()) return;
     const c = chats.find((x) => x.id === chat.id);
     // messages moved under us (edit/delete raced the summary): bail instead
     // of flagging a shifted transcript
     if (!c || c.messages.length !== startLen) {
-      error = "Session changed during compaction — try again.";
+      flashNotice("Session changed during compaction — try again.");
       return;
     }
     // visible divider + summary for the user; the flag is what trims the
@@ -4482,20 +4514,15 @@
         toolStatus = { chatId: chat.id, label: toolLabel(call.name, call.args) };
         // tag first: the call is known now, the result may take a while.
         // `ask` (live card) and `say` (normal prose) own their display.
-        // Silent rounds get a harness activity line before the tag so the
-        // user sees progress, not a bare chain of collapsed tool blocks.
+        // Silent rounds show just the tool tag (the collapsed block below);
+        // the old prose activity line ("Running …"/"Using …") is gone: it
+        // duplicated the tag and models imitated it instead of calling tools.
         // Fence-only text counts as silent: raw ```tool blocks are calls,
         // not narration.
-        const roundProse = newText.replace(/```tool\s*\n[\s\S]*?\n?```/g, "").trim();
-        const roundSilent = roundProse === "" && !calls.some((c) => c.name === "say");
         const c1 = chats.find((x) => x.id === chat.id);
         if (!isAsk && !isSay && c1?.messages[curIndex]) {
           const m1 = c1.messages[curIndex];
-          const activity = roundSilent ? (formatToolActivity(call.name, call.args) ?? (mcp.route.has(call.name) ? `Using \`${call.name}\`…` : null)) : null;
-          c1.messages[curIndex] = {
-            ...m1,
-            content: m1.content + (activity ? `\n\n${activity}\n` : "") + formatToolCallHead(call.name, call.args)
-          };
+          c1.messages[curIndex] = { ...m1, content: m1.content + formatToolCallHead(call.name, call.args) };
           chats = [...chats];
           scrollBottom();
         }
@@ -5509,7 +5536,7 @@
           <span class="queue-hint">queued · joins at the next tool call</span>
         </div>
       {/if}
-      {#if streaming || workRunning}
+      {#if streaming || workRunning || compacting}
         <div class="stream-bar" data-testid="stream-bar" role="progressbar" aria-label="Working"><span></span></div>
       {/if}
       {#if escArmed}
