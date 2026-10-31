@@ -1132,6 +1132,15 @@
   let updateError = $state<string | null>(null);
   let updateNote = $state<string | null>(null);
   let downloadedPath = $state<string | null>(null);
+  /** update errors fade like the main error box (a manual × also exists) */
+  $effect(() => {
+    const msg = updateError;
+    if (!msg) return;
+    const t = setTimeout(() => {
+      if (updateError === msg) updateError = null;
+    }, 12000);
+    return () => clearTimeout(t);
+  });
   let runners = $state<RunningModel[]>([]);
   let runnersError = $state<string | null>(null);
   let modelOp = $state<string | null>(null);
