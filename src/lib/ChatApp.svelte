@@ -756,6 +756,14 @@
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
 
+  function formatPullRate(bps: number): string {
+    if (!isFinite(bps) || bps <= 0) return "";
+    if (bps >= 1e9) return `${(bps / 1e9).toFixed(1)} GB/s`;
+    if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} MB/s`;
+    if (bps >= 1e3) return `${(bps / 1e3).toFixed(0)} KB/s`;
+    return `${Math.round(bps)} B/s`;
+  }
+
   const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
   // composer reflects the starter toggle while starting (home or empty draft);
   // a thread with messages keeps its own mode
@@ -1074,6 +1082,10 @@
   let pullStatus = $state("");
   let pullDone = $state(0);
   let pullTotal = $state(0);
+  let pullRate = $state(0); // bytes/sec, EMA of completed deltas
+  let pullLastAt = 0;
+  let pullLastDone = 0;
+  let pullLastDigest: string | null = null;
   let pullAborter: AbortController | null = null;
   let confirmDeleteModel = $state<string | null>(null);
   let browseView = $state<"installed" | "discover">("installed");
@@ -1252,6 +1264,10 @@
     pullStatus = "starting…";
     pullDone = 0;
     pullTotal = 0;
+    pullRate = 0;
+    pullLastAt = 0;
+    pullLastDone = 0;
+    pullLastDigest = null;
     runnersError = null;
     pullAborter = new AbortController();
     try {
@@ -1261,6 +1277,35 @@
           pullStatus = p.status;
           if (typeof p.completed === "number") pullDone = p.completed;
           if (typeof p.total === "number") pullTotal = p.total;
+          // Ollama reports per-layer completed/total with no rate, so derive
+          // download speed from completed deltas (EMA over ~second windows).
+          if (typeof p.completed === "number" && p.status.startsWith("pulling")) {
+            const digest = p.digest ?? p.status;
+            const now = performance.now();
+            if (pullLastAt === 0 || digest !== pullLastDigest) {
+              pullLastAt = now;
+              pullLastDone = p.completed;
+              pullLastDigest = digest;
+            } else {
+              const dt = (now - pullLastAt) / 1000;
+              if (dt >= 0.2) {
+                const delta = p.completed - pullLastDone;
+                if (delta < 0) {
+                  // new layer / restart: re-baseline without spiking
+                  pullLastAt = now;
+                  pullLastDone = p.completed;
+                } else {
+                  const inst = delta / dt;
+                  pullRate = pullRate > 0 ? pullRate * 0.7 + inst * 0.3 : inst;
+                  pullLastAt = now;
+                  pullLastDone = p.completed;
+                }
+                pullLastDigest = digest;
+              }
+            }
+          } else if (!p.status.startsWith("pulling")) {
+            pullRate = 0;
+          }
         },
         pullAborter.signal
       );
@@ -1278,6 +1323,7 @@
       if (e?.name !== "AbortError") runnersError = e?.message ?? String(e);
     } finally {
       pulling = null;
+      pullRate = 0;
       pullAborter = null;
     }
   }
@@ -6024,7 +6070,7 @@
           <span class="pull-status">{pulling} · {pullStatus}</span>
           {#if pullTotal > 0}
             <div class="pull-bar"><div class="pull-fill" style="width: {Math.min(100, (pullDone / pullTotal) * 100).toFixed(1)}%"></div></div>
-            <span class="pull-pct">{((pullDone / pullTotal) * 100).toFixed(0)}% · {(pullDone / 1e9).toFixed(1)} / {(pullTotal / 1e9).toFixed(1)} GB</span>
+            <span class="pull-pct">{((pullDone / pullTotal) * 100).toFixed(0)}% · {(pullDone / 1e9).toFixed(1)} / {(pullTotal / 1e9).toFixed(1)} GB{#if pullRate > 0} · {formatPullRate(pullRate)}{/if}</span>
           {/if}
         </div>
       {/if}
