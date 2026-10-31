@@ -2431,8 +2431,10 @@ pub fn open_installer(path: &str) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let arg = canon.to_string_lossy().to_string();
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", &canon.to_string_lossy()])
+            .args(["/C", "start", ""])
+            .arg(arg)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
