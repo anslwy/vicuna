@@ -13,6 +13,10 @@ export interface Chat {
   mode?: "chat" | "work";
   /** canonical workspace root for work sessions (null/undefined = unset) */
   workspace?: string | null;
+  /** work-only session objective (/goal): JSON blob, null when unset.
+   *  { text, paused, startedAt, pausedAt } — the turn loop keeps running
+   *  until an unpaused goal reads as met. */
+  goal?: string | null;
 }
 
 const LS_CHATS = "vicuna-chats";
@@ -267,7 +271,7 @@ async function createSqliteBackend(): Promise<Backend> {
       fork_from_index INTEGER
     )`);
   // migrations for databases created before fork attribution existed
-  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT"]) {
+  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT"]) {
     try {
       await db.execute(`ALTER TABLE chats ADD COLUMN ${col}`);
     } catch {
@@ -349,8 +353,8 @@ async function createSqliteBackend(): Promise<Backend> {
     await db.execute("DELETE FROM chats");
     for (const c of chats) {
       await db.execute(
-        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null]
+        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null, c.goal ?? null]
       );
       let i = 0;
       for (const m of c.messages) {
@@ -364,8 +368,8 @@ async function createSqliteBackend(): Promise<Backend> {
 
   return {
     async loadChats(): Promise<Chat[]> {      const rows = await db.select<
-        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null }[]
-      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace FROM chats ORDER BY created_at DESC");
+        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null }[]
+      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace, goal FROM chats ORDER BY created_at DESC");
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
@@ -382,6 +386,7 @@ async function createSqliteBackend(): Promise<Backend> {
           forkFromIndex: r.fork_from_index ?? null,
           mode: r.mode === "work" ? "work" : "chat",
           workspace: r.workspace ?? null,
+          goal: r.goal ?? null,
           messages: msgs.map((m) => ({
             role: m.role as ChatMsg["role"],
             content: m.content,

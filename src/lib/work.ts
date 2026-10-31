@@ -12,7 +12,7 @@ export interface WorkToolCall {
   args: Record<string, any>;
 }
 
-export function buildWorkSystemPrompt(workspace: string): string {
+export function buildWorkSystemPrompt(workspace: string, goal: string | null = null): string {
   return `You are Vicuna Work mode, a minimal coding agent operating inside the workspace: ${workspace}
 
 You can inspect and change ONLY files under that workspace, run shell commands there (cwd = workspace), and search the user's past Vicuna chat sessions.
@@ -36,7 +36,11 @@ Use the provided function tools to act — do not invent results, do not emit ma
   with its path: the picture is fed to you as vision input alongside the tool
   result, then describe/answer about what you actually see. Never claim you
   cannot see images stored as files — list the folder and view them.
-
+${goal ? `
+SESSION GOAL: ${goal}
+- This session has an objective. Keep working until it is FULLY achieved — do not end the turn with a partial result.
+- When it is fully achieved, call \`done\` with a brief completion summary and emit no tool calls after it. Never call \`done\` for partial progress.
+` : ``}
 BACKGROUND COMMANDS (for slow work):
 - exec with {"background": true} starts a long command (tests, builds, long scripts) and returns a job id like bg-3 immediately — it does NOT wait.
 - Keep doing other useful work after starting one: read, grep, write, or start more jobs. Check progress with exec_status {"id": "bg-3"} (omit id to list all jobs); stop one with exec_kill {"id": "bg-3"}.
@@ -232,6 +236,25 @@ export const WORK_TOOLS = [
     }
   }
 ];
+
+/** Self-stop for Goal Mode: offered alongside WORK_TOOLS only while an
+ *  unpaused session goal is set, so default turns are byte-identical.
+ *  The model calls it instead of more tool calls once the objective is
+ *  fully achieved; the loop then settles the turn immediately. */
+export const GOAL_DONE_TOOL = {
+  type: "function",
+  function: {
+    name: "done",
+    description: "Declare the session goal fully achieved and end the turn. Pass your completion summary. Call this INSTEAD of further tool calls once there is nothing left to do — the turn ends immediately after. Never call it for partial progress.",
+    parameters: {
+      type: "object",
+      required: ["summary"],
+      properties: {
+        summary: { type: "string", description: "brief completion summary: what was achieved" }
+      }
+    }
+  }
+};
 
 /** Loose detection of ```tool blocks (valid or not) for the
  *  "model wrote a call-shaped block that never ran" warning. */
@@ -557,13 +580,18 @@ export function extractBackgroundId(text: string): string | null {
 }
 
 /** Rough token estimate for context budgeting: ~4 chars per token plus a
- *  flat per-image vision cost. Conservative by design — the compaction
- *  trigger sits at 70% of the window, so overcounting only compacts early. */
-export function estimateWorkTokens(messages: Array<{ content: string; images?: string[] }>): number {
+ *  flat per-image vision cost. Counts tool-call arguments too — a round of
+ *  big `write`/`exec` calls otherwise hides most of its tokens in JSON the
+ *  estimator never sees (that blind spot once let a transcript sail 189K
+ *  tokens past the window before compaction noticed). Conservative by
+ *  design — the compaction trigger sits at 70% of the window, so
+ *  overcounting only compacts early. */
+export function estimateWorkTokens(messages: Array<{ content?: string; images?: string[]; tool_calls?: unknown }>): number {
   let n = 0;
   for (const m of messages) {
     n += Math.ceil((m.content?.length ?? 0) / 4);
     n += (m.images?.length ?? 0) * 1500;
+    if (m.tool_calls != null) n += Math.ceil(JSON.stringify(m.tool_calls).length / 4);
     n += 4; // role overhead
   }
   return n;

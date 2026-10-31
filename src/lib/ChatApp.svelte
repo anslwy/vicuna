@@ -27,7 +27,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
+  import { buildWorkSystemPrompt, parseToolCalls, hasToolFence, dispatchWorkTool, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatToolActivity, toolLabel, WORK_TOOLS, GOAL_DONE_TOOL, nativeToWorkCall, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, backgroundStatus, formatBackgroundStatus, extractBackgroundId, extractViewedImages, estimateWorkTokens, type WorkTreeEntry } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, callServerTool as callMcpServerTool, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
@@ -2349,7 +2349,7 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
     streaming = true;
     streamingChatId = chat.id;
     streamingStartAt = Date.now();
@@ -2357,7 +2357,12 @@
     aborter = ctrl;
     let produced = false;
     let generatedText = "";
-    isPinned = true;
+    // follow the new output — unless this is a mid-turn work round or the
+    // wrap-up generation: re-pinning there would yank a user who scrolled
+    // up to read earlier tool output, on every single round
+    if (opts.pinFollow ?? true) {
+      isPinned = true;
+    }
     // fresh sends with no explicit think use the effort picker (model default
     // when "auto"); continue/work pass think:false and bypass it
     const think = opts.think ?? effectiveThink();
@@ -3066,22 +3071,174 @@
 
   /** slash commands: like @-mentions but triggered by a leading "/" in an
    *  otherwise empty composer (typing "/usr/…" filters, anything else hides).
-   *  Only /compact for now — the list shape leaves room for more. */
+   *  Args ride along after the command word ("/goal ship it"). */
   const SLASH_COMMANDS = [
-    { name: "compact", desc: "Summarize older messages into one note to free context" }
+    { name: "compact", desc: "Summarize older messages into one note to free context" },
+    { name: "goal", desc: "Set, show, pause, resume or clear the session objective", takesArgs: true }
   ];
-  let slash = $state<{ query: string; items: { name: string; desc: string }[]; index: number } | null>(null);
+  let slash = $state<{ query: string; items: { name: string; desc: string; takesArgs?: boolean }[]; index: number } | null>(null);
 
   /** recompute the slash menu from the input (input/click/keyup/blur) */
   function refreshSlashMenu() {
-    // work-only: /compact trims the agent's context, meaningless in chat
+    // work-only: slash commands steer the agent, meaningless in chat
     if (composerMode !== "work" || !input.startsWith("/") || input.includes("\n") || streaming || workRunning || compacting) {
       slash = null;
       return;
     }
+    // match on the head word so "/goal ship it" still offers /goal
     const q = input.slice(1).trim().toLowerCase();
-    const items = SLASH_COMMANDS.filter((c) => !q || c.name.startsWith(q));
+    const head = q.split(/\s+/)[0] ?? "";
+    const items = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head));
     slash = items.length ? { query: q, items, index: 0 } : null;
+  }
+
+  /** /goal forms: show, set/replace, pause, resume, clear (ZCode-style).
+   *  Setting mid-turn is allowed — the loop reads the live goal. */
+  function goalCommand(args: string) {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat) {
+      // empty starter: no session yet. With an objective, create the Work
+      // session and kick it off (the goal is the first task). Bare `/goal`
+      // raises an empty work session so the header (with Configure) has
+      // somewhere to live.
+      if (composerMode !== "work") {
+        error = "/goal is only available in Work sessions.";
+        return;
+      }
+      if (!args) {
+        const ws0 = (pendingWorkspace || defaultWorkspace || "").trim();
+        const blank: Chat = {
+          id: crypto.randomUUID(),
+          title: "New session",
+          createdAt: Date.now(),
+          messages: [],
+          mode: "work",
+          workspace: ws0 || null
+        };
+        chats = [blank, ...chats];
+        activeId = blank.id;
+        isPinned = true;
+        error = null;
+        save();
+        goalPromptSession = blank.id;
+        goalDraft = "";
+        void goto(`/s/${blank.id}`);
+        return;
+      }
+      void startGoalOnHome(args);
+      return;
+    }
+    if ((chat.mode ?? "chat") !== "work") {
+      error = "/goal is only available in Work sessions.";
+      return;
+    }
+    const cur = chatGoal(chat);
+    const set = (text: string) => {
+      chat.goal = JSON.stringify({ text, paused: false, startedAt: Date.now(), pausedAt: null });
+      chats = [...chats];
+      save();
+    };
+    if (!args) {
+      // bare `/goal`: summon the header strip with its empty state —
+      // Configure opens the popup from there
+      goalPromptSession = chat.id;
+      return;
+    }
+    if (args === "pause") {
+      if (!cur) {
+        error = "No goal to pause — /goal <objective> to set one.";
+        return;
+      }
+      if (cur.paused) {
+        error = "Goal is already paused.";
+        return;
+      }
+      chat.goal = JSON.stringify({ ...cur, paused: true, pausedAt: Date.now() });
+      chats = [...chats];
+      save();
+      return;
+    }
+    if (args === "resume") {
+      if (!cur) {
+        error = "No goal to resume — /goal <objective> to set one.";
+        return;
+      }
+      if (!cur.paused) {
+        error = "Goal isn't paused.";
+        return;
+      }
+      const shift = cur.pausedAt != null ? Date.now() - cur.pausedAt : 0;
+      chat.goal = JSON.stringify({ ...cur, paused: false, startedAt: cur.startedAt + shift, pausedAt: null });
+      chats = [...chats];
+      save();
+      if (!busy) void startGoalTurn();
+      return;
+    }
+    if (args === "clear") {
+      if (!cur) {
+        error = "No goal set.";
+        return;
+      }
+      chat.goal = null;
+      chats = [...chats];
+      save();
+      goalPromptSession = chat.id;
+      return;
+    }
+    const m = args.match(/^replace\s+(.+)$/);
+    const text = (m ? m[1] : args).trim();
+    if (!text) {
+      error = "Goal text is empty — /goal <objective> to set one.";
+      return;
+    }
+    set(text);
+    if (!busy) void startGoalTurn();
+  }
+
+  /** `/goal <text>` on the empty starter: raise the Work session now (the
+   *  goal is its first task) and kick the agent — no extra prompt needed. */
+  async function startGoalOnHome(text: string) {
+    if (busy) return;
+    const ws = (pendingWorkspace || defaultWorkspace || "").trim();
+    const c: Chat = {
+      id: crypto.randomUUID(),
+      title: text.slice(0, 32) + (text.length > 32 ? ".." : ""),
+      createdAt: Date.now(),
+      messages: [],
+      mode: "work",
+      workspace: ws || null,
+      goal: JSON.stringify({ text, paused: false, startedAt: Date.now(), pausedAt: null })
+    };
+    chats = [c, ...chats];
+    activeId = c.id;
+    isPinned = true;
+    error = null;
+    save();
+    await startGoalTurn();
+    // deferred navigation (like send): the route only changes once the
+    // turn is underway, and never if the user moved on meanwhile
+    if (activeId === c.id) void goto(`/s/${c.id}`);
+  }
+
+  /** setting or resuming a goal kicks the agent immediately (when idle)
+   *  instead of waiting for another prompt — the goal itself is the task */
+  async function startGoalTurn() {
+    const c = chats.find((x) => x.id === activeId);
+    if (!c || (c.mode ?? "chat") !== "work" || busy) return;
+    const g = chatGoal(c);
+    if (!g || g.paused) return;
+    if (!c.workspace?.trim()) {
+      error = "Work mode needs a workspace folder — pick one with the folder pill, then send a message.";
+      return;
+    }
+    if (c.title === "New session" || c.title === "New Session") {
+      c.title = g.text.slice(0, 40);
+    }
+    c.messages = [...c.messages, { role: "user", content: g.text }, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+    chats = [...chats];
+    save();
+    scrollBottom();
+    await runWorkTurn(c, c.messages.length - 1, c.workspace);
   }
 
   /** run the highlighted slash command, then clear the composer */
@@ -3089,10 +3246,35 @@
     const cmd = slash?.items[slash.index]?.name;
     slash = null;
     if (!cmd) return;
+    // args ride along after the command word ("/goal ship it") — grab
+    // them before the composer is cleared
+    const sp = cmd === "goal" ? input.indexOf(" ") : -1;
+    const args = sp < 0 ? "" : input.slice(sp + 1).trim();
     input = "";
+    clearDraft(null);
     autosizeComposer();
     composerEl?.focus();
+    if (cmd === "goal") {
+      goalCommand(args);
+      return;
+    }
     if (cmd === "compact") void compactSession();
+  }
+
+  /** Tab on a bare args-taking command ("/go", "/goal") completes it with a
+   *  trailing space so args can follow, instead of running it with no args.
+   *  Tab with args present (or on arg-less commands) runs as usual. */
+  function completeSlash() {
+    const item = slash?.items[slash.index];
+    if (!item) return;
+    input = `/${item.name} `;
+    clearDraft(null);
+    refreshSlashMenu();
+    requestAnimationFrame(() => {
+      composerEl?.setSelectionRange(input.length, input.length);
+      composerEl?.focus();
+      syncBackdropScroll();
+    });
   }
 
   /** context window of the selected model for the usage ring (cached per
@@ -3594,7 +3776,21 @@
         slash.index = (slash.index + (e.key === "ArrowDown" ? 1 : slash.items.length - 1)) % slash.items.length;
         return;
       }
-      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+      if (e.key === "Tab") {
+        e.preventDefault();
+        popupKeyHandled = true;
+        const item = slash.items[slash.index];
+        // bare args-taking command ("/go", "/goal"): complete it with a
+        // trailing space so args can follow, instead of running with none.
+        // Tab with args present, or on arg-less commands, runs as usual.
+        if (item?.takesArgs && !/\s\S/.test(input)) {
+          completeSlash();
+        } else {
+          runSlash();
+        }
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         popupKeyHandled = true;
         runSlash();
@@ -3762,6 +3958,47 @@
     return messages.slice(from).map(toHistory);
   }
 
+  /** Work-only session objective (/goal), persisted as a JSON blob on the
+   *  chat. The turn loop keeps running until an unpaused goal reads as met. */
+  interface SessionGoal {
+    text: string;
+    paused: boolean;
+    startedAt: number;
+    pausedAt: number | null;
+  }
+
+  /** parse the stored goal; null when unset or corrupt */
+  function chatGoal(c: Chat | undefined | null): SessionGoal | null {
+    if (!c?.goal) return null;
+    try {
+      const g = JSON.parse(c.goal) as Partial<SessionGoal>;
+      if (typeof g.text !== "string" || !g.text) return null;
+      return {
+        text: g.text,
+        paused: g.paused === true,
+        startedAt: typeof g.startedAt === "number" ? g.startedAt : Date.now(),
+        pausedAt: typeof g.pausedAt === "number" ? g.pausedAt : null
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** the open thread's goal, for the header strip */
+  const goalNow = $derived(activeChat ? chatGoal(activeChat) : null);
+  /** goal settings popup (Configure button) + editable objective draft */
+  let goalOpen = $state(false);
+  let goalDraft = $state("");
+  /** show the goal strip's "<no goal yet>" empty state for one session:
+   *  keyed by chat id (not a boolean) so creating/navigating to the session
+   *  doesn't race the activeId-change effect that closes the popup */
+  let goalPromptSession: string | null = $state(null);
+  // settings belong to one session: close them when navigating away
+  $effect(() => {
+    activeId;
+    goalOpen = false;
+  });
+
   function noteImagesStripped() {
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
@@ -3866,6 +4103,8 @@
     // they run; a finished job joins the transcript (drain below) and wakes
     // the model only once its output is ready
     const pendingBg = new Set<string>();
+    // set by the `done` self-stop: skip remaining calls and settle the turn
+    let turnDone = false;
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     // native history: proper tool roles for the model; display message holds
     // narration + markdown results for persistence. seedContext carries hidden
@@ -3884,68 +4123,151 @@
       }
     }
     let native: ChatMsg[] = [
-      { role: "system", content: buildWorkSystemPrompt(workspace) },
+      { role: "system", content: buildWorkSystemPrompt(workspace, chatGoal(chats.find((x) => x.id === chat.id))?.text ?? null) },
       ...seed,
       ...baseHistory
     ];
+    // goal mode (/goal): an unpaused objective keeps the turn alive past the
+    // point where the model would stop calling tools. At that exit, one
+    // ephemeral check goes into the native transcript (never persisted) and
+    // the loop runs another round — the model either keeps working or
+    // answers done with no calls, which ends the turn. A check already
+    // outstanding means it answered text twice: treat that as done.
+    const GOAL_CHECK_PREFIX = "Session goal check:";
+    function nativeAtGoalCheck(): boolean {
+      const last = native[native.length - 1];
+      return !!last && last.role === "user" && last.content.startsWith(GOAL_CHECK_PREFIX);
+    }
     // MCP tools (Work mode only): connected servers lend extra tools alongside
     // the built-in workspace ones. Assembled once per turn; chat mode never
     // sees them.
     const mcp = assembleMcpTools();
-    const allTools = [...WORK_TOOLS, ...mcp.tools] as any;
+    // Goal Mode self-stop: `done` is offered only while an unpaused goal is
+    // set, so goal-free turns send byte-identical tools as before.
+    const goalAtStart = chatGoal(chats.find((x) => x.id === chat.id));
+    const allTools = [...WORK_TOOLS, ...(goalAtStart && !goalAtStart.paused ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
     // Move finished background jobs into the transcript: a `role: user`
     // wake-up natively (orphan `role: tool` messages have no matching call)
     // plus a collapsed result block for display. `skip` covers ids the model
     // just polled itself — their output is already in the transcript.
     // Context guard: the native transcript grows every round (assistant text,
     // tool_calls, every tool result, bg completions, viewed images re-sent
-    // each round) against a fixed 32k num_ctx. Once the estimate passes 70%
-    // of the model's own window (via /api/show, 32768 fallback), summarize
-    // the oldest messages into one note and drop the raw prefix — otherwise
-    // the round fails outright and retries resend the same oversized history.
+    // each round). Once the estimate passes 70% of the model's own window
+    // (via /api/show, 32768 fallback), summarize the oldest messages into
+    // one note and drop the raw prefix — otherwise the round fails outright
+    // and retries resend the same oversized history. Two refinements keep
+    // this working when single outputs are huge (verified: one MCP dump
+    // blew a transcript 189K tokens past the window): the kept tail is
+    // sized to fit, not a fixed message count, and oversized tool outputs
+    // in it are stubbed oldest-first.
     const COMPACT_FRACTION = 0.7;
-    const COMPACT_KEEP_TAIL = 20;
+    const COMPACT_MIN_TAIL = 4;
+    // one summarizer call must itself fit comfortably in any window
+    const SUM_CHUNK_CHARS = 60000;
+    const SUM_MAX_CHUNKS = 6;
+    // consecutive rounds that produce nothing (no text, no calls) mean the
+    // transcript no longer fits even compacted — end the turn instead of
+    // spinning (or goal-nudging) forever on identical failures
+    let emptyRounds = 0;
+    function transcriptOf(msgs: ChatMsg[]): string {
+      return msgs.map((m) => {
+        const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
+        return `${who}: ${m.content}${m.images?.length ? ` [${m.images.length} image(s) attached]` : ""}`;
+      }).join("\n\n");
+    }
+    function chunkTranscript(t: string): string[] {
+      if (t.length <= SUM_CHUNK_CHARS) return [t];
+      const chunks: string[] = [];
+      let cur = "";
+      for (const p of t.split("\n\n")) {
+        if (cur && (cur + "\n\n" + p).length > SUM_CHUNK_CHARS) {
+          chunks.push(cur);
+          cur = p;
+        } else {
+          cur = cur ? cur + "\n\n" + p : p;
+        }
+      }
+      if (cur) chunks.push(cur);
+      return chunks.length ? chunks : [t.slice(0, SUM_CHUNK_CHARS)];
+    }
+    async function summarizePieces(parts: string[]): Promise<string> {
+      // oldest pieces first; keep the most recent when there is too much
+      const use = parts.slice(-SUM_MAX_CHUNKS);
+      const out: string[] = [];
+      for (let i = 0; i < use.length; i++) {
+        if (workStop || ctrl?.signal.aborted) return "";
+        try {
+          const r = await chatStream(
+            selectedModel,
+            [
+              { role: "system", content: "Summarize this agent transcript excerpt concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter." },
+              { role: "user", content: (parts.length > use.length && i === 0 ? "[earliest history omitted to fit]\n\n" : "") + use[i] }
+            ],
+            () => {},
+            ctrl?.signal,
+            undefined,
+            0,
+            { think: false, temperature: 0.2 }
+          );
+          if (r.text.trim()) out.push(r.text.trim());
+        } catch {
+          return ""; // a failed chunk poisons the join: bail, stay uncompacted
+        }
+      }
+      return out.join("\n\n");
+    }
     async function maybeCompactContext(): Promise<void> {
       const win = (await modelContextLength(selectedModel)) ?? 32768;
-      if (estimateWorkTokens(native) <= win * COMPACT_FRACTION) return;
-      // cut at a user/system boundary so no assistant(tool_calls)/tool pair
-      // is split; the summary replaces everything after the system prompt.
-      let cut = Math.max(1, native.length - COMPACT_KEEP_TAIL);
-      while (cut < native.length && native[cut].role !== "user" && native[cut].role !== "system") cut++;
-      if (cut >= native.length - 2) return; // nothing safe to drop
-      const older = native.slice(1, cut);
-      const transcript = older
-        .map((m) => {
-          const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
-          return `${who}: ${m.content}${m.images?.length ? ` [${m.images.length} image(s) attached]` : ""}`;
-        })
-        .join("\n\n");
-      toolStatus = { chatId: chat.id, label: "Compacting context…" };
-      let summary = "";
-      try {
-        summary = await chatStream(
-          selectedModel,
-          [
-            { role: "system", content: "Summarize this agent transcript prefix concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter." },
-            { role: "user", content: transcript }
-          ],
-          () => {},
-          ctrl?.signal,
-          undefined,
-          0,
-          { think: false, temperature: 0.2 }
-        ).then((r) => r.text);
-      } catch {
-        summary = "";
-      } finally {
-        if (toolStatus?.chatId === chat.id) toolStatus = null;
+      const toolsTokens = Math.ceil(JSON.stringify(allTools).length / 4);
+      const target = win * COMPACT_FRACTION;
+      const over = () => estimateWorkTokens(native) + toolsTokens - target;
+      if (over() <= 0) return;
+      // drop from the front (cut at a user/system boundary so no
+      // assistant(tool_calls)/tool pair is split), keeping at least a stub
+      // tail so the turn has something to continue from
+      let cut = 1;
+      const lastAllowed = native.length - COMPACT_MIN_TAIL;
+      for (let i = 1; i <= lastAllowed; i++) {
+        if (native[i].role !== "user" && native[i].role !== "system") continue;
+        cut = i;
+        const kept: ChatMsg[] = [native[0], ...native.slice(i)];
+        if (estimateWorkTokens(kept) + toolsTokens <= target) break;
       }
-      if (workStop || ctrl?.signal.aborted || !summary.trim()) return;
-      native = [
+      const older = native.slice(1, cut);
+      let summary = "";
+      if (older.length) {
+        toolStatus = { chatId: chat.id, label: "Compacting context…" };
+        try {
+          summary = await summarizePieces(chunkTranscript(transcriptOf(older)));
+        } finally {
+          if (toolStatus?.chatId === chat.id) toolStatus = null;
+        }
+        if (workStop || ctrl?.signal.aborted) return;
+      }
+      const proposed: ChatMsg[] = [
         native[0],
-        { role: "user", content: `Earlier in this turn, summarized to save context:\n${summary.trim()}` },
+        ...(summary ? [{ role: "user" as const, content: `Earlier in this turn, summarized to save context:\n${summary}` }] : []),
         ...native.slice(cut)
       ];
+      // the tail alone can still exceed the window (giant tool outputs):
+      // stub the oldest tool results until it fits — display copies stay
+      // intact, only the model's native history is trimmed
+      if (older.length && !summary) {
+        // summarizer failed on oversized input: without a summary the drop
+        // would lose context silently, so keep history and rely on stubbing
+        proposed.splice(1, 0, ...older);
+      }
+      for (let i = 1; i < proposed.length; i++) {
+        if (estimateWorkTokens(proposed) + toolsTokens <= target) break;
+        const m = proposed[i];
+        if (m.role === "tool" && m.content.length > 2000) {
+          proposed[i] = { ...m, content: `${m.content.slice(0, 2000)}\n\n[…output truncated to ${m.content.length} chars to fit context…]` };
+        }
+      }
+      if (estimateWorkTokens(proposed) + toolsTokens > target) return; // still won't fit: leave it, the breaker ends the turn
+      const changed = proposed.length !== native.length || proposed.some((m, i) => m !== native[i]);
+      native = proposed;
+      if (!changed) return;
       const c = chats.find((x) => x.id === chat.id);
       if (c?.messages[curIndex]) {
         const m = c.messages[curIndex];
@@ -3998,7 +4320,7 @@
       const target = chats.find((x) => x.id === chat.id);
       if (!target) return;
       const history: ChatMsg[] = [...native, { role: "user", content: note }];
-      await streamInto(target, curIndex, history, false, { mode: "continue", tools: allTools });
+      await streamInto(target, curIndex, history, false, { mode: "continue", tools: allTools, pinFollow: false });
     }
     while (true) {
       if (workStop || ctrl?.signal.aborted) break;
@@ -4031,7 +4353,7 @@
       // by retrying the same oversized history)
       await maybeCompactContext();
       if (workStop || ctrl?.signal.aborted) break;
-      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: allTools });
+      const { text: newText, toolCalls } = await streamInto(cur, curIndex, [...native], false, { mode: firstRound ? "fresh" : "continue", tools: allTools, pinFollow: false });
       firstRound = false;
       if (workStop || ctrl?.signal.aborted) break;
       // record this round's assistant turn natively (text + tool calls)
@@ -4090,6 +4412,32 @@
           // steered mid-wait: loop back around to the queue; otherwise settle
           if (queuedMsgs.some((q) => q.chatId === chat.id)) continue;
         }
+        // circuit breaker: two consecutive rounds that produce nothing (no
+        // text, no calls) mean the transcript no longer fits even compacted
+        // (or the model is stuck) — end the turn with a clear error instead
+        // of spinning, or goal-nudging, on identical failures forever
+        const roundEmpty = newText.trim() === "" && toolCalls.length === 0;
+        if (!workStop && !ctrl?.signal.aborted) {
+          emptyRounds = roundEmpty ? emptyRounds + 1 : 0;
+        } else {
+          emptyRounds = 0;
+        }
+        if (roundEmpty && emptyRounds >= 2) {
+          error = "The model returned empty responses twice in a row — the context likely no longer fits even after compaction. Try /compact or a shorter task.";
+          break;
+        }
+        // goal mode: the turn only ends on a met objective, not on a quiet
+        // round. The check rides the native transcript (never persisted);
+        // an unanswered check outstanding means done — settle.
+        const goal = chatGoal(chats.find((x) => x.id === chat.id));
+        if (goal && !goal.paused && !nativeAtGoalCheck()) {
+          const offerDone = (allTools as any[]).some((t) => t?.function?.name === "done");
+          native.push({
+            role: "user",
+            content: `${GOAL_CHECK_PREFIX} The session goal is: ${goal.text}\n${offerDone ? "If it is fully achieved, call `done` with a brief completion summary (no other tool calls). Otherwise keep working toward it (emit tool calls)." : "If it is fully achieved, reply with a brief completion summary and NO tool calls. Otherwise keep working toward it (emit tool calls)."}`
+          });
+          continue;
+        }
         break;
       }
       const fresh = calls.filter((c) => !seen.has(callKey(c)));
@@ -4104,6 +4452,29 @@
       }
       for (const call of fresh) {
         if (workStop || ctrl?.signal.aborted) break;
+        if (call.name === "done") {
+          // self-stop (goal mode): the model declares the objective met.
+          // Render the summary through the normal result pipeline, retire
+          // the goal, then settle the turn — no further rounds, no wrap-up.
+          const summary = typeof (call.args as any)?.summary === "string" && ((call.args as any).summary as string).trim()
+            ? ((call.args as any).summary as string).trim()
+            : "Done.";
+          const cDone = chats.find((x) => x.id === chat.id);
+          if (cDone?.messages[curIndex]) {
+            const mDone = cDone.messages[curIndex];
+            cDone.messages[curIndex] = { ...mDone, content: mDone.content + formatToolCallHead(call.name, call.args) + formatToolCallTail(summary) };
+            chats = [...chats];
+          }
+          if (cDone && cDone.goal) {
+            cDone.goal = null;
+            chats = [...chats];
+          }
+          native.push({ role: "tool", content: summary, tool_name: "done" });
+          scrollBottom();
+          saveSoon();
+          turnDone = true;
+          break;
+        }
         const isAsk = call.name === "ask";
         const isSay = call.name === "say";
         let askShown = false;
@@ -4213,6 +4584,7 @@
         scrollBottom();
         saveSoon();
       }
+      if (turnDone) break;
       // explicit single-job polls that report a finished job settle it: the
       // full output is already in the transcript, so the idle waiter and the
       // top-of-round drain must not re-inject it
@@ -4865,6 +5237,46 @@
             </span>
           {/if}
         </div>
+        {#if goalNow || goalPromptSession === activeId}
+          {@const goalLive = goalNow && workRunning && workChatId === activeId}
+          <div class="goal-wrap">
+            <div class="goal-strip" data-testid="goal-strip">
+              <span class="goal-badge">Goal</span>
+              <span class="goal-text" title={goalNow?.text ?? ""}>{goalNow ? goalNow.text : "<no goal yet>"}</span>
+              {#if goalNow}
+                <span class="goal-state {goalLive && !goalNow.paused ? 'shimmer' : ''}" data-testid="goal-status">{goalNow.paused ? "paused" : goalLive ? "running" : "stopped"}</span>
+              {:else}
+                <button class="goal-badge goal-btn goal-dim" data-testid="goal-dismiss-btn" title="Dismiss goal header" onclick={() => (goalPromptSession = null)}>Dismiss</button>
+              {/if}
+              <button class="goal-badge goal-btn" data-testid="goal-configure-btn" title="Manage goal" onclick={() => { goalDraft = goalNow?.text ?? ""; goalOpen = true; }}>Configure</button>
+            </div>
+            {#if goalOpen}
+              <button class="model-backdrop" data-testid="goal-backdrop" aria-label="Close goal settings" onclick={() => (goalOpen = false)} tabindex="-1"></button>
+              <div class="goal-popup" data-testid="goal-popup" role="dialog" aria-label="Goal settings" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); goalOpen = false; } }}>
+                <div class="goal-edit-row">
+                  <input
+                    class="pull-input"
+                    data-testid="goal-input"
+                    placeholder="Session objective…"
+                    bind:value={goalDraft}
+                    onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); goalCommand("replace " + goalDraft.trim()); goalOpen = false; } }}
+                  />
+                  <button class="mini-btn primary" data-testid="goal-save-btn" disabled={goalDraft.trim() === ""} onclick={() => { goalCommand("replace " + goalDraft.trim()); goalOpen = false; }}>Save</button>
+                </div>
+                {#if goalNow}
+                  <div class="goal-actions-row">
+                    {#if goalNow.paused}
+                      <button class="mini-btn" data-testid="goal-resume-btn" onclick={() => goalCommand("resume")}>Resume</button>
+                    {:else}
+                      <button class="mini-btn" data-testid="goal-pause-btn" onclick={() => goalCommand("pause")}>Pause</button>
+                    {/if}
+                    <button class="mini-btn" data-testid="goal-clear-btn" onclick={() => goalCommand("clear")}>Clear</button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
       {/if}
       <div
         class="messages"
@@ -5226,7 +5638,14 @@
                   // before blur: keep focus in the composer
                   e.preventDefault();
                   if (slash) slash.index = i;
-                  runSlash();
+                  const item = slash?.items[i];
+                  // same as Tab: bare args-taking commands complete
+                  // ("/goal" → "/goal ") instead of running with no args
+                  if (item?.takesArgs && !/\s\S/.test(input)) {
+                    completeSlash();
+                  } else {
+                    runSlash();
+                  }
                 }}
                 onmousemove={() => {
                   if (slash && slash.index !== i) slash.index = i;
@@ -6849,6 +7268,19 @@
   .ctx-wrap:hover .ctx-popup, .ctx-wrap:focus-within .ctx-popup { display: block; }
   .ctx-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; color: var(--text); padding: 2px 0; font-variant-numeric: tabular-nums; }
   .ctx-row span:first-child { color: var(--muted-2); }
+  .goal-strip { display: flex; align-items: center; gap: 8px; }
+  .goal-wrap { position: relative; max-width: 860px; width: 100%; margin: 0 auto; padding: 6px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  .goal-popup { position: absolute; top: calc(100% + 6px); left: 24px; right: 54px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px; z-index: 30; display: flex; flex-direction: column; gap: 8px; }
+  .goal-edit-row { display: flex; gap: 8px; }
+  .goal-edit-row .pull-input { flex: 1; min-width: 0; }
+  .goal-actions-row { display: flex; gap: 8px; }
+  .goal-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 8px; }
+  button.goal-badge { background: transparent; cursor: pointer; font-family: inherit; }
+  button.goal-badge:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  button.goal-badge.goal-dim { color: var(--text); border-color: var(--border-strong); }
+  button.goal-badge.goal-dim:hover { background: var(--hover); }
+  .goal-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
+  .goal-state { flex-shrink: 0; font-size: 11px; color: var(--muted-2); }
   .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
