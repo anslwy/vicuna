@@ -30,7 +30,7 @@ export interface CatalogEntry {
   variants: CatalogVariant[];
 }
 
-export const CATALOG_UPDATED = "2026-10-29";
+export const CATALOG_UPDATED = "2026-10-30";
 
 export const MODEL_CATALOG: CatalogEntry[] = [
   {
@@ -47,6 +47,12 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "26b", size: "~18.7 GB", sizeMB: 18731 },
       { tag: "31b", size: "~20 GB", sizeMB: 20385 },
       { tag: "31b-cloud", size: "cloud", sizeMB: 0 },
+      { tag: "e2b-mlx", size: "~7.5 GB", sizeMB: 7477 },
+      { tag: "e4b-mlx", size: "~9.5 GB", sizeMB: 9462 },
+      { tag: "12b-mlx", size: "~7.7 GB", sizeMB: 7714 },
+      { tag: "26b-a4b", size: "~18.7 GB", sizeMB: 18731 },
+      { tag: "26b-mlx", size: "~18.3 GB", sizeMB: 18334 },
+      { tag: "31b-mlx", size: "~19.4 GB", sizeMB: 19424 },
     ]
   },
   {
@@ -64,6 +70,8 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "30b", size: "~18.6 GB", sizeMB: 18557 },
       { tag: "32b", size: "~20 GB", sizeMB: 20201 },
       { tag: "235b", size: "~142 GB", sizeMB: 142154 },
+      { tag: "30b-a3b", size: "~18.6 GB", sizeMB: 18557 },
+      { tag: "235b-a22b", size: "~142 GB", sizeMB: 142154 },
     ]
   },
   {
@@ -977,6 +985,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~23 GB", sizeMB: 22863 },
       { tag: "40b", size: "~23 GB", sizeMB: 22863 },
+      { tag: "40b-a2b", size: "~23 GB", sizeMB: 22863 },
     ]
   },
   {
@@ -1347,6 +1356,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~14.4 GB", sizeMB: 14416 },
       { tag: "24b", size: "~14.4 GB", sizeMB: 14416 },
+      { tag: "24b-a2b", size: "~14.4 GB", sizeMB: 14416 },
     ]
   },
   {
@@ -1816,6 +1826,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~18.2 GB", sizeMB: 18157 },
       { tag: "30b", size: "~18.2 GB", sizeMB: 18157 },
+      { tag: "30b-mlx", size: "~19.1 GB", sizeMB: 19054 },
     ]
   },
   {
@@ -1847,6 +1858,10 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "4b", size: "~2.8 GB", sizeMB: 2838 },
       { tag: "30b", size: "~24 GB", sizeMB: 24272 },
       { tag: "30b-cloud", size: "cloud", sizeMB: 0 },
+      { tag: "4b-mlx", size: "~2.9 GB", sizeMB: 2949 },
+      { tag: "30b-a3b", size: "~24 GB", sizeMB: 24272 },
+      { tag: "30b-a3b-mlx", size: "~18.3 GB", sizeMB: 18310 },
+      { tag: "30b-mlx", size: "~18.3 GB", sizeMB: 18310 },
     ]
   },
   {
@@ -1858,6 +1873,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "latest", size: "~87 GB", sizeMB: 86828 },
       { tag: "cloud", size: "cloud", sizeMB: 0 },
       { tag: "120b", size: "~87 GB", sizeMB: 86828 },
+      { tag: "120b-a12b", size: "~87 GB", sizeMB: 86828 },
     ]
   },
   {
@@ -1877,6 +1893,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~25 GB", sizeMB: 24750 },
       { tag: "e4b", size: "~7.9 GB", sizeMB: 7909 },
+      { tag: "74b-a9b", size: "~25 GB", sizeMB: 24750 },
     ]
   },
   {
@@ -1887,6 +1904,9 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~25 GB", sizeMB: 25431 },
       { tag: "30b", size: "~25 GB", sizeMB: 25431 },
+      { tag: "30b-a3b", size: "~25 GB", sizeMB: 25431 },
+      { tag: "30b-a3b-mlx", size: "~19.1 GB", sizeMB: 19073 },
+      { tag: "30b-mlx", size: "~19.1 GB", sizeMB: 19073 },
     ]
   },
   {
@@ -1897,6 +1917,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~90 GB", sizeMB: 90154 },
       { tag: "120b", size: "~90 GB", sizeMB: 90154 },
+      { tag: "120b-a12b", size: "~90 GB", sizeMB: 90154 },
     ]
   },
   {
@@ -1907,6 +1928,9 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~24 GB", sizeMB: 24272 },
       { tag: "30b", size: "~24 GB", sizeMB: 24272 },
+      { tag: "30b-a3b", size: "~24 GB", sizeMB: 24272 },
+      { tag: "30b-a3b-mlx", size: "~18.3 GB", sizeMB: 18310 },
+      { tag: "30b-mlx", size: "~18.3 GB", sizeMB: 18310 },
     ]
   },
   {
@@ -1927,6 +1951,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~28 GB", sizeMB: 27639 },
       { tag: "33b", size: "~28 GB", sizeMB: 27639 },
+      { tag: "33b-mlx", size: "~21 GB", sizeMB: 21188 },
     ]
   },
   {
@@ -2376,6 +2401,8 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "30b", size: "~19.6 GB", sizeMB: 19595 },
       { tag: "32b", size: "~21 GB", sizeMB: 20910 },
       { tag: "235b", size: "~143 GB", sizeMB: 143269 },
+      { tag: "30b-a3b", size: "~19.6 GB", sizeMB: 19595 },
+      { tag: "235b-a22b", size: "~143 GB", sizeMB: 143269 },
     ]
   },
   {
@@ -2392,6 +2419,14 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "27b", size: "~17.5 GB", sizeMB: 17479 },
       { tag: "35b", size: "~22 GB", sizeMB: 22070 },
       { tag: "122b", size: "~81 GB", sizeMB: 81370 },
+      { tag: "0.8b-mlx", size: "~1.2 GB", sizeMB: 1244 },
+      { tag: "2b-mlx", size: "~3.1 GB", sizeMB: 3117 },
+      { tag: "4b-mlx", size: "~4.0 GB", sizeMB: 3973 },
+      { tag: "9b-mlx", size: "~8.9 GB", sizeMB: 8903 },
+      { tag: "27b-mlx", size: "~19.8 GB", sizeMB: 19763 },
+      { tag: "35b-a3b", size: "~22 GB", sizeMB: 22070 },
+      { tag: "35b-mlx", size: "~22 GB", sizeMB: 21909 },
+      { tag: "122b-a10b", size: "~81 GB", sizeMB: 81370 },
     ]
   },
   {
@@ -2403,6 +2438,9 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "latest", size: "~23 GB", sizeMB: 22621 },
       { tag: "27b", size: "~17.8 GB", sizeMB: 17769 },
       { tag: "35b", size: "~23 GB", sizeMB: 22621 },
+      { tag: "27b-mlx", size: "~18.8 GB", sizeMB: 18785 },
+      { tag: "35b-a3b", size: "~23 GB", sizeMB: 22621 },
+      { tag: "35b-mlx", size: "~23 GB", sizeMB: 23106 },
     ]
   },
   {
@@ -2413,6 +2451,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~17.7 GB", sizeMB: 17742 },
       { tag: "27b", size: "~17.7 GB", sizeMB: 17742 },
+      { tag: "27b-mlx", size: "~18.2 GB", sizeMB: 18175 },
     ]
   },
   {
@@ -2424,6 +2463,7 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "125b-a6b-nvfp4", size: "~105 GB", sizeMB: 104852 },
       { tag: "125b-a6b-q4_K_M", size: "~120 GB", sizeMB: 120058 },
       { tag: "125b-a6b-q8_0", size: "~189 GB", sizeMB: 189132 },
+      { tag: "125b-mlx", size: "~105 GB", sizeMB: 104852 },
     ]
   },
   {

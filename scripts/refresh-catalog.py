@@ -33,11 +33,13 @@ UA = {"User-Agent": "vicuna-catalog-refresh/1.0"}
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "lib" / "catalog.ts"
 
-# headline tags: plain sizes (8b, 1.1b, 360m, e2b), latest, and cloud tags.
-# Everything with a quant/packaging suffix (-it-q4_K_M, -fp16, -mlx-*, …) is
-# skipped — the full list stays pullable by exact name.
-HEADLINE = re.compile(r"^(latest|cloud|[0-9.]+[bm]|e[0-9]+b)(-[0-9.]+[bm]-cloud|-cloud)?$", re.I)
-MAX_VARIANTS = 10
+# headline tags: plain sizes (8b, 1.1b, 360m, e2b), latest, cloud tags, and
+# Apple-silicon MLX builds (27b-mlx, 30b-a3b-mlx, …) — first-class variants
+# for Mac users, surfaced by the Discover MLX filter tab. Other
+# quant/packaging suffixes (-it-q4_K_M, -fp16, …) stay skipped — the full
+# list remains pullable by exact name.
+HEADLINE = re.compile(r"^(latest|cloud|[0-9.]+[bm](-a[0-9.]+[bm])?|e[0-9]+b)(-[0-9.]+[bm]-cloud|-cloud|-mlx)?$", re.I)
+MAX_VARIANTS = 16
 
 
 def get(url, accept=None, timeout=20):
@@ -128,6 +130,8 @@ def headline_tags(tags):
     picked = [t for t in tags if HEADLINE.match(t)]
     if not picked:
         picked = tags[:3]
+    if len(picked) > MAX_VARIANTS:
+        print(f"  warn: truncating {len(picked)} headline tags to {MAX_VARIANTS}", file=sys.stderr)
     return picked[:MAX_VARIANTS]
 
 

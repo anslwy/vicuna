@@ -1090,7 +1090,7 @@
   let confirmDeleteModel = $state<string | null>(null);
   let browseView = $state<"installed" | "discover">("installed");
   let browseQuery = $state("");
-  let browseCat = $state<"all" | CatalogCat | "small">("all");
+  let browseCat = $state<"all" | CatalogCat | "small" | "mlx">("all");
   let variantPick = $state<Record<string, string>>({});
   // discover catalog: bundled list, replaced by a fetched override when the
   // user hits Fetch (persisted via store so it survives restarts)
@@ -1847,12 +1847,18 @@
   });
 
   // discover tab: curated registry catalog with client-side search + filters
-  const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small"] as const;
+  const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small", "mlx"] as const;
+  /** variant tags ending in -mlx are Apple-silicon builds (see refresh-catalog.py) */
+  function isMlxVariant(tag: string): boolean {
+    return /-mlx$/i.test(tag);
+  }
   const filteredCatalog = $derived.by(() => {
     const q = browseQuery.trim().toLowerCase();
     return catalog.filter((e) => {
       if (browseCat === "small") {
         if (Math.max(...e.variants.map((v) => v.sizeMB)) > 2560) return false;
+      } else if (browseCat === "mlx") {
+        if (!e.variants.some((v) => isMlxVariant(v.tag))) return false;
       } else if (browseCat !== "all" && !e.cats.includes(browseCat)) return false;
       if (!q) return true;
       return (
@@ -6184,7 +6190,7 @@
       </div>
       <div class="chip-row" data-testid="discover-chips" role="group" aria-label="Filter by capability">
         {#each BROWSE_CATS as c}
-          <button class="chip {browseCat === c ? 'sel' : ''}" data-testid="discover-chip" data-cat={c} onclick={() => (browseCat = c)}>{c === "all" ? "All" : c[0].toUpperCase() + c.slice(1)}</button>
+          <button class="chip {browseCat === c ? 'sel' : ''}" data-testid="discover-chip" data-cat={c} onclick={() => (browseCat = c)}>{c === "all" ? "All" : c === "mlx" ? "MLX" : c[0].toUpperCase() + c.slice(1)}</button>
         {/each}
       </div>
       <p class="browse-count" data-testid="discover-count">{filteredCatalog.length} of {catalog.length} models · catalog {catalogUpdated}
@@ -6198,7 +6204,8 @@
         <p class="goto-error" data-testid="catalog-fetch-error">{catalogError}</p>
       {/if}
       {#each filteredCatalog.filter((e) => e.variants.length > 0) as entry}
-        {@const picked = pickedVariant(entry.name, entry.variants[0].tag)}
+        {@const mlxFirst = entry.variants.find((v) => isMlxVariant(v.tag))?.tag}
+        {@const picked = pickedVariant(entry.name, browseCat === "mlx" && mlxFirst ? mlxFirst : entry.variants[0].tag)}
         {@const fullName = `${entry.name}:${picked}`}
         {@const installed = entry.variants.some((v) => models.includes(`${entry.name}:${v.tag}`))}
         <div class="browse-card" data-testid="browse-card" data-name={entry.name}>
