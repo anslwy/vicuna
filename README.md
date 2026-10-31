@@ -1,27 +1,22 @@
 # Vicuna
 
-Vicuna is a minimal desktop chat client for [Ollama](https://ollama.com).
-SvelteKit + Svelte 5 frontend in a Tauri 2 shell, talking to Ollama's local
-HTTP API (`http://localhost:11434`).
+Cross Platform Desktop Client for [Ollama](https://ollama.com).
+Your private assistant with chat and work mode.
 
 Features:
 
-- Chat with any installed Ollama model, streaming via `/api/chat`
-- Model picker with search, load/unload from memory (`/api/ps`)
-- Sidebar chat history, per-session URLs (`/s/{uuid}`), fork, rename, copy link, delete (with cascades)
-- Continue a stopped reply (appends via `/api/chat` with `think:false`, low temp, custom stop words)
-- Thinking blocks, markdown + code highlighting + KaTeX math
-- Message actions: copy, edit, continue, fork, delete
-- Settings: light/dark theme, accent color, font size, editable stop words, model management
-- Persistence: browser `localStorage` on web, sqlite via `tauri-plugin-sql` in Tauri (`vicuna.db`)
-- Pre-rebrand installs (`ollama-min-*` keys) are read as fallback and migrated forward on write
+- Chat Mode: Suitable for general query with features like forking sessions, continuing from mid-sentence, editing user / assistant responses with/without triggering regeneration and more.
+- Work Mode: Designed to work autonomously to finish a task with features like built-in sidebar file explorer & terminal, MCP servers management and more.
+
+## Download
+https://github.com/anslwy/vicuna/releases
 
 ## Prerequisites
 
 - [Ollama](https://ollama.com) installed and serving: `ollama serve`
 - At least one model pulled, e.g. `ollama pull gemma3:4b`
-- Node 18+ and npm
-- Rust toolchain (only for the Tauri desktop shell)
+- Node 18+ and npm (for development)
+- Rust toolchain (for development)
 
 ## Run it
 
