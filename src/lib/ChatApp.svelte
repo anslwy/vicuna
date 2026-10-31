@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
@@ -39,7 +39,7 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "" };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto" };
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
   /** mode + workspace picker for the session being started (home or empty draft) */
@@ -1430,7 +1430,7 @@
   }
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel });
   }
 
   function setOllamaHost(text: string) {
@@ -1765,6 +1765,71 @@
   function toggleModel() {
     modelOpen = !modelOpen;
     if (modelOpen) modelQuery = "";
+  }
+
+  // reasoning effort, next to the model picker: string think levels are
+  // per-model (gpt-oss low/med/high, qwen3.8 xhigh, deepseek max…), read
+  // from /api/show. The pill only appears for models reporting levels;
+  // boolean-only and non-thinking models keep today's think:true default.
+  let thinkLevel = $state(initialPrefs.thinkLevel ?? "auto");
+  let thinkLevels = $state<string[]>([]);
+  let thinkDefault = $state<string | null>(null);
+  let thinkCanDisable = $state(false);
+  let effortOpen = $state(false);
+
+  function capLevel(l: string): string {
+    return l.length > 0 ? l[0].toUpperCase() + l.slice(1) : l;
+  }
+
+  async function refreshThinking() {
+    const m = selectedModel;
+    if (!m) {
+      thinkLevels = [];
+      thinkDefault = null;
+      thinkCanDisable = false;
+      return;
+    }
+    const info = await modelThinking(m).catch(() => null);
+    if (selectedModel !== m) return; // switched mid-fetch: drop the stale result
+    thinkLevels = info?.levels ?? [];
+    thinkDefault = info?.default ?? null;
+    thinkCanDisable = info?.canDisable ?? false;
+  }
+
+  // keep capabilities in step with the selected model
+  $effect(() => {
+    selectedModel;
+    thinkLevels = [];
+    thinkDefault = null;
+    thinkCanDisable = false;
+    effortOpen = false;
+    void refreshThinking();
+  });
+
+  /** think value for a fresh send: explicit level/off when the current model
+   *  supports it, otherwise today's default (thinking on). Continue and Work
+   *  passes think:false explicitly and never reach this. */
+  function effectiveThink(): boolean | string {
+    if (thinkLevel !== "auto" && thinkLevel !== "off" && thinkLevels.includes(thinkLevel)) return thinkLevel;
+    if (thinkLevel === "off" && thinkCanDisable) return false;
+    return true;
+  }
+
+  /** what's actually in effect for the current model: the stored level only
+   *  when supported, else Auto (the pill must never claim an unsupported
+   *  level — e.g. High stored from gpt-oss while on qwen3.8, which has xhigh) */
+  const shownThink = $derived(
+    thinkLevel === "off"
+      ? (thinkCanDisable ? "off" : "auto")
+      : thinkLevel === "auto" || thinkLevels.includes(thinkLevel)
+        ? thinkLevel
+        : "auto"
+  );
+
+  function setThinkLevel(v: string) {
+    thinkLevel = v;
+    effortOpen = false;
+    persistPrefs();
   }
 
   // ⌘N on macOS, Ctrl+N elsewhere (shown as the New Chat hover hint)
@@ -2275,7 +2340,7 @@
     void goto(`/s/${fork.id}`);
   }
 
-  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
+  async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
     streaming = true;
     streamingChatId = chat.id;
     streamingStartAt = Date.now();
@@ -2284,6 +2349,9 @@
     let produced = false;
     let generatedText = "";
     isPinned = true;
+    // fresh sends with no explicit think use the effort picker (model default
+    // when "auto"); continue/work pass think:false and bypass it
+    const think = opts.think ?? effectiveThink();
     // mark the in-flight stream synchronously: a refresh before settle
     // resumes from the persisted partial instead of losing the turn
     writePendingStream({
@@ -2291,7 +2359,7 @@
       index,
       mode: opts.mode ?? "fresh",
       model: selectedModel,
-      think: opts.think,
+      think,
       temperature: opts.temperature,
       stop: opts.stop
     });
@@ -2373,7 +2441,7 @@
       if (opts.generatePrompt !== undefined) {
         await generateStream(selectedModel, opts.generatePrompt, onTok, ctrl.signal, undefined, 0, { temperature: opts.temperature, stop: opts.stop });
       } else {
-        const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think: opts.think, temperature: opts.temperature, stop: opts.stop, tools: opts.tools, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
+        const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think, temperature: opts.temperature, stop: opts.stop, tools: opts.tools, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
         runEvalCount = res.evalCount;
         runEvalDurationNs = res.evalDurationNs;
         runToolCalls = res.toolCalls ?? [];
@@ -4305,6 +4373,7 @@
       }
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
+      thinkLevel = prefs.thinkLevel ?? "auto";
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
@@ -5038,6 +5107,37 @@
               </div>
             {/if}
           </div>
+          {#if thinkLevels.length > 0}
+            <div class="model-pill-wrap">
+              <button class="model-pill" data-testid="effort-selector" title="Reasoning effort for {selectedModel}" onclick={() => (effortOpen = !effortOpen)}>
+                <span class="model-name">{shownThink === "auto" ? `Auto${thinkDefault ? ` · ${capLevel(thinkDefault)}` : ""}` : shownThink === "off" ? "Off" : capLevel(shownThink)}</span>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
+              </button>
+              {#if effortOpen}
+                <button class="model-backdrop" data-testid="effort-backdrop" aria-label="Close effort menu" onclick={() => (effortOpen = false)} tabindex="-1"></button>
+                <div class="model-drop" data-testid="effort-dropdown">
+                  <div class="model-list-drop">
+                    <button
+                      class="model-opt {shownThink === 'auto' ? 'sel' : ''}"
+                      onclick={() => setThinkLevel("auto")}
+                    >Auto{thinkDefault ? ` (${capLevel(thinkDefault)})` : ""}</button>
+                    {#if thinkCanDisable}
+                      <button
+                        class="model-opt {shownThink === 'off' ? 'sel' : ''}"
+                        onclick={() => setThinkLevel("off")}
+                      >Off</button>
+                    {/if}
+                    {#each thinkLevels as l}
+                      <button
+                        class="model-opt {shownThink === l ? 'sel' : ''}"
+                        onclick={() => setThinkLevel(l)}
+                      >{capLevel(l)}</button>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {/if}
           {#if workRunning}
             <button class="send" data-testid="queue-btn" aria-label="Queue message" title="Queue for the next tool call" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" title="Stop (Esc twice)" onclick={stop}>■</button>

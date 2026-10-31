@@ -138,8 +138,15 @@ fn parse_show_context_length(model_info: &serde_json::Value) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ThinkingInfo {
+    values: Vec<serde_json::Value>,
+    default: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ModelShowInfo {
     context_length: Option<u64>,
+    thinking: Option<ThinkingInfo>,
 }
 
 #[tauri::command]
@@ -162,6 +169,20 @@ async fn ollama_model_show(model: String) -> Result<ModelShowInfo, String> {
         .map_err(|e| format!("ollama show failed: {e}"))?;
     Ok(ModelShowInfo {
         context_length: data.get("model_info").and_then(parse_show_context_length),
+        thinking: data.get("thinking").and_then(|t| {
+            let values = t
+                .get("values")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if values.is_empty() {
+                return None;
+            }
+            Some(ThinkingInfo {
+                values,
+                default: t.get("default").cloned(),
+            })
+        }),
     })
 }
 
@@ -198,7 +219,7 @@ async fn ollama_warm_model(model: String, keep_alive: String) -> Result<(), Stri
 async fn ollama_chat_stream(
     model: String,
     messages: Vec<ChatMessage>,
-    think: Option<bool>,
+    think: Option<serde_json::Value>,
     temperature: Option<f64>,
     stop: Option<Vec<String>>,
     tools: Option<serde_json::Value>,
@@ -217,7 +238,7 @@ async fn ollama_chat_stream(
         "model": model,
         "messages": messages,
         "stream": true,
-        "think": think.unwrap_or(true),
+        "think": think.unwrap_or(serde_json::Value::Bool(true)),
         "options": options,
     });
     if let Some(t) = tools {

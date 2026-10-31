@@ -190,6 +190,60 @@ export async function modelContextLength(model: string): Promise<number | null> 
   showCache.set(model, len);
   return len;
 }
+
+/** Reasoning-effort support for one model: string levels (e.g. gpt-oss's
+ *  low/medium/high, qwen3.8's xhigh, deepseek's max) plus the server default,
+ *  or null when the model only takes boolean think / doesn't think at all.
+ *  Parsed from /api/show `thinking: { values, default }`; cached per model. */
+export interface ModelThinking {
+  levels: string[];
+  default: string | null;
+  /** values also contain false: the model can run with thinking disabled. */
+  canDisable: boolean;
+}
+
+const showThinkingCache = new Map<string, ModelThinking | null>();
+
+/** Pick the string effort levels out of an /api/show `thinking` value. */
+export function parseShowThinking(thinking: unknown): ModelThinking | null {
+  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) return null;
+  const { values, default: def } = thinking as Record<string, unknown>;
+  if (!Array.isArray(values)) return null;
+  const levels = values.filter((v): v is string => typeof v === "string" && v.length > 0);
+  if (levels.length === 0) return null;
+  return {
+    levels,
+    default: typeof def === "string" && def.length > 0 ? def : null,
+    canDisable: values.some((v) => v === false)
+  };
+}
+
+export async function modelThinking(model: string): Promise<ModelThinking | null> {
+  if (!model) return null;
+  if (showThinkingCache.has(model)) return showThinkingCache.get(model) ?? null;
+  let out: ModelThinking | null = null;
+  try {
+    if (isTauriRuntime()) {
+      const { invoke } = await tauri();
+      const info = await invoke<{ thinking?: { values?: unknown; default?: unknown } | null }>("ollama_model_show", { model });
+      out = parseShowThinking(info?.thinking ?? null);
+    } else {
+      const res = await fetch(`${ollamaBase()}/api/show`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        out = parseShowThinking((data as Record<string, unknown>)?.thinking ?? null);
+      }
+    }
+  } catch {
+    out = null;
+  }
+  showThinkingCache.set(model, out);
+  return out;
+}
 /** Load a model into memory (or extend its residency). Generates a single
  *  throwaway token; uses the same context size as chat so follow-up chats
  *  don't trigger a reload. */
@@ -289,7 +343,7 @@ async function chatStreamViaBackend(
   onToken: (t: string) => void,
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
-  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
+  opts: { think?: boolean | string; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
 ): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   const { invoke, Channel } = await tauri();
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
@@ -341,7 +395,7 @@ async function chatStreamViaFetch(
   onToken: (t: string) => void,
   signal: AbortSignal | undefined,
   onThink: ((t: string) => void) | undefined,
-  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
+  opts: { think?: boolean | string; temperature?: number; stop?: string[]; tools?: OllamaToolDef[] }
 ): Promise<{ text: string; doneReason: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   const options: Record<string, number | string[]> = { num_ctx: 32768 };
   // temperature only set when explicitly requested (continue uses low temp
@@ -441,7 +495,7 @@ export async function chatStream(
   signal?: AbortSignal,
   onThink?: (t: string) => void,
   attempt = 0,
-  opts: { think?: boolean; temperature?: number; stop?: string[]; tools?: OllamaToolDef[]; onImagesStripped?: () => void } = {}
+  opts: { think?: boolean | string; temperature?: number; stop?: string[]; tools?: OllamaToolDef[]; onImagesStripped?: () => void } = {}
 ): Promise<{ text: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
   try {
     const { text, doneReason, evalCount, evalDurationNs, toolCalls } = isTauriRuntime()
@@ -470,6 +524,12 @@ export async function chatStream(
       // with thinking disabled instead of failing the turn
       return chatStream(model, messages, onToken, signal, onThink, 1, { ...opts, think: false });
     }
+    if (attempt === 0 && typeof opts.think === "string" && isThinkLevelError(e)) {
+      // the model takes think but not this level (e.g. a stale "high" sent
+      // to a boolean-only model): retry once with plain thinking enabled
+      // (attempt stays 0 so the disabled-thinking fallback below still runs)
+      return chatStream(model, messages, onToken, signal, onThink, 0, { ...opts, think: true });
+    }
     if (attempt === 0 && isToolsUnsupportedError(e)) {
       // model has no native tool support: retry once without tools so the
       // caller can fall back to the ```tool fence parser
@@ -488,6 +548,12 @@ function isVisionUnsupportedError(e: unknown): boolean {
 function isThinkUnsupportedError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return msg.includes("does not support thinking");
+}
+
+/** A string think level the model rejected (but thinking itself may be fine). */
+function isThinkLevelError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.includes("think") && !isThinkUnsupportedError(e);
 }
 
 function isToolsUnsupportedError(e: unknown): boolean {

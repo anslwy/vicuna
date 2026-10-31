@@ -99,7 +99,7 @@ export interface PendingStream {
    *  continue: appending to an existing partial (history includes it) */
   mode: "fresh" | "continue";
   model: string;
-  think?: boolean;
+  think?: boolean | string;
   temperature?: number;
   stop?: string[];
 }
@@ -571,11 +571,15 @@ export interface Prefs {
   /** Last-used Work mode workspace (absolute path). Pre-fills the workspace
    *  picker and "Continue in Work". */
   defaultWorkspace: string;
+  /** Reasoning effort for models with string think levels (gpt-oss family):
+   *  "auto" sends think:true (server default), otherwise the level verbatim.
+   *  Ignored for boolean-only / non-thinking models. */
+  thinkLevel: string;
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "" };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto" };
 const LS_PREFS = "vicuna-prefs";
 
 /** Normalize a stored workspace for the current platform: strip Rust's
@@ -603,7 +607,8 @@ export function readLocalPrefs(): Prefs {
       stopWords: Array.isArray(p.stopWords) ? p.stopWords.filter((s): s is string => typeof s === "string") : [...DEFAULT_STOP_WORDS],
       ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
       zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom,
-      defaultWorkspace: typeof p.defaultWorkspace === "string" ? normalizeStoredWorkspace(p.defaultWorkspace) : normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace)
+      defaultWorkspace: typeof p.defaultWorkspace === "string" ? normalizeStoredWorkspace(p.defaultWorkspace) : normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace),
+      thinkLevel: typeof p.thinkLevel === "string" && p.thinkLevel.length > 0 ? p.thinkLevel : DEFAULT_PREFS.thinkLevel
     };
   } catch {
     return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
@@ -614,7 +619,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -639,6 +644,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
       if (n >= 0.5 && n <= 3) out.zoom = n;
     }
     if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = normalizeStoredWorkspace(r.value);
+    if (r.key === "pref_think_level" && typeof r.value === "string" && r.value.length > 0) out.thinkLevel = r.value;
   }
   return out;
 }
@@ -654,6 +660,7 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_ollama_base', $1)", [p.ollamaBase]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_zoom', $1)", [String(p.zoom)]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_default_workspace', $1)", [p.defaultWorkspace]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_think_level', $1)", [p.thinkLevel]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {
