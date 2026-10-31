@@ -5707,7 +5707,15 @@
               e.stopPropagation();
               mcpMoveSel(-1);
             } else if (e.key === "Enter") {
-              // Space must type a space here — only Enter activates
+              // Enter always activates the selected row
+              e.preventDefault();
+              e.stopPropagation();
+              mcpActivateSelected();
+            } else if (e.key === " " && mcpQuery.trim() === "") {
+              // Space activates too when there is nothing to search —
+              // the filter trims, so a leading space could never match
+              // anything (and the footer advertises "connect space").
+              // With actual query text Space keeps typing normally.
               e.preventDefault();
               e.stopPropagation();
               mcpActivateSelected();
