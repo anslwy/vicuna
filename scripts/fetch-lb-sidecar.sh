@@ -117,7 +117,17 @@ if [ "$PLATFORM" = "darwin" ]; then
 elif [ "$PLATFORM" = "windows" ]; then
   ASSET="live-browser-$VERSION-windows-x86_64.zip"
   fetch_asset "$ASSET"
-  tar -xf "$TMP/$ASSET" -C "$TMP"
+  # Git Bash tar is GNU tar (no zip support) — unzip first, PowerShell
+  # Expand-Archive as fallback (needs Windows paths via cygpath).
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$TMP/$ASSET" -d "$TMP"
+  elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    WTMP="$(cygpath -w "$TMP")"
+    powershell.exe -NoProfile -NonInteractive -Command "Expand-Archive -LiteralPath '${WTMP}\\${ASSET}' -DestinationPath '${WTMP}'"
+  else
+    echo "fetch-lb-sidecar: need unzip or powershell to extract $ASSET" >&2
+    exit 1
+  fi
   SRC="$TMP/live-browser-$VERSION-windows-x86_64"
   cp "$SRC/lb.exe" "$DEST/lb.exe"
   mkdir -p "$DEST/web"
