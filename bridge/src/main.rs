@@ -327,6 +327,11 @@ async fn dispatch(
             ))
         }
         "browser_stop" => Ok(serde_json::json!(vicuna_lib::browser::browser_stop_logic(&st.browser).await?)),
+        "browser_restart" => {
+            Ok(serde_json::json!(
+                vicuna_lib::browser::browser_restart_logic(test_resource_dir(), &st.browser).await?
+            ))
+        }
         "browser_mcp_command" => {
             Ok(serde_json::json!(vicuna_lib::browser::browser_mcp_command(test_resource_dir().as_deref())?))
         }

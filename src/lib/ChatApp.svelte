@@ -36,7 +36,7 @@
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
-  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
+  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -3742,8 +3742,9 @@
 
   // ---- Browser tab (shared `lb` daemon: iframe view + `lb mcp` agent tools) ----
   // The tab is a view onto the daemon, not its owner: closing the tab leaves
-  // the daemon (and the agent's MCP connection) running; Stop in the tab
-  // shuts down only a daemon Vicuna itself started.
+  // the daemon (and the agent's MCP connection) running. The only tab chrome
+  // is a stale-engine strip (owned daemon predates the on-disk bundle):
+  // in-place recover can't fix that, so it offers a full restart instead.
   let browserDaemon = $state<BrowserStatus | null>(null);
   let browserStarting = $state(false);
   let browserError = $state<string | null>(null);
@@ -3786,6 +3787,7 @@
             browserDaemon = {
               running: true,
               owned: false,
+              engine_stale: false,
               url: LB_URL,
               health: { browser_alive: !!h.browser_alive, probe: h.probe, tabs: h.tabs ?? 0 }
             };
@@ -3798,6 +3800,21 @@
       browserError = e?.message ?? String(e);
       browserDaemon = null;
       throw e;
+    } finally {
+      browserStarting = false;
+    }
+  }
+
+  /** full stop + start of an owned daemon (stale engine / wedged
+   *  browser). Refuses adopted daemons — the backend owns that refusal. */
+  async function restartBrowserDaemon() {
+    browserStarting = true;
+    browserError = null;
+    try {
+      browserDaemon = await browserRestart();
+    } catch (e: any) {
+      browserError = e?.message ?? String(e);
+      browserDaemon = null;
     } finally {
       browserStarting = false;
     }
@@ -6766,6 +6783,12 @@
       {/if}
           {:else if t.kind === "browser"}
             {#if browserDaemon?.running}
+              {#if browserDaemon.engine_stale && browserDaemon.owned}
+                <div class="browser-stale" data-testid="browser-stale" role="status">
+                  <span>{browserDaemon.warning ?? "Browser engine is outdated."}</span>
+                  <button class="mini-btn" data-testid="browser-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
+                </div>
+              {/if}
               <!-- allow-same-origin is load-bearing: without it the frame
                    gets an opaque origin, lb's UI throws on localStorage at
                    boot and its same-origin /api fetches go cross-origin — the tab stays
@@ -7753,6 +7776,8 @@
   .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: #f4f4f4; }
   :global(html[data-theme="dark"]) .term-wrap { background: #161616; }
   .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: #fff; }
+  .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
+  .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .exp-empty.browser-error { display: flex; flex-direction: column; align-items: center; gap: 10px; }
   .exp-empty.browser-error span { overflow-wrap: anywhere; }
   .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }

@@ -24,6 +24,7 @@ export interface LbHealth {
 export interface BrowserStatus {
   running: boolean;
   owned: boolean;
+  engine_stale: boolean;
   url: string;
   bin?: string | null;
   source?: string | null;
@@ -41,6 +42,10 @@ export async function browserStart(): Promise<BrowserStatus> {
 
 export async function browserStop(): Promise<BrowserStatus> {
   return await invokeOrBridge<BrowserStatus>("browser_stop", {});
+}
+
+export async function browserRestart(): Promise<BrowserStatus> {
+  return await invokeOrBridge<BrowserStatus>("browser_restart", {});
 }
 
 /** Absolute `lb mcp` argv for the default `browser` MCP entry. */

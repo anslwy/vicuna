@@ -63,6 +63,11 @@ impl LbSource {
 pub struct BrowserState {
     child: Mutex<Option<Child>>,
     bin: Mutex<Option<PathBuf>>,
+    /// `lb --version` captured when our child spawned. Compared against
+    /// the on-disk binary at status time: a fetch bump / rebuild under a
+    /// live daemon leaves the old image running (old recover behavior
+    /// included) with no other visible signal.
+    spawned_version: Mutex<Option<String>>,
 }
 
 fn remember_bin(state: &BrowserState, bin: &Path) {
@@ -313,6 +318,44 @@ fn probe_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Parse `lb --version` output (`lb 0.4.17`) down to the version
+/// number. Split from the probe so skew fixtures don't need a binary.
+pub fn parse_lb_version(out: &str) -> Option<String> {
+    let first = out.lines().next()?.trim();
+    let mut parts = first.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some("lb"), Some(v)) if !v.is_empty() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// `bin --version`, best-effort (failures mean "unknown", never fatal).
+async fn probe_lb_version(bin: &Path) -> Option<String> {
+    let run = tokio::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(5), run).await.ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_lb_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Stale-engine warning when the on-disk binary moved past the running
+/// owned daemon. Adopted daemons report no running version, so they
+/// never warn (and are never restarted from here).
+pub fn stale_engine_warning(spawned: Option<&str>, current: Option<&str>) -> Option<String> {
+    match (spawned, current) {
+        (Some(s), Some(c)) if s != c => Some(format!(
+            "browser engine updated on disk ({s} → {c}) — restart the browser to use the new build"
+        )),
+        _ => None,
+    }
+}
+
 /// Is our owned child still alive? Reaps it when it exited on its own
 /// (so status stops claiming `owned` after a crash).
 fn owned_child_alive(state: &BrowserState) -> bool {
@@ -336,6 +379,9 @@ fn owned_child_alive(state: &BrowserState) -> bool {
 pub struct BrowserStatus {
     pub running: bool,
     pub owned: bool,
+    /// Owned daemon whose image predates the on-disk binary (fetch bump
+    /// or rebuild under a live daemon). The tab offers a restart then.
+    pub engine_stale: bool,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
@@ -359,14 +405,29 @@ pub async fn browser_status_logic(
         .or_else(|| resolve_lb_bin(None));
     let client = probe_client();
     let owned = owned_child_alive(state);
+    // stale check (owned only): one `--version` spawn, and only when we
+    // captured a running version at spawn — adopted daemons skip it.
+    let mut engine_stale = false;
+    let mut stale_warning: Option<String> = None;
+    if owned {
+        let spawned = state.spawned_version.lock().ok().and_then(|g| g.clone());
+        if spawned.is_some() {
+            if let Some((bin, _)) = resolved.as_ref() {
+                let current = probe_lb_version(bin).await;
+                stale_warning = stale_engine_warning(spawned.as_deref(), current.as_deref());
+                engine_stale = stale_warning.is_some();
+            }
+        }
+    }
     let base = BrowserStatus {
         running: false,
         owned,
+        engine_stale,
         url: lb_server_url(),
         bin: resolved.as_ref().map(|(p, _)| p.display().to_string()),
         source: resolved.as_ref().map(|(_, s)| s.as_str().to_string()),
         health: None,
-        warning: None,
+        warning: stale_warning,
     };
     match probe_daemon(&client).await {
         Probe::Free => Ok(base),
@@ -424,6 +485,10 @@ pub async fn browser_start_logic(
                     .map_err(|_| "browser state poisoned".to_string())?
                     .replace(child);
                 remember_bin(state, &bin);
+                let version = probe_lb_version(&bin).await;
+                if let Ok(mut g) = state.spawned_version.lock() {
+                    *g = version;
+                }
                 return browser_status_logic(resource_dir, state).await;
             }
             Err(e) => {
@@ -527,6 +592,9 @@ pub async fn browser_stop_logic(state: &BrowserState) -> Result<BrowserStatus, S
         }
     };
     let was_alive = matches!(taken.try_wait(), Ok(None));
+    if let Ok(mut g) = state.spawned_version.lock() {
+        g.take();
+    }
     if let Some(bin) = owned_bin(state) {
         graceful_stop(&bin).await;
     }
@@ -537,6 +605,17 @@ pub async fn browser_stop_logic(state: &BrowserState) -> Result<BrowserStatus, S
         }
     }
     browser_status_logic(None, state).await
+}
+
+/// Restart an owned daemon (stop + start): picks up an on-disk engine
+/// update and clears wedged browser state the in-place recover can't.
+/// Refuses adopted daemons — `browser_stop_logic` owns that refusal.
+pub async fn browser_restart_logic(
+    resource_dir: Option<PathBuf>,
+    state: &BrowserState,
+) -> Result<BrowserStatus, String> {
+    browser_stop_logic(state).await?;
+    browser_start_logic(resource_dir, state).await
 }
 
 /// Absolute `lb mcp` argv for the default `browser` MCP server entry.
@@ -699,5 +778,28 @@ mod tests {
         assert_eq!(hit, expected);
         assert_eq!(src, LbSource::Bundled);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lb_version_parses() {
+        assert_eq!(parse_lb_version("lb 0.4.17\n"), Some("0.4.17".to_string()));
+        assert_eq!(parse_lb_version("lb 0.4.17"), Some("0.4.17".to_string()));
+        assert_eq!(parse_lb_version("garbage\n"), None);
+        assert_eq!(parse_lb_version(""), None);
+        assert_eq!(parse_lb_version("lb\n"), None);
+    }
+
+    #[test]
+    fn stale_warns_only_on_real_skew() {
+        // the sleep/wake silent-recover case: daemon runs the pre-bump
+        // image while the bundle moved on — warn with both versions
+        let w = stale_engine_warning(Some("0.4.16"), Some("0.4.17")).expect("skew must warn");
+        assert!(w.contains("0.4.16") && w.contains("0.4.17"), "{w}");
+        assert!(w.contains("restart"), "{w}");
+        assert_eq!(stale_engine_warning(Some("0.4.17"), Some("0.4.17")), None);
+        // unknown on either side (adopted daemon, failed probe): no claim
+        assert_eq!(stale_engine_warning(None, Some("0.4.17")), None);
+        assert_eq!(stale_engine_warning(Some("0.4.16"), None), None);
+        assert_eq!(stale_engine_warning(None, None), None);
     }
 }
