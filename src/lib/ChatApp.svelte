@@ -36,6 +36,7 @@
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
+  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -109,10 +110,10 @@
   /** explorer panel width (drag the left edge; in-memory only) */
   let explorerWidth = $state(300);
   let expResizing = $state(false);
-  /** side-panel tabs: one Files view max, any number of terminals */
+  /** side-panel tabs: one Files view max, one Browser max, any number of terminals */
   interface SideTab {
     key: string;
-    kind: "files" | "terminal";
+    kind: "files" | "terminal" | "browser";
     title: string;
     termId?: string;
     dead?: boolean;
@@ -213,6 +214,23 @@
   // the Work agent's native tool loop; chat mode never sees them.
   let mcpServers = $state<McpServerConfig[]>([]);
   let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
+  /** resolved `lb mcp` argv for the synthetic Browser row (null until the
+   *  `lb` binary resolves — bundled sidecar or PATH, via bridge or Tauri) */
+  let browserMcpArgv = $state<string[] | null>(null);
+  /** the built-in Browser row: in-memory only, never in vicuna.json, so it
+   *  shows in Added by default and can never be deleted. A file server
+   *  named `browser` wins over it (explicit config beats the default). */
+  const mcpBrowserSynthetic = $derived<McpServerConfig | null>(
+    browserMcpArgv && !mcpServers.some((s) => s.name.toLowerCase() === BROWSER_MCP_ID)
+      ? browserMcpConfig(browserMcpArgv, LB_URL)
+      : null
+  );
+  const mcpAllServers = $derived<McpServerConfig[]>(
+    mcpBrowserSynthetic ? [mcpBrowserSynthetic, ...mcpServers] : mcpServers
+  );
+  function findMcpServer(id: string): McpServerConfig | undefined {
+    return mcpAllServers.find((s) => s.id === id);
+  }
   /** ids with a connection op in flight (connect/disconnect/refresh/sign-in,
    *  or `builtin:<key>` while a Built-in Add saves). A single shared slot
    *  used to drop every launch reconnect after the first, so only one
@@ -269,7 +287,7 @@
   /** whether the server being edited has a stored OAuth login */
   let mcpHasLogin = $state(false);
   const mcpFiltered = $derived(
-    mcpServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
+    mcpAllServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
   );
   const mcpConnectedCount = $derived(Object.values(mcpLive).filter((l) => l.connected).length);
   const builtinShown = $derived(
@@ -377,19 +395,31 @@
       mcpServers = [];
       return;
     }
+    // resolve the built-in Browser row's `lb mcp` argv (absent when no `lb`
+    // binary is available — then Added simply has no Browser row)
+    try {
+      browserMcpArgv = await browserMcpCommand();
+    } catch {
+      browserMcpArgv = null;
+    }
     // reconnect launch-enabled servers (best-effort: failures surface as
-    // row errors in the popup instead of blocking startup)
+    // row errors in the popup instead of blocking startup). The synthetic
+    // Browser row is excluded: starting a browser daemon at every launch
+    // is too aggressive — it connects when the Browser tab opens instead.
     for (const s of mcpServers) {
       if (s.enabled) void connectMcpServer(s.id);
     }
   }
 
   async function connectMcpServer(id: string) {
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     if (!cfg || mcpIsBusy(id)) return;
     mcpMarkBusy(id);
     mcpLive[id] = { connected: false, tools: [], error: null };
     try {
+      // the Browser row drives the shared daemon: make sure it is up first
+      // (adopt a running one or spawn ours) before `lb mcp` dials it
+      if (isBrowserMcpId(id)) await ensureBrowserDaemon();
       const info = await connectMcpBackend(cfg);
       mcpLive[id] = { connected: true, tools: info.tools, error: null };
     } catch (e: any) {
@@ -400,7 +430,7 @@
   }
 
   async function disconnectMcpServer(id: string, silent = false) {
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     try {
       await disconnectMcpBackend(id, cfg?.transport ?? "stdio");
     } catch (e: any) {
@@ -413,12 +443,14 @@
   }
 
   async function toggleMcpServer(id: string) {
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     if (!cfg || mcpIsBusy(id)) return;
     if (mcpLive[id]?.connected) {
       await disconnectMcpServer(id);
       // disconnecting is the disable preference: persist it so a restart
-      // won't reconnect everything the user just turned off
+      // won't reconnect everything the user just turned off. The synthetic
+      // Browser row has no file entry, so there is nothing to persist.
+      if (isBrowserMcpId(id)) return;
       mcpMarkBusy(id);
       try {
         mcpServers = await saveMcpServer({ ...cfg, enabled: false });
@@ -457,7 +489,7 @@
    *  Opens the system browser; the backend resolves once login completes.
    *  A server that turns out to need no auth falls back to plain connect. */
   async function signInMcpServer(id: string) {
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     if (!cfg || mcpIsBusy(id)) return;
     mcpMarkBusy(id);
     mcpAuthWait = id;
@@ -466,7 +498,7 @@
       const info = await signInMcpBackend(cfg);
       mcpLive[id] = { connected: true, tools: info.tools, error: null };
       // an explicit sign-in implies the user wants the server: enable it
-      if (!mcpServers.find((s) => s.id === id)?.enabled) {
+      if (!findMcpServer(id)?.enabled) {
         try {
           mcpServers = await saveMcpServer({ ...cfg, enabled: true });
         } catch (e: any) {
@@ -496,7 +528,7 @@
   }
 
   async function refreshMcpTools(id: string) {
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     if (!cfg || mcpIsBusy(id)) return;
     mcpMarkBusy(id);
     try {
@@ -514,8 +546,9 @@
     mcpSel = 0;
     mcpBuiltinSel = 0;
     // default to the Added list when the user has servers, Discover only
-    // when there is nothing to show there yet
-    mcpView = mcpServers.length ? "custom" : "builtin";
+    // when there is nothing to show there yet (the built-in Browser row
+    // counts, so Added is the default whenever `lb` is available)
+    mcpView = mcpAllServers.length ? "custom" : "builtin";
     mcpBuiltinError = null;
     mcpShowForm = false;
     mcpFormError = null;
@@ -582,7 +615,7 @@
         : undefined,
       enabled: mcpForm.enabled
     };
-    if (mcpServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
+    if (mcpAllServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
       mcpFormError = "A server with that name already exists.";
       return;
     }
@@ -629,6 +662,18 @@
     delete mcpLive[id];
   }
 
+  /** `live-browser:open-external` from the Browser-tab iframe: lb's own
+   *  target=_blank links die silently in desktop webviews (no new-window
+   *  implementation), so when framed lb posts out instead and the app opens
+   *  the URL natively. Strict loopback-origin + shape check. */
+  function onBrowserFrameMessage(e: MessageEvent) {
+    if (e.origin !== LB_URL) return;
+    const d = e.data as { type?: unknown; url?: unknown } | null;
+    if (!d || d.type !== "live-browser:open-external" || typeof d.url !== "string") return;
+    if (!/^https?:\/\//.test(d.url)) return;
+    void openExternal(d.url);
+  }
+
   /** Open a URL outside the app: system browser on desktop (Tauri opener),
    *  new tab in plain browsers. Never navigates the app webview itself. */
   async function openExternal(url: string): Promise<void> {
@@ -659,7 +704,7 @@
       mcpPatError = "Paste a token first.";
       return;
     }
-    const cfg = mcpServers.find((s) => s.id === id);
+    const cfg = findMcpServer(id);
     if (!cfg) {
       mcpPatFor = null;
       return;
@@ -690,7 +735,7 @@
     // backend would swallow the call as a goal self-stop instead of routing it.
     const builtin = new Set([...WORK_TOOLS.map((t) => t.function.name), "done"]);
     const seen = new Set<string>(builtin);
-    for (const s of mcpServers) {
+    for (const s of mcpAllServers) {
       const live = mcpLive[s.id];
       if (!s.enabled || !live?.connected) continue;
       for (const t of live.tools) {
@@ -3695,6 +3740,100 @@
     if (!explorerEntries.length && !explorerLoading) void loadExplorer();
   }
 
+  // ---- Browser tab (shared `lb` daemon: iframe view + `lb mcp` agent tools) ----
+  // The tab is a view onto the daemon, not its owner: closing the tab leaves
+  // the daemon (and the agent's MCP connection) running; Stop in the tab
+  // shuts down only a daemon Vicuna itself started.
+  let browserDaemon = $state<BrowserStatus | null>(null);
+  let browserStarting = $state(false);
+  let browserError = $state<string | null>(null);
+  /** lb UI url + Vicuna theme/accent: lb reads `?theme=`/`?accent=`/
+   *  `?accentfg=` pre-paint (older lb builds ignore unknown params and fall
+   *  back to their saved theme + built-in greens). Derived from
+   *  `theme`/`accent`, so appearance flips re-navigate the frame into the
+   *  matching lb look with no extra wiring. */
+  const browserFrameSrc = $derived.by(() => {
+    const a = ACCENTS[accent] ?? ACCENTS.orange;
+    const v = theme === "dark" ? a.dark : a.light;
+    const hex = (c: string) => c.replace(/^#/, "");
+    return `${browserDaemon?.url ?? LB_URL}/?theme=${theme}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
+  });
+
+  /** status → start when down. Throws on failure (callers surface it). */
+  async function ensureBrowserDaemon(): Promise<BrowserStatus> {
+    browserStarting = true;
+    browserError = null;
+    try {
+      let st = await browserStatus();
+      if (!st.running) st = await browserStart();
+      browserDaemon = st;
+      if (!browserMcpArgv && st.bin) {
+        try {
+          browserMcpArgv = await browserMcpCommand();
+        } catch {
+          /* row stays hidden; the tab still views the daemon */
+        }
+      }
+      return st;
+    } catch (e: any) {
+      // plain browser with no bridge: still allow viewing a manually-run
+      // daemon (`lb web --port 8765` in a terminal) via a direct probe
+      if (!isTauriRuntime()) {
+        try {
+          const r = await fetch(`${LB_URL}/api/health`);
+          const h = await r.json();
+          if (h?.ok === true && typeof h?.probe === "string") {
+            browserDaemon = {
+              running: true,
+              owned: false,
+              url: LB_URL,
+              health: { browser_alive: !!h.browser_alive, probe: h.probe, tabs: h.tabs ?? 0 }
+            };
+            return browserDaemon;
+          }
+        } catch {
+          /* fall through to the backend error below */
+        }
+      }
+      browserError = e?.message ?? String(e);
+      browserDaemon = null;
+      throw e;
+    } finally {
+      browserStarting = false;
+    }
+  }
+
+  /** side-panel tabs: focus the Browser view, creating it if closed */
+  function openSideBrowser() {
+    newTabMenu = false;
+    const existing = sideTabs.find((t) => t.kind === "browser");
+    if (existing) {
+      activeSideTab = existing.key;
+    } else {
+      sideTabs = [...sideTabs, { key: "browser", kind: "browser", title: "Browser" }];
+      activeSideTab = "browser";
+    }
+    // the daemon serves both the iframe and the agent: bring it up, then
+    // connect the built-in MCP row so Work tools appear in the same step
+    void (async () => {
+      if (!browserMcpArgv) {
+        try {
+          browserMcpArgv = await browserMcpCommand();
+        } catch {
+          browserMcpArgv = null;
+        }
+      }
+      try {
+        await ensureBrowserDaemon();
+      } catch {
+        return;
+      }
+      if (browserMcpArgv && !mcpLive[BROWSER_MCP_ID]?.connected) {
+        void connectMcpServer(BROWSER_MCP_ID);
+      }
+    })();
+  }
+
   function termTheme(): Record<string, string> {
     // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
     // console (yellow prompt segments, white text), so the defaults that
@@ -5004,6 +5143,7 @@
 
   onMount(() => {
     window.addEventListener("beforeunload", handleUnload);
+    window.addEventListener("message", onBrowserFrameMessage);
     void initApp();
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
@@ -5024,6 +5164,7 @@
     }
     return () => {
       window.removeEventListener("beforeunload", handleUnload);
+      window.removeEventListener("message", onBrowserFrameMessage);
       unlistenDeepLink?.();
     };
   });
@@ -6154,7 +6295,7 @@
               role="option"
               aria-selected={i === mcpSel}
               tabindex="0"
-              title={describeMcpServer(s)}
+              title={isBrowserMcpId(s.id) ? "Built-in shared browser (lb mcp) — same tabs as the Browser tab" : describeMcpServer(s)}
               onclick={() => {
                 mcpSel = i;
                 void toggleMcpServer(s.id);
@@ -6172,8 +6313,9 @@
               }}
             >
               <span class="mcp-name">{s.name}</span>
-              <span class="mcp-tools-n">{live?.connected ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : ""}</span>
+              <span class="mcp-tools-n">{live?.connected ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
               <span class="mcp-status {st.kind}">{st.label}</span>
+              {#if !isBrowserMcpId(s.id)}
               <span class="mcp-row-actions">
                 <button
                   class="mcp-mini"
@@ -6210,6 +6352,7 @@
                   >×</button>
                 {/if}
               </span>
+              {/if}
             </div>
             {#if live?.error}
               <div class="mcp-row-error" title={live.error}>{live.error}</div>
@@ -6219,7 +6362,7 @@
               {#if !isTauriRuntime()}
                 MCP servers need the Vicuna desktop app — browsers can't spawn local commands.
               {:else}
-                No MCP servers yet — add one below, e.g. a local `lb mcp` for the live browser.
+                No MCP servers yet — add one below, or open the Browser tab for the built-in browser.
               {/if}
             </div>
           {/each}
@@ -6333,7 +6476,7 @@
               title="Re-list tools on connected servers"
               disabled={mcpBusy.length > 0}
               onclick={() => {
-                for (const s of mcpServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
+                for (const s of mcpAllServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
               }}
             >refresh</button>
           {:else}
@@ -6341,7 +6484,7 @@
           {/if}
         </div>
         {#if mcpPatFor}
-          {@const patCfg = mcpServers.find((s) => s.id === mcpPatFor)}
+          {@const patCfg = findMcpServer(mcpPatFor ?? "")}
           <div
             class="mcp-pat-veil"
             data-testid="mcp-pat-modal"
@@ -6462,6 +6605,8 @@
             >
               {#if t.kind === "files"}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              {:else if t.kind === "browser"}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
               {:else}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
               {/if}
@@ -6483,7 +6628,7 @@
           class="icon-btn side-add"
           data-testid="side-add"
           aria-label="New panel tab"
-          title="New tab: Explorer or Terminal"
+          title="New tab: Explorer, Terminal or Browser"
           onclick={() => (newTabMenu = !newTabMenu)}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -6515,11 +6660,15 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
               <span>Terminal</span>
             </button>
+            <button class="ctx-item" data-testid="new-tab-browser" onclick={openSideBrowser}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              <span>Browser</span>
+            </button>
           </div>
         {/if}
       </div>
       {#if sideTabs.length === 0}
-        <div class="exp-empty">No tabs open — press + to add an Explorer or Terminal.</div>
+        <div class="exp-empty">No tabs open — press + to add an Explorer, Terminal or Browser.</div>
       {/if}
       {#each sideTabs as t (t.key)}
         <div class="side-view" class:hidden={t.key !== activeSideTab}>
@@ -6615,6 +6764,33 @@
       {#if expNotice}
         <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
       {/if}
+          {:else if t.kind === "browser"}
+            {#if browserDaemon?.running}
+              <!-- allow-same-origin is load-bearing: without it the frame
+                   gets an opaque origin, lb's UI throws on localStorage at
+                   boot and its same-origin /api fetches go cross-origin — the tab stays
+                   blank white. The app is still contained: no
+                   allow-top-navigation, and tauri:// is a foreign origin. -->
+              <iframe
+                class="browser-frame"
+                data-testid="browser-frame"
+                title="Shared browser"
+                src={browserFrameSrc}
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"
+              ></iframe>
+            {:else if browserStarting}
+              <div class="exp-empty">Starting browser…</div>
+            {:else if browserError}
+              <div class="exp-empty browser-error" data-testid="browser-error">
+                <span>{browserError}</span>
+                <button class="mini-btn" data-testid="browser-retry" onclick={() => void ensureBrowserDaemon()}>Retry</button>
+              </div>
+            {:else}
+              <div class="exp-empty browser-error" data-testid="browser-start">
+                <span>Browser daemon not running.</span>
+                <button class="mini-btn" data-testid="browser-start-btn" onclick={() => void ensureBrowserDaemon()}>Start browser</button>
+              </div>
+            {/if}
           {:else}
             {#if t.error}
               <div class="exp-empty">{t.error}</div>
@@ -7576,6 +7752,9 @@
   .side-view.hidden { display: none; }
   .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: #f4f4f4; }
   :global(html[data-theme="dark"]) .term-wrap { background: #161616; }
+  .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: #fff; }
+  .exp-empty.browser-error { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .exp-empty.browser-error span { overflow-wrap: anywhere; }
   .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }
   .explorer-search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 0; }
   .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }

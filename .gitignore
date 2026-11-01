@@ -5,6 +5,13 @@ node_modules
 /package
 bridge/target/
 src-tauri/target/
+# lb-sidecar build artifact (see src-tauri/lb-sidecar/README.md): keep the dir + README
+src-tauri/lb-sidecar/lb
+src-tauri/lb-sidecar/lb.exe
+src-tauri/lb-sidecar/lb-arm64
+src-tauri/lb-sidecar/lb-x64
+src-tauri/lb-sidecar/web/
+src-tauri/lb-sidecar/LB_VERSION
 .env
 .env.*
 !.env.example

@@ -12,11 +12,17 @@
 // code is identical between runtimes. Channel args arrive as
 // {"__bridge_channel": "<uuid>"} markers; the bridge creates the queue up
 // front and hands run_loop a real Channel wired into it.
+//
+// VICUNA_TEST_RESOURCE_DIR (test-only): when set, browser_* commands
+// resolve the bundled `lb` from that dir as if it were the app resource
+// root — this is how the bundled (no-PATH) path is verified headlessly
+// (see /tmp/vicuna-browser-bundled.sh).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
 
+use vicuna_lib::browser::BrowserState;
 use vicuna_lib::mcp::McpManager;
 use vicuna_lib::work_agent::{
     agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, run_loop, ChatSnapshot,
@@ -33,6 +39,7 @@ pub struct BridgeState {
     pub bg: Arc<BgExecState>,
     pub mcp: McpManager,
     pub agent: WorkAgentState,
+    pub browser: BrowserState,
     pub events: EventQueues,
 }
 
@@ -42,6 +49,7 @@ impl Default for BridgeState {
             bg: Arc::new(BgExecState::default()),
             mcp: McpManager::default(),
             agent: WorkAgentState::default(),
+            browser: BrowserState::default(),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -90,6 +98,14 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
 
 fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Test-only resource root for browser_* (see header comment).
+fn test_resource_dir() -> Option<std::path::PathBuf> {
+    std::env::var("VICUNA_TEST_RESOURCE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -300,6 +316,20 @@ async fn dispatch(
             Ok(serde_json::Value::Null)
         }
         // ----- registry fetch (no CORS in Rust) -----
+        "browser_status" => {
+            Ok(serde_json::json!(
+                vicuna_lib::browser::browser_status_logic(test_resource_dir(), &st.browser).await?
+            ))
+        }
+        "browser_start" => {
+            Ok(serde_json::json!(
+                vicuna_lib::browser::browser_start_logic(test_resource_dir(), &st.browser).await?
+            ))
+        }
+        "browser_stop" => Ok(serde_json::json!(vicuna_lib::browser::browser_stop_logic(&st.browser).await?)),
+        "browser_mcp_command" => {
+            Ok(serde_json::json!(vicuna_lib::browser::browser_mcp_command(test_resource_dir().as_deref())?))
+        }
         "ollama_fetch_text" => {
             Ok(serde_json::json!(vicuna_lib::ollama_fetch_text_logic(s("url")?).await?))
         }

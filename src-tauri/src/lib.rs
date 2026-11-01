@@ -16,6 +16,7 @@ use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+pub mod browser;
 pub mod mcp;
 pub mod work_agent;
 #[cfg(windows)]
@@ -3102,6 +3103,9 @@ struct AppQuitState {
 /// Kill everything Vicuna started: a self-launched `ollama serve` plus all
 /// terminal ptys. Best-effort — never fails the quit path.
 fn shutdown_children(app: &AppHandle) {
+    if let Some(s) = app.try_state::<browser::BrowserState>() {
+        browser::kill_owned(&s);
+    }
     if let Some(s) = app.try_state::<OllamaServerState>() {
         if let Ok(mut g) = s.child.lock() {
             if let Some(mut child) = g.take() {
@@ -3319,6 +3323,46 @@ async fn mcp_login_present(id: String) -> Result<bool, String> {
     Ok(mcp::auth_present(&name))
 }
 
+/// ---------- Browser tab: `lb` (live-browser) sidecar daemon ----------
+///
+/// The daemon (Chrome via CDP + JSON API + Svelte UI) is the shared engine:
+/// the side-panel tab iframes its web UI while the Work agent drives the
+/// same tabs through `lb mcp`. Adopt-or-spawn + owned-only stop, exactly
+/// like `ollama serve` above. The headless bridge reuses the `*_logic`
+/// fns in `browser.rs` with no resource dir (PATH resolution only).
+
+fn browser_resource_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().resource_dir().ok()
+}
+
+#[tauri::command]
+async fn browser_status(
+    app: AppHandle,
+    state: State<'_, browser::BrowserState>,
+) -> Result<browser::BrowserStatus, String> {
+    browser::browser_status_logic(browser_resource_dir(&app), &state).await
+}
+
+#[tauri::command]
+async fn browser_start(
+    app: AppHandle,
+    state: State<'_, browser::BrowserState>,
+) -> Result<browser::BrowserStatus, String> {
+    browser::browser_start_logic(browser_resource_dir(&app), &state).await
+}
+
+#[tauri::command]
+async fn browser_stop(state: State<'_, browser::BrowserState>) -> Result<browser::BrowserStatus, String> {
+    browser::browser_stop_logic(&state).await
+}
+
+/// Absolute `lb mcp` argv for the default `browser` MCP server entry.
+#[tauri::command]
+async fn browser_mcp_command(app: AppHandle) -> Result<Vec<String>, String> {
+    let dir = browser_resource_dir(&app);
+    browser::browser_mcp_command(dir.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3331,6 +3375,7 @@ pub fn run() {
         .manage(BgExecState::default())
         .manage(work_agent::WorkAgentState::default())
         .manage(AppQuitState::default())
+        .manage(browser::BrowserState::default())
         .manage(mcp::McpManager::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),
@@ -3392,6 +3437,10 @@ pub fn run() {
             mcp_signin,
             mcp_signout,
             mcp_login_present,
+            browser_status,
+            browser_start,
+            browser_stop,
+            browser_mcp_command,
             work_agent::work_agent_start,
             work_agent::work_agent_stop,
             work_agent::work_agent_queue,

@@ -34,6 +34,9 @@ jobs:
 
       - run: npm run check
 
+      - name: Fetch lb browser sidecar (pinned)
+        run: sh scripts/fetch-lb-sidecar.sh
+
       - run: npx tauri build --target universal-apple-darwin --bundles dmg
 
       - name: Upload DMG to rolling release
@@ -89,6 +92,10 @@ jobs:
 
       - run: npm ci
 
+      - name: Fetch lb browser sidecar (pinned)
+        shell: bash
+        run: sh scripts/fetch-lb-sidecar.sh
+
       # nsis = single self-contained setup.exe (the default "all" target
       # would also build an .msi, which needs a WiX toolchain on the runner)
       - run: npx tauri build --bundles nsis
@@ -124,6 +131,9 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - run: npm ci
+
+      - name: Fetch lb browser sidecar (pinned)
+        run: sh scripts/fetch-lb-sidecar.sh
 
       - run: npx tauri build --bundles appimage,deb
 

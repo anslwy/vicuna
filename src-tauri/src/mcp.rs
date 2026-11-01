@@ -178,10 +178,17 @@ async fn stdio_request(
         .map_err(|e| format!("mcp: failed flushing to server: {e}"))?;
     loop {
         let mut buf = String::new();
-        timeout(per_call_timeout, reader.read_line(&mut buf))
+        let n = timeout(per_call_timeout, reader.read_line(&mut buf))
             .await
             .map_err(|_| format!("mcp: timed out waiting for '{method}' response"))?
             .map_err(|e| format!("mcp: failed reading from server: {e}"))?;
+        if n == 0 {
+            // EOF: the child exited (crash? Gatekeeper kill?) — fail now
+            // instead of spinning on empty reads until the timeout.
+            return Err(format!(
+                "mcp: server exited before answering '{method}' (run the command in a terminal for details)"
+            ));
+        }
         if buf.trim().is_empty() {
             continue;
         }
@@ -451,10 +458,11 @@ impl McpManager {
                 .await
                 .map_err(|_| {
                     format!(
-                        "mcp: '{}' did not answer initialize in time",
-                        cfg.name
+                        "mcp: '{}' did not answer initialize in time (spawned {})",
+                        cfg.name, argv[0]
                     )
-                })??;
+                })?
+                .map_err(|e| format!("{e} [{}]", argv[0]))?;
                 if init.get("protocolVersion").is_none() {
                     let _ = child.start_kill();
                     return Err(format!("mcp: '{}' gave a bad initialize reply", cfg.name));
@@ -2083,5 +2091,36 @@ mod oauth_tests {
         assert_eq!(entry.client_id, "static-client");
         assert_eq!(entry.access_token, "test-access-1");
         std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn dead_stdio_child_fails_fast() {
+        // an instant-exit command must surface "exited" immediately — EOF
+        // used to spin on empty reads until the 20s timeout (the mystery
+        // "did not answer initialize in time" hang on dead children)
+        #[cfg(windows)]
+        let argv = vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()];
+        #[cfg(not(windows))]
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()];
+        let cfg = McpServerConfig {
+            id: "dead".to_string(),
+            name: "dead".to_string(),
+            transport: "stdio".to_string(),
+            command: Some(argv),
+            env: None,
+            url: None,
+            headers: None,
+            oauth: None,
+            enabled: true,
+        };
+        let mgr = McpManager::default();
+        let t = std::time::Instant::now();
+        let err = mgr.connect(&cfg).await.unwrap_err();
+        assert!(err.contains("exited before answering"), "{err}");
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "must fail fast, took {:?}",
+            t.elapsed()
+        );
     }
 }
