@@ -235,6 +235,20 @@ export const WORK_TOOLS = [
         }
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "fetch_url",
+      description: "Fetch a public web page (http/https) as plain text — use after a web search to read the linked article instead of answering from snippets. HTML is stripped, 64KB cap.",
+      parameters: {
+        type: "object",
+        required: ["url"],
+        properties: {
+          url: { type: "string", description: "full http(s) URL to fetch" }
+        }
+      }
+    }
   }
 ];
 
@@ -736,6 +750,13 @@ export async function dispatchWorkTool(
         );
         return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
       }
+      case "fetch_url": {
+        if (!str(a.url)) return "Error: fetch_url needs {\"url\": \"...\"}.";
+        const res = await invokeCmd<{ content: string; truncated: boolean; size: number }>(
+          "work_fetch_url", { url: str(a.url) }
+        );
+        return res.content + (res.truncated ? `\n…[truncated, ${res.size} chars total]` : "");
+      }
       case "view_image": {
         if (!str(a.path)) return "Error: view_image needs {\"path\": \"...\"}.";
         if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
@@ -760,9 +781,9 @@ export async function dispatchWorkTool(
         // the call instead of the turn dying.
         const maybeCmd = (call.args as any)?.command;
         if (typeof maybeCmd === "string" && maybeCmd.trim()) {
-          return `Error: unknown tool "${call.name}". There is no ${call.name} tool — run shell commands with exec instead, e.g. {"command": ${JSON.stringify(maybeCmd.trim())}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
+          return `Error: unknown tool "${call.name}". There is no ${call.name} tool — run shell commands with exec instead, e.g. {"command": ${JSON.stringify(maybeCmd.trim())}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.`;
         }
-        return `Error: unknown tool "${call.name}". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.`;
+        return `Error: unknown tool "${call.name}". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.`;
       }
     }
   } catch (e: any) {
@@ -789,6 +810,7 @@ export function toolLabel(name: string, args: Record<string, any>): string {
     name === "sessions" ? String(args.query ?? "") :
     name === "read_session" ? String(args.id ?? "") :
     name === "read_upload" ? String(args.name ?? "") :
+    name === "fetch_url" ? String(args.url ?? "") :
     name === "say" ? String(args.text ?? "") :
     name === "ask" ? String(args.question ?? "") : JSON.stringify(args);
   return `${name} — ${argSummary.slice(0, 120)}`;
@@ -855,6 +877,10 @@ export function formatToolActivity(name: string, args: Record<string, any>): str
     case "read_upload": {
       const n = clean(args.name, 60);
       return n ? `Reading attached file \`${n}\`…` : "Reading an attached file…";
+    }
+    case "fetch_url": {
+      const u = clean(args.url, 60);
+      return u ? `Fetching \`${u}\`…` : "Fetching a page…";
     }
     default: return null;
   }

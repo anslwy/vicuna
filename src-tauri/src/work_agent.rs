@@ -28,9 +28,10 @@ use tokio::sync::oneshot;
 use super::{
     bg_kill, bg_list, bg_snapshot, bg_start, parse_show_context_length,
     upload_read_file_logic as upload_read_file, work_exec_logic as work_exec,
-    work_grep_logic as work_grep, work_list_dir_logic as work_list_dir,
-    work_read_file_logic as work_read_file, work_read_image_logic as work_read_image,
-    work_write_file_logic as work_write_file, BgExecState, ChatMessage, OLLAMA_BASE,
+    work_fetch_url_logic as work_fetch_url, work_grep_logic as work_grep,
+    work_list_dir_logic as work_list_dir, work_read_file_logic as work_read_file,
+    work_read_image_logic as work_read_image, work_write_file_logic as work_write_file,
+    BgExecState, ChatMessage, OLLAMA_BASE,
 };
 use crate::mcp::McpManager;
 
@@ -359,6 +360,7 @@ fn tool_label(name: &str, args: &serde_json::Value) -> String {
         "read_upload" => args.get("name").and_then(|v| v.as_str()).unwrap_or(""),
         "say" => args.get("text").and_then(|v| v.as_str()).unwrap_or(""),
         "ask" => args.get("question").and_then(|v| v.as_str()).unwrap_or(""),
+        "fetch_url" => args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
     };
     let short: String = summary.chars().take(120).collect();
@@ -876,6 +878,24 @@ async fn dispatch_tool(
                 Err(e) => format!("Error: {e}"),
             }
         }
+        "fetch_url" => {
+            let u = str_arg(args, "url");
+            if u.is_empty() {
+                return "Error: fetch_url needs {\"url\": \"...\"}.".to_string();
+            }
+            match work_fetch_url(u).await {
+                Ok(c) => format!(
+                    "{}{}",
+                    c.content,
+                    if c.truncated {
+                        format!("\n…[truncated, {} chars total]", c.size)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Err(e) => format!("Error: {e}"),
+            }
+        }
         _ => {
             if let Some(route) = mcp_routes.get(name) {
                 match mcp.call_tool(&route.server_id, &route.tool_name, args.clone()).await {
@@ -892,11 +912,11 @@ async fn dispatch_tool(
                 let maybe_cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                 if !maybe_cmd.is_empty() {
                     format!(
-                        "Error: unknown tool \"{name}\". There is no {name} tool — run shell commands with exec instead, e.g. {{\"command\": {}}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.",
+                        "Error: unknown tool \"{name}\". There is no {name} tool — run shell commands with exec instead, e.g. {{\"command\": {}}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.",
                         serde_json::json!(maybe_cmd)
                     )
                 } else {
-                    format!("Error: unknown tool \"{name}\". Available: list, read, view_image, grep, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, say, ask.")
+                    format!("Error: unknown tool \"{name}\". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.")
                 }
             }
         }

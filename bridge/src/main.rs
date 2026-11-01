@@ -189,6 +189,9 @@ async fn dispatch(
                 vicuna_lib::work_grep_logic(s("root")?, s("pattern")?, include).await?
             ))
         }
+        "work_fetch_url" => {
+            Ok(serde_json::json!(vicuna_lib::work_fetch_url_logic(s("url")?).await?))
+        }
         "work_write_file" => {
             Ok(serde_json::json!(
                 vicuna_lib::work_write_file_logic(s("root")?, s("path")?, s("content")?).await?
