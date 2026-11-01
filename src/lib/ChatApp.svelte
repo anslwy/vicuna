@@ -3,6 +3,7 @@
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { renderMarkdown } from "$lib/markdown";
+  import "katex/dist/katex.min.css";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
   import {
@@ -684,7 +685,10 @@
   function assembleMcpTools(): { tools: import("$lib/ollama").OllamaToolDef[]; route: Map<string, { server: McpServerConfig; name: string }> } {
     const tools: import("$lib/ollama").OllamaToolDef[] = [];
     const route = new Map<string, { server: McpServerConfig; name: string }>();
-    const builtin = new Set(WORK_TOOLS.map((t) => t.function.name));
+    // "done" is reserved too: the Goal Mode self-stop owns the bare name, so
+    // an MCP tool sanitizing to it must take the prefixed form — otherwise the
+    // backend would swallow the call as a goal self-stop instead of routing it.
+    const builtin = new Set([...WORK_TOOLS.map((t) => t.function.name), "done"]);
     const seen = new Set<string>(builtin);
     for (const s of mcpServers) {
       const live = mcpLive[s.id];
@@ -4508,7 +4512,8 @@
     // MCP tools (Work mode only): same assembly as before — connected
     // servers lend extra tools alongside the built-in workspace ones.
     const mcp = assembleMcpTools();
-    const allTools = [...WORK_TOOLS, ...(startGoal && !startGoal.paused ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
+    const goalOffered = startGoal != null && !startGoal.paused;
+    const allTools = [...WORK_TOOLS, ...(goalOffered ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
     const routes: Record<string, McpRoute> = {};
     for (const [k, v] of mcp.route) routes[k] = { server_id: v.server.id, tool_name: v.name };
     const think = effectiveThink();
@@ -4676,9 +4681,11 @@
               t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) };
               chats = [...chats];
             }
-            if (ev.name === "done" && t && t.goal) {
+            if (ev.name === "done" && goalOffered && t && t.goal) {
               // self-stop (goal mode): the model declared the objective met —
-              // retire the goal and settle the turn with no wrap-up
+              // retire the goal and settle the turn with no wrap-up. Gated on
+              // the turn actually offering `done`: a stray call answered with
+              // an error must never retire a goal set mid-turn.
               t.goal = null;
               chats = [...chats];
             }

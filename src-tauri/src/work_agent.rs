@@ -137,6 +137,26 @@ fn tool_key(name: &str, args: &serde_json::Value) -> String {
     format!("{name}\n{args}")
 }
 
+/// Repeat-guard key: `done` dedups by name alone. A model that signs off
+/// with a fresh summary each round would otherwise never trip the guard
+/// (every key differs) and — with no round cap — loop forever on the
+/// stray-done error below. Goal-mode `done` always ends the turn on first
+/// sight, so this only affects unoffered calls.
+fn seen_key(name: &str, args: &serde_json::Value) -> String {
+    if name == "done" {
+        "done".to_string()
+    } else {
+        tool_key(name, args)
+    }
+}
+
+/// Mirror of the frontend offer condition (`startGoal && !startGoal.paused`,
+/// where chatGoal needs non-empty text): `done` is only a real tool while
+/// an unpaused session goal is set.
+fn goal_done_offered(goal_text: &Option<String>, goal_paused: bool) -> bool {
+    goal_text.as_ref().is_some_and(|g| !g.is_empty()) && !goal_paused
+}
+
 fn estimate_tokens(messages: &[ChatMessage], tools: &Option<serde_json::Value>) -> usize {
     let mut n = 0usize;
     for m in messages {
@@ -1182,7 +1202,7 @@ pub async fn run_loop(
         let fresh: Vec<(String, serde_json::Value)> = calls
             .into_iter()
             .filter(|(n, a)| {
-                let k = tool_key(n, a);
+                let k = seen_key(n, a);
                 if seen.contains(&k) {
                     false
                 } else {
@@ -1225,6 +1245,25 @@ pub async fn run_loop(
                 break;
             }
             if name == "done" {
+                // Self-stop only exists in Goal Mode. Models sometimes emit
+                // `done` + summary uninvited on goal-free turns (verified:
+                // gemma4-cloud signs off that way) — honoring it would abort
+                // the turn mid-round, skipping the remaining calls with no
+                // wrap-up. Answer it as an error instead so the round
+                // continues like any other unknown tool.
+                if !goal_done_offered(&goal_text, goal_paused) {
+                    let msg = "Error: there is no \"done\" tool in this turn (it only exists while a session goal is set). Do not call \"done\" again — continue with the available tools, or reply with no further tool calls when finished.".to_string();
+                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::ToolStart { name: name.clone(), args: args.clone() });
+                    native.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: msg.clone(),
+                        images: None,
+                        tool_calls: None,
+                        tool_name: Some("done".to_string()),
+                    });
+                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::ToolEnd { name, output: msg });
+                    continue;
+                }
                 let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("Done.").trim().to_string();
                 let summary = if summary.is_empty() { "Done.".to_string() } else { summary };
                 native.push(ChatMessage {
@@ -1485,6 +1524,25 @@ mod agent_tests {
         let out = search_sessions(&chats, "project", 8);
         assert!(out.contains("abc"));
         assert_eq!(search_sessions(&chats, "zzz-no-match", 8), "No matching sessions.");
+    }
+
+    #[test]
+    fn done_offered_only_with_unpaused_goal() {
+        assert!(goal_done_offered(&Some("ship it".to_string()), false));
+        assert!(!goal_done_offered(&None, false));
+        assert!(!goal_done_offered(&Some("ship it".to_string()), true));
+        assert!(!goal_done_offered(&Some(String::new()), false));
+    }
+
+    #[test]
+    fn done_dedups_by_name_alone() {
+        let a = serde_json::json!({"summary": "first"});
+        let b = serde_json::json!({"summary": "second"});
+        assert_eq!(seen_key("done", &a), seen_key("done", &b));
+        let r1 = serde_json::json!({"path": "a.txt"});
+        let r2 = serde_json::json!({"path": "b.txt"});
+        assert_ne!(seen_key("read", &r1), seen_key("read", &r2));
+        assert_eq!(seen_key("read", &r1), tool_key("read", &r1));
     }
 
     /// Headless end-to-end: drive the real loop (real Ollama, real FS tools)
