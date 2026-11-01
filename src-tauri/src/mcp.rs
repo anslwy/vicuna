@@ -356,8 +356,36 @@ fn parse_tools(result: &serde_json::Value) -> Result<Vec<McpToolInfo>, String> {
     Ok(tools)
 }
 
-/// MCP `tools/call` content blocks flattened to plain text. Binary blocks
-/// become placeholders so giant payloads never enter the model context.
+/// Base64 cap for MCP image blocks passed to vision (~3MB decoded).
+/// Screenshots are tens of KB; beyond this the bytes stay out of the
+/// model context (which re-sends images every round of the turn).
+const MCP_IMAGE_B64_CAP: usize = 4_000_000;
+
+/// One MCP image block → vision marker + caption, or a placeholder when
+/// the bytes can't ride along (empty, non-image mime, over the cap).
+fn flatten_image(it: &serde_json::Value) -> String {
+    let data = it.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let mime = it.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+    if data.is_empty() || !mime.starts_with("image/") {
+        return "[image content omitted]".to_string();
+    }
+    let approx_kb = data.len() * 3 / 4096;
+    if data.len() > MCP_IMAGE_B64_CAP {
+        return format!("[image omitted: ~{approx_kb}KB exceeds the vision cap]");
+    }
+    // servers may wrap base64 in newlines; data URLs must not contain them
+    let flat: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    format!(
+        "image (~{approx_kb}KB, {mime}) — picture sent as vision input; describe what you see.\n[[VICUNA_IMAGE:data:{mime};base64,{flat}]]"
+    )
+}
+
+/// MCP `tools/call` content blocks flattened to plain text. Image blocks
+/// become `[[VICUNA_IMAGE:...]]` markers (same shape as `view_image`):
+/// the agent loop strips them from the display/tool transcript and re-feeds
+/// the pictures as Ollama `images[]`, so vision models actually see MCP
+/// screenshots. Oversized/unsupported images stay placeholders so giant
+/// payloads never enter the model context.
 fn flatten_content(result: &serde_json::Value) -> (String, bool) {
     let is_error = result
         .get("isError")
@@ -374,7 +402,8 @@ fn flatten_content(result: &serde_json::Value) -> (String, bool) {
                         .unwrap_or("")
                         .to_string(),
                 ),
-                "image" | "audio" => parts.push(format!("[{kind} content omitted]")),
+                "image" => parts.push(flatten_image(it)),
+                "audio" => parts.push("[audio content omitted]".to_string()),
                 "resource" => {
                     let embedded = it.get("resource").cloned().unwrap_or_default();
                     let text = embedded
@@ -429,6 +458,8 @@ impl McpManager {
                 if let Some(env) = cfg.env.as_ref() {
                     cmd.envs(env);
                 }
+                #[cfg(windows)]
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
                 let mut child = cmd.spawn().map_err(|e| {
                     format!("mcp: could not spawn '{}': {e}", argv.join(" "))
                 })?;
@@ -1566,6 +1597,53 @@ mod config_tests {
             oauth: None,
             enabled,
         }
+    }
+
+    #[test]
+    fn flatten_content_routes_images_to_vision() {
+        let r = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "screenshot (14KB JPEG)"},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/jpeg"},
+                {"type": "audio", "data": "xyz", "mimeType": "audio/mp3"},
+            ]
+        });
+        let (text, is_error) = flatten_content(&r);
+        assert!(!is_error);
+        assert!(text.contains("screenshot (14KB JPEG)"), "{text}");
+        assert!(
+            text.contains("[[VICUNA_IMAGE:data:image/jpeg;base64,aGVsbG8=]]"),
+            "{text}"
+        );
+        assert!(text.contains("vision input"), "{text}");
+        assert!(text.contains("[audio content omitted]"), "{text}");
+        assert!(!text.contains("[image content omitted]"), "{text}");
+    }
+
+    #[test]
+    fn flatten_content_unwraps_wrapped_base64() {
+        let r = serde_json::json!({"content": [
+            {"type": "image", "data": "aGVs\nbG8=\n", "mimeType": "image/png"},
+        ]});
+        let (text, _) = flatten_content(&r);
+        assert!(
+            text.contains("[[VICUNA_IMAGE:data:image/png;base64,aGVsbG8=]]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn flatten_content_omits_oversize_and_foreign_images() {
+        let big = "A".repeat(MCP_IMAGE_B64_CAP + 1);
+        let r = serde_json::json!({"content": [
+            {"type": "image", "data": big, "mimeType": "image/png"},
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "application/pdf"},
+            {"type": "image", "data": "", "mimeType": "image/png"},
+        ]});
+        let (text, _) = flatten_content(&r);
+        assert!(!text.contains("VICUNA_IMAGE"), "{text}");
+        assert!(text.contains("exceeds the vision cap"), "{text}");
+        assert!(text.contains("[image content omitted]"), "{text}");
     }
 
     #[test]

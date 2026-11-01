@@ -68,6 +68,10 @@ pub struct BrowserState {
     /// live daemon leaves the old image running (old recover behavior
     /// included) with no other visible signal.
     spawned_version: Mutex<Option<String>>,
+    /// On-disk identity (length + mtime) snapshot at spawn: the status
+    /// fast-path skips the `--version` re-probe while it matches, so the
+    /// 3s tab poll doesn't spawn a process every tick.
+    spawned_id: Mutex<Option<(u64, u64)>>,
 }
 
 fn remember_bin(state: &BrowserState, bin: &Path) {
@@ -349,14 +353,29 @@ pub fn parse_lb_version(out: &str) -> Option<String> {
     }
 }
 
+/// Identity of the on-disk binary (length + mtime secs). Pure stat,
+/// no spawn — the skew fast-path in status.
+fn bin_id(bin: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(bin).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((meta.len(), mtime))
+}
+
 /// `bin --version`, best-effort (failures mean "unknown", never fatal).
 async fn probe_lb_version(bin: &Path) -> Option<String> {
-    let run = tokio::process::Command::new(bin)
-        .arg("--version")
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
+    let run = cmd.output();
     let out = tokio::time::timeout(Duration::from_secs(5), run).await.ok()?.ok()?;
     if !out.status.success() {
         return None;
@@ -433,9 +452,16 @@ pub async fn browser_status_logic(
         let spawned = state.spawned_version.lock().ok().and_then(|g| g.clone());
         if spawned.is_some() {
             if let Some((bin, _)) = resolved.as_ref() {
-                let current = probe_lb_version(bin).await;
-                stale_warning = stale_engine_warning(spawned.as_deref(), current.as_deref());
-                engine_stale = stale_warning.is_some();
+                // fast path: an unchanged binary can't have a new version,
+                // so skip the `--version` spawn (a spawn on every 3s poll
+                // flashes a console window on Windows). Any stat mismatch
+                // — or unknown snapshot — falls through to the probe.
+                let spawned_id = state.spawned_id.lock().ok().and_then(|g| g.clone());
+                if spawned_id != bin_id(bin) {
+                    let current = probe_lb_version(bin).await;
+                    stale_warning = stale_engine_warning(spawned.as_deref(), current.as_deref());
+                    engine_stale = stale_warning.is_some();
+                }
             }
         }
     }
@@ -509,6 +535,10 @@ pub async fn browser_start_logic(
                 if let Ok(mut g) = state.spawned_version.lock() {
                     *g = version;
                 }
+                let id = bin_id(&bin);
+                if let Ok(mut g) = state.spawned_id.lock() {
+                    *g = id;
+                }
                 return browser_status_logic(resource_dir, state).await;
             }
             Err(e) => {
@@ -578,12 +608,14 @@ async fn spawn_attempt(
 /// its Chromium). Only ever called for OUR child (checked alive first —
 /// the port is ours then, so `stop` can't hit a foreign daemon).
 async fn graceful_stop(bin: &Path) {
-    let run = tokio::process::Command::new(bin)
-        .args(["web", "--port", &lb_port().to_string(), "stop"])
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["web", "--port", &lb_port().to_string(), "stop"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
+    let run = cmd.output();
     let _ = tokio::time::timeout(Duration::from_secs(15), run).await;
 }
 
@@ -613,6 +645,9 @@ pub async fn browser_stop_logic(state: &BrowserState) -> Result<BrowserStatus, S
     };
     let was_alive = matches!(taken.try_wait(), Ok(None));
     if let Ok(mut g) = state.spawned_version.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.spawned_id.lock() {
         g.take();
     }
     if let Some(bin) = owned_bin(state) {
@@ -875,6 +910,20 @@ mod tests {
         assert_eq!(parse_lb_version("garbage\n"), None);
         assert_eq!(parse_lb_version(""), None);
         assert_eq!(parse_lb_version("lb\n"), None);
+    }
+
+    #[test]
+    fn bin_id_tracks_identity() {
+        let dir = std::env::temp_dir().join("vicuna-lb-id");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("lb");
+        std::fs::write(&f, "x").expect("write fake lb");
+        let id = bin_id(&f).expect("stat must work");
+        assert_eq!(bin_id(&f), Some(id), "same file, same id");
+        assert_eq!(bin_id(&dir.join("missing")), None);
+        std::fs::write(&f, "longer bytes").expect("rewrite");
+        assert_ne!(bin_id(&f), Some(id), "changed file, changed id");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
