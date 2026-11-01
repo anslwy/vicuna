@@ -87,6 +87,11 @@ pub struct LbHealth {
     pub browser_alive: bool,
     pub probe: String,
     pub tabs: u64,
+    /// Whether the daemon actually serves its UI files. A daemon can
+    /// outlive its own UI (app reinstall under a live daemon orphans
+    /// ServeDir's startup-resolved root: `/` still 200s while every
+    /// asset 404s → blank tab on a "healthy" daemon).
+    pub ui_ok: bool,
 }
 
 /// Parse + validate one `/api/health` body. Split from the fetch so the
@@ -108,6 +113,8 @@ pub fn parse_health_body(body: &str) -> Result<LbHealth, String> {
             .unwrap_or(false),
         probe: probe.to_string(),
         tabs: v.get("tabs").and_then(|t| t.as_u64()).unwrap_or(0),
+        // pure default; `probe_daemon` overwrites with the live check
+        ui_ok: true,
     })
 }
 
@@ -306,9 +313,22 @@ async fn probe_daemon(client: &reqwest::Client) -> Probe {
     };
     let body = res.text().await.unwrap_or_default();
     match parse_health_body(&body) {
-        Ok(h) => Probe::Lb(h),
+        Ok(mut h) => {
+            h.ui_ok = ui_servable(client).await;
+            Probe::Lb(h)
+        }
         Err(e) => Probe::Foreign(e),
     }
+}
+
+/// `globe.svg` is a stable dist filename, so a 200 proves the daemon's
+/// UI root is intact; 404 means startup-resolved files are gone (app
+/// reinstall under a live daemon) and the tab would render blank.
+async fn ui_servable(client: &reqwest::Client) -> bool {
+    matches!(
+        client.get(format!("{}/globe.svg", lb_server_url())).send().await,
+        Ok(r) if r.status().is_success()
+    )
 }
 
 fn probe_client() -> reqwest::Client {
@@ -618,6 +638,74 @@ pub async fn browser_restart_logic(
     browser_start_logic(resource_dir, state).await
 }
 
+/// Force-stop whatever `lb` answers on our port (owned or adopted) and
+/// start our own daemon. The frontend confirms first: this kills foreign
+/// sessions (user's terminal, another app) and their tabs. Refuses
+/// foreign (non-lb) occupants — killing those is never our call. Uses
+/// the RESOLVED binary's `kill` (pidfile/port-scoped, so the victim's
+/// version doesn't matter), falling back to `web --port P stop` for
+/// pre-`kill` binaries, and errors (instead of adopting) when the port
+/// still serves lb afterwards.
+pub async fn browser_takeover_logic(
+    resource_dir: Option<PathBuf>,
+    state: &BrowserState,
+) -> Result<BrowserStatus, String> {
+    let client = probe_client();
+    match probe_daemon(&client).await {
+        Probe::Free => {}
+        Probe::Foreign(e) => {
+            return Err(format!(
+                "port {} is busy ({e}) — stop it first; takeover only stops live-browser",
+                lb_port()
+            ));
+        }
+        Probe::Lb(_) => {
+            force_stop_port_lb(resource_dir.as_deref()).await;
+            if matches!(probe_daemon(&client).await, Probe::Lb(_)) {
+                return Err(format!(
+                    "could not stop the browser on port {} — stop it in its terminal (`lb web --port {} stop`) and retry",
+                    lb_port(),
+                    lb_port()
+                ));
+            }
+        }
+    }
+    // our own child handle (if any) is stale now — drop it so the fresh
+    // spawn below re-tracks from clean state.
+    if let Ok(mut g) = state.child.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.spawned_version.lock() {
+        g.take();
+    }
+    browser_start_logic(resource_dir, state).await
+}
+
+/// `bin kill --port P` against whoever holds our port (never our tracked
+/// child specifically — that's the point), `web stop` fallback for
+/// pre-`kill` binaries.
+async fn force_stop_port_lb(resource_dir: Option<&Path>) {
+    let bin = resource_dir
+        .and_then(|r| resolve_lb_bin(Some(r)))
+        .or_else(|| resolve_lb_bin(None))
+        .map(|(p, _)| p);
+    let bin = match bin {
+        Some(b) => b,
+        None => return,
+    };
+    let kill = tokio::process::Command::new(&bin)
+        .args(["kill", "--port", &lb_port().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match tokio::time::timeout(Duration::from_secs(20), kill).await {
+        Ok(Ok(out)) if out.status.success() => return,
+        _ => {}
+    }
+    graceful_stop(&bin).await;
+}
+
 /// Absolute `lb mcp` argv for the default `browser` MCP server entry.
 /// Absolute paths pass `McpManager`'s resolver straight through, which is
 /// what makes the bundled (non-PATH) binary work as an MCP command.
@@ -662,7 +750,7 @@ mod tests {
         .expect("lb health must parse");
         assert_eq!(
             h,
-            LbHealth { browser_alive: true, probe: "ok".to_string(), tabs: 3 }
+            LbHealth { browser_alive: true, probe: "ok".to_string(), tabs: 3, ui_ok: true }
         );
     }
 

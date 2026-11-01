@@ -19,6 +19,9 @@ export interface LbHealth {
   browser_alive: boolean;
   probe: string;
   tabs: number;
+  /** false when the daemon answers but its UI files 404 (reinstall under
+   *  a live daemon). Optional: older backends omit it — treat missing as ok. */
+  ui_ok?: boolean;
 }
 
 export interface BrowserStatus {
@@ -46,6 +49,10 @@ export async function browserStop(): Promise<BrowserStatus> {
 
 export async function browserRestart(): Promise<BrowserStatus> {
   return await invokeOrBridge<BrowserStatus>("browser_restart", {});
+}
+
+export async function browserTakeover(): Promise<BrowserStatus> {
+  return await invokeOrBridge<BrowserStatus>("browser_takeover", {});
 }
 
 /** Absolute `lb mcp` argv for the default `browser` MCP entry. */

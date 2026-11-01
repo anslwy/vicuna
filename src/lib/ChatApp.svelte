@@ -36,7 +36,8 @@
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
-  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
+  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
+  import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -3788,6 +3789,11 @@
   let browserDaemon = $state<BrowserStatus | null>(null);
   let browserStarting = $state(false);
   let browserError = $state<string | null>(null);
+  /** starting-view label: plain starts vs button restarts/takeovers. */
+  let browserStartLabel = $state("Starting browser…");
+  /** iframe key: bumped whenever the daemon behind a live frame is (re)started,
+   *  so the frame re-navigates instead of sitting on a failed navigation. */
+  let browserFrameRev = $state(0);
   /** lb UI url + Vicuna theme/accent: lb reads `?theme=`/`?accent=`/
    *  `?accentfg=` pre-paint (older lb builds ignore unknown params and fall
    *  back to their saved theme + built-in greens). Derived from
@@ -3800,8 +3806,18 @@
     return `${browserDaemon?.url ?? LB_URL}/?theme=${theme}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
   });
 
-  /** status → start when down. Throws on failure (callers surface it). */
-  async function ensureBrowserDaemon(): Promise<BrowserStatus> {
+  /** status → start when down. Throws on failure (callers surface it).
+   *  Concurrent callers share one in-flight drive (tab-open + visible-tab
+   *  ensure + poll can all fire together) instead of stacking spawns. */
+  let browserDrive: Promise<BrowserStatus> | null = null;
+  function ensureBrowserDaemon(): Promise<BrowserStatus> {
+    browserDrive ??= driveBrowserDaemon().finally(() => {
+      browserDrive = null;
+    });
+    return browserDrive;
+  }
+  async function driveBrowserDaemon(): Promise<BrowserStatus> {
+    browserStartLabel = "Starting browser…";
     browserStarting = true;
     browserError = null;
     try {
@@ -3848,10 +3864,15 @@
   /** full stop + start of an owned daemon (stale engine / wedged
    *  browser). Refuses adopted daemons — the backend owns that refusal. */
   async function restartBrowserDaemon() {
+    // swap the view instantly: the stop + start takes seconds, and the
+    // stale frame meanwhile reads as "nothing happens"
+    browserStartLabel = "Restarting browser…";
+    browserDaemon = null;
     browserStarting = true;
     browserError = null;
     try {
       browserDaemon = await browserRestart();
+      browserFrameRev += 1;
     } catch (e: any) {
       browserError = e?.message ?? String(e);
       browserDaemon = null;
@@ -3859,6 +3880,126 @@
       browserStarting = false;
     }
   }
+
+  /** two-step arm for adopted takeovers (first click explains + arms,
+   *  second within 5s executes) — killing a foreign session must stay a
+   *  deliberate act, never a stray click. */
+  let browserKillArmed = $state(false);
+  let browserKillTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** tab-bar button: `lb start` when down, stop + start when owned,
+   *  confirmed kill + start when adopted. Failures flash a transient
+   *  notice instead of replacing a (possibly healthy) frame. */
+  async function restartBrowserFromButton() {
+    if (browserStarting) return;
+    let st: BrowserStatus | null = null;
+    try {
+      st = await browserStatus();
+    } catch {
+      /* fall through to ensure on last-known state */
+    }
+    const action = browserButtonAction(st ?? browserDaemon);
+    if (action === "start") {
+      // instant view swap (a stale running frame would sit blank meanwhile)
+      browserStartLabel = "Starting browser…";
+      browserDaemon = null;
+      const ok = await ensureBrowserDaemon().then(
+        () => true,
+        () => false
+      );
+      if (ok) browserFrameRev += 1;
+      return;
+    }
+    if (action === "restart") {
+      browserStartLabel = "Restarting browser…";
+      browserDaemon = null;
+      browserStarting = true;
+      try {
+        browserDaemon = await browserRestart();
+        browserError = null;
+        browserFrameRev += 1;
+      } catch (e: any) {
+        flashExpNotice(e?.message ?? String(e));
+        // restore truth instead of guessing: stop may have died mid-flight
+        browserDaemon = await browserStatus().catch(() => null);
+      } finally {
+        browserStarting = false;
+      }
+      return;
+    }
+    if (!browserKillArmed) {
+      browserKillArmed = true;
+      flashExpNotice(
+        "Browser was started outside Vicuna — click again to force-stop it and start Vicuna's own (its tabs will be lost)."
+      );
+      if (browserKillTimer) clearTimeout(browserKillTimer);
+      browserKillTimer = setTimeout(() => {
+        browserKillArmed = false;
+        browserKillTimer = null;
+      }, 5000);
+      return;
+    }
+    if (browserKillTimer) {
+      clearTimeout(browserKillTimer);
+      browserKillTimer = null;
+    }
+    browserKillArmed = false;
+    browserStartLabel = "Taking over browser…";
+    browserDaemon = null;
+    browserStarting = true;
+    try {
+      browserDaemon = await browserTakeover();
+      browserError = null;
+      browserFrameRev += 1;
+    } catch (e: any) {
+      flashExpNotice(e?.message ?? String(e));
+      browserDaemon = await browserStatus().catch(() => null);
+    } finally {
+      browserStarting = false;
+    }
+  }
+
+  /** one poll tick for a visible running tab (see browserPollAction). */
+  async function pollBrowserDaemon() {
+    if (browserStarting) return;
+    let st: BrowserStatus | null = null;
+    try {
+      st = await browserStatus();
+    } catch {
+      /* backend unreachable: keep the frame, retry next tick */
+    }
+    const action = browserPollAction(browserDaemon, st);
+    if (action === "update" && st) browserDaemon = st;
+    else if (action === "ensure") {
+      const ok = await ensureBrowserDaemon().then(
+        () => true,
+        () => false
+      );
+      if (browserPollRevived(action, ok)) browserFrameRev += 1;
+    }
+  }
+
+  // A visible Browser tab must converge to running: the daemon can die
+  // under a live tab (crash, kill, sleep) leaving a dead iframe with no
+  // recourse, so re-validate on every view and poll while up. Never
+  // revives while hidden; errors stay user-driven (Retry owns them).
+  let browserPoll: ReturnType<typeof setInterval> | null = null;
+  const browserTabVisible = $derived(
+    sideTabs.find((t) => t.key === activeSideTab)?.kind === "browser"
+  );
+  $effect(() => {
+    const visible = browserTabVisible;
+    const running = browserDaemon?.running === true;
+    if (visible && !running && !browserStarting && !browserError) {
+      void ensureBrowserDaemon().catch(() => {});
+    }
+    if (visible && running && !browserPoll) {
+      browserPoll = setInterval(() => void pollBrowserDaemon(), 5000);
+    } else if ((!visible || !running) && browserPoll) {
+      clearInterval(browserPoll);
+      browserPoll = null;
+    }
+  });
 
   /** side-panel tabs: focus the Browser view, creating it if closed */
   function openSideBrowser() {
@@ -6699,6 +6840,22 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
         </button>
         <div class="spacer"></div>
+        {#if browserTabVisible}
+          <button
+            class="icon-btn exp-btn"
+            class:browser-restarting={browserStarting}
+            class:browser-kill-armed={browserKillArmed}
+            data-testid="browser-restart-tab-btn"
+            aria-label={browserKillArmed ? "Confirm browser takeover" : "Start, restart, or take over the browser engine"}
+            title={browserKillArmed
+              ? "Click again to confirm: force-stop the foreign browser and start Vicuna's own"
+              : "Start the browser when down · restart when owned · force-stop + start when foreign (asks first)"}
+            disabled={browserStarting}
+            onclick={() => void restartBrowserFromButton()}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+          </button>
+        {/if}
         <button
           class="icon-btn exp-btn"
           data-testid="explorer-close"
@@ -6831,6 +6988,14 @@
       {/if}
           {:else if t.kind === "browser"}
             {#if browserDaemon?.running}
+              {#if browserDaemon.health?.ui_ok === false}
+                <div class="exp-empty browser-error" data-testid="browser-broken-ui">
+                  <span>Browser engine files changed while it was running (usually an app update) — the view can't load. {#if browserDaemon.owned}Restart it to pick up the new files.{:else}Quit the app that started it (check the tray), then reopen this tab — or take it over with the restart button above (asks first).{/if}</span>
+                  {#if browserDaemon.owned}
+                    <button class="mini-btn" data-testid="browser-broken-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
+                  {/if}
+                </div>
+              {:else}
               {#if browserDaemon.engine_stale && browserDaemon.owned}
                 <div class="browser-stale" data-testid="browser-stale" role="status">
                   <span>{browserDaemon.warning ?? "Browser engine is outdated."}</span>
@@ -6842,15 +7007,18 @@
                    boot and its same-origin /api fetches go cross-origin — the tab stays
                    blank white. The app is still contained: no
                    allow-top-navigation, and tauri:// is a foreign origin. -->
-              <iframe
-                class="browser-frame"
-                data-testid="browser-frame"
-                title="Shared browser"
-                src={browserFrameSrc}
-                sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"
-              ></iframe>
+              {#key browserFrameRev}
+                <iframe
+                  class="browser-frame"
+                  data-testid="browser-frame"
+                  title="Shared browser"
+                  src={browserFrameSrc}
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"
+                ></iframe>
+              {/key}
+              {/if}
             {:else if browserStarting}
-              <div class="exp-empty">Starting browser…</div>
+              <div class="exp-empty">{browserStartLabel}</div>
             {:else if browserError}
               <div class="exp-empty browser-error" data-testid="browser-error">
                 <span>{browserError}</span>
@@ -7557,7 +7725,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } .mem-spin::after { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } .mem-spin::after { animation: none; } .browser-restarting svg { animation: none; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -7826,6 +7994,9 @@
   .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: #fff; }
   .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
   .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  @keyframes browser-restart-spin { to { transform: rotate(360deg); } }
+  .browser-restarting svg { animation: browser-restart-spin 1s linear infinite; }
+  .browser-kill-armed { color: var(--danger); }
   .exp-empty.browser-error { display: flex; flex-direction: column; align-items: center; gap: 10px; }
   .exp-empty.browser-error span { overflow-wrap: anywhere; }
   .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }

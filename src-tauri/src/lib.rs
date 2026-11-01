@@ -3364,6 +3364,14 @@ async fn browser_restart(
     browser::browser_restart_logic(browser_resource_dir(&app), &state).await
 }
 
+#[tauri::command]
+async fn browser_takeover(
+    app: AppHandle,
+    state: State<'_, browser::BrowserState>,
+) -> Result<browser::BrowserStatus, String> {
+    browser::browser_takeover_logic(browser_resource_dir(&app), &state).await
+}
+
 /// Absolute `lb mcp` argv for the default `browser` MCP server entry.
 #[tauri::command]
 async fn browser_mcp_command(app: AppHandle) -> Result<Vec<String>, String> {
@@ -3449,6 +3457,7 @@ pub fn run() {
             browser_start,
             browser_stop,
             browser_restart,
+            browser_takeover,
             browser_mcp_command,
             work_agent::work_agent_start,
             work_agent::work_agent_stop,
