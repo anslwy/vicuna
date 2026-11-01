@@ -617,7 +617,7 @@ export function readLocalPrefs(): Prefs {
     return {
       theme: p.theme === "dark" ? "dark" : "light",
       accent: typeof p.accent === "string" ? p.accent : DEFAULT_PREFS.accent,
-      fontSize: typeof p.fontSize === "number" && p.fontSize >= 12 && p.fontSize <= 24 ? p.fontSize : DEFAULT_PREFS.fontSize,
+      fontSize: typeof p.fontSize === "number" && p.fontSize >= 12 && p.fontSize <= 35 ? p.fontSize : DEFAULT_PREFS.fontSize,
       sidebarOpen: typeof p.sidebarOpen === "boolean" ? p.sidebarOpen : DEFAULT_PREFS.sidebarOpen,
       stopWords: Array.isArray(p.stopWords) ? p.stopWords.filter((s): s is string => typeof s === "string") : [...DEFAULT_STOP_WORDS],
       ollamaBase: typeof p.ollamaBase === "string" ? p.ollamaBase : DEFAULT_PREFS.ollamaBase,
@@ -643,7 +643,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
     if (r.key === "pref_accent" && r.value) out.accent = r.value;
     if (r.key === "pref_font_size" && !isNaN(Number(r.value))) {
       const n = Number(r.value);
-      if (n >= 12 && n <= 24) out.fontSize = n;
+      if (n >= 12 && n <= 35) out.fontSize = n;
     }
     if (r.key === "pref_sidebar") out.sidebarOpen = r.value === "1";
     if (r.key === "pref_stop_words") {

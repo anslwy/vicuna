@@ -1650,7 +1650,7 @@
   }
 
   function setFontSize(n: number) {
-    fontSize = Math.min(24, Math.max(12, Math.round(n)));
+    fontSize = Math.min(35, Math.max(12, Math.round(n)));
     persistPrefs();
   }
 
@@ -7764,8 +7764,8 @@
   .answer :global(.hljs-strong) { font-weight: 700; }
   .answer :global(ul), .answer :global(ol) { margin: 0 0 12px 0; padding-left: 22px; }
   .answer :global(li) { margin: 4px 0; }
-  .answer :global(h1), .answer :global(h2), .answer :global(h3), .answer :global(h4) { margin: 14px 0 8px 0; font-weight: 650; line-height: 1.3; }
-  .answer :global(h1) { font-size: 20px; } .answer :global(h2) { font-size: 18px; } .answer :global(h3) { font-size: 16px; } .answer :global(h4) { font-size: 15px; }
+  .answer :global(h1), .answer :global(h2), .answer :global(h3), .answer :global(h4), .answer :global(h5), .answer :global(h6) { margin: 14px 0 8px 0; font-weight: 650; line-height: 1.3; }
+  .answer :global(h1) { font-size: 1.38em; } .answer :global(h2) { font-size: 1.24em; } .answer :global(h3) { font-size: 1.1em; } .answer :global(h4) { font-size: 1.03em; } .answer :global(h5), .answer :global(h6) { font-size: 1em; }
   .answer :global(a) { color: var(--link); }
   .answer :global(blockquote) { border-left: 3px solid var(--border-2); margin: 0 0 12px 0; padding-left: 12px; color: var(--text-dim); }
   .answer :global(table) { border-collapse: collapse; margin: 0; }
