@@ -17,6 +17,7 @@
 //   Done/Error       -> settle the turn (mirror of the old JS loop exits)
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -33,7 +34,11 @@ use super::{
     work_read_image_logic as work_read_image, work_write_file_logic as work_write_file,
     BgExecState, ChatMessage, OLLAMA_BASE,
 };
-use crate::mcp::McpManager;
+use crate::browser::{browser_mcp_command, browser_start_logic, lb_server_url, BrowserState};
+use crate::mcp::{
+    delete_file_server, list_file_servers, save_file_server, McpManager, McpServerConfig,
+    McpServerInfo,
+};
 
 // ---------- public types ----------
 
@@ -290,6 +295,273 @@ fn read_session(chats: &[ChatSnapshot], id: &str, limit: usize) -> String {
     }
 }
 
+// ---------- agent MCP management (`mcp_list` / `mcp_add` / `mcp_remove`) ----------
+//
+// The Work agent manages its own MCP servers: the user says "add X, the
+// endpoint is …" and the agent saves + connects + verifies on the spot. New
+// tools join the NEXT turn (the tool list is fixed per turn); the add result
+// carries the verified tool catalog as text so this turn can still report it.
+
+/// The synthetic in-memory Browser row (`lb mcp`): enable/disable act on
+/// its runtime connection (the daemon is ensured on enable, like the UI
+/// toggle), but it has no file entry so add/remove stay refused.
+const BROWSER_MCP_ID: &str = "browser";
+
+fn norm_transport(t: &str) -> &str {
+    match t {
+        "local" | "stdio" => "stdio",
+        "remote" | "http" => "http",
+        other => other,
+    }
+}
+
+/// In-memory `browser` config for the agent path. Mirrors the frontend's
+/// `browserMcpConfig` exactly (same id/name/transport/command/LB_SERVER
+/// env): the two must stay in sync or list/enable disagree about what
+/// "browser" is.
+fn synthetic_browser_config(lb_argv: Vec<String>) -> McpServerConfig {
+    McpServerConfig {
+        id: BROWSER_MCP_ID.to_string(),
+        name: BROWSER_MCP_ID.to_string(),
+        transport: "stdio".to_string(),
+        command: Some(lb_argv),
+        env: Some(HashMap::from([("LB_SERVER".to_string(), lb_server_url())])),
+        url: None,
+        headers: None,
+        oauth: None,
+        enabled: true,
+    }
+}
+
+/// Config the agent's browser enable/disable/list acts on: a file entry
+/// named `browser` wins (explicit config beats the default, like the
+/// frontend's synthetic-row suppression), else the resolved `lb mcp` argv.
+/// `None` = no browser at all (no `lb` binary anywhere).
+fn browser_agent_config(
+    file_servers: &[McpServerConfig],
+    lb_argv: Option<Vec<String>>,
+) -> Option<McpServerConfig> {
+    if let Some(f) = file_servers
+        .iter()
+        .find(|s| s.name.to_lowercase() == BROWSER_MCP_ID)
+    {
+        return Some(f.clone());
+    }
+    lb_argv.map(synthetic_browser_config)
+}
+
+/// One-line endpoint summary for agent transcripts. Header/env values never
+/// appear here (or in tool labels) — the transcript is not a secrets store.
+fn describe_mcp_endpoint(c: &McpServerConfig) -> String {
+    if norm_transport(&c.transport) == "http" {
+        format!("remote {}", c.url.clone().unwrap_or_default())
+    } else {
+        format!("local {}", c.command.clone().unwrap_or_default().join(" "))
+    }
+}
+
+/// Build a server config from `mcp_add` args. Exactly one of `url` (remote
+/// streamable-HTTP endpoint) or `command` (local stdio argv) selects the
+/// transport. Pure + total: every rejection happens before any disk write.
+fn parse_mcp_add_args(args: &serde_json::Value) -> Result<McpServerConfig, String> {
+    let name = str_arg(args, "name").trim().to_string();
+    if name.is_empty() {
+        return Err("Error: mcp_add needs a \"name\" for the server.".to_string());
+    }
+    if name.len() > 100 || name.contains('/') || name.contains('\\') {
+        return Err("Error: server name must be ≤100 chars with no slashes.".to_string());
+    }
+    let url = str_arg(args, "url").trim().to_string();
+    let command: Vec<String> = args
+        .get("command")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    match (url.is_empty(), command.is_empty()) {
+        (true, true) => {
+            return Err(
+                "Error: mcp_add needs either \"url\" (remote http endpoint) or \"command\" (local argv array)."
+                    .to_string(),
+            )
+        }
+        (false, false) => {
+            return Err(
+                "Error: pass only one of \"url\" or \"command\" — url means a remote server, command a local one."
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    fn str_map(v: Option<&serde_json::Value>) -> Option<HashMap<String, String>> {
+        let obj = v?.as_object()?;
+        if obj.is_empty() {
+            return None;
+        }
+        Some(
+            obj.iter()
+                .map(|(k, val)| {
+                    (
+                        k.clone(),
+                        val.as_str().unwrap_or(&val.to_string()).to_string(),
+                    )
+                })
+                .collect(),
+        )
+    }
+    if command.is_empty() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err("Error: \"url\" must start with http:// or https://.".to_string());
+        }
+        Ok(McpServerConfig {
+            id: name.clone(),
+            name,
+            transport: "http".to_string(),
+            command: None,
+            env: None,
+            url: Some(url),
+            headers: str_map(args.get("headers")),
+            oauth: None,
+            enabled: true,
+        })
+    } else {
+        Ok(McpServerConfig {
+            id: name.clone(),
+            name,
+            transport: "stdio".to_string(),
+            command: Some(command),
+            env: str_map(args.get("env")),
+            url: None,
+            headers: None,
+            oauth: None,
+            enabled: true,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum McpAddPlan {
+    Fresh,
+    Refresh,
+    Overwrite,
+}
+
+/// What `mcp_add` should do about an existing same-name entry: an identical
+/// endpoint just reconnects (refresh), a re-pointed one needs explicit
+/// `overwrite: true` so a typo'd name can't silently kill a working server.
+/// Header/env-only differences update freely (a credential refresh is a
+/// routine update, not a re-point).
+fn mcp_add_plan(
+    existing: Option<&McpServerConfig>,
+    new: &McpServerConfig,
+    overwrite: bool,
+) -> Result<McpAddPlan, String> {
+    let Some(prev) = existing else {
+        return Ok(McpAddPlan::Fresh);
+    };
+    let same_endpoint = norm_transport(&prev.transport) == norm_transport(&new.transport)
+        && if norm_transport(&new.transport) == "http" {
+            prev.url == new.url
+        } else {
+            prev.command == new.command
+        };
+    if same_endpoint {
+        return Ok(McpAddPlan::Refresh);
+    }
+    if overwrite {
+        return Ok(McpAddPlan::Overwrite);
+    }
+    Err(format!(
+        "Error: a server named \"{}\" already exists ({}). Re-run with {{\"overwrite\": true}} to replace it, or pick another name.",
+        prev.name,
+        describe_mcp_endpoint(prev)
+    ))
+}
+
+fn format_mcp_list(servers: &[McpServerConfig], connected: &HashSet<String>) -> String {
+    if servers.is_empty() {
+        return "No MCP servers configured. Add one with mcp_add (name + url or command) — ask the user for the endpoint first."
+            .to_string();
+    }
+    servers
+        .iter()
+        .map(|s| {
+            // the browser row is runtime-only (no enabled flag in the file
+            // unless hand-added): "not connected" states the operative fact
+            let status = if connected.contains(&s.id) {
+                "connected"
+            } else if s.id == BROWSER_MCP_ID && s.enabled {
+                "not connected (built-in)"
+            } else if s.enabled {
+                "enabled, not connected"
+            } else {
+                "disabled"
+            };
+            format!("• \"{}\" [{}] — {status}", s.name, describe_mcp_endpoint(s))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Success record for `mcp_add`/`mcp_enable`: endpoint + verified tool catalog.
+fn format_mcp_connected(action: &str, info: &McpServerInfo, cfg: &McpServerConfig) -> String {
+    let n = info.tools.len();
+    let mut s = format!(
+        "{action} + connected \"{}\" ({}): {n} tool{}.",
+        info.name,
+        describe_mcp_endpoint(cfg),
+        if n == 1 { "" } else { "s" }
+    );
+    if n > 0 {
+        let names: Vec<&str> = info.tools.iter().take(20).map(|t| t.name.as_str()).collect();
+        s.push_str(&format!("\nVerified tools: {}", names.join(", ")));
+        if n > 20 {
+            s.push_str(&format!(" (+{} more)", n - 20));
+        }
+    }
+    s.push_str("\nThey join your tool list from your next reply onward — this turn can't call them yet.");
+    s
+}
+
+/// Enable with no file entry: resolve `lb`, ensure the daemon (adopt a
+/// running one or spawn ours, like opening the tab), connect the
+/// in-memory config. Nothing is persisted — there is no entry for it.
+async fn mcp_enable_synthetic_browser(
+    mcp: &McpManager,
+    browser_resource_dir: Option<&std::path::Path>,
+    browser: &BrowserState,
+) -> String {
+    let Ok(argv) = browser_mcp_command(browser_resource_dir) else {
+        return "Error: the built-in browser isn't available here (no `lb` engine found). It works in the Vicuna desktop app or wherever live-browser is installed."
+            .to_string();
+    };
+    if let Err(e) = browser_start_logic(browser_resource_dir.map(|p| p.to_path_buf()), browser).await
+    {
+        return format!("Error: could not start the browser daemon ({e}).");
+    }
+    let cfg = synthetic_browser_config(argv);
+    match mcp.connect(&cfg).await {
+        Ok(info) => format_mcp_connected("Enabled", &info, &cfg),
+        Err(e) => format!(
+            "Error: the browser daemon is up but `lb mcp` would not connect ({e}). Ask the user to open the Browser tab once, then retry."
+        ),
+    }
+}
+
+/// Disable with no file entry: drop the runtime connection only. The
+/// tab/daemon keeps running — the MCP link is separate from the tab.
+async fn mcp_disable_synthetic_browser(mcp: &McpManager) -> String {
+    match mcp.disconnect(BROWSER_MCP_ID).await {
+        Ok(()) => "Disconnected the built-in Browser tools (the Browser tab/daemon keeps running — the MCP link is separate from the tab). Re-enable anytime with mcp_enable."
+            .to_string(),
+        Err(_) => "\"browser\" is already disconnected.".to_string(),
+    }
+}
+
 fn extract_fences(text: &str) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -361,6 +633,10 @@ fn tool_label(name: &str, args: &serde_json::Value) -> String {
         "say" => args.get("text").and_then(|v| v.as_str()).unwrap_or(""),
         "ask" => args.get("question").and_then(|v| v.as_str()).unwrap_or(""),
         "fetch_url" => args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+        // MCP management labels show the name only — never headers/env: the
+        // status line lands in the visible transcript, not a secrets store
+        "mcp_add" | "mcp_remove" | "mcp_enable" | "mcp_disable" => args.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        "mcp_list" => "",
         _ => "",
     };
     let short: String = summary.chars().take(120).collect();
@@ -652,6 +928,8 @@ async fn dispatch_tool(
     turn: &TurnState,
     turn_id: &str,
     on_event: &Channel<WorkAgentEvent>,
+    browser_resource_dir: Option<&std::path::Path>,
+    browser: &BrowserState,
 ) -> String {
     match name {
         "list" => match work_list_dir(workspace.to_string(), Some(str_arg(args, "path"))).await {
@@ -896,6 +1174,194 @@ async fn dispatch_tool(
                 Err(e) => format!("Error: {e}"),
             }
         }
+        "mcp_list" => match list_file_servers() {
+            Ok(mut servers) => {
+                // the built-in browser row isn't in the file: append it when
+                // `lb` resolves (and no file entry already claims the name),
+                // so the agent can discover + enable/disable it
+                if !servers.iter().any(|s| s.name.to_lowercase() == BROWSER_MCP_ID) {
+                    let argv = browser_mcp_command(browser_resource_dir).ok();
+                    // in this branch only the synthetic row can come back
+                    if let Some(cfg) = browser_agent_config(&servers, argv) {
+                        servers.push(cfg);
+                    }
+                }
+                let set: HashSet<String> = mcp.connected_ids().await.into_iter().collect();
+                format_mcp_list(&servers, &set)
+            }
+            Err(e) => format!("Error: {e}"),
+        },
+        "mcp_add" => {
+            let mut cfg = match parse_mcp_add_args(args) {
+                Ok(c) => c,
+                Err(e) => return e,
+            };
+            if cfg.name.to_lowercase() == BROWSER_MCP_ID {
+                return "Error: \"browser\" is the built-in Browser-tab row — pick another name.".to_string();
+            }
+            let existing = match list_file_servers() {
+                Ok(list) => list
+                    .into_iter()
+                    .find(|s| s.id == cfg.id || s.name.to_lowercase() == cfg.name.to_lowercase()),
+                Err(e) => return format!("Error: {e}"),
+            };
+            // case-only renames reuse the stored key so "Foo" vs "foo" can't
+            // fork into two entries (the UI refuses those outright)
+            if let Some(prev) = existing.as_ref() {
+                if prev.name.to_lowercase() == cfg.name.to_lowercase() {
+                    cfg.id = prev.id.clone();
+                    cfg.name = prev.name.clone();
+                }
+            }
+            let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Err(e) = mcp_add_plan(existing.as_ref(), &cfg, overwrite) {
+                return e;
+            }
+            // connect BEFORE saving: a mistyped endpoint must not persist a
+            // broken entry. A failed re-point rolls the previous config back
+            // (connect drops the old connection first, so restore it too).
+            match mcp.connect(&cfg).await {
+                Ok(info) => match save_file_server(&cfg) {
+                    Ok(_) => format_mcp_connected("Added", &info, &cfg),
+                    Err(e) => format!(
+                        "Connected \"{}\" and verified {} tools, but could not save it: {e}",
+                        cfg.name,
+                        info.tools.len()
+                    ),
+                },
+                Err(e) => {
+                    if let Some(prev) = existing {
+                        let _ = save_file_server(&prev);
+                        let _ = mcp.connect(&prev).await;
+                        format!(
+                            "Error: could not connect to the new endpoint ({e}). Previous \"{}\" config kept.",
+                            prev.name
+                        )
+                    } else if e.to_lowercase().contains("sign-in required") {
+                        // OAuth servers can't finish in-agent (browser flow) —
+                        // save anyway so the user can sign in from the MCP popup
+                        match save_file_server(&cfg) {
+                            Ok(_) => format!(
+                                "Saved \"{}\" ({}) but it needs browser sign-in: tell the user to open the MCP popup and choose \"Sign in required →\". Its tools join your list after they sign in.",
+                                cfg.name,
+                                describe_mcp_endpoint(&cfg)
+                            ),
+                            Err(se) => format!("Error: {e} (and could not save the server: {se})"),
+                        }
+                    } else {
+                        format!("Error: could not connect ({e}). Nothing was saved — check the endpoint and retry.")
+                    }
+                }
+            }
+        }
+        "mcp_remove" => {
+            let name = str_arg(args, "name").trim().to_string();
+            if name.is_empty() {
+                return "Error: mcp_remove needs {\"name\": \"...\"}.".to_string();
+            }
+            if name.to_lowercase() == BROWSER_MCP_ID {
+                return "Error: \"browser\" is the built-in Browser-tab row — it has no saved entry to remove. Use mcp_disable to disconnect it."
+                    .to_string();
+            }
+            let existing = match list_file_servers() {
+                Ok(list) => list
+                    .into_iter()
+                    .find(|s| s.id == name || s.name.to_lowercase() == name.to_lowercase()),
+                Err(e) => return format!("Error: {e}"),
+            };
+            match existing {
+                None => format!("No MCP server named \"{name}\" — nothing to remove."),
+                Some(s) => {
+                    let _ = mcp.disconnect(&s.id).await;
+                    match delete_file_server(&s.id) {
+                        Ok(_) => format!("Removed MCP server \"{}\" (disconnected and deleted).", s.name),
+                        Err(e) => format!("Error: {e}"),
+                    }
+                }
+            }
+        }
+        "mcp_enable" => {
+            let name = str_arg(args, "name").trim().to_string();
+            if name.is_empty() {
+                return "Error: mcp_enable needs {\"name\": \"...\"}.".to_string();
+            }
+            let is_browser = name.to_lowercase() == BROWSER_MCP_ID;
+            let existing = match list_file_servers() {
+                Ok(list) => list
+                    .into_iter()
+                    .find(|s| s.id == name || s.name.to_lowercase() == name.to_lowercase()),
+                Err(e) => return format!("Error: {e}"),
+            };
+            match existing {
+                // no file entry: the built-in row still enables via `lb mcp`
+                None if is_browser => {
+                    mcp_enable_synthetic_browser(mcp, browser_resource_dir, browser).await
+                }
+                None => format!("No MCP server named \"{name}\" — add it with mcp_add first."),
+                Some(s) => {
+                    // same order as the UI toggle: persist enabled first, then
+                    // connect, so a failure still leaves a visible row error
+                    let cfg = McpServerConfig { enabled: true, ..s };
+                    if let Err(e) = save_file_server(&cfg) {
+                        return format!("Error: {e}");
+                    }
+                    if is_browser {
+                        // `lb mcp` dials the daemon: ensure it first, like the
+                        // UI toggle does for this id (a file entry named
+                        // `browser` gets the same treatment)
+                        if let Err(e) =
+                            browser_start_logic(browser_resource_dir.map(|p| p.to_path_buf()), browser).await
+                        {
+                            return format!("Error: could not start the browser daemon ({e}).");
+                        }
+                    }
+                    match mcp.connect(&cfg).await {
+                        Ok(info) => format_mcp_connected("Enabled", &info, &cfg),
+                        Err(e) => {
+                            if e.to_lowercase().contains("sign-in required") {
+                                format!("Enabled \"{}\" ({}) but it needs browser sign-in: tell the user to open the MCP popup and choose \"Sign in required →\".", cfg.name, describe_mcp_endpoint(&cfg))
+                            } else {
+                                format!("Error: could not connect to \"{}\" ({e}). It stays enabled and will retry on launch.", cfg.name)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "mcp_disable" => {
+            let name = str_arg(args, "name").trim().to_string();
+            if name.is_empty() {
+                return "Error: mcp_disable needs {\"name\": \"...\"}.".to_string();
+            }
+            let is_browser = name.to_lowercase() == BROWSER_MCP_ID;
+            let existing = match list_file_servers() {
+                Ok(list) => list
+                    .into_iter()
+                    .find(|s| s.id == name || s.name.to_lowercase() == name.to_lowercase()),
+                Err(e) => return format!("Error: {e}"),
+            };
+            match existing {
+                // no file entry: the built-in row just drops its connection
+                None if is_browser => mcp_disable_synthetic_browser(mcp).await,
+                None => format!("No MCP server named \"{name}\" — nothing to disable."),
+                Some(s) => {
+                    // disconnect first (best-effort: it may never have
+                    // connected), then persist disabled like the UI toggle
+                    let _ = mcp.disconnect(&s.id).await;
+                    if !s.enabled {
+                        return format!("\"{}\" was already disabled (dropped any live connection).", s.name);
+                    }
+                    let cfg = McpServerConfig { enabled: false, ..s };
+                    match save_file_server(&cfg) {
+                        Ok(_) => format!(
+                            "Disabled \"{}\" (disconnected; it won't reconnect on launch). Config kept — mcp_remove deletes it entirely.",
+                            cfg.name
+                        ),
+                        Err(e) => format!("Error: {e}"),
+                    }
+                }
+            }
+        }
         _ => {
             if let Some(route) = mcp_routes.get(name) {
                 match mcp.call_tool(&route.server_id, &route.tool_name, args.clone()).await {
@@ -912,11 +1378,11 @@ async fn dispatch_tool(
                 let maybe_cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                 if !maybe_cmd.is_empty() {
                     format!(
-                        "Error: unknown tool \"{name}\". There is no {name} tool — run shell commands with exec instead, e.g. {{\"command\": {}}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.",
+                        "Error: unknown tool \"{name}\". There is no {name} tool — run shell commands with exec instead, e.g. {{\"command\": {}}}. Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, mcp_list, mcp_add, mcp_remove, mcp_enable, mcp_disable, say, ask.",
                         serde_json::json!(maybe_cmd)
                     )
                 } else {
-                    format!("Error: unknown tool \"{name}\". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, say, ask.")
+                    format!("Error: unknown tool \"{name}\". Available: list, read, view_image, grep, write, exec, exec_status, exec_kill, sessions, read_session, read_upload, fetch_url, mcp_list, mcp_add, mcp_remove, mcp_enable, mcp_disable, say, ask.")
                 }
             }
         }
@@ -942,6 +1408,8 @@ pub async fn run_loop(
     bg: &BgExecState,
     mcp: &McpManager,
     turn_id: &str,
+    browser_resource_dir: Option<PathBuf>,
+    browser: &BrowserState,
 ) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending_bg: HashSet<String> = HashSet::new();
@@ -1300,7 +1768,7 @@ pub async fn run_loop(
             }
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: Some(tool_label(&name, &args)) });
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::ToolStart { name: name.clone(), args: args.clone() });
-            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, mcp, &mcp_routes, &turn, turn_id, &on_event).await;
+            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, mcp, &mcp_routes, &turn, turn_id, &on_event, browser_resource_dir.as_deref(), browser).await;
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: None });
             if out == "__CANCELLED__" {
                 break;
@@ -1433,11 +1901,15 @@ pub async fn work_agent_start(
     // immediately — stop/queue/answer operate on the shared TurnState while
     // the task below owns an AppHandle for State access.
     let tid = turn_id.clone();
+    // resource dir for the bundled `lb` (same lookup the browser_* commands
+    // use — the agent's browser enable/list needs the sidecar too)
+    let browser_resource_dir = app.path().resource_dir().ok();
     tokio::spawn(async move {
         let bg = app.state::<BgExecState>();
         let mcp = app.state::<McpManager>();
+        let browser_state = app.state::<BrowserState>();
         // Hold the guards for the whole turn.
-        let (bg_ref, mcp_ref) = (&*bg, &*mcp);
+        let (bg_ref, mcp_ref, browser_ref) = (&*bg, &*mcp, &*browser_state);
         run_loop(
             turn,
             model,
@@ -1454,6 +1926,8 @@ pub async fn work_agent_start(
             bg_ref,
             mcp_ref,
             &tid,
+            browser_resource_dir,
+            browser_ref,
         )
         .await;
     });
@@ -1565,6 +2039,185 @@ mod agent_tests {
         assert_eq!(seen_key("read", &r1), tool_key("read", &r1));
     }
 
+    fn mcp_cfg(name: &str, transport: &str, url: Option<&str>, command: Option<Vec<&str>>) -> McpServerConfig {
+        McpServerConfig {
+            id: name.to_string(),
+            name: name.to_string(),
+            transport: transport.to_string(),
+            command: command.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            env: None,
+            url: url.map(|s| s.to_string()),
+            headers: None,
+            oauth: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn mcp_add_args_pick_transport() {
+        let remote = parse_mcp_add_args(
+            &serde_json::json!({"name": "x", "url": "https://a/b", "headers": {"Authorization": "k"}}),
+        )
+        .unwrap();
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://a/b"));
+        assert_eq!(
+            remote.headers.as_ref().and_then(|h| h.get("Authorization")).map(|s| s.as_str()),
+            Some("k")
+        );
+        assert!(remote.command.is_none());
+
+        let local = parse_mcp_add_args(
+            &serde_json::json!({"name": "y", "command": ["lb", "mcp"], "env": {"A": "b"}}),
+        )
+        .unwrap();
+        assert_eq!(local.transport, "stdio");
+        assert_eq!(local.command, Some(vec!["lb".to_string(), "mcp".to_string()]));
+        assert!(local.url.is_none());
+    }
+
+    #[test]
+    fn mcp_add_args_reject_before_any_io() {
+        assert!(parse_mcp_add_args(&serde_json::json!({"url": "https://a"}))
+            .unwrap_err()
+            .contains("needs a \"name\""));
+        assert!(parse_mcp_add_args(&serde_json::json!({"name": "a/b", "url": "https://a"}))
+            .unwrap_err()
+            .contains("no slashes"));
+        assert!(parse_mcp_add_args(&serde_json::json!({"name": "x"}))
+            .unwrap_err()
+            .contains("either \"url\""));
+        assert!(parse_mcp_add_args(&serde_json::json!({"name": "x", "url": "https://a", "command": ["y"]}))
+            .unwrap_err()
+            .contains("only one of"));
+        assert!(parse_mcp_add_args(&serde_json::json!({"name": "x", "url": "ftp://a"}))
+            .unwrap_err()
+            .contains("http:// or https://"));
+    }
+
+    #[test]
+    fn mcp_add_plan_guards_repoints() {
+        let new = mcp_cfg("s", "http", Some("https://new"), None);
+        assert!(matches!(mcp_add_plan(None, &new, false), Ok(McpAddPlan::Fresh)));
+        // identical endpoint reconnects freely (refresh)
+        let same = mcp_cfg("s", "http", Some("https://new"), None);
+        assert!(matches!(mcp_add_plan(Some(&same), &new, false), Ok(McpAddPlan::Refresh)));
+        // header-only drift is a credential refresh, not a re-point
+        let mut keyed = same.clone();
+        keyed.headers = Some(HashMap::from([("Authorization".to_string(), "old".to_string())]));
+        assert!(matches!(mcp_add_plan(Some(&keyed), &new, false), Ok(McpAddPlan::Refresh)));
+        // re-pointed endpoint needs explicit overwrite …
+        let old = mcp_cfg("s", "http", Some("https://old"), None);
+        let err = mcp_add_plan(Some(&old), &new, false).unwrap_err();
+        assert!(err.contains("already exists") && err.contains("overwrite"), "got {err:?}");
+        assert!(matches!(mcp_add_plan(Some(&old), &new, true), Ok(McpAddPlan::Overwrite)));
+        // … as does a transport flip
+        let stdio = mcp_cfg("s", "stdio", None, Some(vec!["lb", "mcp"]));
+        assert!(mcp_add_plan(Some(&stdio), &new, false).is_err());
+    }
+
+    #[test]
+    fn mcp_list_format_shows_status() {
+        assert!(format_mcp_list(&[], &HashSet::new()).starts_with("No MCP servers"));
+        let servers = vec![
+            mcp_cfg("up", "http", Some("https://a"), None),
+            McpServerConfig { enabled: false, ..mcp_cfg("off", "stdio", None, Some(vec!["x"])) },
+        ];
+        let out = format_mcp_list(&servers, &HashSet::from(["up".to_string()]));
+        assert!(out.contains("\"up\"") && out.contains("connected"), "got {out:?}");
+        assert!(out.contains("\"off\"") && out.contains("disabled"), "got {out:?}");
+        assert!(out.contains("remote https://a") && out.contains("local x"), "got {out:?}");
+        // the built-in row states the operative fact, not a flag it lacks
+        let synth = synthetic_browser_config(vec!["/x/lb".to_string(), "mcp".to_string()]);
+        let out = format_mcp_list(&[synth.clone()], &HashSet::new());
+        assert!(out.contains("\"browser\"") && out.contains("not connected (built-in)"), "got {out:?}");
+        let out = format_mcp_list(&[synth], &HashSet::from(["browser".to_string()]));
+        assert!(out.contains("connected") && !out.contains("built-in"), "got {out:?}");
+    }
+
+    #[test]
+    fn browser_agent_config_prefers_file_then_synthetic() {
+        // hand-added file entry wins (case-insensitive), like the frontend
+        let file = mcp_cfg("Browser", "stdio", None, Some(vec!["custom"]));
+        let got = browser_agent_config(&[file], Some(vec!["/x/lb".to_string(), "mcp".to_string()])).unwrap();
+        assert_eq!(got.command, Some(vec!["custom".to_string()]));
+        // otherwise the resolved `lb mcp` argv becomes the synthetic row
+        let got =
+            browser_agent_config(&[], Some(vec!["/x/lb".to_string(), "mcp".to_string()])).unwrap();
+        assert_eq!(got.id, "browser");
+        assert_eq!(got.transport, "stdio");
+        assert_eq!(
+            got.env.as_ref().and_then(|e| e.get("LB_SERVER")).map(|s| s.as_str()),
+            Some(lb_server_url().as_str())
+        );
+        // neither: no browser at all
+        assert!(browser_agent_config(&[], None).is_none());
+    }
+
+    #[test]
+    fn mcp_added_format_verifies_without_secrets() {
+        use crate::mcp::McpToolInfo;
+        let mut cfg = mcp_cfg("s", "http", Some("https://a"), None);
+        cfg.headers = Some(HashMap::from([("Authorization".to_string(), "Bearer s3krit".to_string())]));
+        let info = McpServerInfo {
+            id: "s".to_string(),
+            name: "s".to_string(),
+            connected: true,
+            tools: vec![
+                McpToolInfo { name: "alpha".to_string(), description: None, input_schema: serde_json::json!({}) },
+                McpToolInfo { name: "beta".to_string(), description: None, input_schema: serde_json::json!({}) },
+            ],
+        };
+        let out = format_mcp_connected("Added", &info, &cfg);
+        assert!(out.contains("alpha") && out.contains("beta"), "got {out:?}");
+        assert!(out.contains("next reply"), "got {out:?}");
+        assert!(!out.contains("s3krit"), "secret leaked: {out:?}");
+        let out = format_mcp_connected("Enabled", &info, &cfg);
+        assert!(out.starts_with("Enabled + connected"), "got {out:?}");
+        assert_eq!(tool_label("mcp_add", &serde_json::json!({"name": "s", "headers": {"Authorization": "Bearer s3krit"}})), "mcp_add — s");
+    }
+
+    #[tokio::test]
+    async fn manager_starts_with_no_connections() {
+        assert!(McpManager::default().connected_ids().await.is_empty());
+    }
+
+    /// Dispatch-level rejections for the MCP tools that fail before touching
+    /// the config file or the network — hermetic, no temp HOME needed.
+    #[tokio::test]
+    async fn dispatch_mcp_management_rejects_before_io() {
+        let bg = BgExecState::default();
+        let mcp = McpManager::default();
+        let turn = TurnState::new();
+        let routes = HashMap::new();
+        let ch: Channel<WorkAgentEvent> = Channel::new(|_| Ok(()));
+        let browser = BrowserState::default();
+        macro_rules! run {
+            ($name:expr, $args:expr) => {
+                dispatch_tool($name, &$args, "/tmp", None, &[], &bg, &mcp, &routes, &turn, "turn-test", &ch, None, &browser).await
+            };
+        }
+        let out = run!("mcp_add", serde_json::json!({"url": "https://example.com/mcp"}));
+        assert!(out.contains("needs a \"name\""), "got {out:?}");
+        let out = run!("mcp_add", serde_json::json!({"name": "x", "url": "https://a", "command": ["y"]}));
+        assert!(out.contains("only one of"), "got {out:?}");
+        let out = run!("mcp_add", serde_json::json!({"name": "browser", "url": "https://a"}));
+        assert!(out.contains("built-in"), "got {out:?}");
+        let out = run!("mcp_remove", serde_json::json!({}));
+        assert!(out.contains("mcp_remove needs"), "got {out:?}");
+        let out = run!("mcp_remove", serde_json::json!({"name": "browser"}));
+        assert!(out.contains("built-in") && out.contains("mcp_disable"), "got {out:?}");
+        let out = run!("mcp_add", serde_json::json!({"name": "browser", "url": "https://a"}));
+        assert!(out.contains("built-in"), "got {out:?}");
+        let out = run!("mcp_enable", serde_json::json!({}));
+        assert!(out.contains("mcp_enable needs"), "got {out:?}");
+        let out = run!("mcp_disable", serde_json::json!({}));
+        assert!(out.contains("mcp_disable needs"), "got {out:?}");
+        // NOTE: enable/disable("browser") are live paths now (daemon ensure
+        // may spawn Chromium on a machine with `lb`), so they stay out of
+        // this hermetic test — covered by scratch round-trips instead.
+    }
+
     /// Headless end-to-end: drive the real loop (real Ollama, real FS tools)
     /// in a temp workspace and assert the event contract holds. Needs the
     /// local daemon plus a working cloud model; skips gracefully otherwise
@@ -1621,6 +2274,7 @@ mod agent_tests {
         ];
         let bg = BgExecState::default();
         let mcp = McpManager::default();
+        let browser = BrowserState::default();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(240),
             run_loop(
@@ -1639,6 +2293,8 @@ mod agent_tests {
                 &bg,
                 &mcp,
                 "turn-e2e",
+                None,
+                &browser,
             ),
         )
         .await;

@@ -39,7 +39,9 @@ pub struct BridgeState {
     pub bg: Arc<BgExecState>,
     pub mcp: McpManager,
     pub agent: WorkAgentState,
-    pub browser: BrowserState,
+    // Arc so work_agent turns can hold it across the detached run_loop
+    // (shared-ref arms below keep compiling via deref coercion)
+    pub browser: Arc<BrowserState>,
     pub events: EventQueues,
 }
 
@@ -49,7 +51,7 @@ impl Default for BridgeState {
             bg: Arc::new(BgExecState::default()),
             mcp: McpManager::default(),
             agent: WorkAgentState::default(),
-            browser: BrowserState::default(),
+            browser: Arc::new(BrowserState::default()),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -129,6 +131,8 @@ async fn dispatch(
             let turn_id = st.agent.next_turn(turn.clone());
             let bg = st.bg.clone();
             let mcp = st.mcp.clone();
+            let browser = st.browser.clone();
+            let browser_resource_dir = test_resource_dir();
             let tid = turn_id.clone();
             let model = s("model")?;
             let workspace = s("workspace")?;
@@ -150,6 +154,7 @@ async fn dispatch(
                 run_loop(
                     turn, model, workspace, messages, think, tools, session_id,
                     goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &mcp, &tid,
+                    browser_resource_dir, &browser,
                 )
                 .await;
             });

@@ -214,6 +214,10 @@
   // the Work agent's native tool loop; chat mode never sees them.
   let mcpServers = $state<McpServerConfig[]>([]);
   let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
+  /** browser-row touch left by the agent's mcp_enable/mcp_disable this turn
+   *  (consumed by syncMcpServersAfterTurn — the synthetic row has no file
+   *  entry, so the file diff can't see the change) */
+  let mcpBrowserTouch: "mcp_enable" | "mcp_disable" | null = null;
   /** resolved `lb mcp` argv for the synthetic Browser row (null until the
    *  `lb` binary resolves — bundled sidecar or PATH, via bridge or Tauri) */
   let browserMcpArgv = $state<string[] | null>(null);
@@ -538,6 +542,42 @@
       mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
     } finally {
       mcpUnmarkBusy(id);
+    }
+  }
+
+  /** Reconcile the MCP popup with agent-made changes after a work turn
+   *  settles: the agent saves + connects backend-side, so reload the file
+   *  list and sync each added/changed row (connect refreshes its tool
+   *  list); removed ids drop their live state. No-ops when nothing moved. */
+  async function syncMcpServersAfterTurn() {
+    let fresh: McpServerConfig[];
+    try {
+      fresh = await listMcpServers();
+    } catch {
+      return;
+    }
+    const prev = new Map(mcpServers.map((s) => [s.id, s]));
+    const next = new Set(fresh.map((s) => s.id));
+    mcpServers = fresh;
+    for (const s of fresh) {
+      const old = prev.get(s.id);
+      if (old && JSON.stringify(old) === JSON.stringify(s)) continue;
+      if (s.enabled) void connectMcpServer(s.id);
+      else delete mcpLive[s.id];
+    }
+    for (const id of prev.keys()) {
+      if (!next.has(id)) delete mcpLive[id];
+    }
+    if (mcpBrowserTouch) {
+      const op = mcpBrowserTouch;
+      mcpBrowserTouch = null;
+      if (op === "mcp_enable") {
+        // agent connected backend-side: full connect syncs the row's tools
+        // (and repairs the row if the agent's own connect failed)
+        void connectMcpServer(BROWSER_MCP_ID);
+      } else {
+        delete mcpLive[BROWSER_MCP_ID];
+      }
     }
   }
 
@@ -4158,11 +4198,13 @@
     explorerTimer = setTimeout(() => void loadExplorer(), 400);
   });
 
-  // refresh the tree when an agent turn settles (files may have changed)
+  // refresh the tree + MCP popup when an agent turn settles (files may
+  // have changed, and the agent may have added/removed MCP servers)
   let wasWorkRunning = false;
   $effect(() => {
-    if (wasWorkRunning && !workRunning && explorerOpen && !explorerLoading) {
-      void loadExplorer();
+    if (wasWorkRunning && !workRunning) {
+      if (explorerOpen && !explorerLoading) void loadExplorer();
+      void syncMcpServersAfterTurn();
     }
     wasWorkRunning = workRunning;
   });
@@ -4795,6 +4837,12 @@
           clearStall();
           dropStallHint();
           pendingHead = { name: ev.name, args: ev.args };
+          // agent browser toggles need a row sync at settle (the synthetic
+          // row has no file entry, so the file diff can't see the change)
+          if ((ev.name === "mcp_enable" || ev.name === "mcp_disable") &&
+              String(ev.args?.name ?? "").toLowerCase() === BROWSER_MCP_ID) {
+            mcpBrowserTouch = ev.name;
+          }
           // `ask` (live card) and `say` (normal prose) own their display
           if (ev.name === "ask" || ev.name === "say") break;
           appendContent(formatToolCallHead(ev.name, ev.args));

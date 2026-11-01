@@ -571,6 +571,11 @@ impl McpManager {
         }
     }
 
+    /// Ids with a live connection (for the agent's `mcp_list` status column).
+    pub async fn connected_ids(&self) -> Vec<String> {
+        self.inner.lock().await.keys().cloned().collect()
+    }
+
     pub async fn disconnect(&self, id: &str) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         match guard.remove(id) {
