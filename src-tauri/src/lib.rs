@@ -1685,6 +1685,42 @@ fn full_disk_scan_error(frag: &str) -> String {
     )
 }
 
+/// PATH used by Work shell commands. GUI apps launched from Finder may have
+/// a sparse process PATH; prefer the user's login-shell PATH and append any
+/// app-only entries. Probe once so command execution does not pay the shell
+/// startup cost on every invocation. If probing fails, inherit the app PATH.
+#[cfg(not(windows))]
+static WORK_EXEC_PATH: tokio::sync::OnceCell<Option<std::ffi::OsString>> =
+    tokio::sync::OnceCell::const_new();
+
+#[cfg(not(windows))]
+fn work_path_dirs(
+    shell_dirs: &[std::path::PathBuf],
+    process_dirs: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut out = shell_dirs.to_vec();
+    for dir in process_dirs {
+        if !out.iter().any(|existing| existing == dir) {
+            out.push(dir.clone());
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+async fn work_exec_path() -> Option<std::ffi::OsString> {
+    WORK_EXEC_PATH
+        .get_or_init(|| async {
+            let shell_dirs = cli_shell_path_dirs().await;
+            if shell_dirs.is_empty() {
+                return None;
+            }
+            std::env::join_paths(work_path_dirs(&shell_dirs, &cli_path_dirs())).ok()
+        })
+        .await
+        .clone()
+}
+
 /// Run a shell command with cwd=workspace root. Timeout default 30s (max
 /// 120s). Output capped at 32KB per stream. Destructive commands are the
 /// user's responsibility — Work mode is explicit opt-in per session.
@@ -1712,14 +1748,19 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
         .spawn()
         .map_err(|e| format!("cannot run command: {e}"))?;
     #[cfg(not(windows))]
-    let child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(&canon)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run command: {e}"))?;
+    let child = {
+        let mut builder = tokio::process::Command::new("sh");
+        builder
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(&canon)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = work_exec_path().await {
+            builder.env("PATH", path);
+        }
+        builder.spawn().map_err(|e| format!("cannot run command: {e}"))?
+    };
     // wait_with_output takes ownership, so keep the pid for the timeout kill
     let pid = child.id();
     let status = tokio::time::timeout(timeout, child.wait_with_output()).await;
@@ -1939,6 +1980,10 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
         .current_dir(&canon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(not(windows))]
+    if let Some(path) = work_exec_path().await {
+        builder.env("PATH", path);
+    }
     #[cfg(windows)]
     builder.creation_flags(CREATE_NO_WINDOW);
     let mut child = match builder.spawn() {
@@ -4034,6 +4079,19 @@ mod work_tests {
         let dirs = vec![a.clone(), b.clone()];
         assert_eq!(cli_scan_in(&dirs, cli_exe_name()).unwrap(), a.join(cli_exe_name()));
         assert!(cli_scan_in(&dirs, "no-such-launcher").is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn work_path_dirs_prioritize_login_path_and_keep_process_extras() {
+        let login_bin = std::path::PathBuf::from("/login/bin");
+        let shared = std::path::PathBuf::from("/shared/bin");
+        let app_only = std::path::PathBuf::from("/app/bin");
+        let dirs = work_path_dirs(
+            &[login_bin.clone(), shared.clone()],
+            &[shared.clone(), app_only.clone()],
+        );
+        assert_eq!(dirs, vec![login_bin, shared, app_only]);
     }
 
     #[test]
