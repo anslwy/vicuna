@@ -40,7 +40,14 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { followAfterScroll, scrollKeyDirection, upwardScrollInput } from "$lib/scrollFollow";
+  import {
+    captureViewAnchor,
+    followAfterScroll,
+    restoreViewAnchor,
+    scrollKeyDirection,
+    upwardScrollInput,
+    type ViewAnchor
+  } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
   import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
@@ -900,6 +907,8 @@
   let copiedKey = $state<string | null>(null);
   let isPinned = $state(true);
   let scrollFrame = 0;
+  /** viewport anchor held across a streamed DOM write while the reader is paused */
+  let viewAnchor: ViewAnchor | null = null;
   let draggingScrollbar = false;
   let touchScrollY: number | null = null;
 
@@ -979,7 +988,41 @@
 
   function jumpToBottom() {
     isPinned = true;
+    viewAnchor = null;
     scrollBottom();
+  }
+
+  // A paused reader must not be moved by the stream. Auto-follow is not the
+  // only thing that moves the viewport: when the answer above grows, Chromium
+  // still anchors an overflowing scroller (despite `overflow-anchor: none`) and
+  // pushes the text down; when `scrollHeight` collapses — the thinking block is
+  // destroyed as soon as the answer starts — scrollTop is clamped and the view
+  // jumps toward the top. Neither produces a scroll event the app could tell
+  // apart from a real gesture, so record what is on screen around the write and
+  // put it back. Same reasoning as this file's note on input-only unpinning.
+  function holdReaderPlace() {
+    if (!messagesEl) return false;
+    // a pinned view is owned by scrollBottom(); a gesture or a selection during
+    // the stream clears the anchor so the reader is never fought
+    if (isPinned || draggingScrollbar || hasMessageSelection()) {
+      viewAnchor = null;
+      return false;
+    }
+    viewAnchor = captureViewAnchor(messagesEl, messagesEl);
+    return viewAnchor != null;
+  }
+
+  /** Re-apply the anchor recorded by holdReaderPlace, once per flush. */
+  async function releaseReaderPlace() {
+    const anchor = viewAnchor;
+    viewAnchor = null;
+    if (!anchor || !messagesEl) return;
+    // the {tick()} await lets Svelte commit the new markdown; a single frame
+    // after that is where Chromium's own anchoring adjustment has landed
+    await tick();
+    if (!messagesEl || isPinned || hasMessageSelection()) return;
+    if (!anchor.el.isConnected) return;
+    restoreViewAnchor(messagesEl, anchor);
   }
 
   // The send/stop/queue buttons are an {#if} swap: starting or stopping a
@@ -3056,6 +3099,7 @@
       // tokens update state but never touch them
       const isOpen = chat.id === activeId;
       const keep = isOpen ? captureStreamSel(index) : null;
+      const held = isOpen && holdReaderPlace();
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[index]) {
         const m = c.messages[index];
@@ -3064,6 +3108,7 @@
       }
       if (keep) void tick().then(() => restoreStreamSel(index, keep));
       if (isOpen) scrollBottom();
+      if (held) void releaseReaderPlace();
       saveSoon();
     }
     function scheduleFlush() {
@@ -5466,6 +5511,7 @@
       pendingTh = "";
       const isOpen = chat.id === activeId;
       const keep = isOpen ? captureStreamSel(curIndex) : null;
+      const held = isOpen && holdReaderPlace();
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[curIndex]) {
         const m = c.messages[curIndex];
@@ -5474,6 +5520,7 @@
       }
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
       if (isOpen) scrollBottom();
+      if (held) void releaseReaderPlace();
       saveSoon();
     }
     function scheduleFlush() {
