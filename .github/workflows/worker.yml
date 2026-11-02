@@ -35,12 +35,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # reqwest defaults to native-tls, which is openssl on Linux. The
-      # container build hides this because rust:bookworm ships the headers;
-      # GitHub's ubuntu runners do not.
-      - name: Install OpenSSL headers
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-
+      # No OpenSSL: core/ uses reqwest with rustls, so the binary does not
+      # link libssl. That is what lets the release run on a bare debian-slim
+      # image (a native-tls build failed there with "libssl.so.3: cannot open
+      # shared object file"). If this step ever comes back, the rustls
+      # guarantee has regressed — check `ldd` on the artifact.
       - uses: Swatinem/rust-cache@v2
         with:
           # core/ and bridge/ share a lockfile; cache the bridge workspace.

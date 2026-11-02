@@ -28,6 +28,11 @@ services:
     ports:
       # Loopback only: the agent runs shell commands, so never publish this.
       - "127.0.0.1:1422:1421"
+      # The browser UI/API a human uses to watch and take over the agent's tab.
+      # `lb web` binds 127.0.0.1 inside the container, so the entrypoint's socat
+      # forwarder republishes it on this port. Loopback only, like the worker:
+      # this UI can drive a logged-in browser.
+      - "127.0.0.1:18766:18766"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -36,6 +41,8 @@ services:
       # 0 skips the one-time CloakBrowser download at startup.
       VICUNA_SKIP_ENGINE: ${VICUNA_SKIP_ENGINE:-0}
       LB_BROWSER_VERSION: ${LB_BROWSER_VERSION:-145.0.7632.109.2}
+      # Forward the container-loopback lb daemon so the human UI is reachable.
+      VICUNA_LB_FORWARD_PORT: ${VICUNA_LB_FORWARD_PORT:-18766}
     volumes:
       - worker-state:/var/lib/vicuna-worker
       - worker-engine:/var/lib/vicuna-engine

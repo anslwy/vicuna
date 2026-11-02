@@ -4,12 +4,17 @@
 # that is NOT the user's laptop. The desktop app stays a client. See
 # bridge/WORKER.md for the protocol and scripts/check-worker*.py for the tests.
 #
-#   docker compose -f bridge/container/docker-compose.worker.yml build
+#   docker compose -f bridge/container/docker-compose.worker.yml up -d --build
 #
-# Two-stage build, and the worker stage deliberately contains no Rust toolchain
-# and no GTK/WebKit: `vicuna-core` (agent loop, tools, MCP, browser) has no
-# Tauri dependency, so the daemon builds with a plain toolchain and the runtime
-# image is the binary plus Chromium's shared libraries.
+# The worker binary is DOWNLOADED from the GitHub release built by
+# .github/workflows/worker.yml rather than compiled here. Two reasons:
+#
+#   * the image needs no Rust toolchain, so it builds in ~seconds instead of
+#     minutes (this is an emulated amd64 build on Apple silicon)
+#   * the artifact is byte-identical to what a bare `curl` install on a server
+#     gets, so the container tests the real distribution path
+#
+# There is no GTK/WebKit because `vicuna-core` has no Tauri dependency.
 #
 # Why amd64 on Apple silicon: live-browser publishes only linux-x86_64 /
 # darwin-* / windows-x86_64. On an arm64 host this image is emulated, so it is
@@ -19,39 +24,44 @@
 # a volume. Baking it would add ~200MB and couple the image to the browser build
 # rather than the `lb` version pin.
 
-# ---------------------------------------------------------------- build ----
-FROM --platform=linux/amd64 rust:1-bookworm AS build
-
-ARG LB_VERSION=0.4.18
-ENV CARGO_TERM_COLOR=never
-
-WORKDIR /app
-# Only the two crates the worker actually needs. No src-tauri: the daemon must
-# never depend on the desktop shell.
-COPY core/Cargo.toml ./core/
-COPY bridge/Cargo.toml bridge/Cargo.lock ./bridge/
-COPY core/src ./core/src
-COPY bridge/src ./bridge/src
-
-WORKDIR /app/bridge
-RUN cargo build --release --bin worker
-
-# -------------------------------------------------------------- runtime ----
 FROM --platform=linux/amd64 debian:bookworm-slim
 
 ARG LB_VERSION=0.4.18
+# Rolling release published by .github/workflows/worker.yml on every push that
+# touches core/ or bridge/. Pin this to a digest or a tagged release for
+# anything reproducible.
+ARG WORKER_RELEASE_REPO=anslwy/vicuna
+ARG WORKER_RELEASE_TAG=worker-latest
+
 ENV LB_VERSION=${LB_VERSION} \
     DEBIAN_FRONTEND=noninteractive
 
-# Runtime libs headless Chromium needs, plus curl for the lb fetch.
+# Runtime libs headless Chromium needs, plus curl/jq for the two fetches.
+# Note: libssl-dev is deliberately absent — the worker is built with rustls, so
+# it must run without system OpenSSL. If this image ever needs libssl3 to load
+# the binary, the rustls guarantee has regressed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl jq \
+        ca-certificates curl jq socat \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
         libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
         libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
         libatspi2.0-0 libx11-6 libxcb1 libxext6 libglib2.0-0 libdbus-1-3 \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------- worker binary ----
+# Fetched with its published checksum and verified, so a truncated or
+# tampered download fails the build instead of producing a broken image.
+RUN set -eux; \
+    base="https://github.com/${WORKER_RELEASE_REPO}/releases/download/${WORKER_RELEASE_TAG}"; \
+    asset="vicuna-worker-linux-x86_64"; \
+    curl -fsSL -o "/tmp/${asset}" "$base/$asset"; \
+    curl -fsSL -o /tmp/SHA256SUMS "$base/SHA256SUMS"; \
+    cd /tmp; \
+    grep " ${asset}\$" SHA256SUMS > expected.sha; \
+    sha256sum -c expected.sha; \
+    install -m 0755 "/tmp/${asset}" /usr/local/bin/vicuna-worker; \
+    rm -f "/tmp/${asset}" /tmp/SHA256SUMS expected.sha
 
 # live-browser (linux-x86_64 only) → /opt/lb, keeping web/dist next to the
 # binary so `lb`'s cwd fast-path finds its UI (same layout as lb-sidecar).
@@ -65,7 +75,6 @@ RUN set -eux; \
     /opt/lb/lb --version; \
     rm -f /tmp/lb.tgz
 
-COPY --from=build /app/bridge/target/release/worker /usr/local/bin/vicuna-worker
 COPY bridge/container/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -73,6 +82,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # lands on the host rather than in the container layer.
 RUN mkdir -p /workspace
 
+# VICUNA_LB_FORWARD_PORT: `lb web` binds 127.0.0.1 only and has no
+# --host/--bind flag, so inside a container its UI+API are unreachable from
+# outside the container. The entrypoint runs socat to republish it, which is
+# what lets a human watch and take over the agent's tab. Set 0 to disable.
 # Engine cache is a volume, not an image layer: a 200MB Chromium in a layer
 # would be re-downloaded on every rebuild and bloat the image.
 ENV VICUNA_WORKER_STATE=/var/lib/vicuna-worker \
@@ -80,7 +93,8 @@ ENV VICUNA_WORKER_STATE=/var/lib/vicuna-worker \
     VICUNA_OLLAMA_BASE=http://host.docker.internal:11434 \
     CLOAKBROWSER_CACHE_DIR=/var/lib/vicuna-engine \
     LB_BROWSER_VERSION=145.0.7632.109.2 \
-    VICUNA_LB_NO_SANDBOX=1
+    VICUNA_LB_NO_SANDBOX=1 \
+    VICUNA_LB_FORWARD_PORT=18766
 
 EXPOSE 1421
 WORKDIR /workspace

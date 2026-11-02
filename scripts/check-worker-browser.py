@@ -47,7 +47,16 @@ def main():
     ap.add_argument("--token", required=True)
     ap.add_argument("--model", default="deepseek-v4.1-flash:cloud")
     ap.add_argument("--url", default="https://example.com")
+    ap.add_argument(
+        "--lb-exec",
+        help="command prefix used to run the `human` lb CLI, e.g. "
+        "'docker compose -f bridge/container/docker-compose.worker.yml exec -T worker'. "
+        "Required when the worker runs in a container: its lbServer is "
+        "127.0.0.1 INSIDE that container, so running the host's lb against it "
+        "silently inspects the HOST's own daemon instead (a false pass).",
+    )
     a = ap.parse_args()
+    lb_exec = a.lb_exec.split() if a.lb_exec else []
 
     print("1. worker's browser daemon")
     st = call(a.port, a.token, "/status")
@@ -146,13 +155,24 @@ def main():
 
     print("4. the human sees the same tab (same daemon, same web UI)")
     srv = st["lbServer"]
+    host_loopback = srv.startswith(("http://127.0.0.1", "http://localhost"))
+    if host_loopback and not lb_exec:
+        check("human `lb` is inspecting the SAME daemon", False,
+              f"worker's lbServer is {srv}, which from this host is this machine's "
+              f"own lb (if any), not the worker's. Pass --lb-exec to run lb where "
+              f"the worker runs.")
+        print()
+        print(f"{len(PASS)} passed, {len(FAIL)} failed")
+        for f in FAIL:
+            print("  failed:", f)
+        return 1
     try:
         # `--server` is how a human points the CLI at the worker's daemon;
         # the web UI a person controls is that same base URL.
-        out = subprocess.run(["lb", "status", "--server", srv], capture_output=True,
-                             text=True, timeout=20).stdout
-        lst = subprocess.run(["lb", "list", "--json", "--server", srv], capture_output=True,
-                             text=True, timeout=20).stdout
+        out = subprocess.run([*lb_exec, "lb", "status", "--server", srv], capture_output=True,
+                             text=True, timeout=30).stdout
+        lst = subprocess.run([*lb_exec, "lb", "list", "--json", "--server", srv], capture_output=True,
+                             text=True, timeout=30).stdout
         check("human `lb status` answers on the worker's daemon", bool(out.strip()),
               out.strip().splitlines()[0] if out.strip() else "")
         parsed = json.loads(lst or "[]")

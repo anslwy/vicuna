@@ -8,7 +8,27 @@ stop the work.
 This is different from "remote Ollama", which only moves token generation: the
 agent loop, tools, and browser would still die with the app.
 
-## Build
+## Install (prebuilt)
+
+The worker is published as a rolling GitHub release by
+`.github/workflows/worker.yml` on every push that touches `core/` or `bridge/`.
+No Rust toolchain is needed on the server:
+
+```sh
+curl -fsSL -o vicuna-worker \
+  https://github.com/anslwy/vicuna/releases/download/worker-latest/vicuna-worker-linux-x86_64
+curl -fsSL -O https://github.com/anslwy/vicuna/releases/download/worker-latest/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+chmod +x vicuna-worker
+```
+
+The binary is built with **rustls**, not OpenSSL, so `ldd` shows only
+`libc`/`libgcc`/`libm` — it runs on a bare `debian:bookworm-slim` with no
+`libssl` installed. That matters for an install path that drops a binary onto
+an arbitrary server. If you ever see `libssl.so.3: cannot open shared object
+file`, the rustls feature set in `core/Cargo.toml` has regressed.
+
+## Build from source
 
 ```sh
 cd bridge
@@ -48,6 +68,11 @@ don't invalidate a paired client. Override with `--token` or
 the laptop at all. Useful for a GPU/server box, and for testing the "agent is
 somewhere else" topology on a development machine.
 
+The image **downloads the released worker binary** (with checksum
+verification) instead of compiling Rust. That keeps the build to seconds and,
+more importantly, means the container exercises the same artifact a `curl`
+install on a real server would get.
+
 ```sh
 docker compose -f bridge/container/docker-compose.worker.yml up -d --build
 
@@ -55,10 +80,28 @@ docker compose -f bridge/container/docker-compose.worker.yml up -d --build
 TOKEN=$(docker compose -f bridge/container/docker-compose.worker.yml \
           exec worker cat /var/lib/vicuna-worker/worker-token)
 
+# --workspace is the path AS THE CONTAINER SEES IT (/workspace is the bind
+# mount); --workspace-host is the same directory on this machine, which is where
+# proof.txt is verified. A relative path is rejected by the worker.
 python3 scripts/check-worker.py --port 1422 --token "$TOKEN" \
-    --workspace bridge/container/scratch/container/ws
-python3 scripts/check-worker-browser.py --port 1422 --token "$TOKEN"
+    --workspace /workspace \
+    --workspace-host "$PWD/bridge/container/scratch/container"
+# --lb-exec: the worker's lbServer is 127.0.0.1 INSIDE the container, so running
+# the host's own `lb` against it would inspect this machine's daemon instead
+# (a silent false pass).
+python3 scripts/check-worker-browser.py --port 1422 --token "$TOKEN" \
+    --lb-exec "docker compose -f bridge/container/docker-compose.worker.yml \
+                exec -T worker"
+
+# The browser UI a human watches/takes over on the agent's tab:
+#   http://127.0.0.1:18766   (forwarded from the container's 127.0.0.1:18765)
 ```
+
+**Why the forward exists:** `lb web` binds `127.0.0.1` and has no
+`--host`/`--bind` flag, so inside a container neither its UI nor its API is
+reachable from outside. The entrypoint runs `socat` to republish it
+(`VICUNA_LB_FORWARD_PORT`, `0` to disable). On a real remote host you would
+instead reach it over SSH: `ssh -L 18765:127.0.0.1:18765 server`.
 
 Notes that matter:
 
@@ -129,7 +172,8 @@ python3 scripts/check-worker-browser.py --port 1422 --token "$TOKEN"
   turn. Persisting session history, pending questions, and status is the next
   step.
 - **No pairing/installer flow.** Tokens are printed by the worker; there is no
-  pairing code, no service unit, no prebuilt release artifact.
+  pairing code and no systemd/launchd unit. A prebuilt binary is published
+  (`worker-latest`), but installing it is still a manual `curl` + `chmod`.
 - **No transport security.** Bearer over loopback/SSH only. The container
   harness publishes to `127.0.0.1` for this reason.
 - **No arm64 Linux browser.** Upstream publishes x86_64 only, so an

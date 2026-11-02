@@ -33,6 +33,27 @@ if [ "${VICUNA_LB_NO_SANDBOX:-1}" = "1" ]; then
     echo "  browsers: --no-sandbox (container, no userns)"
 fi
 
+# 3. `lb web` listens on 127.0.0.1 only and offers no --host/--bind flag, so
+#    from outside the container neither its UI nor its API is reachable. Republish
+#    it on 0.0.0.0 so a human can watch and take over the agent's tab.
+#    The daemon is started lazily by the worker, so retry until it answers.
+if [ "${VICUNA_LB_FORWARD_PORT:-0}" != "0" ]; then
+    (
+        port="${VICUNA_LB_PORT:-18765}"
+        fwd="${VICUNA_LB_FORWARD_PORT}"
+        for _ in $(seq 1 60); do
+            if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; then
+                exec socat "TCP-LISTEN:${fwd},fork,reuseaddr,bind=0.0.0.0" \
+                           "TCP:127.0.0.1:${port}"
+            fi
+            sleep 2
+        done
+        echo "  WARNING: browser daemon never came up on 127.0.0.1:${port}; \
+no UI forward on ${fwd} (takeover will not work from outside)" >&2
+    ) &
+    echo "  browser UI: forwarding 0.0.0.0:${VICUNA_LB_FORWARD_PORT} -> 127.0.0.1:${VICUNA_LB_PORT:-18765}"
+fi
+
 cd "$WORKSPACE"
 exec /usr/local/bin/vicuna-worker \
     --bind "${VICUNA_WORKER_BIND:-0.0.0.0:1421}" \

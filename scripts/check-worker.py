@@ -76,16 +76,46 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=1422)
     ap.add_argument("--token", required=True)
-    ap.add_argument("--workspace", required=True)
+    ap.add_argument(
+        "--workspace",
+        help="absolute path AS THE WORKER SEES IT (default: the worker's own cwd "
+        "from /status). A relative path is rejected by the worker, and for a "
+        "container this is the in-container path, not the host mount.",
+    )
+    ap.add_argument(
+        "--workspace-host",
+        help="host path holding the same directory (container case), so proof.txt "
+        "can be read from this machine. Omit for a native worker, where "
+        "--workspace is already the host path.",
+    )
     ap.add_argument("--model", default="deepseek-v4.1-flash:cloud")
     ap.add_argument("--session", default="sess-e2e")
     ap.add_argument("--no-turn", action="store_true", help="skip the live model turn")
     a = ap.parse_args()
 
-    os.makedirs(a.workspace, exist_ok=True)
-    proof = os.path.join(a.workspace, "proof.txt")
-    if os.path.exists(proof):
-        os.remove(proof)
+    # Resolve the worker-side workspace first: the worker only accepts an
+    # absolute path that already exists, so default to its cwd rather than
+    # guessing.
+    if not a.workspace:
+        st, j = call(a.port, a.token, "/status")
+        a.workspace = j.get("cwd") or ""
+        if not a.workspace.startswith("/"):
+            print(f"could not determine the worker's cwd (got {a.workspace!r}); "
+                  f"pass --workspace")
+            return 2
+    if not os.path.isabs(a.workspace):
+        print(f"--workspace must be absolute as the worker sees it (got {a.workspace!r})")
+        return 2
+
+    # Where to look for proof.txt on THIS machine. For a container the
+    # in-container workspace is usually not a host path at all, so fall back to
+    # asserting on the tool result instead of silently checking the wrong dir.
+    proof_host = a.workspace_host or a.workspace
+    proof = os.path.join(proof_host, "proof.txt")
+    if a.workspace_host:
+        os.makedirs(a.workspace_host, exist_ok=True)
+        if os.path.exists(proof):
+            os.remove(proof)
 
     print("1. auth")
     st, j = call(a.port, None, "/health")
@@ -173,9 +203,32 @@ def main():
         check("model streamed an answer", len(text.strip()) > 0, repr(text.strip()[:60]))
 
     print("3. the work actually happened on the worker's disk")
-    ok = os.path.exists(proof)
-    content = open(proof).read() if ok else ""
-    check("proof.txt written by the agent", ok and "remote worker" in content, repr(content[:60]))
+    # A toolend carrying "Error:" means the write never happened, so the turn
+    # "succeeding" is not evidence of work. This check works without any host
+    # access, which is what a container needs.
+    tool_errs = []
+    for e in full:
+        ev = e["event"]
+        if ev.get("type") != "toolend":
+            continue
+        out = str(ev.get("output", ""))
+        if ev.get("ok") is False or out.startswith("Error:"):
+            tool_errs.append(out[:120])
+    check("the write tool reported no error", not tool_errs, str(tool_errs)[:160])
+
+    if a.workspace_host:
+        ok = os.path.exists(proof)
+        content = open(proof).read() if ok else ""
+        check("proof.txt landed on the host mount", ok and "remote worker" in content,
+              repr(content[:60]))
+    elif os.path.isdir(proof_host):
+        ok = os.path.exists(proof)
+        content = open(proof).read() if ok else ""
+        check("proof.txt written by the agent", ok and "remote worker" in content,
+              repr(content[:60]))
+    else:
+        print(f"  SKIP  proof.txt on disk — {proof_host!r} is not a path on this "
+              f"machine; pass --workspace-host with the host mount to check it")
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
