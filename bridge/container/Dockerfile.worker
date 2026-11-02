@@ -1,0 +1,87 @@
+# Vicuna remote worker — container image
+#
+# Runs the agent runtime (inference client + tools + live-browser) on a machine
+# that is NOT the user's laptop. The desktop app stays a client. See
+# bridge/WORKER.md for the protocol and scripts/check-worker*.py for the tests.
+#
+#   docker compose -f bridge/container/docker-compose.worker.yml build
+#
+# Two-stage build, and the worker stage deliberately contains no Rust toolchain
+# and no GTK/WebKit: `vicuna-core` (agent loop, tools, MCP, browser) has no
+# Tauri dependency, so the daemon builds with a plain toolchain and the runtime
+# image is the binary plus Chromium's shared libraries.
+#
+# Why amd64 on Apple silicon: live-browser publishes only linux-x86_64 /
+# darwin-* / windows-x86_64. On an arm64 host this image is emulated, so it is
+# slow — fine for a smoke test, use a native amd64 host for anything real.
+#
+# Chromium is NOT baked in: the entrypoint fetches CloakBrowser at runtime into
+# a volume. Baking it would add ~200MB and couple the image to the browser build
+# rather than the `lb` version pin.
+
+# ---------------------------------------------------------------- build ----
+FROM --platform=linux/amd64 rust:1-bookworm AS build
+
+ARG LB_VERSION=0.4.18
+ENV CARGO_TERM_COLOR=never
+
+WORKDIR /app
+# Only the two crates the worker actually needs. No src-tauri: the daemon must
+# never depend on the desktop shell.
+COPY core/Cargo.toml ./core/
+COPY bridge/Cargo.toml bridge/Cargo.lock ./bridge/
+COPY core/src ./core/src
+COPY bridge/src ./bridge/src
+
+WORKDIR /app/bridge
+RUN cargo build --release --bin worker
+
+# -------------------------------------------------------------- runtime ----
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+ARG LB_VERSION=0.4.18
+ENV LB_VERSION=${LB_VERSION} \
+    DEBIAN_FRONTEND=noninteractive
+
+# Runtime libs headless Chromium needs, plus curl for the lb fetch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl jq \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+        libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
+        libatspi2.0-0 libx11-6 libxcb1 libxext6 libglib2.0-0 libdbus-1-3 \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# live-browser (linux-x86_64 only) → /opt/lb, keeping web/dist next to the
+# binary so `lb`'s cwd fast-path finds its UI (same layout as lb-sidecar).
+RUN set -eux; \
+    curl -fsSL -o /tmp/lb.tgz \
+      "https://github.com/anslwy/live-browser/releases/download/v${LB_VERSION}/live-browser-v${LB_VERSION}-linux-x86_64.tar.gz"; \
+    mkdir -p /opt/lb; \
+    tar -xzf /tmp/lb.tgz -C /opt/lb --strip-components=1; \
+    chmod +x /opt/lb/lb; \
+    ln -sf /opt/lb/lb /usr/local/bin/lb; \
+    /opt/lb/lb --version; \
+    rm -f /tmp/lb.tgz
+
+COPY --from=build /app/bridge/target/release/worker /usr/local/bin/vicuna-worker
+COPY bridge/container/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# The agent's file/exec tools operate in here; keep it a bind mount so output
+# lands on the host rather than in the container layer.
+RUN mkdir -p /workspace
+
+# Engine cache is a volume, not an image layer: a 200MB Chromium in a layer
+# would be re-downloaded on every rebuild and bloat the image.
+ENV VICUNA_WORKER_STATE=/var/lib/vicuna-worker \
+    VICUNA_WORKER_BIND=0.0.0.0:1421 \
+    VICUNA_OLLAMA_BASE=http://host.docker.internal:11434 \
+    CLOAKBROWSER_CACHE_DIR=/var/lib/vicuna-engine \
+    LB_BROWSER_VERSION=145.0.7632.109.2 \
+    VICUNA_LB_NO_SANDBOX=1
+
+EXPOSE 1421
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

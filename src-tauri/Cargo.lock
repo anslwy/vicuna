@@ -5417,6 +5417,22 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-sql",
  "tokio",
+ "vicuna-core",
+]
+
+[[package]]
+name = "vicuna-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures-util",
+ "getrandom 0.3.4",
+ "portable-pty",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

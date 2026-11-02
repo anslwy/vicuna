@@ -1,0 +1,33 @@
+[package]
+name = "vicuna-core"
+version = "0.1.0"
+description = "Vicuna backend core: agent loop, tools, MCP, browser management (no Tauri)"
+authors = ["you"]
+edition = "2024"
+
+[lib]
+name = "vicuna_core"
+path = "src/lib.rs"
+
+# Deliberately NO tauri / tauri-* dependency. Everything needed to run an agent
+# turn lives here, so the remote worker builds with a plain Rust toolchain and
+# no GTK/WebKit dev packages. The desktop shell (src-tauri) depends on this
+# crate and adds the Tauri commands on top.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt", "rt-multi-thread", "macros", "fs"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+portable-pty = "0.9.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

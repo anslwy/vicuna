@@ -646,8 +646,14 @@ pub async fn browser_start_logic(
     // system Chrome is never used (real profiles, picker settings, and
     // running-instance joins caused all the Windows trouble).
     let engine = browser_ensure_engine_logic(resource_dir.clone()).await?;
-    let attempts: Vec<Vec<String>> =
-        vec![vec!["--chrome".to_string(), engine.path.clone()]];
+    // In a container there is no user namespace for Chrome's sandbox, so the
+    // daemon is told to pass --no-sandbox through. Gated by env because it
+    // weakens browser isolation and must not be on for a normal desktop.
+    let mut lb_args = vec!["--chrome".to_string(), engine.path.clone()];
+    if std::env::var("VICUNA_LB_NO_SANDBOX").ok().as_deref() == Some("1") {
+        lb_args.push("--no-sandbox".to_string());
+    }
+    let attempts: Vec<Vec<String>> = vec![lb_args];
     let mut last_err = String::from("no attempt ran");
     for extra in &attempts {
         match spawn_attempt(&bin, source, extra, &client).await {
