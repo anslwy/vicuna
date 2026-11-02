@@ -1543,6 +1543,148 @@ fn trunc_out(s: &str) -> (String, bool) {
     }
 }
 
+/// Refuse agent `exec` commands that crawl the whole disk (or a whole home
+/// folder) with a recursive walker: `find / …`, `find ~ …`, `grep -r … /`,
+/// …. On macOS such a scan descends into every TCC-protected zone
+/// (Documents, Downloads, Photos/Music libraries, …) and macOS raises one
+/// consent dialog per zone for the full scan — a prompt storm the user
+/// cannot click through (verified live: one `find / -name …` produced the
+/// Documents/Downloads/Photos/Music dialogs back to back until the 30s
+/// timeout killed it). It also violates the workspace boundary outright.
+/// Narrow scans (`find /opt/homebrew …`, `grep -r … src`) still pass: only
+/// storm-scale roots are refused. Returns the offending fragment for the
+/// coaching error, or None when the command is fine.
+fn refuse_full_disk_scan(cmd: &str) -> Option<String> {
+    /// Storm-scale scan roots: the filesystem root, any home folder, and
+    /// macOS's physical-root alias. Anything narrower (a specific bin dir,
+    /// a workspace-relative path, `$HOME/sub`) stays allowed.
+    fn is_storm_root(tok: &str, home: &str) -> bool {
+        let norm = tok.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if matches!(
+            norm,
+            "/" | "/." | "~" | "$HOME" | "${HOME}" | "/Users" | "/System/Volumes/Data"
+        ) {
+            return true;
+        }
+        if !home.is_empty() && norm == home.trim_end_matches('/') {
+            return true;
+        }
+        // /Users/<name> is a whole home folder; deeper /Users/<name>/…
+        // subpaths are bounded single-zone scans, left to the boundary rule.
+        if let Some(rest) = norm.strip_prefix("/Users/") {
+            if !rest.is_empty() && !rest.contains('/') {
+                return true;
+            }
+        }
+        // ~user (no slash) is a whole home folder too; ~/… is bounded.
+        if norm.starts_with('~') && !norm.contains('/') {
+            return true;
+        }
+        false
+    }
+    fn basename(argv0: &str) -> &str {
+        argv0.rsplit('/').next().unwrap_or(argv0)
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    // Split on shell command separators so `a; find / …` and `a && find / …`
+    // are caught too (covers $(…) via the parens). Quote-aware enough for
+    // the check: quote chars are stripped from tokens (`"/"` still matches).
+    // NB: `{`/`}` are NOT separators — splitting on them would shred
+    // `${HOME}`; brace groups are skipped as wrapper tokens below instead.
+    for seg in cmd.split([';', '|', '&', '\n', '(', ')', '`']) {
+        let toks: Vec<String> = seg
+            .split_whitespace()
+            .map(|t| t.replace(['\'', '"'], ""))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if toks.is_empty() {
+            continue;
+        }
+        // skip wrappers (sudo/command/env), brace-group markers, and VAR=
+        // prefixes to the real argv0
+        let mut i = 0;
+        while i < toks.len()
+            && (matches!(toks[i].as_str(), "sudo" | "command" | "env" | "{" | "}")
+                || (toks[i].contains('=') && !toks[i].starts_with('=')))
+        {
+            i += 1;
+        }
+        if i >= toks.len() {
+            continue;
+        }
+        let argv0 = basename(&toks[i]);
+        let rest = &toks[i + 1..];
+        let recursive_walker = match argv0 {
+            "find" | "rg" | "fd" | "du" | "tree" => true,
+            "grep" => rest.iter().any(|t| {
+                t == "--recursive"
+                    || (t.starts_with('-')
+                        && !t.starts_with("--")
+                        && t.len() > 1
+                        && t[1..].chars().any(|c| c == 'r' || c == 'R'))
+            }),
+            // ls -r is reverse-sort, not recursive: only -R/--recursive walks
+            "ls" => rest.iter().any(|t| {
+                t == "--recursive"
+                    || (t.starts_with('-')
+                        && !t.starts_with("--")
+                        && t.len() > 1
+                        && t[1..].contains('R'))
+            }),
+            _ => false,
+        };
+        if !recursive_walker {
+            continue;
+        }
+        let mut skip_next = false;
+        let mut find_options = argv0 == "find";
+        for t in rest {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if t.starts_with('-') {
+                // A pattern-taking flag consumes the next token — except in
+                // --opt=value form, where the value is already attached.
+                // (Exact `--file`, not the prefix: rg's `--files` takes no
+                // value and must not swallow the scan root.)
+                if matches!(t.as_str(), "-e" | "-f" | "--regexp" | "--file") {
+                    skip_next = true;
+                }
+                if argv0 == "find" {
+                    // find's global options (-H/-L/-P, -O0-3, -D…) precede
+                    // the paths; any other flag ends the path operands
+                    // (expression-first means default `.` = workspace: fine).
+                    if find_options
+                        && (matches!(t.as_str(), "-H" | "-L" | "-P")
+                            || t.starts_with("-O")
+                            || t.starts_with("-D"))
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+            find_options = false;
+            // Skip -e/-f values above so a pattern of `/` can't misfire.
+            if is_storm_root(t, &home) {
+                return Some(format!("{argv0} {t}"));
+            }
+        }
+    }
+    None
+}
+
+/// Coaching error for refused full-disk scans: tells the model what to do
+/// instead so the turn continues productively.
+fn full_disk_scan_error(frag: &str) -> String {
+    format!(
+        "refused: `{frag} …` crawls the whole disk (or a whole home folder), including macOS privacy-protected folders — macOS raises one consent dialog per folder for the entire scan. Locate tools with `command -v <name>` or `ls` on specific bin dirs (/opt/homebrew/bin, /usr/local/bin, /usr/bin), search inside the workspace with the grep tool, or ask the user for the path."
+    )
+}
+
 /// Run a shell command with cwd=workspace root. Timeout default 30s (max
 /// 120s). Output capped at 32KB per stream. Destructive commands are the
 /// user's responsibility — Work mode is explicit opt-in per session.
@@ -1553,6 +1695,9 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
     }
     if cmd.len() > 8000 {
         return Err("command too long".to_string());
+    }
+    if let Some(frag) = refuse_full_disk_scan(cmd) {
+        return Err(full_disk_scan_error(&frag));
     }
     let canon = work_canonical_root(root.trim())?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000).clamp(1000, 120000));
@@ -1886,6 +2031,9 @@ pub async fn bg_start(state: &BgExecState, root: String, command: String) -> Res
     }
     if cmd.len() > 8000 {
         return Err("command too long".to_string());
+    }
+    if let Some(frag) = refuse_full_disk_scan(cmd) {
+        return Err(full_disk_scan_error(&frag));
     }
     let canon = work_canonical_root(root.trim())?;
     let n = state.seq.fetch_add(1, Ordering::Relaxed);
@@ -3668,6 +3816,103 @@ mod work_tests {
         assert_eq!(res.exit_code, Some(0));
         let slow = work_exec(root, "sleep 5".into(), Some(1200)).await.unwrap();
         assert!(slow.timed_out);
+    }
+
+    #[test]
+    fn full_disk_scan_matcher_cases() {
+        // refused: recursive walkers rooted at storm-scale roots, including
+        // the exact escalation that stormed TCC (`…; find / -name …`)
+        for cmd in [
+            "find / -name gh",
+            "find / -name 'gh*' 2>/dev/null",
+            "find /",
+            "find -H / -name gh",
+            "command -v gh; echo done; find / -name gh",
+            "ls /opt/homebrew/bin && find / -name gh",
+            "echo $(find / -name gh)",
+            "find ~ -name '*.pem'",
+            "find ~/ -name x",
+            "find ~other -name x",
+            "find $HOME -name x",
+            "find ${HOME} -name x",
+            "find \"/\" -name x",
+            "find /Users -name x",
+            "find /Users/waiyip -name x",
+            "find /System/Volumes/Data -name x",
+            "grep -r secret /",
+            "grep -R --regexp=foo /",
+            "rg --files /",
+            "fd passwd /",
+            "ls -R /",
+            "du -sh /",
+            "tree /",
+            "sudo find / -name x",
+            "FOO=1 find / -name x",
+            "{ find / -name x; }",
+        ] {
+            assert!(
+                refuse_full_disk_scan(cmd).is_some(),
+                "should refuse: {cmd}"
+            );
+        }
+        // $HOME spelled out is still a whole-home scan; $HOME/sub is bounded
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(refuse_full_disk_scan(&format!("find {home} -name x")).is_some());
+            assert!(refuse_full_disk_scan(&format!("find {home}/proj -name x")).is_none());
+        }
+        // allowed: narrow scans + everyday commands (incl. the good probes
+        // from the same turn that produced the `find /` escalation)
+        for cmd in [
+            "command -v gh",
+            "which gh && gh --version",
+            "ls /opt/homebrew/bin/ | grep -i gh",
+            "ls /usr/local/bin/ | grep -i gh",
+            "/opt/homebrew/bin/gh --version",
+            "find . -name '*.rs'",
+            "find src -name x",
+            "find -name x",
+            "find /opt/homebrew -name gh",
+            "find /tmp/work -name x",
+            "find ~/proj -name x",
+            "find $HOME/proj -name x",
+            "find /Users/waiyip/Documents -name x",
+            "grep -r needle src",
+            "grep -e / needle.txt",
+            "rg needle /tmp/thing",
+            "fd clone src",
+            "ls -R src",
+            "ls -r /",
+            "ls /",
+            "du -sh /opt/homebrew",
+            "echo /",
+            "echo don't find / trouble",
+            "python3 fizzbuzz.py",
+        ] {
+            assert!(
+                refuse_full_disk_scan(cmd).is_none(),
+                "should allow: {cmd}"
+            );
+        }
+    }
+
+    /// Both exec entry points refuse a full-disk scan with a coaching error
+    /// instead of running it into the timeout + a TCC prompt storm.
+    #[tokio::test]
+    async fn exec_refuses_full_disk_scan() {
+        let d = tmp_root("findguard");
+        let root = d.to_string_lossy().to_string();
+        let err = work_exec(root.clone(), "command -v gh; find / -name gh".into(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("whole disk"), "coaching error, got: {err}");
+        assert!(err.contains("command -v"), "coaching error, got: {err}");
+        // background start refuses the same way (no storm via detached jobs)
+        let state = BgExecState::default();
+        let err = bg_start(&state, root, "find / -name gh".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("whole disk"), "coaching error, got: {err}");
+        assert!(bg_list(&state).unwrap().is_empty());
     }
 
     #[tokio::test]

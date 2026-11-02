@@ -23,6 +23,7 @@ WORKSPACE BOUNDARY (strict):
 - Already granted exceptions: read_upload (files the user attached to this session) and sessions/read_session (past chats).
 - If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
 - Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
+- Never crawl from / or your home folder (\`find /\`, \`find ~\`, \`grep -r /\`): on macOS that walks privacy-protected folders (Documents, Downloads, Photos/Music libraries) and spams a consent dialog per folder. The harness refuses such commands — use \`command -v\`, \`ls\` on specific bin dirs, or \`ask\` instead.
 - Use \`ask\` when a decision is genuinely needed (which approach/file/scope, or before anything destructive) instead of guessing. It shows buttons plus an "Other" free-text field and waits for the answer.
 - Use \`say\` to show the user any narration, answer, or explanation between tool calls. Its text is rendered as normal assistant prose. Never put narration inside another tool's arguments — the \`ask\` question must be only the question.
 
@@ -131,7 +132,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands. Do not access paths outside the workspace without asking the user first. Pass background:true for slow commands (tests, builds) to run detached and keep working — you will be woken with the result.",
+      description: "Run a shell command with cwd=workspace. Prefer non-interactive, time-bounded commands. Never run interactive commands. Do not access paths outside the workspace without asking the user first. Never scan from / or the home folder (find /, find ~, grep -r / …) — the harness refuses full-disk scans; locate tools with `command -v` or `ls` on specific bin dirs, or ask the user. Pass background:true for slow commands (tests, builds) to run detached and keep working — you will be woken with the result.",
       parameters: {
         type: "object",
         required: ["command"],
