@@ -152,6 +152,20 @@ export function clearPendingStream(): void {
   }
 }
 
+/** clear the resume marker only when it belongs to this session: several
+ *  sessions can stream at once, and one settling must never drop another's
+ *  marker (a refresh would then lose that turn instead of resuming it) */
+export function clearPendingStreamFor(chatId: string): void {
+  try {
+    const raw = localStorage.getItem(LS_PENDING);
+    if (!raw) return;
+    const p = JSON.parse(raw) as PendingStream;
+    if (p.chatId === chatId) localStorage.removeItem(LS_PENDING);
+  } catch {
+    /* ignore */
+  }
+}
+
 // legacy keys from the pre-rebrand "ollama-desktop-min" builds; read once as
 // fallback so existing users keep their chats/prefs, writes go to vicuna-*.
 const LEGACY_LS_CHATS = "ollama-min-chats";

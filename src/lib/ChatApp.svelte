@@ -20,6 +20,7 @@
     writePendingStream,
     readPendingStream,
     clearPendingStream,
+    clearPendingStreamFor,
     readDraft,
     writeDraft,
     clearDraft,
@@ -71,11 +72,24 @@
   $effect(() => {
     if (workspacePickerOpen) workspacePickerInput?.focus();
   });
-  /** visible "command running" indicator while a work tool executes */
-  let toolStatus = $state<{ chatId: string; label: string } | null>(null);
-  /** live multiple-choice question from the work agent (null when none is
-   *  pending). The turn blocks in dispatchWorkTool until the user answers. */
-  let pendingAsk = $state<{
+  /** visible "command running" indicator while a work tool executes.
+   *  Per session (chatId → label): several sessions can run at once, and a
+   *  background turn must never overwrite the open session's indicator. */
+  let toolStatuses = $state<Record<string, string>>({});
+  function setToolStatus(chatId: string, label: string | null) {
+    if (label == null) {
+      if (!(chatId in toolStatuses)) return;
+      const { [chatId]: _, ...rest } = toolStatuses;
+      toolStatuses = rest;
+    } else {
+      if (toolStatuses[chatId] === label) return;
+      toolStatuses = { ...toolStatuses, [chatId]: label };
+    }
+  }
+  /** live multiple-choice question from a work agent turn, per session. The
+   *  turn blocks until the user answers; each session keeps its own card so
+   *  concurrent turns don't overwrite each other's question. */
+  interface PendingAsk {
     chatId: string;
     index: number;
     question: string;
@@ -83,7 +97,10 @@
     other: string;
     otherOpen: boolean;
     resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel") => void;
-  } | null>(null);
+  }
+  let pendingAsks = $state<Record<string, PendingAsk>>({});
+  /** the open session's ask card (null when it has none pending) */
+  const pendingAsk = $derived(activeId != null ? (pendingAsks[activeId] ?? null) : null);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
   let explorerEntries = $state<WorkTreeEntry[]>([]);
@@ -189,31 +206,37 @@
   let selectedModel = $state("gemma4:31b-cloud");
   let modelOpen = $state(false);
   let modelQuery = $state("");
-  let streaming = $state(false);
-  /** session id of the live chat-completion stream (null when idle). Together
-   *  with workRunning/workChatId this drives the sidebar shimmer so a
-   *  streaming session stays visible even when it isn't the open one. */
-  let streamingChatId = $state<string | null>(null);
-  /** wall-clock start of the live chat stream (null when idle): sidebar hover
-   *  shows elapsed time since the query started */
-  let streamingStartAt = $state<number | null>(null);
+  /** sessions with a live chat-completion stream. Per session (not one global
+   *  flag) so one thread working never blocks starting or using another:
+   *  gates check the OPEN session only, while the sidebar/tray aggregate. */
+  let streamingIds = $state<string[]>([]);
+  /** wall-clock start per live chat stream: sidebar hover shows elapsed time */
+  let streamingStartedAt = $state<Record<string, number>>({});
+  /** any chat stream live (sidebar shimmer clock + tray aggregate) */
+  const streaming = $derived(streamingIds.length > 0);
   /** true for the whole Work turn, including tool dispatch + the wait for the
    *  next round's first token — `streaming` only covers a single request */
-  let workRunning = $state(false);
+  let workRunningIds = $state<string[]>([]);
   /** manual compaction in flight (/compact): blocks sends + edits like a turn */
-  let compacting = $state(false);
-  let workChatId = $state<string | null>(null);
-  /** wall-clock start of the live Work turn (null when idle): sidebar hover
-   *  shows elapsed time since the task started */
-  let workStartAt = $state<number | null>(null);
+  let compactingIds = $state<string[]>([]);
+  /** any Work turn live (sidebar shimmer clock + tray aggregate) */
+  const workRunning = $derived(workRunningIds.length > 0);
+  /** wall-clock start per live Work turn: sidebar hover shows elapsed time */
+  let workStartedAt = $state<Record<string, number>>({});
   /** ticking clock for live elapsed labels: advances once a second while a
    *  turn is live so sidebar hover tooltips stay current */
   let now = $state(Date.now());
-  let workStop = false;
+  /** sessions the user asked to stop (Stop / double-Esc / chat deleted):
+   *  per session so stopping one turn never aborts another */
+  const workStopIds = new Set<string>();
   let workTurnSeq = 0;
-  /** backend turn id of the live Rust agent loop (null when idle) — needed
-   *  for stop/steer/ask-answer routing while a turn runs */
-  let workTurnId: string | null = null;
+  /** current frontend turn number per session: a stale turn's late events are
+   *  dropped by comparing against this (a single global slot would invalidate
+   *  every other live turn the moment a second one starts) */
+  const workTurnSeqByChat = new Map<string, number>();
+  /** backend turn id of each live Rust agent loop — needed for
+   *  stop/steer/ask-answer routing while a turn runs */
+  const workTurnIds = new Map<string, string>();
   // ---- MCP servers (Work mode only) ----
   // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
   // file is the source of truth and the UI edits it via the backend.
@@ -809,7 +832,9 @@
   /** first Esc arms interrupt, a second Esc within 2.5s stops the agent */
   let escArmed = $state(false);
   let escTimer: ReturnType<typeof setTimeout> | null = null;
-  let continuing = $state(false);
+  /** sessions with a Continue append in flight (drives the thinking shimmer) */
+  let continuingIds = $state<string[]>([]);
+  const continuing = $derived(activeId != null && continuingIds.includes(activeId));
   /** picked or pasted image attachments as data URLs (shown as thumbnails, sent as base64) */
   let attachImages = $state<string[]>([]);
   /** composer file attachments (any type): staged to ~/vicuna/uploads/<session>/ on send */
@@ -842,7 +867,9 @@
       }
     };
   });
-  let aborter = $state<AbortController | null>(null);
+  /** one AbortController per live chat stream (Stop / delete aborts only its
+   *  own session's request, never a turn running in another session) */
+  const aborters = new Map<string, AbortController>();
   let messagesEl = $state<HTMLDivElement | null>(null);
   let composerEl = $state<HTMLTextAreaElement | null>(null);
   let composerBackdrop = $state<HTMLDivElement | null>(null);
@@ -975,11 +1002,56 @@
     !activeChat || activeChat.messages.length === 0 ? pendingMode : (activeChat.mode ?? "chat")
   );
   const queuedForActive = $derived(queuedMsgs.filter((q) => q.chatId === activeId));
-  /** a turn is live: either a single request or a whole Work agent turn */
-  const busy = $derived(streaming || workRunning || compacting);
+  /** per-session liveness: several sessions can stream/work/compact at once */
+  function isChatStreaming(id: string): boolean {
+    return streamingIds.includes(id);
+  }
+  function isWorkRunning(id: string): boolean {
+    return workRunningIds.includes(id);
+  }
+  function isCompacting(id: string): boolean {
+    return compactingIds.includes(id);
+  }
+  function isSessionBusy(id: string | null): boolean {
+    if (id == null) return false;
+    return isChatStreaming(id) || isWorkRunning(id) || isCompacting(id);
+  }
+  function markStreaming(id: string) {
+    if (!streamingIds.includes(id)) streamingIds = [...streamingIds, id];
+    streamingStartedAt = { ...streamingStartedAt, [id]: Date.now() };
+  }
+  function unmarkStreaming(id: string) {
+    if (!streamingIds.includes(id)) return;
+    streamingIds = streamingIds.filter((x) => x !== id);
+    const { [id]: _, ...rest } = streamingStartedAt;
+    streamingStartedAt = rest;
+  }
+  function markWorkRunning(id: string) {
+    if (!workRunningIds.includes(id)) workRunningIds = [...workRunningIds, id];
+    workStartedAt = { ...workStartedAt, [id]: Date.now() };
+  }
+  function unmarkWorkRunning(id: string) {
+    if (!workRunningIds.includes(id)) return;
+    workRunningIds = workRunningIds.filter((x) => x !== id);
+    const { [id]: _, ...rest } = workStartedAt;
+    workStartedAt = rest;
+  }
+  function markCompacting(id: string) {
+    if (!compactingIds.includes(id)) compactingIds = [...compactingIds, id];
+  }
+  function unmarkCompacting(id: string) {
+    if (!compactingIds.includes(id)) return;
+    compactingIds = compactingIds.filter((x) => x !== id);
+  }
+  /** the OPEN session has a live turn (single request, Work agent turn, or
+   *  compaction). Every edit/send/delete gate reads this, so a turn running
+   *  in another session never blocks the one being used. */
+  const busy = $derived(isSessionBusy(activeId));
+  const activeStreaming = $derived(activeId != null && streamingIds.includes(activeId));
+  const activeWorkRunning = $derived(activeId != null && workRunningIds.includes(activeId));
   /** sidebar shimmer: a session with a live chat stream or work turn */
   function isSessionStreaming(id: string): boolean {
-    return (streaming && streamingChatId === id) || (workRunning && workChatId === id);
+    return isChatStreaming(id) || isWorkRunning(id);
   }
   // live elapsed ("32m 25s", "1h 32m", "3d 2h") since the task/query started
   function formatLiveElapsed(ms: number): string {
@@ -998,15 +1070,15 @@
   /** elapsed ms for a live session (work turn start wins between rounds);
    *  null when the session isn't live. Reads `now` so hover tooltips tick. */
   function liveElapsedMs(id: string): number | null {
-    if (workRunning && workChatId === id && workStartAt != null) return now - workStartAt;
-    if (streaming && streamingChatId === id && streamingStartAt != null) return now - streamingStartAt;
+    if (isWorkRunning(id) && workStartedAt[id] != null) return now - workStartedAt[id];
+    if (isChatStreaming(id) && streamingStartedAt[id] != null) return now - streamingStartedAt[id];
     return null;
   }
   /** sidebar hover tooltip for a live session ("Working · 32m 25s") */
   function liveTitle(id: string): string | undefined {
     const ms = liveElapsedMs(id);
     if (ms == null) return undefined;
-    const kind = workRunning && workChatId === id ? "Working" : "Streaming";
+    const kind = isWorkRunning(id) ? "Working" : "Streaming";
     return `${kind} · ${formatLiveElapsed(ms)}`;
   }
   // advance the live clock while a turn runs so elapsed tooltips stay current
@@ -1033,13 +1105,13 @@
     void minuteBucket;
     const starts: number[] = [];
     const ids = new Set<string>();
-    if (streaming && streamingChatId) {
-      ids.add(streamingChatId);
-      if (streamingStartAt != null) starts.push(streamingStartAt);
+    for (const sid of streamingIds) {
+      ids.add(sid);
+      if (streamingStartedAt[sid] != null) starts.push(streamingStartedAt[sid]);
     }
-    if (workRunning && workChatId) {
-      ids.add(workChatId);
-      if (workStartAt != null) starts.push(workStartAt);
+    for (const sid of workRunningIds) {
+      ids.add(sid);
+      if (workStartedAt[sid] != null) starts.push(workStartedAt[sid]);
     }
     const n = ids.size;
     const at = Date.now();
@@ -1154,11 +1226,8 @@
   }
 
   function newChat() {
-    aborter?.abort();
-    aborter = null;
-    streaming = false;
-    streamingChatId = null;
-    streamingStartAt = null;
+    // navigating never touches live turns: other sessions keep streaming or
+    // working in the background (sidebar shimmer shows them)
     // the composer box is global: New never touches the textbox.
     // No placeholder session is created: the sidebar stays unchanged and
     // the session only appears once the first message is sent (send()
@@ -1177,11 +1246,7 @@
 
   function selectChat(id: string) {
     if (id === activeId) return;
-    aborter?.abort();
-    aborter = null;
-    streaming = false;
-    streamingChatId = null;
-    streamingStartAt = null;
+    // navigating never aborts live turns (see newChat)
     editingIndex = null;
     editDraft = "";
     copiedKey = null;
@@ -1215,11 +1280,7 @@
     if (sid === appliedSession) return;
     appliedSession = sid;
     if (sid === activeId) return;
-    aborter?.abort();
-    aborter = null;
-    streaming = false;
-    streamingChatId = null;
-    streamingStartAt = null;
+    // external nav also leaves live turns alone (see newChat)
     editingIndex = null;
     editDraft = "";
     copiedKey = null;
@@ -1236,21 +1297,26 @@
   });
 
   function deleteChat(id: string) {
-    if (pendingAsk?.chatId === id) cancelPendingAsk("(the chat was deleted before answering)");
-    if (workRunning && workChatId === id && workTurnId) void stopWorkAgentTurn(workTurnId).catch(() => {});
-    aborter?.abort();
-    aborter = null;
-    streaming = false;
-    if (streamingChatId === id) {
-      streamingChatId = null;
-      streamingStartAt = null;
+    // stop only THIS session's live turn — other sessions keep running
+    if (pendingAsks[id]) cancelPendingAsk(id, "(the chat was deleted before answering)");
+    const turnId = workTurnIds.get(id);
+    if (turnId) {
+      workStopIds.add(id);
+      void stopWorkAgentTurn(turnId).catch(() => {});
+      workTurnIds.delete(id);
     }
-    if (workChatId === id) {
-      workChatId = null;
-      workRunning = false;
-      workStartAt = null;
-      workTurnId = null;
+    workTurnSeqByChat.delete(id);
+    aborters.get(id)?.abort();
+    aborters.delete(id);
+    // drop any prompts queued for the deleted session (backend-confirmed or
+    // not — their turn is gone)
+    if (queuedMsgs.some((q) => q.chatId === id)) {
+      queuedMsgs = queuedMsgs.filter((q) => q.chatId !== id);
     }
+    unmarkStreaming(id);
+    unmarkWorkRunning(id);
+    unmarkCompacting(id);
+    setToolStatus(id, null);
     ctxMenu = null;
     pendingDeleteId = null;
     const remaining = chats.filter((c) => c.id !== id);
@@ -2733,7 +2799,7 @@
   let pendingSaveAction = $state<"regen" | "save">("regen");
   function saveOrConfirm() {
     const c = activeChat;
-    if (!c || editingIndex == null || streaming) return;
+    if (!c || editingIndex == null || activeStreaming) return;
     if (editingIndex >= c.messages.length - 1) {
       void saveEdit();
     } else {
@@ -2745,7 +2811,7 @@
   // confirm — it rewrites just that message and leaves everything after it.
   function saveOnlyOrConfirm() {
     const c = activeChat;
-    if (!c || editingIndex == null || streaming) return;
+    if (!c || editingIndex == null || activeStreaming) return;
     void saveEditOnly();
   }
   function cancelSaveConfirm() {
@@ -2758,7 +2824,7 @@
   }
   async function forkAndSave() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || streaming) return;
+    if (!chat || editingIndex == null || activeStreaming) return;
     const i = editingIndex;
     const draft = editDraft;
     const imgs = [...editImages];
@@ -2783,7 +2849,7 @@
   // message in place — no truncation, no model reply. Then persist.
   async function saveEditOnly() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || streaming || workRunning) return;
+    if (!chat || editingIndex == null || activeStreaming || activeWorkRunning) return;
     const text = editDraft.trim();
     const images = editImages.length ? [...editImages] : undefined;
     if (!text && !images) return;
@@ -2812,7 +2878,7 @@
 
   async function saveEdit() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || streaming || workRunning) return;
+    if (!chat || editingIndex == null || activeStreaming || activeWorkRunning) return;
     const trimmed = editDraft.trim();
     const images = editImages.length ? [...editImages] : undefined;
     if (!trimmed && !images) return;
@@ -2879,9 +2945,10 @@
 
   function forkAt(i: number) {
     const c = chats.find((x) => x.id === activeId);
+    // busy is the open session's: forking a live session is blocked, but a
+    // turn running elsewhere never blocks forking this one (and forking must
+    // never abort that other turn)
     if (!c || busy) return;
-    aborter?.abort();
-    aborter = null;
     const fork: Chat = {
       id: crypto.randomUUID(),
       title: `${c.title} (fork)`,
@@ -2909,17 +2976,16 @@
   }
 
   async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; rawStyle?: PromptStyle; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
-    streaming = true;
-    streamingChatId = chat.id;
-    streamingStartAt = Date.now();
+    markStreaming(chat.id);
     const ctrl = new AbortController();
-    aborter = ctrl;
+    aborters.set(chat.id, ctrl);
     let produced = false;
     let generatedText = "";
     // follow the new output — unless this is a mid-turn work round or the
     // wrap-up generation: re-pinning there would yank a user who scrolled
-    // up to read earlier tool output, on every single round
-    if (opts.pinFollow ?? true) {
+    // up to read earlier tool output, on every single round. A background
+    // session's stream never touches the open view's pin/scroll either.
+    if ((opts.pinFollow ?? true) && chat.id === activeId) {
       isPinned = true;
     }
     // fresh sends with no explicit think use the effort picker (model default
@@ -2938,7 +3004,7 @@
       rawStyle: opts.rawStyle
     });
     save();
-    scrollBottom();
+    if (chat.id === activeId) scrollBottom();
     // raw Continue can overrun the turn on some builds (see
     // isRunawayRepetition): remember the partial so a cut keeps only the
     // clean continuation
@@ -2966,7 +3032,10 @@
       const th = pendingTh;
       pendingTok = "";
       pendingTh = "";
-      const keep = captureStreamSel(index);
+      // selection + scroll belong to the open view: a background session's
+      // tokens update state but never touch them
+      const isOpen = chat.id === activeId;
+      const keep = isOpen ? captureStreamSel(index) : null;
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[index]) {
         const m = c.messages[index];
@@ -2974,7 +3043,7 @@
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(index, keep));
-      scrollBottom();
+      if (isOpen) scrollBottom();
       saveSoon();
     }
     function scheduleFlush() {
@@ -2993,15 +3062,15 @@
       }
     }
     function dropStallHint() {
-      if (toolStatus?.chatId === chat.id && toolStatus.label === "Preparing tool call…") toolStatus = null;
+      if (toolStatuses[chat.id] === "Preparing tool call…") setToolStatus(chat.id, null);
     }
     function armStall() {
       clearStall();
       if (!opts.tools) return;
       stallTimer = setTimeout(() => {
         stallTimer = null;
-        if (!pendingTok && !pendingTh && !toolStatus) {
-          toolStatus = { chatId: chat.id, label: "Preparing tool call…" };
+        if (!pendingTok && !pendingTh && !toolStatuses[chat.id]) {
+          setToolStatus(chat.id, "Preparing tool call…");
         }
       }, 1000);
     }
@@ -3055,12 +3124,8 @@
         }
       }
     } finally {
-      streaming = false;
-      if (streamingChatId === chat.id) {
-        streamingChatId = null;
-        streamingStartAt = null;
-      }
-      aborter = null;
+      unmarkStreaming(chat.id);
+      if (aborters.get(chat.id) === ctrl) aborters.delete(chat.id);
       clearStall();
       dropStallHint();
       // drop any scheduled flush and push the tail synchronously: the final
@@ -3105,10 +3170,11 @@
         chats = [...chats];
       }
       // user stop / natural settle clears the marker; a refresh/close
-      // abort keeps it so the next load resumes the turn
-      if (!unloading) clearPendingStream();
+      // abort keeps it so the next load resumes the turn. Only this
+      // session's own marker is cleared — never a concurrent turn's.
+      if (!unloading) clearPendingStreamFor(chat.id);
       save();
-      scrollBottom();
+      if (chat.id === activeId) scrollBottom();
       return { text: generatedText, toolCalls: runToolCalls };
     }
   }
@@ -3140,7 +3206,7 @@
       if (!useRawContinue(continueMode, style)) style = null;
     }
     const raw = style ? buildRawContinuePrompt(history, style) : null;
-    continuing = true;
+    if (!continuingIds.includes(chat.id)) continuingIds = [...continuingIds, chat.id];
     try {
       if (raw && style) {
         await streamInto(chat, i, history, false, {
@@ -3158,7 +3224,7 @@
         await streamInto(chat, i, history, false, { think: false, temperature: 0.2, stop: stopWords, mode: "continue" });
       }
     } finally {
-      continuing = false;
+      continuingIds = continuingIds.filter((x) => x !== chat.id);
     }
   }
 
@@ -3224,9 +3290,9 @@
       const imgs = h.images?.length ? ` [${h.images.length} image(s) attached]` : "";
       return `${who}: ${h.content}${imgs}`;
     }).join("\n\n");
-    compacting = true;
+    markCompacting(chat.id);
     error = null;
-    toolStatus = { chatId: chat.id, label: "Compacting context…" };
+    setToolStatus(chat.id, "Compacting context…");
     let summary = "";
     try {
       const res = await chatStream(
@@ -3245,8 +3311,8 @@
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      compacting = false;
-      if (toolStatus?.chatId === chat.id) toolStatus = null;
+      unmarkCompacting(chat.id);
+      setToolStatus(chat.id, null);
     }
     if (!summary.trim()) return;
     const c = chats.find((x) => x.id === chat.id);
@@ -3274,7 +3340,10 @@
   async function send() {
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
-    if (compacting) return;
+    // only THIS session's own live turn blocks its composer: a turn running
+    // in another session never stops this one from sending (each session runs
+    // its own stream/work turn concurrently)
+    if (isCompacting(activeId ?? "")) return;
     // keep focus off the send/queue button: the streaming swap destroys it,
     // and Safari scrolls the thread to the top on the resulting focus loss
     parkComposerFocus();
@@ -3282,11 +3351,11 @@
     // treats typed-then-sent as picked (the native dialog is modal, so
     // desktop can never send mid-pick either)
     if (workspacePickerOpen) await commitWorkspacePicker();
-    if (streaming || workRunning) {
+    if (activeStreaming || activeWorkRunning) {
       // work turns stay interactive: a prompt typed mid-run queues for the
       // next round instead of being dropped or starting a parallel turn
-      const running = chats.find((c) => c.id === workChatId);
-      if (workRunning && workChatId === activeId && (running?.mode ?? "chat") === "work") {
+      const running = chats.find((c) => c.id === activeId);
+      if (activeWorkRunning && (running?.mode ?? "chat") === "work") {
         if (attachFiles.length) {
           error = "Wait for the turn to finish before sending files.";
           return;
@@ -3427,7 +3496,8 @@
     const id = crypto.randomUUID();
     const msg: ChatMsg = { role: "user", content: text, ...(images ? { images } : {}) };
     queuedMsgs = [...queuedMsgs, { chatId, id, msg }];
-    if (workTurnId) void queueWorkAgentMsg(workTurnId, id, msg).catch(() => {});
+    const turnId = workTurnIds.get(chatId);
+    if (turnId) void queueWorkAgentMsg(turnId, id, msg).catch(() => {});
     input = "";
     clearDraft(null);
     attachImages = [];
@@ -3454,7 +3524,8 @@
     const removed = queuedMsgs.filter((_, i) => i === index);
     queuedMsgs = queuedMsgs.filter((_, i) => i !== index);
     for (const q of removed) {
-      if (workTurnId) void removeWorkAgentMsg(workTurnId, q.id).catch(() => {});
+      const turnId = workTurnIds.get(q.chatId);
+      if (turnId) void removeWorkAgentMsg(turnId, q.id).catch(() => {});
     }
   }
 
@@ -3734,7 +3805,7 @@
   /** recompute the slash menu from the input (input/click/keyup/blur) */
   function refreshSlashMenu() {
     // work-only: slash commands steer the agent, meaningless in chat
-    if (composerMode !== "work" || !input.startsWith("/") || input.includes("\n") || streaming || workRunning || compacting) {
+    if (composerMode !== "work" || !input.startsWith("/") || input.includes("\n") || busy) {
       slash = null;
       return;
     }
@@ -4655,9 +4726,11 @@
     wasWorkRunning = workRunning;
   });
 
-  /** work mode: Esc once arms the interrupt, Esc again within 2.5s stops it */
+  /** work mode: Esc once arms the interrupt, Esc again within 2.5s stops it.
+   *  Only the open session's own turn is interruptible here — a background
+   *  turn keeps running until its own session stops it. */
   function onEscape() {
-    if (!workRunning && !streaming) return false;
+    if (!busy) return false;
     if (!escArmed) {
       escArmed = true;
       if (escTimer) clearTimeout(escTimer);
@@ -4677,9 +4750,11 @@
   /** user answered a live ask card: resolve the blocked tool call (the work
    *  loop appends the visible record) */
   function answerAsk(value: string) {
-    const a = pendingAsk;
-    if (!a) return;
-    pendingAsk = null;
+    const id = activeId;
+    const a = id != null ? pendingAsks[id] : undefined;
+    if (!id || !a) return;
+    const { [id]: _, ...rest } = pendingAsks;
+    pendingAsks = rest;
     a.resolve(value, "answer");
     scrollBottom();
   }
@@ -4687,9 +4762,11 @@
   /** user dismissed the question without answering: tell the model so it
    *  stops waiting and doesn't re-ask */
   function dismissAsk() {
-    const a = pendingAsk;
-    if (!a) return;
-    pendingAsk = null;
+    const id = activeId;
+    const a = id != null ? pendingAsks[id] : undefined;
+    if (!id || !a) return;
+    const { [id]: _, ...rest } = pendingAsks;
+    pendingAsks = rest;
     a.resolve(
       "User dismissed the question without answering. Do not ask it again — continue with your best judgment or explain what you need.",
       "dismiss"
@@ -4697,23 +4774,29 @@
     scrollBottom();
   }
 
-  /** dismiss a pending ask without an answer (stop / chat deleted) so the
-   *  awaiting work loop can unwind instead of hanging forever */
-  function cancelPendingAsk(reason: string) {
-    const a = pendingAsk;
+  /** dismiss a session's pending ask without an answer (stop / chat deleted)
+   *  so the awaiting work loop can unwind instead of hanging forever */
+  function cancelPendingAsk(chatId: string, reason: string) {
+    const a = pendingAsks[chatId];
     if (!a) return;
-    pendingAsk = null;
+    const { [chatId]: _, ...rest } = pendingAsks;
+    pendingAsks = rest;
     a.resolve(reason, "cancel");
   }
 
+  /** stop the OPEN session's live turn only — background sessions keep
+   *  running (each has its own Stop while open, and its own sidebar row) */
   function stop() {
+    const id = activeId;
     // same destroyed-node focus loss as send(): the stop button unmounts at
     // settle, so park focus first or Safari jumps to the top on Stop too
     parkComposerFocus();
-    if (workRunning) workStop = true;
-    if (workTurnId) void stopWorkAgentTurn(workTurnId).catch(() => {});
-    cancelPendingAsk("(the user interrupted before answering)");
-    aborter?.abort();
+    if (id == null) return;
+    if (isWorkRunning(id)) workStopIds.add(id);
+    const turnId = workTurnIds.get(id);
+    if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
+    cancelPendingAsk(id, "(the user interrupted before answering)");
+    aborters.get(id)?.abort();
   }
 
   function onKey(e: KeyboardEvent) {
@@ -5065,13 +5148,20 @@
    *  turns, goal retirement, stats) are unchanged. */
   async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = []) {
     const turnId = ++workTurnSeq;
+    workTurnSeqByChat.set(chat.id, turnId);
+    // a turn is live while it is still its session's newest: late events
+    // from a superseded turn (or a deleted session) are dropped
+    const isCurrentTurn = () => workTurnSeqByChat.get(chat.id) === turnId;
+    // view updates belong to the open session: a background turn updates
+    // state but never scrolls the thread being read
+    const scrollIfOpen = () => {
+      if (chat.id === activeId) scrollBottom();
+    };
     // No Tauri gate here: plain browsers drive the same flow through the
     // loopback bridge (startWorkAgentTurn throws the desktop/bridge error
     // when neither is present, and the catch below surfaces it).
-    workRunning = true;
-    workChatId = chat.id;
-    workStartAt = Date.now();
-    workStop = false;
+    markWorkRunning(chat.id);
+    workStopIds.delete(chat.id);
     let curIndex = index;
     // in-flight tool head (for say/ask/done display) + the ask answer the
     // frontend itself sent (the record mirrors it once the result lands)
@@ -5090,7 +5180,8 @@
       const th = pendingTh;
       pendingTok = "";
       pendingTh = "";
-      const keep = captureStreamSel(curIndex);
+      const isOpen = chat.id === activeId;
+      const keep = isOpen ? captureStreamSel(curIndex) : null;
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[curIndex]) {
         const m = c.messages[curIndex];
@@ -5098,7 +5189,7 @@
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
-      scrollBottom();
+      if (isOpen) scrollBottom();
       saveSoon();
     }
     function scheduleFlush() {
@@ -5115,14 +5206,14 @@
       }
     }
     function dropStallHint() {
-      if (toolStatus?.chatId === chat.id && toolStatus.label === "Preparing tool call…") toolStatus = null;
+      if (toolStatuses[chat.id] === "Preparing tool call…") setToolStatus(chat.id, null);
     }
     function armStall() {
       clearStall();
       stallTimer = setTimeout(() => {
         stallTimer = null;
-        if (!pendingTok && !pendingTh && !toolStatus) {
-          toolStatus = { chatId: chat.id, label: "Preparing tool call…" };
+        if (!pendingTok && !pendingTh && !toolStatuses[chat.id]) {
+          setToolStatus(chat.id, "Preparing tool call…");
         }
       }, 1000);
     }
@@ -5173,7 +5264,7 @@
       flushTokens();
       clearStall();
       dropStallHint();
-      if (!unloading) clearPendingStream();
+      if (!unloading) clearPendingStreamFor(chat.id);
       save();
       if (escTimer) {
         clearTimeout(escTimer);
@@ -5182,8 +5273,8 @@
       escArmed = false;
       // prompts that arrived after the last round: continue the agent with them
       // (an aborted turn returns them to the composer instead)
-      const aborted = workStop || stopped;
-      const leftovers = turnId === workTurnSeq ? takeQueued(chat.id) : [];
+      const aborted = workStopIds.has(chat.id) || stopped;
+      const leftovers = isCurrentTurn() ? takeQueued(chat.id) : [];
       if (leftovers.length) {
         if (aborted) {
           if (activeId === chat.id) {
@@ -5199,24 +5290,27 @@
             }
             chats = [c, ...chats.filter((x) => x.id !== c.id)];
             save();
-            // hand off to a fresh turn; the inner call clears workRunning
+            // hand off to a fresh turn; the inner call clears this
+            // session's running mark when it settles
             await runWorkTurn(chat, c.messages.length - 1, workspace);
             return;
           }
         }
       }
       // natural end or abort: no step cap — the backend loop already exits
-      // when the model makes no calls, repeats finished work, or stops
-      if (turnId === workTurnSeq) {
-        workRunning = false;
-        workChatId = null;
-        workStartAt = null;
-        workTurnId = null;
+      // when the model makes no calls, repeats finished work, or stops.
+      // Only the current turn clears its session (a superseded turn's late
+      // settle must never wipe the newer turn's state).
+      if (isCurrentTurn()) {
+        unmarkWorkRunning(chat.id);
+        workStopIds.delete(chat.id);
+        workTurnSeqByChat.delete(chat.id);
+        workTurnIds.delete(chat.id);
       }
     }
 
     function handleEvent(ev: WorkAgentEvent) {
-      if (turnId !== workTurnSeq) return;
+      if (!isCurrentTurn()) return;
       switch (ev.type) {
         case "token":
           pendingTok += ev.text;
@@ -5231,8 +5325,8 @@
           armStall();
           break;
         case "status":
-          if (ev.label) toolStatus = { chatId: chat.id, label: ev.label };
-          else if (toolStatus?.chatId === chat.id) toolStatus = null;
+          if (ev.label) setToolStatus(chat.id, ev.label);
+          else setToolStatus(chat.id, null);
           break;
         case "roundstart":
           // a generation round is in flight: persist the resume marker (same
@@ -5244,7 +5338,7 @@
         case "roundend": {
           clearStall();
           dropStallHint();
-          if (!unloading) clearPendingStream();
+          if (!unloading) clearPendingStreamFor(chat.id);
           // per-round stats accumulate onto the live bubble (same math the
           // old streamInto settle used: wall time always, server eval rate
           // when present, eval tokens over wall time for cloud APIs)
@@ -5262,7 +5356,7 @@
         }
         case "displaynote":
           appendContent(ev.text);
-          scrollBottom();
+          scrollIfOpen();
           saveSoon();
           break;
         case "queuedrained": {
@@ -5282,7 +5376,7 @@
             }
             chats = [t, ...chats.filter((x) => x.id !== t.id)];
             curIndex = t.messages.length - 1;
-            scrollBottom();
+            scrollIfOpen();
             saveSoon();
           }
           break;
@@ -5300,7 +5394,7 @@
           // `ask` (live card) and `say` (normal prose) own their display
           if (ev.name === "ask" || ev.name === "say") break;
           appendContent(formatToolCallHead(ev.name, ev.args));
-          scrollBottom();
+          scrollIfOpen();
           break;
         case "toolend": {
           const head = pendingHead;
@@ -5348,7 +5442,7 @@
               chats = [...chats];
             }
           }
-          scrollBottom();
+          scrollIfOpen();
           saveSoon();
           break;
         }
@@ -5362,45 +5456,48 @@
             };
             chats = [...chats];
           }
-          scrollBottom();
+          scrollIfOpen();
           saveSoon();
           break;
         }
         case "contextcompacted":
           appendContent(`\n${ev.note}\n`);
-          scrollBottom();
+          scrollIfOpen();
           saveSoon();
           break;
         case "askrequest":
           askOutcome = null;
           askText = "";
-          pendingAsk = {
-            chatId: chat.id,
-            index: curIndex,
-            question: ev.question,
-            options: ev.options,
-            other: "",
-            otherOpen: false,
-            resolve: (answer, outcome) => {
-              // cancel (Stop / chat deleted) needs no backend call: the stop
-              // path already unblocked the waiting tool with no record
-              if (outcome === "cancel") return;
-              askOutcome = outcome;
-              askText = answer;
-              const tid = workTurnId;
-              if (tid) void answerWorkAgentAsk(tid, ev.ask_id, answer).catch(() => {});
-              scrollBottom();
+          pendingAsks = {
+            ...pendingAsks,
+            [chat.id]: {
+              chatId: chat.id,
+              index: curIndex,
+              question: ev.question,
+              options: ev.options,
+              other: "",
+              otherOpen: false,
+              resolve: (answer, outcome) => {
+                // cancel (Stop / chat deleted) needs no backend call: the stop
+                // path already unblocked the waiting tool with no record
+                if (outcome === "cancel") return;
+                askOutcome = outcome;
+                askText = answer;
+                const tid = workTurnIds.get(chat.id);
+                if (tid) void answerWorkAgentAsk(tid, ev.ask_id, answer).catch(() => {});
+                scrollIfOpen();
+              }
             }
           };
-          requestAnimationFrame(() => scrollBottom());
+          requestAnimationFrame(() => scrollIfOpen());
           break;
         case "done":
-          toolStatus = null;
+          setToolStatus(chat.id, null);
           void settle(ev.stopped);
           break;
         case "error":
           error = ev.message;
-          toolStatus = null;
+          setToolStatus(chat.id, null);
           void settle(false);
           break;
       }
@@ -5432,7 +5529,13 @@
       await settle(true);
       return;
     }
-    workTurnId = agentTurn;
+    if (isCurrentTurn()) {
+      workTurnIds.set(chat.id, agentTurn);
+    } else {
+      // the session went away (deleted/stopped) while the turn was starting:
+      // stop the orphan so it doesn't run detached with no UI
+      void stopWorkAgentTurn(agentTurn).catch(() => {});
+    }
   }
 
   /** "Continue in Work": fork a chat transcript into a new work session rooted
@@ -5441,13 +5544,10 @@
    *  transcript travels as hidden seed context, never as a visible bubble. */
   async function continueInWork(id: string) {
     const src = chats.find((c) => c.id === id);
-    if (!src || streaming) return;
+    // only the source session's own live turn blocks the fork — and forking
+    // never aborts anything (the source keeps running in the background)
+    if (!src || isSessionBusy(id)) return;
     ctxMenu = null;
-    aborter?.abort();
-    aborter = null;
-    streaming = false;
-    streamingChatId = null;
-    streamingStartAt = null;
     const ws = defaultWorkspace || pendingWorkspace || "";
     const seedContext: ChatMsg[] = [
       ...compactedHistory(src.messages.slice(-20)),
@@ -5655,7 +5755,7 @@
         return;
       }
       if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
-      if (!workRunning) return;
+      if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
     window.addEventListener("keydown", h);
@@ -5703,7 +5803,7 @@
 
   onDestroy(() => {
     if (scrollFrame) cancelAnimationFrame(scrollFrame);
-    aborter?.abort();
+    for (const c of aborters.values()) c.abort();
   });
 
   async function initApp() {
@@ -5830,7 +5930,7 @@
         const resumeHistory: ChatMsg[] = compactedHistory(
           pending.mode === "continue" ? pc.messages.slice(0, pending.index + 1) : pc.messages.slice(0, pending.index)
         );
-        if (pending.mode === "continue") continuing = true;
+        if (pending.mode === "continue" && !continuingIds.includes(pc.id)) continuingIds = [...continuingIds, pc.id];
         // raw Continue resumes through /api/generate: rebuild the prefilled
         // prompt from the persisted partial (the marker carries the style
         // because the family lookup could differ offline)
@@ -5846,7 +5946,7 @@
             rawStyle: pending.rawStyle
           });
         } finally {
-          continuing = false;
+          continuingIds = continuingIds.filter((x) => x !== pc.id);
         }
       } else {
         clearPendingStream();
@@ -6060,7 +6160,7 @@
           {/if}
         </div>
         {#if goalNow || goalPromptSession === activeId}
-          {@const goalLive = goalNow && workRunning && workChatId === activeId}
+          {@const goalLive = goalNow && activeWorkRunning}
           <div class="goal-wrap">
             <div class="goal-strip" data-testid="goal-strip">
               <span class="goal-badge">Goal</span>
@@ -6168,11 +6268,11 @@
             </div></div>
           {:else}
             {@const isLast = i === activeChat.messages.length - 1}
-            {@const thinkingActive = streaming && isLast && !m.content && !continuing}
+            {@const thinkingActive = activeStreaming && isLast && !m.content && !continuing}
             {@const isWorkMsg = (activeChat?.mode ?? "chat") === "work"}
             <!-- work turns keep thinking collapsed between rounds, so the label
                  stays shimmering for the whole turn, not just the first stream -->
-            {@const thinkingLive = (streaming || workRunning) && isLast && !continuing && (thinkingActive || isWorkMsg)}
+            {@const thinkingLive = (activeStreaming || activeWorkRunning) && isLast && !continuing && (thinkingActive || isWorkMsg)}
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if m.summary}
                 <div class="compact-div" data-testid="compact-divider">
@@ -6221,38 +6321,40 @@
                   {/if}
                 </div>
               {/if}
-              <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if streaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
-              {#if pendingAsk && pendingAsk.chatId === activeChat?.id && pendingAsk.index === i}
+              <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
+              {#if pendingAsk && pendingAsk.index === i && activeId != null}
+                {@const askCard = pendingAsks[activeId]}
+                {#if askCard}
                 <div class="ask-card" data-testid="ask-card">
-                  <div class="ask-question">{pendingAsk.question}</div>
+                  <div class="ask-question">{askCard.question}</div>
                   <div class="ask-options">
-                    {#each pendingAsk.options as opt, oi}
+                    {#each askCard.options as opt, oi}
                       <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
                     {/each}
-                    {#if pendingAsk.otherOpen}
+                    {#if askCard.otherOpen}
                       <form
                         class="ask-other"
                         onsubmit={(e) => {
                           e.preventDefault();
-                          const v = pendingAsk?.other.trim() ?? "";
+                          const v = askCard.other.trim() ?? "";
                           if (v) answerAsk(v);
                         }}
                       >
                         <input
                           class="ask-input"
                           data-testid="ask-input"
-                          bind:value={pendingAsk.other}
+                          bind:value={askCard.other}
                           placeholder="Type your answer…"
                           aria-label="Custom answer"
                           onkeydown={(e) => {
                             if (e.key === "Escape") {
                               e.preventDefault();
                               e.stopPropagation();
-                              if (pendingAsk) pendingAsk.otherOpen = false;
+                              askCard.otherOpen = false;
                             }
                           }}
                         />
-                        <button class="ask-send" type="submit" data-testid="ask-send" disabled={!pendingAsk.other.trim()}>Send</button>
+                        <button class="ask-send" type="submit" data-testid="ask-send" disabled={!askCard.other.trim()}>Send</button>
                         <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
                       </form>
                     {:else}
@@ -6261,8 +6363,7 @@
                           class="ask-option ask-other-toggle"
                           data-testid="ask-other"
                           onclick={() => {
-                            if (!pendingAsk) return;
-                            pendingAsk.otherOpen = true;
+                            askCard.otherOpen = true;
                             requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[data-testid="ask-input"]')?.focus());
                           }}
                         >Other…</button>
@@ -6271,6 +6372,7 @@
                     {/if}
                   </div>
                 </div>
+                {/if}
               {/if}
               <div class="actions">
                 <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
@@ -6283,7 +6385,7 @@
                   {@const noContinue = isCloudModel(selectedModel) || isOpenRouterSelection(selectedModel)}
                   {@const isWork = (activeChat?.mode ?? "chat") === "work"}
                   {#if !isWork}
-                    <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for this model — use Regenerate or a new message" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
+                    <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for this model — use Regenerate or a new message" : "Continue"} disabled={activeStreaming || noContinue} onclick={() => continueFrom(i)}>
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                     </button>
                   {/if}
@@ -6298,7 +6400,7 @@
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
                 {#if m.model}
-                  {@const liveTurn = workRunning && workChatId === activeChat?.id && isLast}
+                  {@const liveTurn = activeWorkRunning && isLast}
                   <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{modelLabel(m.model)}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
                 {/if}
               </div>
@@ -6316,9 +6418,9 @@
     {#if error}
       <div class="err" data-testid="error-box"><span>{error}</span><button type="button" class="err-x" data-testid="error-dismiss" aria-label="Dismiss error" title="Dismiss" onclick={() => (error = null)}>×</button></div>
     {/if}
-    {#if toolStatus && toolStatus.chatId === activeId}
+    {#if activeId != null && toolStatuses[activeId]}
       <div class="tool-status" data-testid="tool-status">
-        <span class="tool-status-label shimmer">{toolStatus.label}</span>
+        <span class="tool-status-label shimmer">{toolStatuses[activeId]}</span>
       </div>
     {/if}
 
@@ -6336,7 +6438,7 @@
           <span class="queue-hint">queued · joins at the next tool call</span>
         </div>
       {/if}
-      {#if streaming || workRunning || compacting}
+      {#if busy}
         <div class="stream-bar" data-testid="stream-bar" role="progressbar" aria-label="Working"><span></span></div>
       {/if}
       {#if escArmed}
@@ -6418,7 +6520,7 @@
           <div class="composer-backdrop" data-testid="composer-backdrop" aria-hidden="true" bind:this={composerBackdrop}>{@html renderMentions(input)}</div>
           <textarea
             data-testid="message-input"
-            placeholder={composerMode === "work" ? (workRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
+            placeholder={composerMode === "work" ? (activeWorkRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
             bind:this={composerEl}
             bind:value={input}
             onkeydown={onKey}
@@ -6683,10 +6785,10 @@
               {/if}
             </div>
           {/if}
-          {#if workRunning}
+          {#if activeWorkRunning}
             <button class="send" data-testid="queue-btn" aria-label="Queue message" title="Queue for the next tool call" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" title="Stop (Esc twice)" onclick={stop}>■</button>
-          {:else if streaming}
+          {:else if activeStreaming}
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
           {:else}
             <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
