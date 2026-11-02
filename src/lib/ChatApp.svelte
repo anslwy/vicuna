@@ -39,6 +39,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
+  import { followAfterScroll, scrollKeyDirection, upwardScrollInput } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
   import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
@@ -851,56 +852,82 @@
   let editImages = $state<string[]>([]);
   let copiedKey = $state<string | null>(null);
   let isPinned = $state(true);
-  // scrollTop value of our last programmatic jump; a scroll event landing
-  // exactly here is our own doing and must not unpin
-  let lastJumpTop = Number.MIN_SAFE_INTEGER;
-  // set when swapping chats: content replacement clamps scrollTop and fires
-  // one reset event that belongs to us, not the user
-  let suppressReset = false;
+  let scrollFrame = 0;
+  let draggingScrollbar = false;
+  let touchScrollY: number | null = null;
 
-  let lastSeenTop = 0;
-  // scrollHeight twin of lastSeenTop: content removed from above the viewport
-  // (thinking auto-collapse at answer start, dismissed ask cards) shrinks
-  // this without any user gesture. A user scrolling up never changes it, so
-  // a shrink positively identifies an engine layout correction.
-  let lastSeenHeight = 0;
+  function hasMessageSelection() {
+    const sel = window.getSelection();
+    return !!(sel && !sel.isCollapsed && messagesEl?.contains(sel.anchorNode));
+  }
+
+  // Code blocks and other nested scroll areas should consume their own input
+  // without pausing follow on the surrounding transcript.
+  function nestedScrollerConsumes(target: EventTarget | null, deltaY: number) {
+    let el = target instanceof Element ? target : null;
+    while (el && el !== messagesEl) {
+      if (el.scrollHeight > el.clientHeight && /^(auto|scroll)$/.test(getComputedStyle(el).overflowY)) {
+        if (deltaY < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight) return true;
+      }
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  function pauseForScrollInput(deltaY: number, target: EventTarget | null) {
+    if (messagesEl && upwardScrollInput(deltaY, messagesEl.scrollTop) && !nestedScrollerConsumes(target, deltaY)) {
+      isPinned = false;
+    }
+  }
+
+  function onMessagesWheel(e: WheelEvent) {
+    if (!e.ctrlKey) pauseForScrollInput(e.deltaY, e.target);
+  }
+
+  function onMessagesTouchStart(e: TouchEvent) {
+    touchScrollY = e.touches.length === 1 ? e.touches[0].clientY : null;
+  }
+
+  function onMessagesTouchMove(e: TouchEvent) {
+    const y = e.touches.length === 1 ? e.touches[0].clientY : null;
+    if (y != null && touchScrollY != null) pauseForScrollInput(touchScrollY - y, e.target);
+    touchScrollY = y;
+  }
+
+  function onMessagesPointerDown(e: PointerEvent) {
+    if (!messagesEl || e.pointerType !== "mouse" || e.button !== 0 || e.target !== messagesEl) return;
+    const rect = messagesEl.getBoundingClientRect();
+    // Overlay scrollbars have no layout width. Reserve their edge too.
+    const gutter = Math.max(12, messagesEl.offsetWidth - messagesEl.clientWidth);
+    if (e.clientX < rect.right - gutter) return;
+    draggingScrollbar = true;
+    isPinned = false;
+  }
+
+  function onMessagesPointerUp() {
+    if (!draggingScrollbar) return;
+    draggingScrollbar = false;
+    onMessagesScroll();
+  }
+
+  function onMessagesKeyDown(e: KeyboardEvent) {
+    if (!messagesEl || e.defaultPrevented) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (target?.closest("input, textarea, select, button, a, summary, [contenteditable]:not([contenteditable=false]), [role=textbox]")) return;
+    if (target !== document.body && target !== document.documentElement && !messagesEl.contains(target)) return;
+    const direction = scrollKeyDirection(e);
+    if (direction && !nestedScrollerConsumes(target, direction)) {
+      pauseForScrollInput(direction, target);
+    }
+  }
+
   function onMessagesScroll() {
     if (!messagesEl) return;
-    if (suppressReset) {
-      suppressReset = false;
-      lastSeenTop = messagesEl.scrollTop;
-      lastSeenHeight = messagesEl.scrollHeight;
-      return;
-    }
-    const { scrollTop, scrollHeight, clientHeight } = messagesEl;
-    // our own jump lands exactly on lastJumpTop (1px tolerance for rounding)
-    if (Math.abs(scrollTop - lastJumpTop) < 2) {
-      lastSeenTop = scrollTop;
-      lastSeenHeight = scrollHeight;
-      return;
-    }
-    // content above the viewport collapsed (never a user gesture — scrolling
-    // up can't shrink scrollHeight). Safari reports the resulting scrollTop
-    // correction as a decrease that would otherwise look exactly like "user
-    // scrolled up" and permanently unpin a pinned view mid-stream. Never
-    // unpin for it; re-jump if we were following.
-    if (scrollHeight < lastSeenHeight - 1) {
-      lastSeenTop = scrollTop;
-      lastSeenHeight = scrollHeight;
-      if (isPinned) scrollBottom();
-      return;
-    }
-    const dist = scrollHeight - scrollTop - clientHeight;
-    if (scrollTop < lastSeenTop - 1 && dist >= 1) {
-      // user moved up, even by 1px: pause auto-follow immediately
-      isPinned = false;
-    } else {
-      // at the very bottom the arrow hides and follow resumes;
-      // anywhere else it stays paused
-      isPinned = dist < 80;
-    }
-    lastSeenTop = scrollTop;
-    lastSeenHeight = scrollHeight;
+    // WebKit may reset scrollTop during a streamed {@html} replacement,
+    // focus loss, or layout correction. A scroll event alone is NOT proof
+    // the reader scrolled up. Only the input handlers above may unpin.
+    isPinned = followAfterScroll(isPinned, messagesEl, draggingScrollbar);
+    if (isPinned) scrollBottom();
   }
 
   function jumpToBottom() {
@@ -913,14 +940,14 @@
   // drops focus to <body> and scrolls the thread to the top, permanently
   // unpinning auto-follow (Chromium leaves the viewport alone). Park focus
   // in the composer — which is never destroyed — before the swap happens.
-  // Focusing the composer scrolls toward the bottom, never the top.
+  // Moving focus must not itself scroll the transcript or the page.
   function parkComposerFocus() {
     const ae = document.activeElement;
     if (
       ae instanceof HTMLButtonElement &&
       ["send-btn", "stop-btn", "queue-btn"].includes(ae.dataset.testid ?? "")
     ) {
-      composerEl?.focus();
+      composerEl?.focus({ preventScroll: true });
     }
   }
 
@@ -1162,7 +1189,6 @@
     dropActiveDraft(id);
     activeId = id;
     isPinned = true;
-    suppressReset = true;
     void goto(`/s/${id}`);
   }
 
@@ -1202,7 +1228,6 @@
     if (sid && chats.some((c) => c.id === sid)) {
       activeId = sid;
       isPinned = true;
-      suppressReset = true;
     } else if (!sid) {
       activeId = null;
     } else {
@@ -2395,17 +2420,14 @@
   }
 
   function scrollBottom() {
-    // never yank the viewport while the user is selecting text: every
-    // streamed token calls this, which would otherwise drag the selection
-    // (and the view) out from under them mid-drag
-    const sel = window.getSelection();
-    if (sel && sel.rangeCount > 0 && !sel.isCollapsed && messagesEl?.contains(sel.anchorNode)) return;
-    requestAnimationFrame(() => {
-      if (!messagesEl || !isPinned) return;
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-      // record the clamped value actually applied: a scroll event reporting
-      // exactly this position is our own doing and must not unpin
-      lastJumpTop = messagesEl.scrollTop;
+    // Coalesce token/layout/scroll notifications into one frame. Check
+    // selection and pin state INSIDE it: a gesture can arrive after scheduling.
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      if (!messagesEl || !isPinned || draggingScrollbar || hasMessageSelection()) return;
+      const bottom = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight);
+      if (Math.abs(messagesEl.scrollTop - bottom) > 1) messagesEl.scrollTop = bottom;
     });
   }
 
@@ -5648,6 +5670,9 @@
   onMount(() => {
     window.addEventListener("beforeunload", handleUnload);
     window.addEventListener("message", onBrowserFrameMessage);
+    window.addEventListener("pointerup", onMessagesPointerUp);
+    window.addEventListener("pointercancel", onMessagesPointerUp);
+    window.addEventListener("keydown", onMessagesKeyDown);
     void initApp();
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
@@ -5669,11 +5694,15 @@
     return () => {
       window.removeEventListener("beforeunload", handleUnload);
       window.removeEventListener("message", onBrowserFrameMessage);
+      window.removeEventListener("pointerup", onMessagesPointerUp);
+      window.removeEventListener("pointercancel", onMessagesPointerUp);
+      window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
     };
   });
 
   onDestroy(() => {
+    if (scrollFrame) cancelAnimationFrame(scrollFrame);
     aborter?.abort();
   });
 
@@ -6078,6 +6107,10 @@
         role="log"
         aria-label="Chat messages"
         onscroll={onMessagesScroll}
+        onwheel={onMessagesWheel}
+        ontouchstart={onMessagesTouchStart}
+        ontouchmove={onMessagesTouchMove}
+        onpointerdown={onMessagesPointerDown}
       >
         {#if forkInfo && forkNoteIndex == null}
           {@render forkNote(forkInfo.title, forkInfo.id, "Continue from chat")}
@@ -8119,7 +8152,7 @@
   .suggest-title { font-size: 15px; font-weight: 650; color: var(--text); }
   .suggest-sub { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .suggest-icon { flex-shrink: 0; width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: var(--accent-fg); display: flex; align-items: center; justify-content: center; }
-  .messages { flex: 1; overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 40px 24px 12px 24px; display: flex; flex-direction: column; gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
+  .messages { flex: 1; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; min-height: 0; min-width: 0; padding: 40px 24px 12px 24px; display: flex; flex-direction: column; gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
   .row { display: flex; }
   .user-row { justify-content: flex-end; }
   .asst-row { justify-content: flex-start; }
