@@ -25,6 +25,7 @@
     clearDraft,
     loadActiveChat,
     saveActiveChat,
+    chatActivity,
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
@@ -2069,6 +2070,7 @@
       id: crypto.randomUUID(),
       title: workspaceBase(canon).slice(0, 40) || "New session",
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       messages: [],
       mode: "work",
       workspace: canon
@@ -2365,13 +2367,17 @@
     const yesterday: Chat[] = [];
     const week: Chat[] = [];
     const older: Chat[] = [];
-    for (const c of chats) {
+    // order by last user-message time, not creation: a reply to an old
+    // session brings it back to the top (and into Today)
+    const ordered = [...chats].sort((a, b) => chatActivity(b) - chatActivity(a));
+    for (const c of ordered) {
       // empty drafts are never listed: a session appears only after the
       // first message is sent
       if (c.messages.length === 0) continue;
-      if (c.createdAt >= startOfToday) today.push(c);
-      else if (c.createdAt >= startOfYesterday) yesterday.push(c);
-      else if (c.createdAt >= weekAgo) week.push(c);
+      const t = chatActivity(c);
+      if (t >= startOfToday) today.push(c);
+      else if (t >= startOfYesterday) yesterday.push(c);
+      else if (t >= weekAgo) week.push(c);
       else older.push(c);
     }
     return { today, yesterday, week, older };
@@ -2769,12 +2775,13 @@
       updated[editingIndex] = { ...target, content: text, images };
     } else {
       updated[editingIndex] = { role: "user", content: text, ...(images ? { images } : {}) };
+      chat.updatedAt = Date.now();
       if (text && (chat.title === "New session" || chat.title === "New Session")) {
         chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
       }
     }
     chat.messages = updated;
-    chats = [...chats];
+    chats = [chat, ...chats.filter((x) => x.id !== chat.id)];
     cancelEdit();
     isPinned = true;
     save();
@@ -2811,6 +2818,9 @@
     }
     // editing own message: replace it, drop everything after, regenerate
     chat.messages = [...chat.messages.slice(0, editingIndex), { role: "user", content: text, ...(images ? { images } : {}) }];
+    // re-engaging the thread re-times it like a fresh reply
+    chat.updatedAt = Date.now();
+    chats = [chat, ...chats.filter((x) => x.id !== chat.id)];
     if (text && (chat.title === "New session" || chat.title === "New Session")) {
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
@@ -2854,6 +2864,7 @@
       id: crypto.randomUUID(),
       title: `${c.title} (fork)`,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       messages: JSON.parse(JSON.stringify(c.messages.slice(0, i + 1))),
       forkedFrom: { id: c.id, title: c.title },
       forkFromIndex: i,
@@ -3338,6 +3349,7 @@
         id: stagedId,
         title: titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : ""),
         createdAt: Date.now(),
+        updatedAt: Date.now(),
         messages: [
           { role: "user", content: fullText, ...(images ? { images } : {}) },
           { role: "assistant", content: "", thinking: "", model: selectedModel }
@@ -3355,12 +3367,17 @@
         chat.mode = effectiveMode;
         if (effectiveMode === "work") chat.workspace = workRoot;
       }
+      // a new user message re-times the session: sidebar Today/Yesterday
+      // and ordering follow this, not creation
+      chat.updatedAt = Date.now();
       chat.messages = [...chat.messages, { role: "user", content: fullText, ...(images ? { images } : {}) }];
       if (chat.title === "New session" || chat.title === "New Session") {
         const titleSrc = text || (images ? "Image" : (firstUploadName ?? "New session"));
         chat.title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
       }
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+      // most-recently-active first, so the just-messaged session jumps to top
+      chats = [chat, ...chats.filter((x) => x.id !== chat!.id)];
     }
     input = "";
     mention = null;
@@ -3725,6 +3742,7 @@
           id: crypto.randomUUID(),
           title: "New session",
           createdAt: Date.now(),
+          updatedAt: Date.now(),
           messages: [],
           mode: "work",
           workspace: ws0 || null
@@ -3818,6 +3836,7 @@
       id: crypto.randomUUID(),
       title: text.slice(0, 32) + (text.length > 32 ? ".." : ""),
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       messages: [],
       mode: "work",
       workspace: ws || null,
@@ -3849,7 +3868,8 @@
       c.title = g.text.slice(0, 40);
     }
     c.messages = [...c.messages, { role: "user", content: g.text }, { role: "assistant", content: "", thinking: "", model: selectedModel }];
-    chats = [...chats];
+    c.updatedAt = Date.now();
+    chats = [c, ...chats.filter((x) => x.id !== c.id)];
     save();
     scrollBottom();
     await runWorkTurn(c, c.messages.length - 1, c.workspace);
@@ -5151,10 +5171,11 @@
         } else {
           const c = live();
           if (c) {
+            c.updatedAt = Date.now();
             for (const q of leftovers) {
               c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
             }
-            chats = [...chats];
+            chats = [c, ...chats.filter((x) => x.id !== c.id)];
             save();
             // hand off to a fresh turn; the inner call clears workRunning
             await runWorkTurn(chat, c.messages.length - 1, workspace);
@@ -5229,6 +5250,7 @@
           confirmQueuedDrained(ev.ids);
           const t = live();
           if (t) {
+            t.updatedAt = Date.now();
             for (const q of ev.messages) {
               t.messages = [
                 ...t.messages,
@@ -5236,7 +5258,7 @@
                 { role: "assistant", content: "", thinking: "", model: selectedModel }
               ];
             }
-            chats = [...chats];
+            chats = [t, ...chats.filter((x) => x.id !== t.id)];
             curIndex = t.messages.length - 1;
             scrollBottom();
             saveSoon();
@@ -5413,6 +5435,7 @@
       id: crypto.randomUUID(),
       title: `${src.title} (work)`.slice(0, 40),
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       messages: [
         { role: "assistant", content: "", thinking: "", model: selectedModel }
       ],

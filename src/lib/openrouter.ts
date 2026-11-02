@@ -403,6 +403,14 @@ export interface OpenRouterChatResult {
 
 const EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
+/** 5xx from the gateway means a routed provider failed, not a bad request —
+ *  worth one immediate retry (OpenRouter re-routes, so the second attempt
+ *  usually lands elsewhere). 429 is excluded on purpose: hammering a
+ *  rate limit makes it worse, and the caller already tells the user to wait. */
+export function isRetryableOpenRouterStatus(status: number): boolean {
+  return status === 500 || status === 502 || status === 503 || status === 529;
+}
+
 /** Map Vicuna's `think` value onto OpenRouter's `reasoning` object.
  *  Auto/true means "model default" (omit the param): forcing `enabled: true`
  *  would switch reasoning on for models that default it off. */
@@ -495,16 +503,23 @@ export async function openRouterChatStream(
   if (opts.stop?.length) body.stop = opts.stop.slice(0, 4);
   if (opts.tools?.length) body.tools = opts.tools;
   let res: Response;
-  try {
-    res = await fetch(`${API_BASE}/chat/completions`, {
-      method: "POST",
-      headers: { ...authHeaders(key), "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal
-    });
-  } catch (e: unknown) {
-    if (e instanceof Error && e.name === "AbortError") throw e;
-    throw new Error("Couldn't reach OpenRouter — check your internet connection.");
+  let attempt = 0;
+  for (;;) {
+    try {
+      res = await fetch(`${API_BASE}/chat/completions`, {
+        method: "POST",
+        headers: { ...authHeaders(key), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal
+      });
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      throw new Error("Couldn't reach OpenRouter — check your internet connection.");
+    }
+    // transient provider 5xx (verified live on a rolling -latest alias):
+    // one immediate retry, then surface the error as before
+    if (res.ok || !isRetryableOpenRouterStatus(res.status) || signal?.aborted || attempt >= 1) break;
+    attempt += 1;
   }
   if (!res.ok) throw new Error(await describeError(res));
 

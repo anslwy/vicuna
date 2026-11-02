@@ -6,6 +6,10 @@ export interface Chat {
   id: string;
   title: string;
   createdAt: number;
+  /** last user-message time (ms). New sends/steers bump it; assistant-only
+   *  activity (regenerate/continue) does not. Absent on pre-migration
+   *  sessions — readers fall back to createdAt via chatActivity(). */
+  updatedAt?: number;
   messages: ChatMsg[];
   forkedFrom?: { id: string; title: string } | null;
   /** index of the last forked message; the note renders right after it */
@@ -18,6 +22,12 @@ export interface Chat {
    *  { text, paused, startedAt, pausedAt } — the turn loop keeps running
    *  until an unpaused goal reads as met. */
   goal?: string | null;
+}
+
+/** effective sidebar time: last user message, falling back to creation
+ *  for sessions that predate updatedAt. */
+export function chatActivity(c: Chat): number {
+  return typeof c.updatedAt === "number" ? c.updatedAt : c.createdAt;
 }
 
 const LS_CHATS = "vicuna-chats";
@@ -187,6 +197,7 @@ const lsBackend: Backend = {
       // normalize pre-work-mode sessions
       return list.map((c) => ({
         ...c,
+        updatedAt: typeof c.updatedAt === "number" ? c.updatedAt : c.createdAt,
         mode: c.mode === "work" ? "work" : "chat",
         workspace: c.workspace ?? null
       }));
@@ -276,7 +287,7 @@ async function createSqliteBackend(): Promise<Backend> {
       fork_from_index INTEGER
     )`);
   // migrations for databases created before fork attribution existed
-  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT"]) {
+  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER"]) {
     try {
       await db.execute(`ALTER TABLE chats ADD COLUMN ${col}`);
     } catch {
@@ -319,8 +330,8 @@ async function createSqliteBackend(): Promise<Backend> {
     if (legacy.length > 0) {
       for (const c of legacy) {
         await db.execute(
-          "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index) VALUES ($1, $2, $3, $4, $5)",
-          [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null]
+          "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+          [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, chatActivity(c)]
         );
         let i = 0;
         for (const m of c.messages) {
@@ -358,8 +369,8 @@ async function createSqliteBackend(): Promise<Backend> {
     await db.execute("DELETE FROM chats");
     for (const c of chats) {
       await db.execute(
-        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null, c.goal ?? null]
+        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null, c.goal ?? null, chatActivity(c)]
       );
       let i = 0;
       for (const m of c.messages) {
@@ -373,8 +384,8 @@ async function createSqliteBackend(): Promise<Backend> {
 
   return {
     async loadChats(): Promise<Chat[]> {      const rows = await db.select<
-        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null }[]
-      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace, goal FROM chats ORDER BY created_at DESC");
+        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null; updated_at: number | null }[]
+      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at FROM chats ORDER BY COALESCE(updated_at, created_at) DESC");
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
@@ -387,6 +398,7 @@ async function createSqliteBackend(): Promise<Backend> {
           id: r.id,
           title: r.title,
           createdAt: r.created_at,
+          updatedAt: typeof r.updated_at === "number" ? r.updated_at : r.created_at,
           forkedFrom: r.forked_from ? (JSON.parse(r.forked_from) as Chat["forkedFrom"]) : null,
           forkFromIndex: r.fork_from_index ?? null,
           mode: r.mode === "work" ? "work" : "chat",

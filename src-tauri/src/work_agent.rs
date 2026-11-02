@@ -1059,6 +1059,7 @@ async fn openrouter_round(
     let mut think = think.clone();
     let mut tools = tools.clone();
     let mut strip_images = false;
+    let mut retried_5xx = false;
     let has_images = messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()));
     for _ in 0..4 {
         match openrouter_round_attempt(model, api_key, messages, &think, &tools, strip_images, on_event, stop).await {
@@ -1066,6 +1067,12 @@ async fn openrouter_round(
             Err(e) => {
                 if stop.load(Ordering::Relaxed) {
                     return Err(e);
+                }
+                // transient provider 5xx (same retry the chat transport does):
+                // one immediate re-attempt before the fallback ladder runs
+                if !retried_5xx && e.starts_with("openrouter chat failed: 5") {
+                    retried_5xx = true;
+                    continue;
                 }
                 let low = e.to_lowercase();
                 if !strip_images
@@ -1292,12 +1299,29 @@ async fn openrouter_oneshot(
         .header("X-Title", "Vicuna")
         .json(&body)
         .send();
-    let res = tokio::select! {
+    let mut res = tokio::select! {
         r = fut => r.map_err(|e| format!("openrouter chat failed: {e}"))?,
         _ = async { while !stop.load(Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => {
             return Err("stopped".to_string());
         }
     };
+    // one immediate retry on a transient provider 5xx (same policy as the
+    // chat transport): the gateway re-routes, so the second attempt usually
+    // lands on a healthy provider
+    if res.status().is_server_error() && !stop.load(Ordering::Relaxed) {
+        let fut2 = client
+            .post(format!("{OPENROUTER_BASE}/chat/completions"))
+            .header("Authorization", format!("Bearer {}", api_key.trim()))
+            .header("X-Title", "Vicuna")
+            .json(&body)
+            .send();
+        res = tokio::select! {
+            r = fut2 => r.map_err(|e| format!("openrouter chat failed: {e}"))?,
+            _ = async { while !stop.load(Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => {
+                return Err("stopped".to_string());
+            }
+        };
+    }
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
