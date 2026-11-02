@@ -182,8 +182,12 @@ def main():
             urls = [str(t.get("url", "")) for t in parsed.get("tabs", [])]
         check("the tab the agent drove is visible to the human", any(a.url.rstrip('/') in u for u in urls),
               str(urls))
+        # With --lb-exec the daemon is reachable only inside that context, so
+        # quoting `srv` (container-loopback) would tell the user to open a URL
+        # that does not work from here.
+        where = f"{srv} (inside the worker's container/namespace)" if lb_exec else srv
         check("human takeover is available on that session", bool(srv),
-              f"open {srv} to watch/claim the same tab")
+              f"open {where} to watch/claim the same tab")
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
         check("human `lb` reachable", False, str(e))
 
