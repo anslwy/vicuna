@@ -417,6 +417,81 @@ fn bin_id(bin: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), mtime))
 }
 
+/// Last non-empty stdout line of `lb browsers download` (the installed
+/// binary path — that command's contract). Split out so fixtures don't
+/// need a network download.
+pub fn parse_browsers_download_output(out: &str) -> Option<String> {
+    out.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .last()
+        .map(|s| s.to_string())
+}
+
+/// CloakBrowser engine status: binary path + whether this call fetched it.
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineInfo {
+    pub path: String,
+    pub downloaded: bool,
+}
+
+/// Ensure the CloakBrowser engine exists, downloading it (one-time) when
+/// the cache is empty. Vicuna is cloak-only: system Chrome is never
+/// launched (real profiles, picker settings, and running-instance joins
+/// caused all the Windows trouble), so a failed download is a hard error,
+/// not a fallback trigger. Idempotent — warm cache returns instantly.
+pub async fn browser_ensure_engine_logic(
+    resource_dir: Option<PathBuf>,
+) -> Result<EngineInfo, String> {
+    let (bin, _) = resource_dir
+        .as_deref()
+        .and_then(|r| resolve_lb_bin(Some(r)))
+        .or_else(|| resolve_lb_bin(None))
+        .ok_or_else(|| "no `lb` browser engine found".to_string())?;
+    if let Some(hit) = find_cloak_browser() {
+        return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+    }
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(["browsers", "download"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
+    // ~150MB+ plus extract; generous ceiling for slow links
+    let out = tokio::time::timeout(Duration::from_secs(15 * 60), cmd.output())
+        .await
+        .map_err(|_| {
+            "CloakBrowser download timed out after 15 minutes — check your connection and retry"
+                .to_string()
+        })
+        .and_then(|r| r.map_err(|e| format!("could not run engine download: {e}")))?;
+    if !out.status.success() {
+        // filled concurrently (second instance raced us)? take the win
+        if let Some(hit) = find_cloak_browser() {
+            return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("unrecognized subcommand") {
+            return Err(
+                "this `lb` is too old to fetch engines (need ≥0.4.18) — upgrade live-browser or reinstall Vicuna"
+                    .to_string(),
+            );
+        }
+        let tail = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
+        return Err(format!(
+            "could not download the CloakBrowser engine{} — check your connection and retry",
+            if tail.is_empty() { String::new() } else { format!(" ({tail})") }
+        ));
+    }
+    if let Some(path) = parse_browsers_download_output(&String::from_utf8_lossy(&out.stdout)) {
+        return Ok(EngineInfo { path, downloaded: true });
+    }
+    find_cloak_browser()
+        .map(|hit| EngineInfo { path: hit.display().to_string(), downloaded: true })
+        .ok_or_else(|| "engine download reported success but no binary appeared — retry".to_string())
+}
+
 /// `bin --version`, best-effort (failures mean "unknown", never fatal).
 async fn probe_lb_version(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
@@ -566,16 +641,13 @@ pub async fn browser_start_logic(
     if source == LbSource::Bundled {
         ensure_exec_bit(&bin);
     }
-    // Attempts: plain first (respects lb's persisted choice + system
-    // Chrome), then explicit `--chrome` at the CloakBrowser cache. The
-    // retry self-heals machines whose saved choice was cleared (lb drops
-    // it after a failed launch) and which have no system Chrome — and lb
-    // persists the explicit choice after a successful launch, so later
-    // starts succeed on the first attempt again.
-    let mut attempts: Vec<Vec<String>> = vec![vec![]];
-    if let Some(cloak) = find_cloak_browser() {
-        attempts.push(vec!["--chrome".to_string(), cloak.display().to_string()]);
-    }
+    // Cloak-only: ensure the engine (downloads on first run), then
+    // launch with it explicit. There is deliberately no plain attempt —
+    // system Chrome is never used (real profiles, picker settings, and
+    // running-instance joins caused all the Windows trouble).
+    let engine = browser_ensure_engine_logic(resource_dir.clone()).await?;
+    let attempts: Vec<Vec<String>> =
+        vec![vec!["--chrome".to_string(), engine.path.clone()]];
     let mut last_err = String::from("no attempt ran");
     for extra in &attempts {
         match spawn_attempt(&bin, source, extra, &client).await {
@@ -607,7 +679,7 @@ pub async fn browser_start_logic(
         }
     }
     Err(format!(
-        "`lb web` failed to start ({last_err}). It needs a browser: install Chrome/Chromium, or fetch CloakBrowser once with `npx cloakbrowser install` (picked up automatically), then retry. Run `lb web --port {}` in a terminal for details",
+        "`lb web` failed to start ({last_err}). The CloakBrowser engine is installed but wouldn't launch — retry, or run `lb web --port {}` in a terminal for details",
         lb_port()
     ))
 }
@@ -741,6 +813,9 @@ pub async fn browser_takeover_logic(
     resource_dir: Option<PathBuf>,
     state: &BrowserState,
 ) -> Result<BrowserStatus, String> {
+    // Engine first: never kill the adopted session before knowing our own
+    // replacement can start (a failed download must not cost their tabs).
+    browser_ensure_engine_logic(resource_dir.clone()).await?;
     let client = probe_client();
     match probe_daemon(&client).await {
         Probe::Free => {}
@@ -960,6 +1035,16 @@ mod tests {
         assert_eq!(hit, expected);
         assert_eq!(src, LbSource::Bundled);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn browsers_download_output_takes_last_line() {
+        assert_eq!(
+            parse_browsers_download_output("/cache/chromium-1/x\n"),
+            Some("/cache/chromium-1/x".to_string())
+        );
+        assert_eq!(parse_browsers_download_output("\n\n"), None);
+        assert_eq!(parse_browsers_download_output(""), None);
     }
 
     #[test]

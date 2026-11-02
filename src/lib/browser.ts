@@ -51,6 +51,15 @@ export async function browserRestart(): Promise<BrowserStatus> {
   return await invokeOrBridge<BrowserStatus>("browser_restart", {});
 }
 
+export interface EngineInfo {
+  path: string;
+  downloaded: boolean;
+}
+
+export async function browserEnsureEngine(): Promise<EngineInfo> {
+  return await invokeOrBridge<EngineInfo>("browser_ensure_engine", {});
+}
+
 export async function browserTakeover(): Promise<BrowserStatus> {
   return await invokeOrBridge<BrowserStatus>("browser_takeover", {});
 }

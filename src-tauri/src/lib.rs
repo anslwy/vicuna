@@ -3365,6 +3365,11 @@ async fn browser_restart(
 }
 
 #[tauri::command]
+async fn browser_ensure_engine(app: AppHandle) -> Result<browser::EngineInfo, String> {
+    browser::browser_ensure_engine_logic(browser_resource_dir(&app)).await
+}
+
+#[tauri::command]
 async fn browser_takeover(
     app: AppHandle,
     state: State<'_, browser::BrowserState>,
@@ -3458,6 +3463,7 @@ pub fn run() {
             browser_stop,
             browser_restart,
             browser_takeover,
+            browser_ensure_engine,
             browser_mcp_command,
             work_agent::work_agent_start,
             work_agent::work_agent_stop,

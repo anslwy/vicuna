@@ -36,7 +36,7 @@
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
-  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
+  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
@@ -3816,13 +3816,25 @@
     });
     return browserDrive;
   }
+  /** one-time CloakBrowser fetch with an honest label (backend start
+   *  ensures internally too — this pre-warm exists so a minutes-long first
+   *  download doesn't sit under "Starting browser…" looking stuck). */
+  async function prewarmBrowserEngine() {
+    browserStartLabel = "Downloading browser engine (one-time setup)…";
+    await browserEnsureEngine();
+  }
+
   async function driveBrowserDaemon(): Promise<BrowserStatus> {
     browserStartLabel = "Starting browser…";
     browserStarting = true;
     browserError = null;
     try {
       let st = await browserStatus();
-      if (!st.running) st = await browserStart();
+      if (!st.running) {
+        await prewarmBrowserEngine();
+        browserStartLabel = "Starting browser…";
+        st = await browserStart();
+      }
       browserDaemon = st;
       if (!browserMcpArgv && st.bin) {
         try {
@@ -3871,6 +3883,8 @@
     browserStarting = true;
     browserError = null;
     try {
+      await prewarmBrowserEngine();
+      browserStartLabel = "Restarting browser…";
       browserDaemon = await browserRestart();
       browserFrameRev += 1;
     } catch (e: any) {
@@ -3915,6 +3929,8 @@
       browserDaemon = null;
       browserStarting = true;
       try {
+        await prewarmBrowserEngine();
+        browserStartLabel = "Restarting browser…";
         browserDaemon = await browserRestart();
         browserError = null;
         browserFrameRev += 1;
@@ -3948,6 +3964,10 @@
     browserDaemon = null;
     browserStarting = true;
     try {
+      // pre-warm BEFORE the kill: a failed download must not cost their tabs
+      // (backend takeover ensures pre-kill too — this is the honest label)
+      await prewarmBrowserEngine();
+      browserStartLabel = "Taking over browser…";
       browserDaemon = await browserTakeover();
       browserError = null;
       browserFrameRev += 1;

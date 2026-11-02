@@ -337,6 +337,11 @@ async fn dispatch(
                 vicuna_lib::browser::browser_restart_logic(test_resource_dir(), &st.browser).await?
             ))
         }
+        "browser_ensure_engine" => {
+            Ok(serde_json::json!(
+                vicuna_lib::browser::browser_ensure_engine_logic(test_resource_dir()).await?
+            ))
+        }
         "browser_takeover" => {
             Ok(serde_json::json!(
                 vicuna_lib::browser::browser_takeover_logic(test_resource_dir(), &st.browser).await?
