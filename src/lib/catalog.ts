@@ -30,7 +30,7 @@ export interface CatalogEntry {
   variants: CatalogVariant[];
 }
 
-export const CATALOG_UPDATED = "2026-10-30";
+export const CATALOG_UPDATED = "2026-11-02";
 
 export const MODEL_CATALOG: CatalogEntry[] = [
   {
@@ -2889,6 +2889,24 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "latest", size: "~5.0 GB", sizeMB: 5037 },
       { tag: "1.5b", size: "~866 MB", sizeMB: 866 },
       { tag: "9b", size: "~5.0 GB", sizeMB: 5037 },
+    ]
+  },
+  {
+    name: "mimo-v2.6-flash",
+    blurb: "Xiaomi's efficiency-balanced MiMo-V2.6 checkpoint, with 309B total parameters, 15B active, omnimodal input, and a 1M token context.",
+    params: "",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "cloud", size: "cloud", sizeMB: 0 },
+    ]
+  },
+  {
+    name: "mimo-v2.6-pro",
+    blurb: "Xiaomi's flagship MiMo-V2.6 checkpoint, with 1.02T total parameters, 42B active, omnimodal input, and a 1M token context.",
+    params: "",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "cloud", size: "cloud", sizeMB: 0 },
     ]
   },
 ];
