@@ -28,11 +28,12 @@ use tokio::sync::oneshot;
 
 use super::{
     bg_kill, bg_list, bg_snapshot, bg_start, parse_show_context_length,
+    undo_begin_turn, undo_capture_prev, undo_key, undo_record, undo_record_write,
     upload_read_file_logic as upload_read_file, work_exec_logic as work_exec,
     work_fetch_url_logic as work_fetch_url, work_grep_logic as work_grep,
     work_list_dir_logic as work_list_dir, work_read_file_logic as work_read_file,
     work_read_image_logic as work_read_image, work_write_file_logic as work_write_file,
-    BgExecState, ChatMessage, OLLAMA_BASE,
+    BgExecState, ChatMessage, OLLAMA_BASE, UndoOp, UndoState,
 };
 use crate::browser::{browser_mcp_command, browser_start_logic, lb_server_url, BrowserState};
 use crate::mcp::{
@@ -1350,6 +1351,8 @@ async fn dispatch_tool(
     on_event: &Channel<WorkAgentEvent>,
     browser_resource_dir: Option<&std::path::Path>,
     browser: &BrowserState,
+    undo_state: &UndoState,
+    undo_key: &str,
 ) -> String {
     match name {
         "list" => match work_list_dir(workspace.to_string(), Some(str_arg(args, "path"))).await {
@@ -1414,10 +1417,25 @@ async fn dispatch_tool(
                 return "Error: write needs {\"path\": \"...\", \"content\": \"...\"}.".to_string();
             }
             match args.get("content").and_then(|v| v.as_str()) {
-                Some(content) => match work_write_file(workspace.to_string(), p.clone(), content.to_string()).await {
-                    Ok(_) => format!("Wrote {} ({} chars).", p, content.len()),
-                    Err(e) => format!("Error: {e}"),
-                },
+                Some(content) => {
+                    // snapshot before clobbering so /undo can restore the old
+                    // bytes and /redo can put the turn's bytes back
+                    let prev = if undo_key.is_empty() {
+                        None
+                    } else {
+                        undo_capture_prev(workspace, &p)
+                    };
+                    let res = work_write_file(workspace.to_string(), p.clone(), content.to_string()).await;
+                    if res.is_ok() {
+                        if let Some((existed, old)) = prev {
+                            undo_record_write(undo_state, undo_key, &p, existed, old, content.as_bytes());
+                        }
+                    }
+                    match res {
+                        Ok(_) => format!("Wrote {} ({} chars).", p, content.len()),
+                        Err(e) => format!("Error: {e}"),
+                    }
+                }
                 None => "Error: write needs a string \"content\".".to_string(),
             }
         }
@@ -1425,6 +1443,11 @@ async fn dispatch_tool(
             let cmd = str_arg(args, "command");
             if cmd.is_empty() {
                 return "Error: exec needs {\"command\": \"...\"}.".to_string();
+            }
+            // shell side effects aren't invertible — record the fact so
+            // /undo can say so instead of silently pretending
+            if !undo_key.is_empty() && !cmd.trim().is_empty() {
+                undo_record(undo_state, undo_key, UndoOp::ExecNote { command: cmd.clone() });
             }
             if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
                 match bg_start(bg, workspace.to_string(), cmd.clone()).await {
@@ -1833,7 +1856,10 @@ pub async fn run_loop(
     turn_id: &str,
     browser_resource_dir: Option<PathBuf>,
     browser: &BrowserState,
+    undo_state: &UndoState,
 ) {
+    let undo_key = undo_key(session_id.as_deref(), &workspace);
+    undo_begin_turn(undo_state, &undo_key, &workspace);
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending_bg: HashSet<String> = HashSet::new();
     let mut empty_rounds = 0u32;
@@ -2232,7 +2258,7 @@ pub async fn run_loop(
             }
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: Some(tool_label(&name, &args)) });
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::ToolStart { name: name.clone(), args: args.clone() });
-            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, mcp, &mcp_routes, &turn, turn_id, &on_event, browser_resource_dir.as_deref(), browser).await;
+            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, mcp, &mcp_routes, &turn, turn_id, &on_event, browser_resource_dir.as_deref(), browser, undo_state, &undo_key).await;
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: None });
             if out == "__CANCELLED__" {
                 break;
@@ -2375,8 +2401,9 @@ pub async fn work_agent_start(
         let bg = app.state::<BgExecState>();
         let mcp = app.state::<McpManager>();
         let browser_state = app.state::<BrowserState>();
+        let undo_state = app.state::<UndoState>();
         // Hold the guards for the whole turn.
-        let (bg_ref, mcp_ref, browser_ref) = (&*bg, &*mcp, &*browser_state);
+        let (bg_ref, mcp_ref, browser_ref, undo_ref) = (&*bg, &*mcp, &*browser_state, &*undo_state);
         run_loop(
             turn,
             model,
@@ -2398,6 +2425,7 @@ pub async fn work_agent_start(
             &tid,
             browser_resource_dir,
             browser_ref,
+            undo_ref,
         )
         .await;
     });
@@ -2662,9 +2690,10 @@ mod agent_tests {
         let routes = HashMap::new();
         let ch: Channel<WorkAgentEvent> = Channel::new(|_| Ok(()));
         let browser = BrowserState::default();
+        let undo = UndoState::default();
         macro_rules! run {
             ($name:expr, $args:expr) => {
-                dispatch_tool($name, &$args, "/tmp", None, &[], &bg, &mcp, &routes, &turn, "turn-test", &ch, None, &browser).await
+                dispatch_tool($name, &$args, "/tmp", None, &[], &bg, &mcp, &routes, &turn, "turn-test", &ch, None, &browser, &undo, "").await
             };
         }
         let out = run!("mcp_add", serde_json::json!({"url": "https://example.com/mcp"}));
@@ -2745,6 +2774,7 @@ mod agent_tests {
         let bg = BgExecState::default();
         let mcp = McpManager::default();
         let browser = BrowserState::default();
+        let undo = UndoState::default();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(240),
             run_loop(
@@ -2768,6 +2798,7 @@ mod agent_tests {
                 "turn-e2e",
                 None,
                 &browser,
+                &undo,
             ),
         )
         .await;

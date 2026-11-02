@@ -202,6 +202,11 @@
   }
   let explorerTimer: ReturnType<typeof setTimeout> | null = null;
   let input = $state("");
+  /** terminal-style prompt history: ArrowUp/Down walks this session's sent
+   *  user messages; `historyDraft` is the in-progress text to restore on the
+   *  way back down. `historyIndex` is null while not browsing. */
+  let historyIndex = $state<number | null>(null);
+  let historyDraft = "";
   let models = $state<string[]>(["gemma4:31b-cloud"]);
   let selectedModel = $state("gemma4:31b-cloud");
   let modelOpen = $state(false);
@@ -841,10 +846,9 @@
   let attachFiles = $state<{ id: number; name: string; size: number; file: File }[]>([]);
   let attachFileSeq = 0;
   let error = $state<string | null>(null);
-  /** auto-clear delay for the error box (ms): command notices flash by
-   *  fast, real failures linger long enough to read — nothing squats until
-   *  restart anymore. Plain holder (not $state) so reading it here doesn't
-   *  re-trigger this effect; flashNotice() lowers it for its own message. */
+  /** auto-clear delay for the error box (ms): real failures linger long
+   *  enough to read, then clear — nothing squats until restart anymore.
+   *  Command outcomes use the separate neutral `notice` toast below. */
   const errorCfg = { ttl: 12000 };
   let errorTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
@@ -867,6 +871,22 @@
       }
     };
   });
+  /** Transient command feedback (undo/redo/compact): a neutral toast that
+   *  clears itself. These are outcomes, not failures — they must never use
+   *  the red error box and must never linger until dismissed. */
+  let notice = $state<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+  function flashNotice(text: string, ttl = 4000) {
+    notice = text;
+    if (noticeTimer) {
+      clearTimeout(noticeTimer);
+      noticeTimer = null;
+    }
+    noticeTimer = setTimeout(() => {
+      noticeTimer = null;
+      if (notice === text) notice = null;
+    }, ttl);
+  }
   /** one AbortController per live chat stream (Stop / delete aborts only its
    *  own session's request, never a turn running in another session) */
   const aborters = new Map<string, AbortController>();
@@ -3258,12 +3278,6 @@
    *  The UI keeps every message; only future model context is trimmed. */
   async function compactSession() {
     const chat = chats.find((c) => c.id === activeId);
-    // command feedback (not a failure): the global error auto-clear picks it
-    // up with a short fuse — real inference errors below get the longer one
-    const flashNotice = (text: string) => {
-      errorCfg.ttl = 6000;
-      error = text;
-    };
     if (!chat) {
       flashNotice("/compact needs a Work session — open one first.");
       return;
@@ -3471,6 +3485,9 @@
       chats = [chat, ...chats.filter((x) => x.id !== chat!.id)];
     }
     input = "";
+    // a send ends any history walk: the next ArrowUp starts from the newest
+    historyIndex = null;
+    historyDraft = "";
     mention = null;
     clearDraft(null);
     attachImages = [];
@@ -3499,6 +3516,8 @@
     const turnId = workTurnIds.get(chatId);
     if (turnId) void queueWorkAgentMsg(turnId, id, msg).catch(() => {});
     input = "";
+    historyIndex = null;
+    historyDraft = "";
     clearDraft(null);
     attachImages = [];
     error = null;
@@ -3798,9 +3817,15 @@
    *  Args ride along after the command word ("/goal ship it"). */
   const SLASH_COMMANDS = [
     { name: "compact", desc: "Summarize older messages into one note to free context" },
-    { name: "goal", desc: "Set, show, pause, resume or clear the session objective", takesArgs: true }
+    { name: "goal", desc: "Set, show, pause, resume or clear the session objective", takesArgs: true },
+    { name: "undo", desc: "Remove the last turn and revert its file changes" },
+    { name: "redo", desc: "Re-apply the turn most recently undone" }
   ];
-  let slash = $state<{ query: string; items: { name: string; desc: string; takesArgs?: boolean }[]; index: number } | null>(null);
+  type SlashItem = { name: string; desc: string; takesArgs?: boolean; disabled?: boolean };
+  let slash = $state<{ query: string; items: SlashItem[]; index: number } | null>(null);
+  /** message pairs removed by /undo, newest last, per session — /redo
+   *  re-inserts them while the transcript still matches (afterLen). */
+  let undoStashes = $state<Record<string, { messages: ChatMsg[]; index: number; afterLen: number }[]>>({});
 
   /** recompute the slash menu from the input (input/click/keyup/blur) */
   function refreshSlashMenu() {
@@ -3812,8 +3837,22 @@
     // match on the head word so "/goal ship it" still offers /goal
     const q = input.slice(1).trim().toLowerCase();
     const head = q.split(/\s+/)[0] ?? "";
-    const items = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head));
-    slash = items.length ? { query: q, items, index: 0 } : null;
+    const chat = chats.find((c) => c.id === activeId) ?? null;
+    // unavailable commands stay visible but greyed out (undo/redo state)
+    const items: SlashItem[] = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head)).map((c) => ({
+      ...c,
+      disabled:
+        c.name === "undo" ? !undoPossible(chat) :
+        c.name === "redo" ? !redoPossible(chat) :
+        false
+    }));
+    if (!items.length) {
+      slash = null;
+      return;
+    }
+    // open on the first runnable row (a greyed /redo shouldn't be preselected)
+    const firstEnabled = items.findIndex((it) => !it.disabled);
+    slash = { query: q, items, index: firstEnabled < 0 ? 0 : firstEnabled };
   }
 
   /** /goal forms: show, set/replace, pause, resume, clear (ZCode-style).
@@ -3968,16 +4007,162 @@
     await runWorkTurn(c, c.messages.length - 1, c.workspace);
   }
 
+  /** /undo: drop the last user + assistant pair and revert the last turn's
+   *  file writes (backend pops one undo frame onto its redo stack). Work-only,
+   *  idle only — like /compact. Shell (`exec`) side effects are reported,
+   *  never auto-reverted. The removed pair is stashed so /redo can restore
+   *  it in place. */
+  async function undoSession() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat) {
+      flashNotice("/undo needs a Work session — open one first.");
+      return;
+    }
+    if ((chat.mode ?? "chat") !== "work") {
+      flashNotice("/undo is only available in Work sessions.");
+      return;
+    }
+    if (busy) return;
+    // last user message with a following assistant reply (the turn's pair).
+    // Later messages (e.g. a /compact summary) stay — only the pair goes.
+    let userIdx = -1;
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      if (chat.messages[i].role === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx < 0) {
+      flashNotice("Nothing to undo — no user message yet.");
+      return;
+    }
+    if (userIdx + 1 >= chat.messages.length || chat.messages[userIdx + 1].role !== "assistant") {
+      flashNotice("Nothing to undo — last user message has no reply yet.");
+      return;
+    }
+    const pair = [chat.messages[userIdx], chat.messages[userIdx + 1]];
+    const afterLen = chat.messages.length - 2;
+    let undoMsg: string | null = null;
+    try {
+      undoMsg = await invokeOrBridge<string>("work_undo", { sessionId: chat.id });
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+      if (msg.includes("Nothing to undo")) {
+        undoMsg = "Undone last turn — no file changes to revert.";
+      } else {
+        error = `Undo failed: ${msg}`;
+        return;
+      }
+    }
+    const c = chats.find((x) => x.id === chat.id);
+    if (!c) return;
+    c.messages = [...c.messages.slice(0, userIdx), ...c.messages.slice(userIdx + 2)];
+    c.updatedAt = Date.now();
+    chats = [...chats];
+    // stash for /redo: only valid while the transcript still matches the
+    // shape undo left behind (any new/edited message greys redo out)
+    const stack = undoStashes[chat.id] ?? [];
+    undoStashes = {
+      ...undoStashes,
+      [chat.id]: [...stack.slice(-19), { messages: pair, index: userIdx, afterLen }]
+    };
+    save();
+    scrollBottom();
+    void loadExplorer().catch(() => {});
+    // the backend message is already a full sentence ("Undid last turn: …");
+    // the fallback covers turns with no recorded frame (messages only)
+    flashNotice(undoMsg ?? "Undone last turn — no file changes to revert.");
+  }
+
+  /** /redo: re-insert the pair /undo removed and re-apply that turn's file
+   *  writes (backend pops its redo frame). Greys out when impossible. */
+  async function redoSession() {
+    const chat = chats.find((c) => c.id === activeId);
+    if (!chat) {
+      flashNotice("/redo needs a Work session — open one first.");
+      return;
+    }
+    if ((chat.mode ?? "chat") !== "work") {
+      flashNotice("/redo is only available in Work sessions.");
+      return;
+    }
+    if (busy || !redoPossible(chat)) return;
+    const stack = undoStashes[chat.id] ?? [];
+    const top = stack[stack.length - 1];
+    if (!top) return;
+    let redoMsg: string | null = null;
+    try {
+      redoMsg = await invokeOrBridge<string>("work_redo", { sessionId: chat.id });
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+      // messages come from the frontend stash, so a missing backend frame
+      // (e.g. the turn ran before this build) is not a failure
+      if (!msg.includes("Nothing to redo")) {
+        error = `Redo failed: ${msg}`;
+        return;
+      }
+      redoMsg = "Redone last turn — no file changes to replay.";
+    }
+    const c = chats.find((x) => x.id === chat.id);
+    if (!c || c.messages.length !== top.afterLen) {
+      flashNotice("Transcript changed since the undo — redo is no longer possible.");
+      return;
+    }
+    c.messages = [
+      ...c.messages.slice(0, top.index),
+      ...top.messages,
+      ...c.messages.slice(top.index)
+    ];
+    c.updatedAt = Date.now();
+    chats = [...chats];
+    undoStashes = { ...undoStashes, [chat.id]: stack.slice(0, -1) };
+    save();
+    scrollBottom();
+    void loadExplorer().catch(() => {});
+    flashNotice(redoMsg ?? "Redone last turn — no file changes to replay.");
+  }
+
+  /** /undo availability: a user+assistant pair exists (Work, idle only). */
+  function undoPossible(chat: Chat | null): boolean {
+    if (!chat || (chat.mode ?? "chat") !== "work" || busy) return false;
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      if (chat.messages[i].role === "user") {
+        return i + 1 < chat.messages.length && chat.messages[i + 1].role === "assistant";
+      }
+    }
+    return false;
+  }
+
+  /** /redo availability: something was undone and the transcript is
+   *  unchanged since (a new message or edit greys it out). */
+  function redoPossible(chat: Chat | null): boolean {
+    if (!chat || (chat.mode ?? "chat") !== "work" || busy) return false;
+    const stack = undoStashes[chat.id];
+    const top = stack?.[stack.length - 1];
+    return !!top && chat.messages.length === top.afterLen;
+  }
+
+  /** a new agent turn invalidates the redo history (backend clears its
+   *  stack in undo_begin_turn; drop the message stash to match) */
+  function dropUndoStash(chatId: string) {
+    if (!(chatId in undoStashes)) return;
+    const { [chatId]: _, ...rest } = undoStashes;
+    undoStashes = rest;
+  }
+
   /** run the highlighted slash command, then clear the composer */
   function runSlash() {
-    const cmd = slash?.items[slash.index]?.name;
+    const item = slash?.items[slash.index];
+    const cmd = item?.name;
     slash = null;
-    if (!cmd) return;
+    if (!cmd || item?.disabled) return;
     // args ride along after the command word ("/goal ship it") — grab
     // them before the composer is cleared
     const sp = cmd === "goal" ? input.indexOf(" ") : -1;
     const args = sp < 0 ? "" : input.slice(sp + 1).trim();
     input = "";
+    historyIndex = null;
+    historyDraft = "";
     clearDraft(null);
     autosizeComposer();
     composerEl?.focus();
@@ -3986,6 +4171,8 @@
       return;
     }
     if (cmd === "compact") void compactSession();
+    if (cmd === "undo") void undoSession();
+    if (cmd === "redo") void redoSession();
   }
 
   /** Tab on a bare args-taking command ("/go", "/goal") completes it with a
@@ -4799,6 +4986,71 @@
     aborters.get(id)?.abort();
   }
 
+  /** Terminal-style prompt history for the open session: the sent user
+   *  messages, newest first. Empty threads have no history. */
+  function promptHistory(): string[] {
+    const c = chats.find((x) => x.id === activeId);
+    if (!c) return [];
+    const out: string[] = [];
+    for (const m of c.messages) {
+      if (m.role === "user" && m.content.trim()) out.push(m.content);
+    }
+    return out.reverse();
+  }
+
+  /** Move one step through the prompt history (dir -1 = older/ArrowUp,
+   *  +1 = newer/ArrowDown; the list is newest-first). Reaching past the
+   *  newest restores the draft the user was typing. Returns false when
+   *  there was nothing to do (let the caret move). */
+  function historyStep(dir: -1 | 1): boolean {
+    const hist = promptHistory();
+    if (!hist.length) return false;
+    if (historyIndex == null) {
+      if (dir > 0) return false; // ArrowDown with nothing recalled: plain caret
+      historyDraft = input;
+      historyIndex = 0;
+    } else {
+      // newest-first list: older entries live at larger indexes
+      const next = historyIndex - dir;
+      if (next < 0) {
+        // stepped past the newest recalled entry: hand the draft back
+        input = historyDraft;
+        historyIndex = null;
+        historyDraft = "";
+        historyAfterFill();
+        return true;
+      }
+      if (next >= hist.length) return true; // already at the oldest entry
+      historyIndex = next;
+    }
+    input = hist[historyIndex];
+    historyAfterFill();
+    return true;
+  }
+
+  /** caret to the end + autosize after a history fill (no input event fires
+   *  for a programmatic value change, so do the upkeep by hand) */
+  function historyAfterFill() {
+    autosizeComposer();
+    requestAnimationFrame(() => {
+      const el = composerEl;
+      if (el) {
+        el.setSelectionRange(input.length, input.length);
+        el.focus();
+      }
+      syncBackdropScroll();
+      refreshMentionMenu();
+    });
+  }
+
+  // switching sessions starts a fresh history walk (the box is shared, but
+  // each session walks its own sent messages)
+  $effect(() => {
+    activeId;
+    historyIndex = null;
+    historyDraft = "";
+  });
+
   function onKey(e: KeyboardEvent) {
     const noMod = !e.metaKey && !e.ctrlKey && !e.altKey;
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") caretHopped = false;
@@ -4809,7 +5061,15 @@
       if ((e.key === "ArrowDown" || e.key === "ArrowUp") && noMod) {
         e.preventDefault();
         popupKeyHandled = true;
-        slash.index = (slash.index + (e.key === "ArrowDown" ? 1 : slash.items.length - 1)) % slash.items.length;
+        // greyed rows are skipped: arrows only land on runnable commands
+        const dir = e.key === "ArrowDown" ? 1 : -1;
+        const n = slash.items.length;
+        let next = slash.index;
+        for (let step = 0; step < n; step++) {
+          next = (next + dir + n) % n;
+          if (!slash.items[next].disabled) break;
+        }
+        slash.index = next;
         return;
       }
       if (e.key === "Tab") {
@@ -4870,6 +5130,28 @@
         popupKeyHandled = true;
         mention = null;
         return;
+      }
+    }
+    // terminal-style prompt history: ArrowUp recalls the last sent message
+    // (even over typed text, as long as the caret is on the first line),
+    // ArrowUp again walks older, ArrowDown returns toward the draft. While
+    // browsing, Down on the last line steps past the newest entry and hands
+    // the draft back. Collapsed carets only, so in-message navigation wins.
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && noMod && !e.shiftKey) {
+      const el = composerEl;
+      const collapsed = !el || el.selectionStart === el.selectionEnd;
+      if (collapsed) {
+        const caret = el?.selectionStart ?? input.length;
+        const firstLine = !input.slice(0, caret).includes("\n");
+        const lastLine = !input.slice(caret).includes("\n");
+        const up = e.key === "ArrowUp";
+        const browsing = historyIndex != null;
+        const canRecall = up && (browsing ? firstLine : input.trim() === "" || firstLine);
+        const canForward = !up && browsing && lastLine;
+        if ((canRecall || canForward) && historyStep(up ? -1 : 1)) {
+          e.preventDefault();
+          return;
+        }
       }
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -5162,6 +5444,8 @@
     // when neither is present, and the catch below surfaces it).
     markWorkRunning(chat.id);
     workStopIds.delete(chat.id);
+    // a new turn invalidates /redo (backend clears its stack in undo_begin_turn)
+    dropUndoStash(chat.id);
     let curIndex = index;
     // in-flight tool head (for say/ask/done display) + the ask answer the
     // frontend itself sent (the record mirrors it once the result lands)
@@ -6425,6 +6709,9 @@
     {/if}
 
     <div class="composer-wrap">
+      {#if notice}
+        <div class="notice" data-testid="notice-box" role="status"><span>{notice}</span><button type="button" class="notice-x" data-testid="notice-dismiss" aria-label="Dismiss notice" title="Dismiss" onclick={() => (notice = null)}>×</button></div>
+      {/if}
       {#if queuedForActive.length}
         <div class="queue-strip" data-testid="queue-strip">
           {#each queuedMsgs as q, qi}
@@ -6528,6 +6815,9 @@
             onscroll={syncBackdropScroll}
             oninput={() => {
               caretHopped = false;
+              // typing leaves history browsing (the recalled text is now a draft)
+              historyIndex = null;
+              historyDraft = "";
               syncBackdropScroll();
               refreshMentionMenu();
               refreshSlashMenu();
@@ -6561,26 +6851,30 @@
           <div class="mention-menu" data-testid="slash-menu" role="listbox" aria-label="Commands">
             {#each slash.items as item, i (item.name)}
               <button
-                class="mention-item {i === slash.index ? 'sel' : ''}"
+                class="mention-item {i === slash.index ? 'sel' : ''} {item.disabled ? 'disabled' : ''}"
                 data-testid="slash-item"
+                data-disabled={item.disabled ? "true" : "false"}
                 role="option"
                 aria-selected={i === slash.index}
-                title={item.desc}
+                aria-disabled={item.disabled}
+                disabled={item.disabled}
+                title={item.disabled ? `${item.desc} — unavailable right now` : item.desc}
                 onmousedown={(e) => {
                   // before blur: keep focus in the composer
                   e.preventDefault();
+                  if (item.disabled) return;
                   if (slash) slash.index = i;
-                  const item = slash?.items[i];
+                  const picked = slash?.items[i];
                   // same as Tab: bare args-taking commands complete
                   // ("/goal" → "/goal ") instead of running with no args
-                  if (item?.takesArgs && !/\s\S/.test(input)) {
+                  if (picked?.takesArgs && !/\s\S/.test(input)) {
                     completeSlash();
                   } else {
                     runSlash();
                   }
                 }}
                 onmousemove={() => {
-                  if (slash && slash.index !== i) slash.index = i;
+                  if (slash && !item.disabled && slash.index !== i) slash.index = i;
                 }}
               >
                 <span class="mention-path">/{item.name}</span>
@@ -8355,6 +8649,16 @@
   .err span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .err-x { flex: none; border: 0; background: none; color: inherit; opacity: .6; font-size: 15px; line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
   .err-x:hover { opacity: 1; background: rgba(127,127,127,.25); }
+  /* transient command feedback (undo/redo/compact): neutral, not an error.
+     Floats above the composer (composer-wrap is position:relative) so it
+     takes NO layout space — showing/hiding it must never shift the thread
+     or the composer. */
+  .notice { position: absolute; left: 24px; right: 24px; bottom: calc(100% + 8px); max-width: 720px; margin: 0 auto; z-index: 6; color: var(--text); background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 8px 12px; font-size: 13px; display: flex; align-items: center; gap: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.10); animation: notice-in .14s ease-out; }
+  @keyframes notice-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  @media (prefers-reduced-motion: reduce) { .notice { animation: none; } }
+  .notice span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .notice-x { flex: none; border: 0; background: none; color: inherit; opacity: .5; font-size: max(14px, 1em); line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+  .notice-x:hover { opacity: 1; background: rgba(127,127,127,.25); }
   .tool-status { max-width: 860px; width: 100%; margin: 0 auto 8px auto; box-sizing: border-box; display: flex; align-items: center; gap: 8px; color: var(--muted-2); font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0 24px; }
   .tool-status-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .composer-wrap { position: relative; padding: 12px 24px 22px 24px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
@@ -8401,6 +8705,9 @@
   .mention-item { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; border: none; background: transparent; font: inherit; font-size: 13px; color: var(--text); padding: 7px 10px; border-radius: 10px; cursor: pointer; text-align: left; min-width: 0; }
   .mention-item:hover { background: var(--hover-3); }
   .mention-item.sel { background: var(--hover-3); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .mention-item.disabled { opacity: .42; cursor: default; }
+  .mention-item.disabled:hover { background: transparent; }
+  .mention-item.disabled.sel { background: transparent; }
   .mention-item svg { flex-shrink: 0; color: var(--muted-2); }
   .mention-path { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .mention-empty { padding: 8px 12px; font-size: 13px; color: var(--muted); }

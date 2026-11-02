@@ -28,7 +28,7 @@ use vicuna_lib::work_agent::{
     agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, run_loop, ChatSnapshot,
     McpRoute, TurnState, WorkAgentState, WorkAgentEvent,
 };
-use vicuna_lib::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage};
+use vicuna_lib::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
 
 const EVENT_CAP: usize = 2000;
 const BODY_CAP: u64 = 32 * 1024 * 1024;
@@ -42,6 +42,7 @@ pub struct BridgeState {
     // Arc so work_agent turns can hold it across the detached run_loop
     // (shared-ref arms below keep compiling via deref coercion)
     pub browser: Arc<BrowserState>,
+    pub undo: Arc<UndoState>,
     pub events: EventQueues,
 }
 
@@ -52,6 +53,7 @@ impl Default for BridgeState {
             mcp: McpManager::default(),
             agent: WorkAgentState::default(),
             browser: Arc::new(BrowserState::default()),
+            undo: Arc::new(UndoState::default()),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -132,6 +134,7 @@ async fn dispatch(
             let bg = st.bg.clone();
             let mcp = st.mcp.clone();
             let browser = st.browser.clone();
+            let undo = st.undo.clone();
             let browser_resource_dir = test_resource_dir();
             let tid = turn_id.clone();
             let model = s("model")?;
@@ -153,11 +156,12 @@ async fn dispatch(
             let mcp_routes: HashMap<String, McpRoute> =
                 serde_json::from_value(args.get("mcpRoutes").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad mcpRoutes: {e}"))?;
+            // leak the undo state for the detached turn (process-lifetime)
             tokio::spawn(async move {
                 run_loop(
                     turn, model, provider, api_key, context_length, workspace, messages, think, tools, session_id,
                     goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &mcp, &tid,
-                    browser_resource_dir, &browser,
+                    browser_resource_dir, &browser, &undo,
                 )
                 .await;
             });
@@ -248,6 +252,20 @@ async fn dispatch(
         "work_delete" => {
             vicuna_lib::work_delete_logic(s("root")?, s("path")?).await?;
             Ok(serde_json::Value::Null)
+        }
+        "work_undo" => {
+            let sid = arg_opt_str(args, "sessionId")
+                .or_else(|| arg_opt_str(args, "session_id"))
+                .or_else(|| arg_opt_str(args, "id"))
+                .ok_or_else(|| "missing arg sessionId".to_string())?;
+            Ok(serde_json::json!(vicuna_lib::work_undo_logic(&st.undo, sid).await?))
+        }
+        "work_redo" => {
+            let sid = arg_opt_str(args, "sessionId")
+                .or_else(|| arg_opt_str(args, "session_id"))
+                .or_else(|| arg_opt_str(args, "id"))
+                .ok_or_else(|| "missing arg sessionId".to_string())?;
+            Ok(serde_json::json!(vicuna_lib::work_redo_logic(&st.undo, sid).await?))
         }
         "work_import_file" => {
             Ok(serde_json::json!(

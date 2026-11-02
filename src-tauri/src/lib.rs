@@ -1060,7 +1060,7 @@ async fn ollama_stop_server(state: State<'_, OllamaServerState>) -> Result<(), S
 /// canonicalized once, joined paths must stay under it, and `..` escapes are
 /// rejected. Shell commands run with cwd=root, a timeout, and capped output.
 
-fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
+pub fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(root);
     if !p.is_absolute() {
         return Err("workspace must be an absolute path".to_string());
@@ -1082,7 +1082,7 @@ fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
 
 /// Join a session-relative path onto a canonical root, rejecting escapes.
 /// Empty/`"."` resolves to the root itself.
-fn work_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+pub fn work_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
     let rel = rel.trim();
     if rel.is_empty() || rel == "." || rel == "./" {
         return Ok(root.to_path_buf());
@@ -2206,6 +2206,317 @@ async fn work_exec_list(state: State<'_, BgExecState>) -> Result<Vec<BgJobSummar
 #[tauri::command]
 async fn work_exec_kill(id: String, state: State<'_, BgExecState>) -> Result<BgJobStatus, String> {
     bg_kill(&state, &id)
+}
+
+/// ---------- Work undo/redo (/undo, /redo: revert last turn's file changes) ----------
+///
+/// The agent mutates the workspace through `write` (direct) and `exec`
+/// (arbitrary shell). Before each `write`, dispatch snapshots the previous
+/// bytes and records the new ones, so the change is invertible in both
+/// directions; `exec` commands are recorded as notes since shell side
+/// effects can't be reliably inverted. A turn pushes one frame at start
+/// (`undo_begin_turn`); `/undo` pops the last frame and inverts it (delete
+/// created files, restore modified ones), pushing it onto a redo stack;
+/// `/redo` pops that and re-applies it.
+#[derive(Debug, Clone)]
+pub enum UndoOp {
+    /// File did not exist before the turn: undo deletes it, redo rewrites it.
+    Created { path: String, content: Vec<u8> },
+    /// File existed: undo restores `prev`, redo restores `next`.
+    Modified { path: String, prev: Vec<u8>, next: Vec<u8> },
+    ExecNote { command: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct UndoTurn {
+    pub workspace: String,
+    pub ops: Vec<UndoOp>,
+}
+
+#[derive(Default)]
+pub struct UndoState {
+    turns: Mutex<HashMap<String, Vec<UndoTurn>>>,
+    /// Frames popped by /undo, newest last; cleared by a new agent turn.
+    redo: Mutex<HashMap<String, Vec<UndoTurn>>>,
+}
+
+/// Session key for the undo stack: the session id when present, else the
+/// workspace (agent turns always carry a session, the fallback keeps
+/// headless callers grouped sensibly).
+pub fn undo_key(session_id: Option<&str>, workspace: &str) -> String {
+    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => workspace.trim().to_string(),
+    }
+}
+
+/// Snapshot a file before the agent overwrites it. `Some((existed, bytes))`
+/// means tracked; `None` means untrackable (directory, >5MB, unreadable) and
+/// the write is then left out of the undo history.
+pub fn undo_capture_prev(root: &str, path: &str) -> Option<(bool, Vec<u8>)> {
+    let canon = work_canonical_root(root).ok()?;
+    let full = work_join(&canon, path).ok()?;
+    if !full.exists() {
+        return Some((false, Vec::new()));
+    }
+    if !full.is_file() {
+        return None;
+    }
+    const CAP: u64 = 5 * 1024 * 1024;
+    if std::fs::metadata(&full).map(|m| m.len() > CAP).unwrap_or(true) {
+        return None;
+    }
+    std::fs::read(&full).ok().map(|b| (true, b))
+}
+
+/// Push a fresh frame for a starting turn (cap 20 per session). A new turn
+/// also invalidates the redo history, like an editor after a new edit.
+pub fn undo_begin_turn(state: &UndoState, key: &str, workspace: &str) {
+    if key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut m) = state.turns.lock() {
+        let stack = m.entry(key.to_string()).or_default();
+        stack.push(UndoTurn { workspace: workspace.to_string(), ops: Vec::new() });
+        while stack.len() > 20 {
+            stack.remove(0);
+        }
+    }
+    if let Ok(mut r) = state.redo.lock() {
+        r.remove(key);
+    }
+}
+
+/// Record one op onto the session's live frame (creating one if the turn
+/// started before this backend rolled, e.g. older app versions).
+pub fn undo_record(state: &UndoState, key: &str, op: UndoOp) {
+    if key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut m) = state.turns.lock() {
+        let stack = m.entry(key.to_string()).or_default();
+        if stack.is_empty() {
+            stack.push(UndoTurn { workspace: String::new(), ops: Vec::new() });
+        }
+        if let Some(top) = stack.last_mut() {
+            top.ops.push(op);
+        }
+    }
+}
+
+/// Record a completed `write` (prev captured before it ran) so both undo
+/// and redo can restore the exact bytes.
+pub fn undo_record_write(state: &UndoState, key: &str, path: &str, existed: bool, prev: Vec<u8>, next: &[u8]) {
+    let op = if existed {
+        UndoOp::Modified { path: path.to_string(), prev, next: next.to_vec() }
+    } else {
+        UndoOp::Created { path: path.to_string(), content: next.to_vec() }
+    };
+    undo_record(state, key, op);
+}
+
+/// Write `bytes` to a workspace-relative file, creating parent folders.
+fn undo_write_file(canon: &std::path::Path, path: &str, bytes: &[u8]) -> Result<(), ()> {
+    let full = work_join(canon, path).map_err(|_| ())?;
+    if full.is_dir() {
+        return Err(());
+    }
+    if let Some(parent) = full.parent() {
+        if !parent.starts_with(canon) {
+            return Err(());
+        }
+        std::fs::create_dir_all(parent).map_err(|_| ())?;
+    }
+    std::fs::write(&full, bytes).map_err(|_| ())
+}
+
+/// Invert one frame: created files are deleted, modified ones restored.
+/// `exec` notes are reported, never auto-reverted (shell side effects are
+/// not reliably invertible).
+fn undo_apply_reverse(canon: &std::path::Path, ops: &[UndoOp]) -> (usize, usize, Vec<String>, Vec<String>) {
+    let mut restored = 0usize;
+    let mut removed = 0usize;
+    let mut execs: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for op in ops.iter().rev() {
+        match op {
+            UndoOp::Created { path, .. } => match work_join(canon, path) {
+                Ok(full) => {
+                    if full.is_file() && !full.is_symlink() {
+                        match std::fs::remove_file(&full) {
+                            Ok(_) => removed += 1,
+                            Err(_) => skipped.push(path.clone()),
+                        }
+                    } else if !full.exists() {
+                        removed += 1; // already gone counts as reverted
+                    } else {
+                        skipped.push(path.clone());
+                    }
+                }
+                Err(_) => skipped.push(path.clone()),
+            },
+            UndoOp::Modified { path, prev, .. } => {
+                if undo_write_file(canon, path, prev).is_ok() {
+                    restored += 1;
+                } else {
+                    skipped.push(path.clone());
+                }
+            }
+            UndoOp::ExecNote { command } => {
+                execs.push(command.chars().take(80).collect());
+            }
+        }
+    }
+    (restored, removed, execs, skipped)
+}
+
+/// Re-apply one frame: created files are rewritten, modified ones get the
+/// turn's bytes back. Exec notes still can't be replayed.
+fn undo_apply_forward(canon: &std::path::Path, ops: &[UndoOp]) -> (usize, usize, Vec<String>, Vec<String>) {
+    let mut restored = 0usize;
+    let mut recreated = 0usize;
+    let mut execs: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for op in ops.iter() {
+        match op {
+            UndoOp::Created { path, content } => {
+                if undo_write_file(canon, path, content).is_ok() {
+                    recreated += 1;
+                } else {
+                    skipped.push(path.clone());
+                }
+            }
+            UndoOp::Modified { path, next, .. } => {
+                if undo_write_file(canon, path, next).is_ok() {
+                    restored += 1;
+                } else {
+                    skipped.push(path.clone());
+                }
+            }
+            UndoOp::ExecNote { command } => {
+                execs.push(command.chars().take(80).collect());
+            }
+        }
+    }
+    (restored, recreated, execs, skipped)
+}
+
+/// Shared tail for the undo/redo notices ("restored 1 file, removed …").
+fn undo_message(verb: &str, restored: usize, other: usize, other_verb: &str, other_noun: &str, execs: &[String], skipped: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if restored > 0 {
+        parts.push(format!("restored {} file{}", restored, if restored == 1 { "" } else { "s" }));
+    }
+    if other > 0 {
+        parts.push(format!(
+            "{other_verb} {other} {other_noun}{}",
+            if other == 1 { "" } else { "s" }
+        ));
+    }
+    let mut msg = if parts.is_empty() {
+        format!("{verb}: no file writes to change.")
+    } else {
+        format!("{verb}: {}.", parts.join(", "))
+    };
+    if !execs.is_empty() {
+        msg.push_str(&format!(
+            " ({} shell command{} ran — not auto-replayed, check manually).",
+            execs.len(),
+            if execs.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !skipped.is_empty() {
+        let names: Vec<String> = skipped.iter().take(3).cloned().collect();
+        msg.push_str(&format!(" Skipped: {}.", names.join(", ")));
+    }
+    msg
+}
+
+/// Pop the last turn for a session, invert its file ops, and park it on the
+/// redo stack. Returns a human summary for the chat notice.
+pub async fn work_undo_logic(state: &UndoState, session_id: String) -> Result<String, String> {
+    let key = session_id.trim().to_string();
+    if key.is_empty() {
+        return Err("no session for undo".to_string());
+    }
+    let turn = {
+        let mut m = state.turns.lock().map_err(|_| "undo state poisoned".to_string())?;
+        let stack = m.get_mut(&key).ok_or_else(|| "Nothing to undo — no assistant turn was recorded for this session.".to_string())?;
+        stack.pop().ok_or_else(|| "Nothing to undo — no assistant turn was recorded for this session.".to_string())?
+    };
+    // every popped frame is redoable, even an empty one (frontend still
+    // restores the message pair)
+    if let Ok(mut r) = state.redo.lock() {
+        let stack = r.entry(key).or_default();
+        stack.push(turn.clone());
+        while stack.len() > 20 {
+            stack.remove(0);
+        }
+    }
+    if turn.ops.is_empty() || turn.workspace.trim().is_empty() {
+        let execs = turn.ops.iter().filter(|o| matches!(o, UndoOp::ExecNote { .. })).count();
+        if execs > 0 {
+            return Ok(format!("Undid last turn: no file changes to revert ({} shell command{} ran — check manually).", execs, if execs == 1 { "" } else { "s" }));
+        }
+        return Ok("Undid last turn: no file changes to revert.".to_string());
+    }
+    let canon = work_canonical_root(turn.workspace.trim())
+        .map_err(|e| format!("cannot undo into workspace: {e}"))?;
+    let (restored, removed, execs, skipped) = undo_apply_reverse(&canon, &turn.ops);
+    if restored == 0 && removed == 0 && execs.is_empty() && skipped.is_empty() {
+        return Ok("Undid last turn: no file changes to revert.".to_string());
+    }
+    Ok(undo_message("Undid last turn", restored, removed, "removed", "created file", &execs, &skipped))
+}
+
+/// Re-apply the last undo frame for a session (the bubbles come back from
+/// the frontend's stash). Pushes the frame back onto the undo stack so the
+/// pair can alternate.
+pub async fn work_redo_logic(state: &UndoState, session_id: String) -> Result<String, String> {
+    let key = session_id.trim().to_string();
+    if key.is_empty() {
+        return Err("no session for redo".to_string());
+    }
+    let turn = {
+        let mut r = state.redo.lock().map_err(|_| "undo state poisoned".to_string())?;
+        let stack = r.get_mut(&key).ok_or_else(|| "Nothing to redo — /undo first.".to_string())?;
+        stack.pop().ok_or_else(|| "Nothing to redo — /undo first.".to_string())?
+    };
+    if let Ok(mut m) = state.turns.lock() {
+        let stack = m.entry(key).or_default();
+        stack.push(turn.clone());
+        while stack.len() > 20 {
+            stack.remove(0);
+        }
+    }
+    if turn.ops.is_empty() || turn.workspace.trim().is_empty() {
+        let execs = turn.ops.iter().filter(|o| matches!(o, UndoOp::ExecNote { .. })).count();
+        if execs > 0 {
+            return Ok(format!("Redid last turn: no file changes to replay ({} shell command{} — run manually).", execs, if execs == 1 { "" } else { "s" }));
+        }
+        return Ok("Redid last turn: no file changes to replay.".to_string());
+    }
+    let canon = work_canonical_root(turn.workspace.trim())
+        .map_err(|e| format!("cannot redo into workspace: {e}"))?;
+    let (restored, recreated, execs, skipped) = undo_apply_forward(&canon, &turn.ops);
+    if restored == 0 && recreated == 0 && execs.is_empty() && skipped.is_empty() {
+        return Ok("Redid last turn: no file changes to replay.".to_string());
+    }
+    Ok(undo_message("Redid last turn", restored, recreated, "recreated", "file", &execs, &skipped))
+}
+
+/// Revert the last recorded Work turn's file changes for a session.
+/// Pops one undo frame; chat bubbles are removed frontend-side.
+#[tauri::command]
+async fn work_undo(session_id: String, state: State<'_, UndoState>) -> Result<String, String> {
+    work_undo_logic(&state, session_id).await
+}
+
+/// Re-apply the turn most recently reverted by /undo. Chat bubbles are
+/// restored frontend-side.
+#[tauri::command]
+async fn work_redo(session_id: String, state: State<'_, UndoState>) -> Result<String, String> {
+    work_redo_logic(&state, session_id).await
 }
 
 /// ---------- Vicuna CLI launcher (Settings → General, desktop only) ----------
@@ -3587,6 +3898,7 @@ pub fn run() {
         .manage(OllamaServerState::default())
         .manage(TermState::default())
         .manage(BgExecState::default())
+        .manage(UndoState::default())
         .manage(work_agent::WorkAgentState::default())
         .manage(AppQuitState::default())
         .manage(browser::BrowserState::default())
@@ -3629,6 +3941,8 @@ pub fn run() {
             work_exec_status,
             work_exec_list,
             work_exec_kill,
+            work_undo,
+            work_redo,
             cli_status,
             cli_install,
             cli_uninstall,
@@ -4345,6 +4659,46 @@ mod work_tests {
         assert!(work_delete(root.clone(), ".".into()).await.is_err());
         assert!(work_delete(root.clone(), "../outside".into()).await.is_err());
         assert!(work_delete(root.clone(), "missing.txt".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn undo_restores_modified_and_removes_created() {
+        let d = tmp_root("undo");
+        let root = d.to_string_lossy().to_string();
+        std::fs::write(d.join("keep.txt"), b"before").unwrap();
+        let state = UndoState::default();
+        let key = "sess-undo-test";
+        // turn 1: modify keep.txt + create new.txt
+        undo_begin_turn(&state, key, &root);
+        undo_record(&state, key, UndoOp::Modified { path: "keep.txt".into(), prev: b"before".to_vec(), next: b"after".to_vec() });
+        work_write_file(root.clone(), "keep.txt".into(), "after".into()).await.unwrap();
+        undo_record(&state, key, UndoOp::Created { path: "new.txt".into(), content: b"new".to_vec() });
+        work_write_file(root.clone(), "new.txt".into(), "new".into()).await.unwrap();
+        // turn 2 (empty): only an exec note
+        undo_begin_turn(&state, key, &root);
+        undo_record(&state, key, UndoOp::ExecNote { command: "echo hi".into() });
+        let msg = work_undo_logic(&state, key.to_string()).await.unwrap();
+        assert!(msg.contains("no file writes"), "got {msg:?}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "after");
+        let msg = work_undo_logic(&state, key.to_string()).await.unwrap();
+        assert!(msg.contains("restored 1 file") && msg.contains("removed 1 created file"), "got {msg:?}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "before");
+        assert!(!d.join("new.txt").exists());
+        // /redo puts the turn's bytes back, then /undo can revert it again
+        let msg = work_redo_logic(&state, key.to_string()).await.unwrap();
+        assert!(msg.contains("restored 1 file") && msg.contains("recreated 1 file"), "got {msg:?}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(d.join("new.txt")).unwrap(), "new");
+        let msg = work_undo_logic(&state, key.to_string()).await.unwrap();
+        assert!(msg.contains("restored 1 file"), "got {msg:?}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "before");
+        // a fresh turn drops the redo history
+        let msg = work_redo_logic(&state, "other-session".to_string()).await.unwrap_err();
+        assert!(msg.contains("Nothing to redo"), "got {msg:?}");
+        undo_begin_turn(&state, key, &root);
+        assert!(work_redo_logic(&state, key.to_string()).await.is_err());
+        assert_eq!(work_undo_logic(&state, key.to_string()).await.unwrap(), "Undid last turn: no file changes to revert.");
+        assert!(work_undo_logic(&state, key.to_string()).await.is_err());
     }
 
     /// Real pty roundtrip: spawn a login shell, run echo, read it back,
