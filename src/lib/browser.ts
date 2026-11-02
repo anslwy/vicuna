@@ -9,7 +9,7 @@
 import { invokeOrBridge } from "./bridge";
 import type { McpServerConfig } from "./mcp";
 
-export const LB_PORT = 8765;
+export const LB_PORT = 18765;
 export const LB_URL = `http://127.0.0.1:${LB_PORT}`;
 
 /** Synthetic MCP server id for the shared browser (never in vicuna.json). */

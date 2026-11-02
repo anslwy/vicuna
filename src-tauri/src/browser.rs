@@ -19,11 +19,13 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
-/// live-browser's default port. Fixed (not picked) so a user-run `lb web`
-/// on the default port is adopted instead of fighting for a second one.
-/// `VICUNA_TEST_LB_PORT` overrides it (headless E2E only: lets the bundled
-/// lifecycle test run while a foreign daemon holds 8765).
-pub const LB_PORT: u16 = 8765;
+/// Vicuna's browser port. Deliberately NOT live-browser's default 8765:
+/// the tab drives an internal daemon, and sharing the default meant a
+/// user-run `lb web` (own version, own tabs, own UI state) was adopted
+/// instead — or blocked the tab outright. On this port Vicuna adopts only
+/// its own kind (a second instance, a manual `--port` twin).
+/// `VICUNA_TEST_LB_PORT` overrides it (headless E2E only).
+pub const LB_PORT: u16 = 18765;
 
 pub fn lb_port() -> u16 {
     std::env::var("VICUNA_TEST_LB_PORT")
@@ -245,6 +247,55 @@ pub fn find_cloak_in(cache: &Path) -> Option<PathBuf> {
 
 pub fn find_cloak_browser() -> Option<PathBuf> {
     cloak_cache_dir().and_then(|c| find_cloak_in(&c))
+}
+
+/// lb's cache base, mirrored (`%LOCALAPPDATA%` / `~/Library/Caches` /
+/// `$XDG_CACHE_HOME`): the Vicuna browser profile lives in lb's own tree
+/// (`profile-vicuna`, plus lb's `-cloak` kind suffix when on CloakBrowser)
+/// so its pidfiles/logs stay findable by plain `lb` commands, while the
+/// profile itself never touches a personal daemon's.
+fn lb_cache_base() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            if !local.trim().is_empty() {
+                return PathBuf::from(local);
+            }
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join("AppData").join("Local");
+            }
+        }
+        return std::env::temp_dir();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        return PathBuf::from(home).join("Library").join("Caches");
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join(".cache");
+            }
+        }
+        return std::env::temp_dir();
+    }
+}
+
+pub fn vicuna_profile_under(base: &Path) -> PathBuf {
+    base.join("live-browser").join("profile-vicuna")
+}
+
+pub fn vicuna_profile_dir() -> PathBuf {
+    vicuna_profile_under(&lb_cache_base())
 }
 
 /// Resource roots to search for the bundled binary. Release builds use
@@ -485,10 +536,14 @@ pub async fn browser_status_logic(
     }
 }
 
-/// Start `lb web --port 8765 --foreground` when nothing answers, adopting
+/// Start `lb web --port P --foreground` when nothing answers, adopting
 /// an already-reachable daemon instead. `--foreground` keeps the daemon
 /// as our child (`lb web` backgrounds itself by default, which would
-/// orphan it from our stop/quit tracking).
+/// orphan it from our stop/quit tracking). `--profile` pins a
+/// Vicuna-private browser profile: lb's default profile dir is shared by
+/// every daemon on the machine, so without this a personal `lb web`
+/// running next to Vicuna would SingletonLock-fight ours (and share
+/// cookies/logins with it).
 pub async fn browser_start_logic(
     resource_dir: Option<PathBuf>,
     state: &BrowserState,
@@ -569,6 +624,7 @@ async fn spawn_attempt(
 ) -> Result<Child, String> {
     let mut cmd = Command::new(bin);
     cmd.args(["web", "--port", &lb_port().to_string(), "--foreground"])
+        .args(["--profile", &vicuna_profile_dir().display().to_string()])
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -728,12 +784,15 @@ async fn force_stop_port_lb(resource_dir: Option<&Path>) {
         Some(b) => b,
         None => return,
     };
-    let kill = tokio::process::Command::new(&bin)
+    let mut kill_cmd = tokio::process::Command::new(&bin);
+    kill_cmd
         .args(["kill", "--port", &lb_port().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    kill_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
+    let kill = kill_cmd.output();
     match tokio::time::timeout(Duration::from_secs(20), kill).await {
         Ok(Ok(out)) if out.status.success() => return,
         _ => {}
@@ -924,6 +983,14 @@ mod tests {
         std::fs::write(&f, "longer bytes").expect("rewrite");
         assert_ne!(bin_id(&f), Some(id), "changed file, changed id");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vicuna_profile_is_private_to_lb_tree() {
+        let p = vicuna_profile_under(Path::new("/cache"));
+        assert_eq!(p, PathBuf::from("/cache/live-browser/profile-vicuna"));
+        // must differ from a personal daemon's default profile dir
+        assert!(!p.ends_with("live-browser/profile"));
     }
 
     #[test]

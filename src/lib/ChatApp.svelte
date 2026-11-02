@@ -3834,7 +3834,7 @@
       return st;
     } catch (e: any) {
       // plain browser with no bridge: still allow viewing a manually-run
-      // daemon (`lb web --port 8765` in a terminal) via a direct probe
+      // daemon (`lb web --port 18765` in a terminal) via a direct probe
       if (!isTauriRuntime()) {
         try {
           const r = await fetch(`${LB_URL}/api/health`);
