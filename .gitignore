@@ -4,6 +4,10 @@ node_modules
 /.svelte-kit
 /package
 bridge/target/
+core/target/
+# remote worker scratch (token + state dir, see bridge/WORKER.md)
+.vicuna-worker/
+bridge/container/scratch/
 src-tauri/target/
 # lb-sidecar build artifact (see src-tauri/lb-sidecar/README.md): keep the dir + README
 src-tauri/lb-sidecar/lb

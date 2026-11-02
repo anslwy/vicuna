@@ -1,0 +1,97 @@
+# Build and publish the remote worker binary.
+#
+# The worker is the daemon half of Vicuna: it runs the agent loop, tools, MCP
+# and live-browser on a machine that is NOT the user's laptop (see
+# bridge/WORKER.md). It links `vicuna-core`, which has no Tauri dependency, so
+# these builds need no GTK/WebKit and finish in seconds.
+#
+# Published as a rolling `worker-latest` prerelease so the install script can
+# fetch a binary instead of requiring a Rust toolchain on the server:
+#
+#   curl -fsSL https://github.com/<owner>/vicuna/releases/download/worker-latest/vicuna-worker-linux-x86_64 -o vicuna-worker
+#
+# Linux is built on ubuntu-22.04 for the older glibc, matching the desktop
+# release job, so the binary runs on more distros.
+name: Build + release (remote worker)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only rebuild when the worker or its crates change.
+      - "core/**"
+      - "bridge/**"
+      - ".github/workflows/worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-worker:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No OpenSSL: core/ uses reqwest with rustls, so the binary does not
+      # link libssl. That is what lets the release run on a bare debian-slim
+      # image (a native-tls build failed there with "libssl.so.3: cannot open
+      # shared object file"). If this step ever comes back, the rustls
+      # guarantee has regressed — check `ldd` on the artifact.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # core/ and bridge/ share a lockfile; cache the bridge workspace.
+          workspaces: bridge -> target
+
+      - name: Build worker (release)
+        run: cargo build --release --manifest-path bridge/Cargo.toml --bin worker
+
+      - name: Stage binary + checksum
+        run: |
+          set -eu
+          mkdir -p dist
+          # Target triple in the filename so clients can pick by platform.
+          OUT="dist/vicuna-worker-linux-x86_64"
+          cp bridge/target/release/worker "$OUT"
+          strip "$OUT" || true
+          ( cd dist && sha256sum vicuna-worker-linux-x86_64 > SHA256SUMS )
+          ls -lh dist
+          file "$OUT"
+
+      - name: Upload to rolling worker release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view worker-latest >/dev/null 2>&1 \
+            || gh release create worker-latest --prerelease \
+                 --title "Latest remote worker build" || true
+          gh release upload worker-latest --clobber dist/*
+          gh release edit worker-latest --notes-file - <<'EOF'
+          ## Vicuna remote worker
+
+          The daemon that runs agent turns, tools and live-browser on a machine
+          that is not your laptop. The desktop app connects to it.
+
+          **Install on the remote host**
+
+          ```sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/worker-latest/vicuna-worker-linux-x86_64 \
+            -o vicuna-worker
+          chmod +x vicuna-worker
+          ./vicuna-worker --bind 127.0.0.1:1421
+          ```
+
+          It prints a bearer token on first start and persists it (mode 0600)
+          in `--state-dir`. Every route except `/health` requires it.
+
+          `live-browser` (`lb`) is a **separate** dependency: install it and
+          put it on `PATH`, or set `VICUNA_LB_BIN`. Chromium is fetched by `lb`
+          on first use.
+
+          Keep the port on loopback and reach it over SSH. The agent runs shell
+          commands with no OS sandbox.
+
+          Checksums: `SHA256SUMS` in this release.
+          EOF

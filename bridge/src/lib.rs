@@ -1,39 +1,33 @@
-// Vicuna headless bridge: loopback HTTP (+ poll-based events) exposing the
-// backend commands so a plain browser (live-browser/Chrome) can drive the
-// REAL backend without the Tauri shell. Dev/test tool only: binds
-// 127.0.0.1, no auth — never expose beyond loopback.
+// Vicuna headless dispatch library — the Tauri-free backend surface shared
+// by two binaries:
 //
-//   cargo run --bin bridge [--port 1421]      (src-tauri/)
-//   POST /invoke {"cmd": "...", "args": {...}} -> {"ok": true, "data": ...}
-//   GET  /poll/<channel-id>                    -> {"events": [ ... ]}
-//   GET  /health                                -> {"ok": true}
+//   bin/bridge.rs   loopback dev bridge (127.0.0.1, no auth — dev/test only)
+//   bin/worker.rs   remote worker (auth + durable event log + reconnect)
 //
-// Argument keys are camelCase (same as Tauri's IPC convention) so frontend
-// code is identical between runtimes. Channel args arrive as
-// {"__bridge_channel": "<uuid>"} markers; the bridge creates the queue up
-// front and hands run_loop a real Channel wired into it.
+// Everything here is transport-agnostic on purpose: `dispatch` maps the same
+// camelCase command names Tauri's IPC uses onto the `*_logic` fns in
+// `vicuna_lib`, so `run_loop` is byte-identical across all three runtimes.
+// Channel args arrive as {"__bridge_channel": "<id>"} markers; the caller
+// decides what to do with the events pushed into `BridgeState::events`.
 //
-// VICUNA_TEST_RESOURCE_DIR (test-only): when set, browser_* commands
-// resolve the bundled `lb` from that dir as if it were the app resource
-// root — this is how the bundled (no-PATH) path is verified headlessly
-// (see /tmp/vicuna-browser-bundled.sh).
+// VICUNA_TEST_RESOURCE_DIR (test-only): when set, browser_* commands resolve
+// the bundled `lb` from that dir as if it were the app resource root.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tauri::ipc::{Channel, InvokeResponseBody};
 
-use vicuna_lib::browser::BrowserState;
-use vicuna_lib::mcp::McpManager;
-use vicuna_lib::work_agent::{
+use vicuna_core::browser::BrowserState;
+use vicuna_core::mcp::McpManager;
+use vicuna_core::work_agent::{
     agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, run_loop, ChatSnapshot,
-    McpRoute, TurnState, WorkAgentState, WorkAgentEvent,
+    McpRoute, TurnState, WorkAgentState,
 };
-use vicuna_lib::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
+use vicuna_core::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
 
-const EVENT_CAP: usize = 2000;
-const BODY_CAP: u64 = 32 * 1024 * 1024;
+pub const EVENT_CAP: usize = 2000;
+pub const BODY_CAP: u64 = 32 * 1024 * 1024;
 
-type EventQueues = Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>;
+pub type EventQueues = Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>;
 
 pub struct BridgeState {
     pub bg: Arc<BgExecState>,
@@ -59,7 +53,7 @@ impl Default for BridgeState {
     }
 }
 
-fn push_event(queues: &EventQueues, id: &str, raw: &str) {
+pub fn push_event(queues: &EventQueues, id: &str, raw: &str) {
     let v: serde_json::Value =
         serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
     if let Ok(mut map) = queues.lock() {
@@ -71,7 +65,7 @@ fn push_event(queues: &EventQueues, id: &str, raw: &str) {
     }
 }
 
-fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
+pub fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
     if let Ok(mut map) = queues.lock() {
         if let Some(q) = map.get_mut(id) {
             return q.drain(..).collect();
@@ -80,32 +74,29 @@ fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
-fn channel_for(queues: &EventQueues, uuid: &str) -> Channel<WorkAgentEvent> {
-    // Real Tauri Channel wired into the poll queue: run_loop is unchanged,
-    // its Token/Think/Tool/Done sends land here as JSON for GET /poll/<id>.
+pub fn channel_for(queues: &EventQueues, uuid: &str) -> vicuna_core::events::Sink {
+    // A core EventSink wired into the poll queue: run_loop is unchanged, its
+    // Token/Think/Tool/Done sends land here as JSON for GET /poll/<id>.
     let queues = queues.clone();
     let id = uuid.to_string();
-    Channel::<WorkAgentEvent>::new(move |body| {
-        if let InvokeResponseBody::Json(s) = body {
-            push_event(&queues, &id, &s);
-        }
-        Ok(())
+    vicuna_core::events::sink(move |json| {
+        push_event(&queues, &id, json);
     })
 }
 
-fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+pub fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("missing arg {key}"))
 }
 
-fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
+pub fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 /// Test-only resource root for browser_* (see header comment).
-fn test_resource_dir() -> Option<std::path::PathBuf> {
+pub fn test_resource_dir() -> Option<std::path::PathBuf> {
     std::env::var("VICUNA_TEST_RESOURCE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -113,7 +104,7 @@ fn test_resource_dir() -> Option<std::path::PathBuf> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch(
+pub async fn dispatch(
     st: &BridgeState,
     cmd: &str,
     args: &serde_json::Value,
@@ -192,65 +183,65 @@ async fn dispatch(
         }
         // ----- workspace validation / tools -----
         "work_validate_root" => {
-            Ok(serde_json::json!(vicuna_lib::work_validate_root_logic(s("path")?).await?))
+            Ok(serde_json::json!(vicuna_core::work_validate_root_logic(s("path")?).await?))
         }
         "work_list_dir" => {
             let path = arg_opt_str(args, "path");
-            Ok(serde_json::json!(vicuna_lib::work_list_dir_logic(s("root")?, path).await?))
+            Ok(serde_json::json!(vicuna_core::work_list_dir_logic(s("root")?, path).await?))
         }
         "work_tree" => {
             let max = args.get("maxDepth").and_then(|v| v.as_u64()).map(|n| n as usize);
-            Ok(serde_json::json!(vicuna_lib::work_tree_logic(s("root")?, max).await?))
+            Ok(serde_json::json!(vicuna_core::work_tree_logic(s("root")?, max).await?))
         }
         "work_read_file" => {
             let max = args.get("maxBytes").and_then(|v| v.as_u64());
             Ok(serde_json::json!(
-                vicuna_lib::work_read_file_logic(s("root")?, s("path")?, max).await?
+                vicuna_core::work_read_file_logic(s("root")?, s("path")?, max).await?
             ))
         }
         "work_read_image" => {
-            Ok(serde_json::json!(vicuna_lib::work_read_image_logic(s("root")?, s("path")?).await?))
+            Ok(serde_json::json!(vicuna_core::work_read_image_logic(s("root")?, s("path")?).await?))
         }
         "work_grep" => {
             let include = arg_opt_str(args, "include");
             Ok(serde_json::json!(
-                vicuna_lib::work_grep_logic(s("root")?, s("pattern")?, include).await?
+                vicuna_core::work_grep_logic(s("root")?, s("pattern")?, include).await?
             ))
         }
         "work_fetch_url" => {
-            Ok(serde_json::json!(vicuna_lib::work_fetch_url_logic(s("url")?).await?))
+            Ok(serde_json::json!(vicuna_core::work_fetch_url_logic(s("url")?).await?))
         }
         "work_write_file" => {
             Ok(serde_json::json!(
-                vicuna_lib::work_write_file_logic(s("root")?, s("path")?, s("content")?).await?
+                vicuna_core::work_write_file_logic(s("root")?, s("path")?, s("content")?).await?
             ))
         }
         "work_exec" => {
             let timeout = args.get("timeoutMs").and_then(|v| v.as_u64());
             Ok(serde_json::json!(
-                vicuna_lib::work_exec_logic(s("root")?, s("command")?, timeout).await?
+                vicuna_core::work_exec_logic(s("root")?, s("command")?, timeout).await?
             ))
         }
         "work_exec_start" => {
-            Ok(serde_json::json!(vicuna_lib::bg_start(&st.bg, s("root")?, s("command")?).await?))
+            Ok(serde_json::json!(vicuna_core::bg_start(&st.bg, s("root")?, s("command")?).await?))
         }
         "work_exec_status" => {
-            let r: BgJobStatus = vicuna_lib::bg_snapshot(&st.bg, &s("id")?)?;
+            let r: BgJobStatus = vicuna_core::bg_snapshot(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
         }
         "work_exec_list" => {
-            let l: Vec<BgJobSummary> = vicuna_lib::bg_list(&st.bg)?;
+            let l: Vec<BgJobSummary> = vicuna_core::bg_list(&st.bg)?;
             Ok(serde_json::json!(l))
         }
         "work_exec_kill" => {
-            let r: BgJobStatus = vicuna_lib::bg_kill(&st.bg, &s("id")?)?;
+            let r: BgJobStatus = vicuna_core::bg_kill(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
         }
         "work_rename" => {
-            Ok(serde_json::json!(vicuna_lib::work_rename_logic(s("root")?, s("path")?, s("newName")?).await?))
+            Ok(serde_json::json!(vicuna_core::work_rename_logic(s("root")?, s("path")?, s("newName")?).await?))
         }
         "work_delete" => {
-            vicuna_lib::work_delete_logic(s("root")?, s("path")?).await?;
+            vicuna_core::work_delete_logic(s("root")?, s("path")?).await?;
             Ok(serde_json::Value::Null)
         }
         "work_undo" => {
@@ -258,43 +249,43 @@ async fn dispatch(
                 .or_else(|| arg_opt_str(args, "session_id"))
                 .or_else(|| arg_opt_str(args, "id"))
                 .ok_or_else(|| "missing arg sessionId".to_string())?;
-            Ok(serde_json::json!(vicuna_lib::work_undo_logic(&st.undo, sid).await?))
+            Ok(serde_json::json!(vicuna_core::work_undo_logic(&st.undo, sid).await?))
         }
         "work_redo" => {
             let sid = arg_opt_str(args, "sessionId")
                 .or_else(|| arg_opt_str(args, "session_id"))
                 .or_else(|| arg_opt_str(args, "id"))
                 .ok_or_else(|| "missing arg sessionId".to_string())?;
-            Ok(serde_json::json!(vicuna_lib::work_redo_logic(&st.undo, sid).await?))
+            Ok(serde_json::json!(vicuna_core::work_redo_logic(&st.undo, sid).await?))
         }
         "work_import_file" => {
             Ok(serde_json::json!(
-                vicuna_lib::work_import_file_logic(s("root")?, s("path")?, s("base64")?).await?
+                vicuna_core::work_import_file_logic(s("root")?, s("path")?, s("base64")?).await?
             ))
         }
         "upload_stage_file" => {
             Ok(serde_json::json!(
-                vicuna_lib::upload_stage_file_logic(s("sessionId")?, s("fileName")?, s("base64")?).await?
+                vicuna_core::upload_stage_file_logic(s("sessionId")?, s("fileName")?, s("base64")?).await?
             ))
         }
         "upload_read_file" => {
             Ok(serde_json::json!(
-                vicuna_lib::upload_read_file_logic(s("sessionId")?, s("name")?).await?
+                vicuna_core::upload_read_file_logic(s("sessionId")?, s("name")?).await?
             ))
         }
         // ----- MCP -----
-        "mcp_list_servers" => Ok(serde_json::json!(vicuna_lib::mcp::list_file_servers()?)),
+        "mcp_list_servers" => Ok(serde_json::json!(vicuna_core::mcp::list_file_servers()?)),
         "mcp_save_server" => {
-            let cfg: vicuna_lib::mcp::McpServerConfig =
+            let cfg: vicuna_core::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad config: {e}"))?;
-            Ok(serde_json::json!(vicuna_lib::mcp::save_file_server(&cfg)?))
+            Ok(serde_json::json!(vicuna_core::mcp::save_file_server(&cfg)?))
         }
         "mcp_delete_server" => {
-            Ok(serde_json::json!(vicuna_lib::mcp::delete_file_server(&s("id")?)?))
+            Ok(serde_json::json!(vicuna_core::mcp::delete_file_server(&s("id")?)?))
         }
         "mcp_connect" => {
-            let cfg: vicuna_lib::mcp::McpServerConfig =
+            let cfg: vicuna_core::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad config: {e}"))?;
             Ok(serde_json::json!(st.mcp.connect(&cfg).await?))
@@ -312,73 +303,73 @@ async fn dispatch(
         }
         "mcp_signout" => {
             let id = s("id")?;
-            let name = vicuna_lib::mcp::list_file_servers()?
+            let name = vicuna_core::mcp::list_file_servers()?
                 .into_iter()
                 .find(|cf| cf.id == id)
                 .map(|cf| cf.name)
                 .unwrap_or(id.clone());
-            vicuna_lib::mcp::delete_auth(&name);
+            vicuna_core::mcp::delete_auth(&name);
             let _ = st.mcp.disconnect(&id).await;
             Ok(serde_json::Value::Null)
         }
         "mcp_login_present" => {
             let id = s("id")?;
-            let name = vicuna_lib::mcp::list_file_servers()?
+            let name = vicuna_core::mcp::list_file_servers()?
                 .into_iter()
                 .find(|cf| cf.id == id)
                 .map(|cf| cf.name)
                 .unwrap_or(id);
-            Ok(serde_json::json!(vicuna_lib::mcp::auth_present(&name)))
+            Ok(serde_json::json!(vicuna_core::mcp::auth_present(&name)))
         }
         "mcp_signin" => Err("browser sign-in needs the Vicuna desktop app".to_string()),
         // ----- in-app updates -----
-        "app_build_info" => Ok(vicuna_lib::app_build_info_logic().await?),
-        "github_latest_release" => Ok(vicuna_lib::github_latest_release_logic().await?),
+        "app_build_info" => Ok(vicuna_core::app_build_info_logic().await?),
+        "github_latest_release" => Ok(vicuna_core::github_latest_release_logic().await?),
         "github_download_asset" => {
-            Ok(serde_json::json!(vicuna_lib::github_download_asset_logic(s("url")?, s("fileName")?).await?))
+            Ok(serde_json::json!(vicuna_core::github_download_asset_logic(s("url")?, s("fileName")?).await?))
         }
         "bridge_open_path" => {
-            vicuna_lib::open_installer(&s("path")?)?;
+            vicuna_core::open_installer(&s("path")?)?;
             Ok(serde_json::Value::Null)
         }
         // ----- registry fetch (no CORS in Rust) -----
         "browser_status" => {
             Ok(serde_json::json!(
-                vicuna_lib::browser::browser_status_logic(test_resource_dir(), &st.browser).await?
+                vicuna_core::browser::browser_status_logic(test_resource_dir(), &st.browser).await?
             ))
         }
         "browser_start" => {
             Ok(serde_json::json!(
-                vicuna_lib::browser::browser_start_logic(test_resource_dir(), &st.browser).await?
+                vicuna_core::browser::browser_start_logic(test_resource_dir(), &st.browser).await?
             ))
         }
-        "browser_stop" => Ok(serde_json::json!(vicuna_lib::browser::browser_stop_logic(&st.browser).await?)),
+        "browser_stop" => Ok(serde_json::json!(vicuna_core::browser::browser_stop_logic(&st.browser).await?)),
         "browser_restart" => {
             Ok(serde_json::json!(
-                vicuna_lib::browser::browser_restart_logic(test_resource_dir(), &st.browser).await?
+                vicuna_core::browser::browser_restart_logic(test_resource_dir(), &st.browser).await?
             ))
         }
         "browser_ensure_engine" => {
             Ok(serde_json::json!(
-                vicuna_lib::browser::browser_ensure_engine_logic(test_resource_dir()).await?
+                vicuna_core::browser::browser_ensure_engine_logic(test_resource_dir()).await?
             ))
         }
         "browser_takeover" => {
             Ok(serde_json::json!(
-                vicuna_lib::browser::browser_takeover_logic(test_resource_dir(), &st.browser).await?
+                vicuna_core::browser::browser_takeover_logic(test_resource_dir(), &st.browser).await?
             ))
         }
         "browser_mcp_command" => {
-            Ok(serde_json::json!(vicuna_lib::browser::browser_mcp_command(test_resource_dir().as_deref())?))
+            Ok(serde_json::json!(vicuna_core::browser::browser_mcp_command(test_resource_dir().as_deref())?))
         }
         "ollama_fetch_text" => {
-            Ok(serde_json::json!(vicuna_lib::ollama_fetch_text_logic(s("url")?).await?))
+            Ok(serde_json::json!(vicuna_core::ollama_fetch_text_logic(s("url")?).await?))
         }
         _ => Err(format!("unknown bridge command {cmd}")),
     }
 }
 
-fn json_resp(body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+pub fn json_resp(body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     use tiny_http::Header;
     let h = |n: &[u8], v: &[u8]| Header::from_bytes(n, v).unwrap();
     tiny_http::Response::from_string(body)
@@ -388,7 +379,7 @@ fn json_resp(body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         .with_header(h(b"Content-Type", b"application/json"))
 }
 
-fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http::Request) {
+pub fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http::Request) {
     use tiny_http::Method::{Get, Options, Post};
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     if *req.method() == Options {
@@ -450,27 +441,20 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
     let _ = req.respond(json_resp(r#"{"ok":false,"error":"not found"}"#.to_string()));
 }
 
-/// Serve forever on 127.0.0.1:<port>. Called from `main` below.
-pub fn run(port: u16) {
+/// Serve forever on the given address using a caller-built state.
+/// `label` is only used for the startup line. Returns the bound port
+/// (resolve `:0` by passing a real port in — this stays simple).
+pub fn serve(addr: String, state: Arc<BridgeState>, label: &str) -> ! {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("bridge runtime");
-    let state = Arc::new(BridgeState::default());
-    let server =
-        tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("bridge bind 127.0.0.1");
-    println!("vicuna bridge on http://127.0.0.1:{port}");
+        .expect("dispatch runtime");
+    let server = tiny_http::Server::http(&addr).unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+    println!("{label} on http://{addr}");
     for req in server.incoming_requests() {
         let st = state.clone();
         let h = rt.handle().clone();
         std::thread::spawn(move || handle(&h, &st, req));
     }
-}
-
-fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(1421);
-    run(port);
+    unreachable!("incoming_requests() never ends")
 }

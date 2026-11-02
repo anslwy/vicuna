@@ -1,0 +1,27 @@
+# Docker build context exclusions (see bridge/container/Dockerfile.worker).
+# Without these the context is ~28GB (Rust target dirs dominate).
+node_modules
+build
+.svelte-kit
+.git
+.github
+
+# Rust build output — the whole point of building in the image
+src-tauri/target
+bridge/target
+**/target
+
+# Local state that must never leak into an image layer
+.env
+.env.*
+.vicuna-worker
+bridge/container/scratch
+src-tauri/gen
+
+# Not needed to compile the worker. NOTE: `core/` and `bridge/` must stay
+# included — they are the crate the worker is built from (`src/` here is the
+# Svelte frontend, which the daemon does not use).
+src
+static
+scripts
+*.md

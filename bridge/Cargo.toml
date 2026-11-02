@@ -1,13 +1,27 @@
 [package]
 name = "vicuna-bridge"
 version = "0.1.0"
-description = "Vicuna headless bridge: loopback HTTP for driving the real backend without the Tauri shell (dev/test only)"
+description = "Vicuna headless dispatch library + dev bridge + remote worker"
 authors = ["you"]
 edition = "2024"
+default-run = "bridge"
+
+[lib]
+name = "vicuna_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
 
 [dependencies]
-vicuna_lib = { package = "vicuna", path = "../src-tauri" }
-tauri = { version = "2" }
+vicuna-core = { package = "vicuna-core", path = "../core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tiny_http = "0.12"
 serde_json = "1"
+sha2 = "0.10"
+getrandom = "0.3"
