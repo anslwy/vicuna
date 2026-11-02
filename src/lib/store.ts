@@ -297,7 +297,7 @@ async function createSqliteBackend(): Promise<Backend> {
     `CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, idx)`
   );
   // databases created before these columns existed lack them
-  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER"]) {
+  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL"]) {
     try {
       await db.execute(`ALTER TABLE messages ADD COLUMN ${col}`);
     } catch {
@@ -325,8 +325,8 @@ async function createSqliteBackend(): Promise<Backend> {
         let i = 0;
         for (const m of c.messages) {
           await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null]
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null]
           );
         }
       }
@@ -364,8 +364,8 @@ async function createSqliteBackend(): Promise<Backend> {
       let i = 0;
       for (const m of c.messages) {
         await db.execute(
-          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null]
+          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null]
         );
       }
     }
@@ -378,9 +378,9 @@ async function createSqliteBackend(): Promise<Backend> {
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
-          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null; summary: number | null }[]
+          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null; summary: number | null; gen_cost: number | null }[]
         >(
-          "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
+          "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
           [r.id]
         );
         chats.push({
@@ -400,6 +400,7 @@ async function createSqliteBackend(): Promise<Backend> {
           images: parseImages(m.images),
           genMs: typeof m.gen_ms === "number" ? m.gen_ms : undefined,
           genTps: typeof m.gen_tps === "number" ? m.gen_tps : undefined,
+          genCost: typeof m.gen_cost === "number" ? m.gen_cost : undefined,
           summary: m.summary === 1 ? true : undefined
         }))
         });
@@ -590,11 +591,19 @@ export interface Prefs {
    *  prompt through /api/generate where the format is known), "auto" (raw
    *  only for gemma4, native otherwise), or "native" (always /api/chat). */
   continueMode: ContinueMode;
+  /** OpenRouter API key for the Settings → OpenRouter catalog. Stored like
+   *  every other pref (localStorage + sqlite meta); only ever sent to
+   *  openrouter.ai. */
+  openrouterApiKey?: string;
+  /** Curated OpenRouter model ids: only these appear in the model picker
+   *  and the default Settings list (the live catalog has 400+ entries).
+   *  Added/removed per row; search browses the full catalog. */
+  openrouterAdded: string[];
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw", openrouterApiKey: "", openrouterAdded: [] };
 const LS_PREFS = "vicuna-prefs";
 
 /** Normalize a stored workspace for the current platform: strip Rust's
@@ -624,7 +633,9 @@ export function readLocalPrefs(): Prefs {
       zoom: typeof p.zoom === "number" && p.zoom >= 0.5 && p.zoom <= 3 ? p.zoom : DEFAULT_PREFS.zoom,
       defaultWorkspace: typeof p.defaultWorkspace === "string" ? normalizeStoredWorkspace(p.defaultWorkspace) : normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace),
       thinkLevel: typeof p.thinkLevel === "string" && p.thinkLevel.length > 0 ? p.thinkLevel : DEFAULT_PREFS.thinkLevel,
-      continueMode: normalizeContinueMode(p.continueMode)
+      continueMode: normalizeContinueMode(p.continueMode),
+      openrouterApiKey: typeof p.openrouterApiKey === "string" ? p.openrouterApiKey : DEFAULT_PREFS.openrouterApiKey,
+      openrouterAdded: Array.isArray(p.openrouterAdded) ? p.openrouterAdded.filter((s): s is string => typeof s === "string") : [...DEFAULT_PREFS.openrouterAdded]
     };
   } catch {
     return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
@@ -635,7 +646,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level', 'pref_continue_mode')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level', 'pref_continue_mode', 'pref_openrouter_key', 'pref_openrouter_added')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -662,6 +673,15 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
     if (r.key === "pref_default_workspace" && typeof r.value === "string") out.defaultWorkspace = normalizeStoredWorkspace(r.value);
     if (r.key === "pref_think_level" && typeof r.value === "string" && r.value.length > 0) out.thinkLevel = r.value;
     if (r.key === "pref_continue_mode") out.continueMode = normalizeContinueMode(r.value);
+    if (r.key === "pref_openrouter_key" && typeof r.value === "string") out.openrouterApiKey = r.value;
+    if (r.key === "pref_openrouter_added") {
+      try {
+        const arr = JSON.parse(r.value);
+        if (Array.isArray(arr)) out.openrouterAdded = arr.filter((s): s is string => typeof s === "string");
+      } catch {
+        /* ignore */
+      }
+    }
   }
   return out;
 }
@@ -679,6 +699,8 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_default_workspace', $1)", [p.defaultWorkspace]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_think_level', $1)", [p.thinkLevel]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_continue_mode', $1)", [p.continueMode]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_openrouter_key', $1)", [p.openrouterApiKey ?? ""]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_openrouter_added', $1)", [JSON.stringify(p.openrouterAdded ?? [])]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {

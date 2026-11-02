@@ -135,6 +135,9 @@ async fn dispatch(
             let browser_resource_dir = test_resource_dir();
             let tid = turn_id.clone();
             let model = s("model")?;
+            let provider = arg_opt_str(args, "provider").unwrap_or_else(|| "ollama".to_string());
+            let api_key = arg_opt_str(args, "apiKey");
+            let context_length = args.get("contextLength").and_then(|v| v.as_u64());
             let workspace = s("workspace")?;
             let messages: Vec<ChatMessage> =
                 serde_json::from_value(args.get("messages").cloned().unwrap_or_default())
@@ -152,7 +155,7 @@ async fn dispatch(
                     .map_err(|e| format!("bad mcpRoutes: {e}"))?;
             tokio::spawn(async move {
                 run_loop(
-                    turn, model, workspace, messages, think, tools, session_id,
+                    turn, model, provider, api_key, context_length, workspace, messages, think, tools, session_id,
                     goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &mcp, &tid,
                     browser_resource_dir, &browser,
                 )

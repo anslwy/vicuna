@@ -1004,7 +1004,7 @@ export type WorkAgentEvent =
   | { type: "think"; text: string }
   | { type: "status"; label: string | null }
   | { type: "roundstart"; mode: string }
-  | { type: "roundend"; gen_ms: number; gen_tps: number | null }
+  | { type: "roundend"; gen_ms: number; gen_tps: number | null; gen_cost?: number | null }
   | { type: "displaynote"; text: string }
   | { type: "queuedrained"; ids: string[]; messages: ChatMsg[] }
   | { type: "toolstart"; name: string; args: Record<string, any> }
@@ -1041,6 +1041,12 @@ export interface McpRoute {
 
 export interface WorkTurnParams {
   model: string;
+  /** inference provider: Ollama /api/chat (default) or OpenRouter. */
+  provider?: "ollama" | "openrouter";
+  /** OpenRouter bearer token (only read for provider === "openrouter"). */
+  apiKey?: string;
+  /** catalog context window, so the backend can compact without /api/show. */
+  contextLength?: number | null;
   workspace: string;
   messages: ChatMsg[];
   think?: boolean | string;
@@ -1059,6 +1065,9 @@ export interface WorkTurnParams {
 export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
   const args = {
     model: p.model,
+    provider: p.provider ?? "ollama",
+    apiKey: p.apiKey ?? null,
+    contextLength: p.contextLength ?? null,
     workspace: p.workspace,
     messages: p.messages,
     think: p.think ?? true,

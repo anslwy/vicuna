@@ -6,6 +6,8 @@
 // outside Tauri (plain `npm run dev` in a browser) they fall back to direct
 // fetch so web-only dev keeps working without the shell.
 
+import { isOpenRouterSelection, openRouterChatStream, openRouterModelId } from "./openrouter";
+
 export const OLLAMA_BASE = "http://localhost:11434";
 /** Plain-browser override for the Ollama endpoint (Settings → General →
  *  Ollama host). Empty = default above. The Tauri backend always uses the
@@ -343,6 +345,9 @@ export interface ChatMsg {
   genMs?: number;
   /** generation speed in tok/s from Ollama's eval stats (latest run) */
   genTps?: number;
+  /** OpenRouter charge in USD (accumulates across Continue/Work rounds).
+   *  Absent for Ollama/local models — the footer only shows it when set. */
+  genCost?: number;
   /** native tool calls requested by the assistant (Ollama `tool_calls`) */
   tool_calls?: OllamaToolCall[];
   /** tool result target (Ollama `tool` role uses `tool_name`) */
@@ -538,7 +543,24 @@ export async function chatStream(
   onThink?: (t: string) => void,
   attempt = 0,
   opts: { think?: boolean | string; temperature?: number; stop?: string[]; tools?: OllamaToolDef[]; onImagesStripped?: () => void } = {}
-): Promise<{ text: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[] }> {
+): Promise<{ text: string; evalCount: number; evalDurationNs: number; toolCalls: OllamaToolCall[]; cost: number | null }> {
+  if (isOpenRouterSelection(model)) {
+    // OpenRouter runs over its own OpenAI-compatible SSE transport. The
+    // prefix is stripped here; everything else (messages, images, tools,
+    // abort, reasoning) maps one-to-one.
+    try {
+      const r = await openRouterChatStream(openRouterModelId(model), messages, onToken, signal, onThink, opts);
+      return { text: r.text, evalCount: r.evalCount, evalDurationNs: r.evalDurationNs, toolCalls: r.toolCalls, cost: r.cost };
+    } catch (e: unknown) {
+      if (attempt === 0 && isOpenRouterImageError(e)) {
+        // endpoint set has no vision: retry without the picture and tell the
+        // user, same contract as the Ollama multimodal fallback below
+        opts.onImagesStripped?.();
+        return chatStream(model, stripImages(messages), onToken, signal, onThink, attempt, opts);
+      }
+      throw e;
+    }
+  }
   try {
     const { text, doneReason, evalCount, evalDurationNs, toolCalls } = isTauriRuntime()
       ? await chatStreamViaBackend(model, messages, onToken, signal, onThink, opts)
@@ -551,7 +573,7 @@ export async function chatStream(
         return chatStream(model, messages, onToken, signal, onThink, attempt + 1, opts);
       }
     }
-    return { text, evalCount, evalDurationNs, toolCalls };
+    return { text, evalCount, evalDurationNs, toolCalls, cost: null };
   } catch (e: unknown) {
     if (isVisionUnsupportedError(e)) {
       // text-only model: retry the same turn without images (the stripped
@@ -585,6 +607,13 @@ export async function chatStream(
 function isVisionUnsupportedError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return msg.includes("does not support multimodal");
+}
+
+/** OpenRouter rejects image payloads for text-only endpoints with messages
+ *  like "No endpoints found that support image input". */
+function isOpenRouterImageError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("image") && (msg.includes("support") || msg.includes("modality") || msg.includes("multimodal"));
 }
 
 function isThinkUnsupportedError(e: unknown): boolean {

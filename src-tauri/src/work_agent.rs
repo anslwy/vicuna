@@ -69,7 +69,7 @@ pub enum WorkAgentEvent {
     Think { text: String },
     Status { label: Option<String> },
     RoundStart { mode: String },
-    RoundEnd { gen_ms: u64, gen_tps: Option<f64> },
+    RoundEnd { gen_ms: u64, gen_tps: Option<f64>, gen_cost: Option<f64> },
     DisplayNote { text: String },
     QueueDrained { ids: Vec<String>, messages: Vec<ChatMessage> },
     ToolStart { name: String, args: serde_json::Value },
@@ -670,6 +670,7 @@ struct RoundResult {
     tool_calls: Vec<serde_json::Value>,
     eval_count: u64,
     eval_duration_ns: u64,
+    cost: Option<f64>,
 }
 
 /// One streaming /api/chat round with the same retry ladder as the old
@@ -861,7 +862,7 @@ async fn ollama_round_attempt(
         }
         buf.drain(..start);
     }
-    Ok(RoundResult { text: full, tool_calls, eval_count, eval_duration_ns })
+    Ok(RoundResult { text: full, tool_calls, eval_count, eval_duration_ns, cost: None })
 }
 
 async fn ollama_oneshot(model: &str, system: &str, user: &str, stop: &AtomicBool) -> Result<String, String> {
@@ -911,6 +912,401 @@ async fn model_context_length(model: &str) -> Option<u64> {
     }
     let data: serde_json::Value = res.json().await.ok()?;
     data.get("model_info").and_then(parse_show_context_length)
+}
+
+// ---------- OpenRouter (Cloud models via the agent loop) ----------
+
+const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+
+fn openrouter_error(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .and_then(|e| match e {
+            serde_json::Value::String(s) => Some(s),
+            other => other
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| body.chars().take(400).collect());
+    format!("openrouter chat failed: {status} {detail}")
+}
+
+/// `think` → OpenRouter `reasoning`. Auto/true is left out so the provider's
+/// model default applies (forcing `enabled: true` would switch reasoning on
+/// for models that default it off).
+fn openrouter_reasoning(think: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match think {
+        Some(serde_json::Value::Bool(false)) => Some(serde_json::json!({ "enabled": false })),
+        Some(serde_json::Value::String(level)) => {
+            let l = level.to_lowercase();
+            if matches!(l.as_str(), "minimal" | "low" | "medium" | "high" | "xhigh") {
+                Some(serde_json::json!({ "effort": l }))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn json_piece(v: Option<&serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// History → OpenAI chat messages. Tool results need a `tool_call_id`; the
+/// shared ChatMessage only carries `tool_name`, so ids are assigned
+/// deterministically (or reused from the raw call) and matched in order.
+fn openrouter_wire(messages: &[ChatMessage], strip_images: bool) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut seq = 0usize;
+    for m in messages {
+        match m.role.as_str() {
+            "assistant" => {
+                let mut v = serde_json::json!({ "role": "assistant", "content": m.content });
+                if let Some(arr) = m.tool_calls.as_ref().and_then(|t| t.as_array()) {
+                    let mut calls = Vec::new();
+                    for tc in arr {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = match tc.get("function").and_then(|f| f.get("arguments")) {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => "{}".to_string(),
+                        };
+                        let id = match tc.get("id").and_then(|v| v.as_str()) {
+                            Some(s) if !s.is_empty() => s.to_string(),
+                            _ => {
+                                let id = format!("call_{seq}");
+                                seq += 1;
+                                id
+                            }
+                        };
+                        if !name.is_empty() {
+                            pending.push((name.clone(), id.clone()));
+                        }
+                        calls.push(serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": args }
+                        }));
+                    }
+                    v["tool_calls"] = serde_json::Value::Array(calls);
+                }
+                out.push(v);
+            }
+            "tool" => {
+                let name = m.tool_name.clone().unwrap_or_default();
+                let at = pending.iter().position(|(n, _)| n == &name).unwrap_or(0);
+                let id = if pending.is_empty() {
+                    let id = format!("call_unknown_{seq}");
+                    seq += 1;
+                    id
+                } else {
+                    pending.remove(at).1
+                };
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": m.content
+                }));
+            }
+            role => {
+                let images = m.images.as_ref().filter(|i| !i.is_empty());
+                if !strip_images && images.is_some() {
+                    let mut parts = Vec::new();
+                    if !m.content.is_empty() {
+                        parts.push(serde_json::json!({ "type": "text", "text": m.content }));
+                    }
+                    for url in images.unwrap() {
+                        parts.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
+                    }
+                    out.push(serde_json::json!({ "role": role, "content": parts }));
+                } else {
+                    out.push(serde_json::json!({ "role": role, "content": m.content }));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openrouter_round(
+    model: &str,
+    api_key: &str,
+    messages: &[ChatMessage],
+    think: &Option<serde_json::Value>,
+    tools: &Option<serde_json::Value>,
+    on_event: &Channel<WorkAgentEvent>,
+    stop: &AtomicBool,
+) -> Result<RoundResult, String> {
+    let mut think = think.clone();
+    let mut tools = tools.clone();
+    let mut strip_images = false;
+    let has_images = messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()));
+    for _ in 0..4 {
+        match openrouter_round_attempt(model, api_key, messages, &think, &tools, strip_images, on_event, stop).await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                if stop.load(Ordering::Relaxed) {
+                    return Err(e);
+                }
+                let low = e.to_lowercase();
+                if !strip_images
+                    && has_images
+                    && (low.contains("image") || low.contains("multimodal") || low.contains("modality"))
+                {
+                    strip_images = true;
+                    emit_ev(
+                        on_event,
+                        stop,
+                        WorkAgentEvent::DisplayNote {
+                            text: format!(
+                                "\n\n> Note: {model} doesn't accept images, so the attached picture was not sent."
+                            ),
+                        },
+                    );
+                    continue;
+                }
+                if low.contains("reasoning") && think.is_some() {
+                    think = None;
+                    continue;
+                }
+                if low.contains("tool")
+                    && (low.contains("not supported")
+                        || low.contains("does not support")
+                        || low.contains("unsupported")
+                        || low.contains("no endpoints"))
+                    && tools.as_ref().is_some_and(|t| !t.is_null())
+                {
+                    tools = None;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err("openrouter chat failed: retry ladder exhausted".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openrouter_round_attempt(
+    model: &str,
+    api_key: &str,
+    messages: &[ChatMessage],
+    think: &Option<serde_json::Value>,
+    tools: &Option<serde_json::Value>,
+    strip_images: bool,
+    on_event: &Channel<WorkAgentEvent>,
+    stop: &AtomicBool,
+) -> Result<RoundResult, String> {
+    if api_key.trim().is_empty() {
+        return Err("No OpenRouter API key is set — add one in Settings → OpenRouter.".to_string());
+    }
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": openrouter_wire(messages, strip_images),
+        "stream": true,
+        "usage": { "include": true },
+    });
+    if let Some(reasoning) = openrouter_reasoning(think) {
+        body["reasoning"] = reasoning;
+    }
+    if let Some(t) = tools {
+        if !t.is_null() {
+            body["tools"] = t.clone();
+        }
+    }
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{OPENROUTER_BASE}/chat/completions"))
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("X-Title", "Vicuna")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("openrouter chat failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(openrouter_error(status, &text));
+    }
+    use futures_util::StreamExt;
+    let mut stream = res.bytes_stream();
+    let mut buf = String::new();
+    let mut full = String::new();
+    let mut calls: Vec<(u64, Option<String>, String, String)> = Vec::new();
+    let mut eval_count: u64 = 0;
+    let mut cost: Option<f64> = None;
+    let mut first_token: Option<Instant> = None;
+    'stream: loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let chunk = match stream.next().await {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => return Err(format!("openrouter chat failed: {e}")),
+            None => break,
+        };
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                break 'stream;
+            }
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            if let Some(err) = obj.get("error") {
+                let detail = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| err.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| err.to_string());
+                return Err(format!("openrouter chat failed: {detail}"));
+            }
+            if let Some(n) = obj
+                .pointer("/usage/completion_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                eval_count = n;
+            }
+            if let Some(c) = obj.pointer("/usage/cost").and_then(|v| v.as_f64()) {
+                cost = Some(c);
+            }
+            let delta = match obj.pointer("/choices/0/delta") {
+                Some(d) => d,
+                None => continue,
+            };
+            let think_piece = json_piece(delta.get("reasoning"));
+            let think_piece = if think_piece.is_empty() {
+                json_piece(delta.get("reasoning_content"))
+            } else {
+                think_piece
+            };
+            if !think_piece.is_empty() {
+                first_token.get_or_insert_with(Instant::now);
+                emit_ev(on_event, stop, WorkAgentEvent::Think { text: think_piece });
+            }
+            let piece = json_piece(delta.get("content"));
+            if !piece.is_empty() {
+                first_token.get_or_insert_with(Instant::now);
+                full.push_str(&piece);
+                emit_ev(on_event, stop, WorkAgentEvent::Token { text: piece });
+            }
+            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                first_token.get_or_insert_with(Instant::now);
+                for tc in tcs {
+                    let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(calls.len() as u64);
+                    if !calls.iter().any(|c| c.0 == index) {
+                        calls.push((index, None, String::new(), String::new()));
+                    }
+                    let slot = calls.iter_mut().find(|c| c.0 == index).unwrap();
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            slot.1 = Some(id.to_string());
+                        }
+                    }
+                    if let Some(f) = tc.get("function") {
+                        if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                            slot.2.push_str(name);
+                        }
+                        match f.get("arguments") {
+                            Some(serde_json::Value::String(s)) => slot.3.push_str(s),
+                            Some(other) if !other.is_null() => slot.3.push_str(&other.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    calls.sort_by_key(|c| c.0);
+    let tool_calls = calls
+        .into_iter()
+        .filter(|c| !c.2.is_empty())
+        .map(|(_, id, name, args)| {
+            serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": if args.trim().is_empty() { "{}".to_string() } else { args }
+                }
+            })
+        })
+        .collect();
+    let eval_duration_ns = first_token
+        .map(|t| t.elapsed().as_nanos() as u64)
+        .unwrap_or(0);
+    Ok(RoundResult { text: full, tool_calls, eval_count, eval_duration_ns, cost })
+}
+
+async fn openrouter_oneshot(
+    model: &str,
+    api_key: &str,
+    system: &str,
+    user: &str,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    if api_key.trim().is_empty() {
+        return Err("No OpenRouter API key is set — add one in Settings → OpenRouter.".to_string());
+    }
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "stream": false,
+    });
+    let fut = client
+        .post(format!("{OPENROUTER_BASE}/chat/completions"))
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("X-Title", "Vicuna")
+        .json(&body)
+        .send();
+    let res = tokio::select! {
+        r = fut => r.map_err(|e| format!("openrouter chat failed: {e}"))?,
+        _ = async { while !stop.load(Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => {
+            return Err("stopped".to_string());
+        }
+    };
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(openrouter_error(status, &text));
+    }
+    let data: serde_json::Value = res.json().await.map_err(|e| format!("openrouter chat failed: {e}"))?;
+    Ok(json_piece(data.pointer("/choices/0/message/content"))
+        .trim()
+        .to_string())
 }
 
 // ---------- tool dispatch (mirrors the old JS dispatchWorkTool) ----------
@@ -1395,6 +1791,9 @@ async fn dispatch_tool(
 pub async fn run_loop(
     turn: Arc<TurnState>,
     model: String,
+    provider: String,
+    api_key: Option<String>,
+    context_length: Option<u64>,
     workspace: String,
     mut native: Vec<ChatMessage>,
     think: Option<serde_json::Value>,
@@ -1469,7 +1868,11 @@ pub async fn run_loop(
         }
         // context guard: 70% of the model's own window (32768 fallback)
         {
-            let win = model_context_length(&model).await.unwrap_or(32768) as usize;
+            let win = if provider == "openrouter" {
+                context_length.unwrap_or(32768) as usize
+            } else {
+                model_context_length(&model).await.unwrap_or(32768) as usize
+            };
             let target = (win as f64 * 0.7) as usize;
             if estimate_tokens(&native, &tools) > target && native.len() > 5 {
                 emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: Some("Compacting context…".to_string()) });
@@ -1490,13 +1893,24 @@ pub async fn run_loop(
                     .map(|m| format!("{}: {}", m.role, m.content))
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                let summary = ollama_oneshot(
-                    &model,
-                    "Summarize this agent transcript excerpt concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter.",
-                    &transcript.chars().take(60000).collect::<String>(),
-                    &turn.stop,
-                )
-                .await
+                let summary = if provider == "openrouter" {
+                    openrouter_oneshot(
+                        &model,
+                        api_key.as_deref().unwrap_or(""),
+                        "Summarize this agent transcript excerpt concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter.",
+                        &transcript.chars().take(60000).collect::<String>(),
+                        &turn.stop,
+                    )
+                    .await
+                } else {
+                    ollama_oneshot(
+                        &model,
+                        "Summarize this agent transcript excerpt concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter.",
+                        &transcript.chars().take(60000).collect::<String>(),
+                        &turn.stop,
+                    )
+                    .await
+                }
                 .unwrap_or_default();
                 if !turn.stop.load(Ordering::Relaxed) && !summary.is_empty() {
                     let mut proposed = vec![
@@ -1526,10 +1940,23 @@ pub async fn run_loop(
         let mode = if first_round { "fresh" } else { "continue" };
         emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundStart { mode: mode.to_string() });
         let t0 = Instant::now();
-        let round = match ollama_round(&model, &native, &think, &tools, &on_event, &turn.stop).await {
+        let round = match if provider == "openrouter" {
+            openrouter_round(
+                &model,
+                api_key.as_deref().unwrap_or(""),
+                &native,
+                &think,
+                &tools,
+                &on_event,
+                &turn.stop,
+            )
+            .await
+        } else {
+            ollama_round(&model, &native, &think, &tools, &on_event, &turn.stop).await
+        } {
             Ok(r) => r,
             Err(e) => {
-                emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: 0, gen_tps: None });
+                emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: 0, gen_tps: None, gen_cost: None });
                 if turn.stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1539,7 +1966,7 @@ pub async fn run_loop(
         };
         first_round = false;
         let wall_ms = t0.elapsed().as_millis() as u64;
-        emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: wall_ms, gen_tps: round_tps(&round, wall_ms) });
+        emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: wall_ms, gen_tps: round_tps(&round, wall_ms), gen_cost: round.cost });
         if turn.stop.load(Ordering::Relaxed) {
             break;
         }
@@ -1709,11 +2136,24 @@ pub async fn run_loop(
             });
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundStart { mode: "continue".to_string() });
             let t0 = Instant::now();
-            let wrap = ollama_round(&model, &native, &think, &tools, &on_event, &turn.stop).await;
+            let wrap = if provider == "openrouter" {
+                openrouter_round(
+                    &model,
+                    api_key.as_deref().unwrap_or(""),
+                    &native,
+                    &think,
+                    &tools,
+                    &on_event,
+                    &turn.stop,
+                )
+                .await
+            } else {
+                ollama_round(&model, &native, &think, &tools, &on_event, &turn.stop).await
+            };
             let wall_ms = t0.elapsed().as_millis() as u64;
             match wrap {
                 Ok(r) => {
-                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: wall_ms, gen_tps: round_tps(&r, wall_ms) });
+                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: wall_ms, gen_tps: round_tps(&r, wall_ms), gen_cost: r.cost });
                     native.push(ChatMessage {
                         role: "assistant".to_string(),
                         content: r.text,
@@ -1723,7 +2163,7 @@ pub async fn run_loop(
                     });
                 }
                 Err(_) => {
-                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: 0, gen_tps: None });
+                    emit_ev(&on_event, &turn.stop, WorkAgentEvent::RoundEnd { gen_ms: 0, gen_tps: None, gen_cost: None });
                 }
             }
             break;
@@ -1883,6 +2323,9 @@ fn get_turn(agent_state: &WorkAgentState, turn_id: &str) -> Result<Arc<TurnState
 pub async fn work_agent_start(
     app: AppHandle,
     model: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+    context_length: Option<u64>,
     workspace: String,
     messages: Vec<ChatMessage>,
     think: Option<serde_json::Value>,
@@ -1913,6 +2356,9 @@ pub async fn work_agent_start(
         run_loop(
             turn,
             model,
+            provider.unwrap_or_else(|| "ollama".to_string()),
+            api_key,
+            context_length,
             workspace,
             messages,
             think,
@@ -2280,6 +2726,9 @@ mod agent_tests {
             run_loop(
                 turn,
                 "beam:cloud".to_string(),
+                "ollama".to_string(),
+                None,
+                None,
                 root.clone(),
                 native,
                 Some(serde_json::Value::Bool(false)),

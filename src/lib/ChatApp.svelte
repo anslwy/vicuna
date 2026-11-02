@@ -38,6 +38,8 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
+  import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
+  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -46,7 +48,9 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[] };
+  // the chat/Work transports read the key from the openrouter module
+  setOpenRouterApiKey(initialPrefs.openrouterApiKey ?? "");
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
   /** mode + workspace picker for the session being started (home or empty draft) */
@@ -854,17 +858,35 @@
   let suppressReset = false;
 
   let lastSeenTop = 0;
+  // scrollHeight twin of lastSeenTop: content removed from above the viewport
+  // (thinking auto-collapse at answer start, dismissed ask cards) shrinks
+  // this without any user gesture. A user scrolling up never changes it, so
+  // a shrink positively identifies an engine layout correction.
+  let lastSeenHeight = 0;
   function onMessagesScroll() {
     if (!messagesEl) return;
     if (suppressReset) {
       suppressReset = false;
       lastSeenTop = messagesEl.scrollTop;
+      lastSeenHeight = messagesEl.scrollHeight;
       return;
     }
     const { scrollTop, scrollHeight, clientHeight } = messagesEl;
     // our own jump lands exactly on lastJumpTop (1px tolerance for rounding)
     if (Math.abs(scrollTop - lastJumpTop) < 2) {
       lastSeenTop = scrollTop;
+      lastSeenHeight = scrollHeight;
+      return;
+    }
+    // content above the viewport collapsed (never a user gesture — scrolling
+    // up can't shrink scrollHeight). Safari reports the resulting scrollTop
+    // correction as a decrease that would otherwise look exactly like "user
+    // scrolled up" and permanently unpin a pinned view mid-stream. Never
+    // unpin for it; re-jump if we were following.
+    if (scrollHeight < lastSeenHeight - 1) {
+      lastSeenTop = scrollTop;
+      lastSeenHeight = scrollHeight;
+      if (isPinned) scrollBottom();
       return;
     }
     const dist = scrollHeight - scrollTop - clientHeight;
@@ -877,11 +899,28 @@
       isPinned = dist < 80;
     }
     lastSeenTop = scrollTop;
+    lastSeenHeight = scrollHeight;
   }
 
   function jumpToBottom() {
     isPinned = true;
     scrollBottom();
+  }
+
+  // The send/stop/queue buttons are an {#if} swap: starting or stopping a
+  // turn DESTROYS the focused node when it was mouse-clicked. Safari then
+  // drops focus to <body> and scrolls the thread to the top, permanently
+  // unpinning auto-follow (Chromium leaves the viewport alone). Park focus
+  // in the composer — which is never destroyed — before the swap happens.
+  // Focusing the composer scrolls toward the bottom, never the top.
+  function parkComposerFocus() {
+    const ae = document.activeElement;
+    if (
+      ae instanceof HTMLButtonElement &&
+      ["send-btn", "stop-btn", "queue-btn"].includes(ae.dataset.testid ?? "")
+    ) {
+      composerEl?.focus();
+    }
   }
 
   // opencode-style run stats: "27m 48s", "8.1s" under a minute
@@ -1206,7 +1245,7 @@
   let gotoError = $state<string | null>(null);
   let gotoSel = $state(0);
   let settingsOpen = $state(false);
-  let settingsTab = $state<"general" | "models">("general");
+  let settingsTab = $state<"general" | "models" | "openrouter">("general");
   /** Vicuna CLI launcher status (desktop only, loaded when Settings opens) */
   let cliState = $state<CliStatus | null>(null);
   let cliOp = $state<null | "load" | "install" | "uninstall">(null);
@@ -1262,6 +1301,126 @@
   let catalogUpdated = $state(CATALOG_UPDATED);
   let fetching = $state<{ done: number; total: number } | null>(null);
   let catalogError = $state<string | null>(null);
+
+  // ── OpenRouter (Settings → OpenRouter) ─────────────────────────────
+  // The key lives in prefs; the catalog is fetched at runtime (the public
+  // endpoint is CORS-enabled) and cached in localStorage. Chat + Work both
+  // run through OpenRouter selections (`openrouter:` ids).
+  let openrouterKey = $state(initialPrefs.openrouterApiKey ?? "");
+  let openrouterKeyDraft = $state(initialPrefs.openrouterApiKey ?? "");
+  let openrouterKeyVisible = $state(false);
+  /** Once a key is saved the full form collapses (frees room for the model
+   *  list); "Change" reveals it again. Always open when no key is set. */
+  let openrouterKeyEditing = $state(false);
+  let openrouterKeyBusy = $state(false);
+  let openrouterKeyInfo = $state<OpenRouterKeyInfo | null>(null);
+  let openrouterKeyError = $state<string | null>(null);
+  let openrouterModels = $state<OpenRouterModel[]>([]);
+  let openrouterUpdated = $state("");
+  let openrouterLoading = $state(false);
+  let openrouterError = $state<string | null>(null);
+  let openrouterQuery = $state("");
+  let openrouterCat = $state<OpenRouterFilter>("added");
+  const openrouterKeyDirty = $derived(openrouterKeyDraft.trim() !== openrouterKey);
+  /** Curated ids: only these appear in the model picker and under the
+   *  Added chip — the live catalog is 400+ entries. Any other chip or a
+   *  search query browses the full catalog for discovery. */
+  let openrouterAdded = $state<string[]>([...(initialPrefs.openrouterAdded ?? [])]);
+  const openrouterAddedSet = $derived(new Set(openrouterAdded));
+  const openrouterBrowsing = $derived(openrouterCat !== "added" || openrouterQuery.trim() !== "");
+  const filteredOpenRouterModels = $derived.by(() => {
+    const base =
+      openrouterCat === "added" && openrouterQuery.trim() === ""
+        ? openrouterModels.filter((m) => openrouterAddedSet.has(m.id))
+        : openrouterModels;
+    return filterOpenRouterModels(base, openrouterQuery, openrouterCat);
+  });
+
+  function toggleOpenRouterAdded(id: string) {
+    openrouterAdded = openrouterAddedSet.has(id)
+      ? openrouterAdded.filter((x) => x !== id)
+      : [...openrouterAdded, id];
+    persistPrefs();
+  }
+
+  function openOpenRouterTab() {
+    settingsTab = "openrouter";
+    // Verify a saved key when the tab opens. Success sticks (no network per
+    // click); a failed check retries next time, which helps after the account
+    // or network is fixed.
+    if (openrouterKey && !openrouterKeyInfo && !openrouterKeyBusy) void verifyOpenRouterKey();
+  }
+
+  /** Persist the trimmed key and verify it immediately. */
+  async function saveOpenRouterKey() {
+    const next = openrouterKeyDraft.trim();
+    const changed = next !== openrouterKey;
+    openrouterKey = next;
+    openrouterKeyDraft = next;
+    openrouterKeyInfo = null;
+    openrouterKeyError = null;
+    setOpenRouterApiKey(next);
+    if (changed) persistPrefs();
+    if (!next) {
+      openrouterKeyVisible = false;
+      return;
+    }
+    await verifyOpenRouterKey();
+    if (!openrouterKeyError) openrouterKeyEditing = false;
+  }
+
+  async function verifyOpenRouterKey() {
+    if (openrouterKeyBusy) return;
+    openrouterKeyError = null;
+    if (!openrouterKey) {
+      openrouterKeyError = "Enter an API key first.";
+      return;
+    }
+    openrouterKeyBusy = true;
+    try {
+      openrouterKeyInfo = await testOpenRouterKey(openrouterKey);
+    } catch (e: any) {
+      openrouterKeyInfo = null;
+      openrouterKeyError = e?.message ?? String(e);
+    } finally {
+      openrouterKeyBusy = false;
+    }
+  }
+
+  function clearOpenRouterKey() {
+    openrouterKey = "";
+    openrouterKeyDraft = "";
+    openrouterKeyVisible = false;
+    openrouterKeyEditing = false;
+    openrouterKeyInfo = null;
+    openrouterKeyError = null;
+    setOpenRouterApiKey("");
+    persistPrefs();
+  }
+
+  async function fetchOpenRouterCatalog() {
+    if (openrouterLoading) return;
+    openrouterLoading = true;
+    openrouterError = null;
+    try {
+      const list = await fetchOpenRouterModels(openrouterKey);
+      openrouterModels = list;
+      openrouterUpdated = writeOpenRouterCache(list);
+    } catch (e: any) {
+      openrouterError = e?.message ?? String(e);
+    } finally {
+      openrouterLoading = false;
+    }
+  }
+
+  function openRouterUsageText(info: OpenRouterKeyInfo): string {
+    const bits: string[] = [];
+    if (info.usage !== null) bits.push(`usage ${formatUsd(info.usage)}`);
+    if (info.limit !== null && info.limit > 0) {
+      bits.push(info.limitRemaining !== null ? `${formatUsd(info.limitRemaining)} of ${formatUsd(info.limit)} left` : `limit ${formatUsd(info.limit)}`);
+    }
+    return bits.join(" · ");
+  }
 
   async function fetchCatalog() {
     if (fetching) return;
@@ -1544,7 +1703,7 @@
       if (models.includes(name)) {
         selectedModel = name;
         save();
-      } else if (models.length > 0 && !models.includes(selectedModel)) {
+      } else if (models.length > 0 && !models.includes(selectedModel) && !isOpenRouterSelection(selectedModel)) {
         selectedModel = models[0];
         save();
       }
@@ -1583,7 +1742,7 @@
       await deleteModel(name);
       await refreshModels();
       await refreshRunners();
-      if (!models.includes(selectedModel) && models.length > 0) {
+      if (!models.includes(selectedModel) && models.length > 0 && !isOpenRouterSelection(selectedModel)) {
         selectedModel = models[0];
         save();
       }
@@ -1666,7 +1825,7 @@
   }
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded });
   }
 
   function setOllamaHost(text: string) {
@@ -2026,6 +2185,17 @@
       thinkCanDisable = false;
       return;
     }
+    if (isOpenRouterSelection(m)) {
+      // OpenRouter exposes reasoning as a model capability, not a level list.
+      // Effort strings are only offered when the model advertises support;
+      // OpenRouter normalizes/falls back otherwise.
+      const om = findOpenRouterModel(openrouterModels, m);
+      if (selectedModel !== m) return;
+      thinkLevels = om?.reasoning && om.supportedParameters.includes("reasoning_effort") ? ["low", "medium", "high"] : [];
+      thinkDefault = null;
+      thinkCanDisable = Boolean(om?.reasoning);
+      return;
+    }
     const info = await modelThinking(m).catch(() => null);
     if (selectedModel !== m) return; // switched mid-fetch: drop the stale result
     thinkLevels = info?.levels ?? [];
@@ -2072,9 +2242,51 @@
   // ⌘N on macOS, Ctrl+N elsewhere (shown as the New Chat hover hint)
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent ?? "");
 
-  const filteredModels = $derived(
-    models.filter((m) => m.toLowerCase().includes(modelQuery.trim().toLowerCase()))
-  );
+  /** human-readable model name, Ollama-style everywhere: OpenRouter picks
+   *  show the bare provider id (`org/model…`, `openrouter:` prefix and the
+   *  registry's `~` rolling-pointer mark stripped) instead of the catalog
+   *  marketing name — the provider icon already says which backend it is,
+   *  and ids stay precise across vendors. */
+  function modelLabel(sel: string): string {
+    if (!sel) return "";
+    return isOpenRouterSelection(sel) ? displayOpenRouterId(openRouterModelId(sel)) : sel;
+  }
+
+  interface ModelChoice {
+    id: string;
+    name: string;
+    sub: string;
+    provider: "ollama" | "openrouter";
+  }
+
+  // model menu: installed Ollama tags first (as before), then the added
+  // OpenRouter models under `openrouter:` ids. Rows show the bare provider
+  // id exactly like Ollama tags (no marketing-name line); search still
+  // matches the id and the catalog display name so both "claude" and
+  // "anthropic/..." find the same rows. The current selection always stays
+  // visible (even if removed) so a persisted pick never strands the pill.
+  const filteredModelChoices = $derived.by(() => {
+    const q = modelQuery.trim().toLowerCase();
+    const out: ModelChoice[] = [];
+    for (const m of models) {
+      if (!q || m.toLowerCase().includes(q)) out.push({ id: m, name: m, sub: "", provider: "ollama" });
+    }
+    for (const om of openrouterModels) {
+      const sel = openRouterSelection(om.id);
+      if (!openrouterAddedSet.has(om.id) && sel !== selectedModel) continue;
+      if (q && !om.id.toLowerCase().includes(q) && !om.name.toLowerCase().includes(q)) continue;
+      out.push({ id: sel, name: displayOpenRouterId(om.id), sub: "", provider: "openrouter" });
+    }
+    // loaded models pin to the top (selected first): clicking Load closes
+    // the menu, and the model should be right there — not lost in the long
+    // list — when it reopens. Stable otherwise, so search order is steady.
+    const rank = (c: ModelChoice) =>
+      c.id === selectedModel ? 0 : c.provider === "ollama" && runningNames.has(c.id) ? 1 : 2;
+    return out
+      .map((c, i) => ({ c, i }))
+      .sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i)
+      .map((x) => x.c);
+  });
 
   const runningNames = $derived(new Set(runners.map((r) => r.name)));
 
@@ -2169,7 +2381,7 @@
     try {
       const tags = await listModels();
       models = tags.map((t) => t.name);
-      if (models.length > 0 && !models.includes(selectedModel)) selectedModel = models[0];
+      if (models.length > 0 && !models.includes(selectedModel) && !isOpenRouterSelection(selectedModel)) selectedModel = models[0];
       error = null;
     } catch (err: any) {
       error = `Cannot reach Ollama at ${activeOllamaBase()}. Is \`ollama serve\` running?`;
@@ -2705,6 +2917,7 @@
     const wallStart = Date.now();
     let runEvalCount = 0;
     let runEvalDurationNs = 0;
+    let runCost: number | null = null;
     let runToolCalls: import("$lib/ollama").OllamaToolCall[] = [];
     // token batching: cloud models burst dozens of tokens per frame, and each
     // state write re-renders + re-highlights the whole message — with multi-KB
@@ -2724,7 +2937,7 @@
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[index]) {
         const m = c.messages[index];
-        c.messages[index] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
+        c.messages[index] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(index, keep));
@@ -2794,6 +3007,7 @@
         const res = await chatStream(selectedModel, history, onTok, ctrl.signal, onTh, 0, { think, temperature: opts.temperature, stop: opts.stop, tools: opts.tools, onImagesStripped: opts.onImagesStripped ?? noteImagesStripped });
         runEvalCount = res.evalCount;
         runEvalDurationNs = res.evalDurationNs;
+        runCost = res.cost ?? null;
         runToolCalls = res.toolCalls ?? [];
       }
     } catch (err: any) {
@@ -2846,10 +3060,14 @@
             : runEvalCount > 0 && wallMs > 0
               ? runEvalCount / (wallMs / 1000)
               : m.genTps;
+        const prevCost = m.genCost ?? 0;
+        const addCost = runCost ?? 0;
+        const nextCost = prevCost + addCost > 0 ? prevCost + addCost : undefined;
         c.messages[index] = {
           ...m,
           genMs: (m.genMs ?? 0) + wallMs,
-          genTps: tps
+          genTps: tps,
+          ...(nextCost !== undefined ? { genCost: nextCost } : {})
         };
         chats = [...chats];
       }
@@ -2871,7 +3089,9 @@
     // Continue generates with the selected model: cloud models can't append
     // (raw /api/generate returns empty, native starts a new turn), so refuse
     // both routes here even if this is called outside the disabled button.
-    if (isCloudModel(selectedModel)) return;
+    // OpenRouter selections have no /api/generate path either — chat and Work
+    // are the supported transports there.
+    if (isCloudModel(selectedModel) || isOpenRouterSelection(selectedModel)) return;
     error = null;
     const history: ChatMsg[] = compactedHistory(chat.messages.slice(0, i + 1));
     // Two ways to extend a reply. Native /api/chat resends the partial as
@@ -3022,6 +3242,9 @@
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
     if (compacting) return;
+    // keep focus off the send/queue button: the streaming swap destroys it,
+    // and Safari scrolls the thread to the top on the resulting focus loss
+    parkComposerFocus();
     // an open workspace draft never outlives the send: committing first
     // treats typed-then-sent as picked (the native dialog is modal, so
     // desktop can never send mid-pick either)
@@ -3673,12 +3896,19 @@
   let ctxWindow = $state(32768);
   async function refreshCtxWindow() {
     const m = selectedModel;
+    if (isOpenRouterSelection(m)) {
+      const om = findOpenRouterModel(openrouterModels, m);
+      if (selectedModel !== m) return;
+      if (om?.contextLength) ctxWindow = om.contextLength;
+      return;
+    }
     const len = await modelContextLength(m).catch(() => null);
     if (selectedModel !== m) return;
     if (len) ctxWindow = len;
   }
   $effect(() => {
     selectedModel;
+    openrouterModels;
     void refreshCtxWindow();
   });
 
@@ -3691,6 +3921,19 @@
     const used = estimateWorkTokens([{ content: buildWorkSystemPrompt(c.workspace ?? "") }, ...compactedHistory(c.messages)]);
     const win = ctxWindow > 0 ? ctxWindow : 32768;
     return { used, win, frac: Math.min(1, used / win) };
+  });
+
+  /** total OpenRouter spend for the open Work session: sum of per-message
+   *  `genCost` (USD, authoritative `usage.cost` per round). Ollama messages
+   *  carry no cost, so they contribute nothing. */
+  const workSpent = $derived.by(() => {
+    const c = activeChat;
+    if (!c || (c.mode ?? "chat") !== "work") return 0;
+    let total = 0;
+    for (const m of c.messages) {
+      if (typeof m.genCost === "number" && Number.isFinite(m.genCost)) total += m.genCost;
+    }
+    return total;
   });
 
   /** keep the composer backdrop scrolled with the textarea */
@@ -4422,6 +4665,9 @@
   }
 
   function stop() {
+    // same destroyed-node focus loss as send(): the stop button unmounts at
+    // settle, so park focus first or Safari jumps to the top on Stop too
+    parkComposerFocus();
     if (workRunning) workStop = true;
     if (workTurnId) void stopWorkAgentTurn(workTurnId).catch(() => {});
     cancelPendingAsk("(the user interrupted before answering)");
@@ -4806,7 +5052,7 @@
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[curIndex]) {
         const m = c.messages[curIndex];
-        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps };
+        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
@@ -4962,7 +5208,10 @@
           const t = live();
           const m = t?.messages[curIndex];
           if (t && m && m.role === "assistant") {
-            t.messages[curIndex] = { ...m, genMs: (m.genMs ?? 0) + ev.gen_ms, genTps: ev.gen_tps ?? m.genTps };
+            const prevCost = m.genCost ?? 0;
+            const addCost = ev.gen_cost ?? 0;
+            const nextCost = prevCost + addCost > 0 ? prevCost + addCost : undefined;
+            t.messages[curIndex] = { ...m, genMs: (m.genMs ?? 0) + ev.gen_ms, genTps: ev.gen_tps ?? m.genTps, ...(nextCost !== undefined ? { genCost: nextCost } : {}) };
             chats = [...chats];
           }
           save();
@@ -5114,9 +5363,15 @@
     }
 
     let agentTurn: string;
+    const workProvider = isOpenRouterSelection(selectedModel) ? "openrouter" : "ollama";
+    const workModel = workProvider === "openrouter" ? openRouterModelId(selectedModel) : selectedModel;
+    const workModelInfo = findOpenRouterModel(openrouterModels, selectedModel);
     try {
       agentTurn = await startWorkAgentTurn({
-        model: selectedModel,
+        model: workModel,
+        provider: workProvider,
+        apiKey: workProvider === "openrouter" ? openrouterKey : "",
+        contextLength: workModelInfo?.contextLength ?? null,
         workspace,
         messages: native,
         think,
@@ -5423,6 +5678,10 @@
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
       continueMode = normalizeContinueMode(prefs.continueMode);
+      openrouterKey = prefs.openrouterApiKey ?? "";
+      openrouterKeyDraft = openrouterKey;
+      setOpenRouterApiKey(openrouterKey);
+      openrouterAdded = [...(prefs.openrouterAdded ?? [])];
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
@@ -5474,6 +5733,11 @@
       if (savedCatalog) {
         catalog = savedCatalog.entries;
         catalogUpdated = savedCatalog.updated;
+      }
+      const cachedOpenRouter = readOpenRouterCache();
+      if (cachedOpenRouter) {
+        openrouterModels = cachedOpenRouter.models;
+        openrouterUpdated = cachedOpenRouter.updated;
       }
       const m = await loadModel();
       if (m) selectedModel = m;
@@ -5738,6 +6002,7 @@
               <span class="ctx-popup" data-testid="ctx-popup">
                 <span class="ctx-row"><span>Usage</span><span>{pct}%</span></span>
                 <span class="ctx-row"><span>Tokens</span><span>{workCtx.used.toLocaleString()}</span></span>
+                <span class="ctx-row"><span>Spent</span><span data-testid="ctx-spent">${workSpent.toFixed(2)}</span></span>
               </span>
             </span>
           {/if}
@@ -5959,10 +6224,10 @@
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                 </button>
                 {#if isLast}
-                  {@const noContinue = isCloudModel(selectedModel)}
+                  {@const noContinue = isCloudModel(selectedModel) || isOpenRouterSelection(selectedModel)}
                   {@const isWork = (activeChat?.mode ?? "chat") === "work"}
                   {#if !isWork}
-                    <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for cloud models" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
+                    <button class="act" data-testid="continue-btn" aria-label="Continue generating" title={noContinue ? "Continue isn't supported for this model — use Regenerate or a new message" : "Continue"} disabled={streaming || noContinue} onclick={() => continueFrom(i)}>
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                     </button>
                   {/if}
@@ -5978,7 +6243,7 @@
                 </button>
                 {#if m.model}
                   {@const liveTurn = workRunning && workChatId === activeChat?.id && isLast}
-                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{m.model}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
+                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{modelLabel(m.model)}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
                 {/if}
               </div>
             </div>
@@ -6267,7 +6532,14 @@
           {/if}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
-              <span class="model-name">{selectedModel}</span>
+              <span class="prov-ico" aria-hidden="true">
+                {#if isOpenRouterSelection(selectedModel)}
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg>
+                {:else}
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg>
+                {/if}
+              </span>
+              <span class="model-name" title={selectedModel}>{modelLabel(selectedModel)}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
             {#if modelOpen}
@@ -6281,24 +6553,40 @@
                   autofocus
                 />
                 <div class="model-list-drop">
-                  {#each filteredModels as m}
-                    <div class="model-opt-row {m === selectedModel ? 'sel' : ''}">
+                  {#each filteredModelChoices as choice (choice.id)}
+                    <div class="model-opt-row {choice.id === selectedModel ? 'sel' : ''}">
                       <button
                         class="model-opt"
-                        onclick={() => { selectedModel = m; modelOpen = false; save(); }}
-                      >{m}</button>
-                      {#if !isCloudModel(m)}
-                        {@const loaded = runningNames.has(m)}
+                        data-testid="model-opt"
+                        data-provider={choice.provider}
+                        data-model={choice.id}
+                        title={choice.sub || choice.name}
+                        onclick={() => { selectedModel = choice.id; modelOpen = false; save(); }}
+                      >
+                        <span class="model-opt-top">
+                          <span class="prov-ico" aria-hidden="true">
+                            {#if choice.provider === "openrouter"}
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg>
+                            {:else}
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg>
+                            {/if}
+                          </span>
+                          <span class="model-opt-name">{choice.name}</span>
+                        </span>
+                        {#if choice.sub}<span class="model-opt-id">{choice.sub}</span>{/if}
+                      </button>
+                      {#if choice.provider === "ollama" && !isCloudModel(choice.id)}
+                        {@const loaded = runningNames.has(choice.id)}
                         <button
                           class="model-mem-btn"
                           class:is-loaded={loaded}
                           data-testid={loaded ? "menu-unload-model-btn" : "menu-load-model-btn"}
-                          data-name={m}
-                          title={loaded ? `Unload ${m}` : `Load ${m}`}
-                          aria-label={loaded ? `Unload ${m}` : `Load ${m}`}
+                          data-name={choice.id}
+                          title={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
+                          aria-label={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
                           disabled={modelOp !== null || pulling !== null}
-                          onclick={(e) => { e.stopPropagation(); void toggleModelLoaded(m, loaded); }}
-                        ><span class="mem-ico" class:mem-spin={modelOp === m}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
+                          onclick={(e) => { e.stopPropagation(); void toggleModelLoaded(choice.id, loaded); }}
+                        ><span class="mem-ico" class:mem-spin={modelOp === choice.id}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
                       {/if}
                     </div>
                   {:else}
@@ -7270,7 +7558,8 @@
     <p class="confirm-text">Settings</p>
     <div class="seg settings-tabs" role="tablist" aria-label="Settings sections">
       <button class="seg-btn {settingsTab === 'general' ? 'sel' : ''}" data-testid="settings-tab-general" role="tab" onclick={() => (settingsTab = "general")}>General</button>
-      <button class="seg-btn {settingsTab === 'models' ? 'sel' : ''}" data-testid="settings-tab-models" role="tab" onclick={openModelsTab}>Models</button>
+      <button class="seg-btn {settingsTab === 'models' ? 'sel' : ''}" data-testid="settings-tab-ollama" role="tab" onclick={openModelsTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg></span>Ollama</button>
+      <button class="seg-btn {settingsTab === 'openrouter' ? 'sel' : ''}" data-testid="settings-tab-openrouter" role="tab" onclick={openOpenRouterTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg></span>OpenRouter</button>
     </div>
     {#if settingsTab === "general"}
     <div class="setting-row">
@@ -7403,7 +7692,7 @@
       </div>
       <span class="setting-note">Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.</span>
     {/if}
-    {:else}
+    {:else if settingsTab === "models"}
     <div class="model-manage-list" data-testid="model-manage-list">
       <div class="server-row" data-testid="ollama-server-row">
         <div class="model-manage-info">
@@ -7555,6 +7844,119 @@
         <p class="no-match">No matches — try another search, or pull by exact name above.</p>
       {/each}
       {/if}
+    </div>
+    {:else}
+    <div class="or-panel" data-testid="openrouter-panel">
+      <div class="server-row" data-testid="openrouter-key-row">
+        <div class="model-manage-info">
+          <span class="model-manage-name">OpenRouter API key</span>
+          <span class="model-manage-sub" data-testid="openrouter-key-status">
+            {#if openrouterKeyBusy}
+              <span class="dot-idle"></span> Checking key…
+            {:else if openrouterKeyInfo}
+              <span class="dot-live"></span> Connected{openrouterKeyInfo.isFreeTier ? " · free tier" : ""}{#if openrouterKey}{" · "}{maskKey(openrouterKey)}{/if}
+            {:else if openrouterKey}
+              <span class="dot-idle"></span> Saved · not verified
+            {:else}
+              <span class="dot-idle"></span> Not configured
+            {/if}
+          </span>
+          {#if openrouterKeyInfo && openRouterUsageText(openrouterKeyInfo)}
+            <span class="model-manage-sub or-usage">{openRouterUsageText(openrouterKeyInfo)}</span>
+          {/if}
+        </div>
+        <div class="model-manage-actions">
+          <button class="mini-btn" data-testid="openrouter-key-test" disabled={openrouterKeyBusy || !openrouterKey} onclick={() => void verifyOpenRouterKey()}>{openrouterKeyBusy ? "…" : "Test"}</button>
+          {#if openrouterKey && !openrouterKeyEditing}
+            <button class="mini-btn" data-testid="openrouter-key-change" disabled={openrouterKeyBusy} onclick={() => (openrouterKeyEditing = true)}>Change</button>
+          {/if}
+          {#if openrouterKey}
+            <button class="mini-btn" data-testid="openrouter-key-clear" disabled={openrouterKeyBusy} onclick={clearOpenRouterKey}>Clear</button>
+          {/if}
+        </div>
+      </div>
+      {#if !openrouterKey || openrouterKeyEditing}
+      <div class="pull-row" data-testid="openrouter-key-form">
+        <input
+          class="pull-input"
+          data-testid="openrouter-key-input"
+          type={openrouterKeyVisible ? "text" : "password"}
+          placeholder="sk-or-v1-…"
+          bind:value={openrouterKeyDraft}
+          spellcheck={false}
+          autocomplete="off"
+          disabled={openrouterKeyBusy}
+          onkeydown={(e) => { if (e.key === "Enter") void saveOpenRouterKey(); }}
+        />
+        <button class="mini-btn" data-testid="openrouter-key-reveal" disabled={!openrouterKeyDraft} onclick={() => (openrouterKeyVisible = !openrouterKeyVisible)}>{openrouterKeyVisible ? "Hide" : "Show"}</button>
+        <button class="mini-btn primary" data-testid="openrouter-key-save" disabled={openrouterKeyBusy || (!openrouterKeyDirty && !openrouterKeyEditing)} onclick={() => void saveOpenRouterKey()}>Save</button>
+      </div>
+      <div class="or-note-row">
+        <span class="setting-note">Stored locally with your settings and only sent to openrouter.ai. The public catalog fetches without a key; a key verifies your account and usage.</span>
+        <button class="mini-btn" data-testid="openrouter-get-key" onclick={() => void openExternal("https://openrouter.ai/keys")}>Get a key</button>
+      </div>
+      {/if}
+      {#if openrouterKeyError}
+        <p class="goto-error" data-testid="openrouter-key-error">{openrouterKeyError}</p>
+      {/if}
+      <div class="pull-row" data-testid="openrouter-search-row">
+        <input
+          class="pull-input"
+          data-testid="openrouter-search-input"
+          placeholder="Search models — try claude, free, vision…"
+          bind:value={openrouterQuery}
+          disabled={openrouterModels.length === 0}
+        />
+      </div>
+      <div class="chip-row" data-testid="openrouter-chips" role="group" aria-label="Filter OpenRouter models">
+        {#each OPENROUTER_FILTERS as c}
+          <button class="chip {openrouterCat === c ? 'sel' : ''}" data-testid="openrouter-chip" data-cat={c} onclick={() => (openrouterCat = c)}>{c === "all" ? "All" : c[0].toUpperCase() + c.slice(1)}</button>
+        {/each}
+      </div>
+      <p class="browse-count" data-testid="openrouter-count">
+        {#if openrouterLoading}
+          <span class="fetch-progress">Fetching the live OpenRouter catalog…</span>
+        {:else if openrouterModels.length > 0}
+          {#if openrouterBrowsing}
+            {filteredOpenRouterModels.length} of {openrouterModels.length} models{openrouterUpdated ? ` · updated ${formatCacheAge(openrouterUpdated)}` : ""}
+          {:else}
+            {filteredOpenRouterModels.length} added{openrouterUpdated ? ` · catalog updated ${formatCacheAge(openrouterUpdated)}` : ""}
+          {/if}
+        {:else}
+          No catalog loaded yet.
+        {/if}
+        <button class="mini-btn" data-testid="openrouter-fetch-btn" disabled={openrouterLoading} onclick={() => void fetchOpenRouterCatalog()}>{openrouterLoading ? "…" : "Fetch"}</button>
+      </p>
+      {#if openrouterError}
+        <p class="goto-error" data-testid="openrouter-error">{openrouterError}</p>
+      {/if}
+      <div class="model-manage-list or-models" data-testid="openrouter-models">
+        {#each filteredOpenRouterModels as m (m.id)}
+          <div class="model-manage-row" data-testid="openrouter-model-row" data-id={m.id} title={m.description}>
+            <div class="model-manage-info">
+              <span class="model-manage-name">{displayOpenRouterId(m.id)}</span>
+              <span class="model-manage-sub or-meta">
+                <span>{formatContextLength(m.contextLength)} ctx</span>
+                <span>·</span>
+                <span>{formatModelPricing(m)}</span>
+                {#if isFreeModel(m)}<span class="browse-cat">free</span>{/if}
+                {#if supportsVision(m)}<span class="browse-cat">vision</span>{/if}
+                {#if supportsTools(m)}<span class="browse-cat">tools</span>{/if}
+                {#if m.reasoning}<span class="browse-cat">reasoning</span>{/if}
+              </span>
+            </div>
+            <div class="model-manage-actions">
+              {#if openrouterAddedSet.has(m.id)}
+                <button class="mini-btn" data-testid="openrouter-remove-btn" data-id={m.id} title="Remove from your models" onclick={() => toggleOpenRouterAdded(m.id)}>Remove</button>
+              {:else}
+                <button class="mini-btn primary" data-testid="openrouter-add-btn" data-id={m.id} title="Add to your models" onclick={() => toggleOpenRouterAdded(m.id)}>Add</button>
+              {/if}
+            </div>
+          </div>
+        {:else}
+          <p class="no-match">{openrouterModels.length === 0 ? "Press Fetch to load the OpenRouter catalog." : openrouterBrowsing ? "No models match this search." : "No models added yet — search above to find models to add."}</p>
+        {/each}
+      </div>
     </div>
     {/if}
   </div>
@@ -7847,14 +8249,18 @@
   .slash-desc { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: var(--muted); text-align: right; }
   .spacer { flex: 1; }
   .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
+  .prov-ico { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted-2); }
   .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
   .model-pill-wrap { position: relative; }
   .model-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 9; }
-  .model-drop { position: absolute; bottom: 40px; right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,.14); width: 300px; overflow: hidden; z-index: 10; }
+  .model-drop { position: absolute; bottom: 40px; right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,.14); width: 330px; overflow: hidden; z-index: 10; }
   .model-search { width: 100%; box-sizing: border-box; border: none; border-bottom: 1px solid var(--border); outline: none; padding: 13px 18px; font-size: 17px; font-family: inherit; background: var(--card); color: var(--text); }
   .model-search::placeholder { color: var(--faint); }
   .model-list-drop { max-height: 252px; overflow-y: auto; padding: 4px 0 8px 0; }
-  .model-opt { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 18px; font-size: 17px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-opt { display: flex; flex-direction: column; align-items: stretch; gap: 1px; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 18px; font-size: 17px; cursor: pointer; min-width: 0; }
+  .model-opt-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .model-opt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-opt-id { font-size: 11.5px; color: var(--muted-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 21px; }
   .model-opt:hover { background: var(--hover-3); }
   .model-opt.sel { background: var(--hover-3); }
   .model-opt-row { display: flex; align-items: center; }
@@ -7889,6 +8295,8 @@
   .settings-card { width: 80vw; max-width: 900px; height: 80vh; max-height: 820px; top: 50%; display: flex; flex-direction: column; overflow-y: auto; }
   .settings-tabs { margin-bottom: 16px; align-self: stretch; }
   .settings-tabs .seg-btn { flex: 1; }
+  .seg-btn .tab-ico { display: inline-flex; vertical-align: -2px; margin-right: 6px; color: var(--muted-2); }
+  .seg-btn.sel .tab-ico { color: inherit; }
   .font-val { font-size: 14px; min-width: 48px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 5px; }
   .model-manage-list { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 4px; }
   .server-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--composer); border-radius: 16px; }
@@ -7950,6 +8358,13 @@
   .stopwords-input { width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--card); color: var(--text); font: inherit; font-size: 13px; line-height: 1.6; padding: 10px 12px; resize: vertical; outline: none; }
   .stopwords-input:focus { border-color: var(--accent); }
   .setting-note { font-size: 12px; color: var(--muted); }
+  .or-note-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 4px 10px 4px; }
+  .or-panel { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; }
+  .or-models { flex: 1; min-height: 120px; }
+  .or-note-row .setting-note { flex: 1; min-width: 0; }
+  .or-id { font-size: 11.5px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .or-meta { flex-wrap: wrap; }
+  .or-usage { color: var(--muted-2); font-variant-numeric: tabular-nums; }
   .mode-toggle { margin-bottom: 18px; }
   .mode-toggle .seg-btn { min-width: 90px; }
   .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
@@ -8112,7 +8527,7 @@
     .suggest-grid { grid-template-columns: 1fr; }
     .empty-title { font-size: 20px; margin-bottom: 20px; }
     .model-pill { max-width: 150px; }
-    .model-drop { width: 300px; max-width: calc(100vw - 48px); }
+    .model-drop { width: 330px; max-width: calc(100vw - 48px); }
   .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
     .work-banner, .goal-wrap { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
