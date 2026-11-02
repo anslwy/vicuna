@@ -7672,7 +7672,7 @@
   .confirm-ok { flex: 1; border: none; background: var(--accent); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--accent-fg); }
   .confirm-ok:hover { background: var(--accent-hover); }
   .empty-hint { color: var(--faint); font-size: 13px; padding: 0 8px; }
-  .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
+  .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; container-type: inline-size; }
   .stream-bar { position: relative; height: 3px; border-radius: 999px; overflow: hidden; margin: 0 4px 8px 4px; background: var(--border); pointer-events: none; }
   .stream-bar span { position: absolute; top: 0; bottom: 0; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: stream-slide 1.2s ease-in-out infinite; }
   @keyframes stream-slide { from { left: -40%; } to { left: 100%; } }
@@ -7684,7 +7684,7 @@
   .queue-hint { font-size: 11.5px; color: var(--faint); }
   .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
-  .collapsed-rail .icon-btn { width: 100%; padding: 8px 0; border-radius: 8px; }
+  .collapsed-rail .icon-btn { width: 100%; padding: 4px 0; border-radius: 8px; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
   .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
   .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
@@ -7959,7 +7959,7 @@
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 10px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .ctx-wrap { position: relative; margin-left: auto; display: inline-flex; cursor: default; }
   .ctx-popup { display: none; position: absolute; right: 0; top: calc(100% + 8px); background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px 14px; z-index: 30; min-width: 170px; }
@@ -8100,6 +8100,12 @@
   .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
   .mcp-pat-link:hover { text-decoration: underline; }
 
+  /* Narrow main column (small window OR side panels open): shift the Work
+   * banner + goal strip right so the collapsed-rail toggle can't overlap them.
+   * Viewport media queries can't see panel-driven narrowing, hence @container. */
+  @container (max-width: 920px) {
+    .work-banner, .goal-wrap { padding-left: 60px; }
+  }
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
     .composer-wrap { padding: 8px 12px 14px 12px; }
@@ -8108,6 +8114,7 @@
     .model-pill { max-width: 150px; }
     .model-drop { width: 300px; max-width: calc(100vw - 48px); }
   .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
+    .work-banner, .goal-wrap { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
     .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
     .confirm-card { width: calc(100vw - 32px); }
