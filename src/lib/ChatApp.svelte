@@ -2873,6 +2873,21 @@
     }
   }
 
+  /** Copy xterm's model selection. Prefer the synchronous copy command:
+   *  xterm's own `copy` listener fills clipboardData, and WebView2 may deny
+   *  the async Clipboard API on the custom scheme. */
+  function copyTermSelection(term: XTerm) {
+    const text = term.getSelection();
+    if (!text) return;
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    if (!ok) void copyText(text);
+  }
+
   function copyMessage(i: number) {
     const m = activeChat?.messages[i];
     if (!m) return;
@@ -4885,12 +4900,50 @@
         fontSize: 13,
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
         cursorBlink: true,
-        scrollback: 5000
+        scrollback: 5000,
+        windowsPty: /win/i.test(navigator.userAgent ?? "") ? { backend: "conpty" } : undefined
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(el);
       fit.fit();
+      // xterm leaves clipboard chords to the embedder. macOS WKWebView fires
+      // the browser copy event for ⌘C, but WebView2 does not, so a selection
+      // there could not be copied and Ctrl+C interrupted the shell instead.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== "keydown") return true;
+        const key = ev.key.toLowerCase();
+        // Windows Terminal's select-all chord: a no-drag escape hatch.
+        if (!isMac && ev.ctrlKey && ev.shiftKey && key === "a") {
+          term.selectAll();
+          return false;
+        }
+        if (key !== "c" || !term.hasSelection()) return true;
+        const copyChord = isMac ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.altKey;
+        if (!copyChord) return true;
+        // Returning false also keeps xterm from sending ETX, which sent SIGINT
+        // to the shell and cleared the selection on Windows.
+        copyTermSelection(term);
+        return false;
+      });
+      // Tauri disables the native WebView context menu; make right-click copy
+      // a selection, or paste when there is none (Windows Terminal behavior).
+      el.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        if (term.hasSelection()) {
+          copyTermSelection(term);
+          return;
+        }
+        const clip = navigator.clipboard;
+        if (clip?.readText) {
+          clip
+            .readText()
+            .then((text) => {
+              if (text) term.paste(text);
+            })
+            .catch(() => {});
+        }
+      });
       const setTab = (patch: Partial<SideTab>) => {
         sideTabs = sideTabs.map((t) => (t.key === key ? { ...t, ...patch } : t));
       };
