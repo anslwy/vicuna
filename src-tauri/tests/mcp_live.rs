@@ -24,6 +24,8 @@ fn test_config() -> McpServerConfig {
         env: None,
         url: None,
         headers: None,
+        oauth: None,
+        enabled: true,
     }
 }
 

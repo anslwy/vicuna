@@ -31,9 +31,9 @@ use super::{
     bg_snapshot, bg_start, parse_show_context_length, undo_begin_turn, undo_capture_prev, undo_key,
     undo_record, undo_record_write, upload_read_file_logic as upload_read_file,
     work_fetch_url_logic as work_fetch_url, work_grep_logic as work_grep,
-    work_list_dir_logic as work_list_dir, work_read_file_logic as work_read_file,
-    work_read_image_logic as work_read_image, work_write_file_logic as work_write_file,
-    AgentShellState, BgExecState, ChatMessage, OLLAMA_BASE, UndoOp, UndoState,
+    work_list_dir_logic as work_list_dir, work_read_file, work_read_image_logic as work_read_image,
+    work_write_file_logic as work_write_file, workspace_git_note, AgentShellState, BgExecState,
+    ChatMessage, OLLAMA_BASE, UndoOp, UndoState,
 };
 use crate::browser::{browser_mcp_command, browser_start_logic, lb_server_url, BrowserState};
 use crate::mcp::{
@@ -155,6 +155,14 @@ fn seen_key(name: &str, args: &serde_json::Value) -> String {
     } else {
         tool_key(name, args)
     }
+}
+
+/// Polling and terminal interaction are stateful, not idempotent: the same
+/// `exec_status` poll or `exec_input("q")` may be exactly what is needed twice
+/// in a row (the first q only advanced a pager's help screen). Never suppress
+/// them as "already ran", unlike file/content-mutating tools.
+fn repeatable_tool(name: &str) -> bool {
+    matches!(name, "exec_status" | "exec_input" | "exec_kill")
 }
 
 /// Mirror of the frontend offer condition (`startGoal && !startGoal.paused`,
@@ -1395,12 +1403,17 @@ async fn dispatch_tool(
             if p.is_empty() {
                 return "Error: read needs {\"path\": \"...\"}.".to_string();
             }
-            match work_read_file(workspace.to_string(), p.clone(), None).await {
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            let limit = args.get("limit").and_then(|v| v.as_u64());
+            match work_read_file(workspace.to_string(), p.clone(), None, offset, limit).await {
                 Ok(c) => format!(
                     "{}{}",
                     c.content,
                     if c.truncated {
-                        format!("\n…[truncated, {}B total]", c.size)
+                        format!(
+                            "\n…[more text, {}B total — read another range with offset/limit]",
+                            c.size
+                        )
                     } else {
                         String::new()
                     }
@@ -1483,7 +1496,19 @@ async fn dispatch_tool(
                         if r.running {
                             parts.push(running_shell_note());
                         } else {
-                            parts.push(format!("[exit {}]", r.exit_code.unwrap_or(-1)));
+                            let code = r
+                                .exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "unknown (signal or probe timeout)".to_string());
+                            let mut tag = format!("[exit {code}");
+                            if let Some(ms) = r.duration_ms {
+                                tag.push_str(&format!(" · {ms}ms"));
+                            }
+                            if let Some(cwd) = r.cwd.as_deref().filter(|s| !s.is_empty()) {
+                                tag.push_str(&format!(" · cwd={cwd}"));
+                            }
+                            tag.push(']');
+                            parts.push(tag);
                         }
                         parts.join("\n")
                     }
@@ -1533,7 +1558,11 @@ async fn dispatch_tool(
                         if !r.output.trim().is_empty() {
                             parts.push(r.output);
                         }
-                        parts.push("[interrupted]".to_string());
+                        if r.running {
+                            parts.push(running_shell_note());
+                        } else {
+                            parts.push("[interrupted]".to_string());
+                        }
                         parts.join("\n")
                     }
                     Err(e) => format!("Error: {e}"),
@@ -1889,6 +1918,28 @@ pub async fn run_loop(
 ) {
     let undo_key = undo_key(session_id.as_deref(), &workspace);
     undo_begin_turn(undo_state, &undo_key, &workspace);
+    // Attribution guard: tell the model what was already dirty before it acts,
+    // and what changed since its previous turn, so it cannot claim "I touched
+    // nothing" while the user's edits are sitting in the working tree.
+    if let Some(note) = workspace_git_note(undo_state, &undo_key, &workspace).await {
+        if let Some(sys) = native.first_mut().filter(|m| m.role == "system") {
+            if !sys.content.trim().is_empty() {
+                sys.content.push_str("\n\n");
+            }
+            sys.content.push_str(&note);
+        } else {
+            native.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: note,
+                    images: None,
+                    tool_calls: None,
+                    tool_name: None,
+                },
+            );
+        }
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending_bg: HashSet<String> = HashSet::new();
     let mut empty_rounds = 0u32;
@@ -2196,6 +2247,9 @@ pub async fn run_loop(
         let fresh: Vec<(String, serde_json::Value)> = calls
             .into_iter()
             .filter(|(n, a)| {
+                if repeatable_tool(n) {
+                    return true;
+                }
                 let k = seen_key(n, a);
                 if seen.contains(&k) {
                     false
@@ -2508,6 +2562,16 @@ pub async fn work_agent_answer(
 #[cfg(test)]
 mod agent_tests {
     use super::*;
+
+    #[test]
+    fn interactive_tools_are_exempt_from_repeat_guard() {
+        for name in ["exec_status", "exec_input", "exec_kill"] {
+            assert!(repeatable_tool(name), "{name} must be repeatable");
+        }
+        for name in ["read", "write", "exec", "grep", "mcp_add"] {
+            assert!(!repeatable_tool(name), "{name} must be deduped");
+        }
+    }
 
     #[test]
     fn bg_id_extraction_matches_frontend() {

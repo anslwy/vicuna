@@ -1340,7 +1340,15 @@ pub struct WorkFileContent {
 }
 
 /// Read a workspace-relative text file (cap ~64KB; binary smells rejected).
-pub async fn work_read_file_logic(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
+/// `offset` is a 1-based starting line and `limit` a line count: together they
+/// make files larger than one read possible to inspect without writing blind.
+pub async fn work_read_file_logic(
+    root: String,
+    path: String,
+    max_bytes: Option<u64>,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<WorkFileContent, String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join(&canon, &path)?;
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
@@ -1354,11 +1362,30 @@ pub async fn work_read_file_logic(root: String, path: String, max_bytes: Option<
     if bytes.iter().take(4096).any(|&b| b == 0) {
         return Err("binary file — refusing to dump as text (use view_image for png/jpg/webp/gif)".to_string());
     }
-    let truncated = bytes.len() > cap;
-    let slice = &bytes[..bytes.len().min(cap)];
+    let text = String::from_utf8_lossy(&bytes);
+    let ranged = offset.is_some() || limit.is_some();
+    let (selected, more_lines) = if ranged {
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let start = offset.unwrap_or(1).max(1) as usize - 1;
+        let start = start.min(lines.len());
+        let end = match limit {
+            Some(n) if n > 0 => start.saturating_add(n as usize).min(lines.len()),
+            Some(_) => start,
+            None => lines.len(),
+        };
+        (lines[start..end].concat(), end < lines.len())
+    } else {
+        (text.to_string(), false)
+    };
+    let truncated = more_lines || selected.len() > cap;
+    let content = if selected.len() > cap {
+        String::from_utf8_lossy(&selected.as_bytes()[..cap]).to_string()
+    } else {
+        selected
+    };
     Ok(WorkFileContent {
         path: path.trim().to_string(),
-        content: String::from_utf8_lossy(slice).to_string(),
+        content,
         truncated,
         size,
     })
@@ -1740,6 +1767,7 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
     #[cfg(windows)]
     let child = tokio::process::Command::new("powershell")
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd])
+        .envs(AGENT_NONINTERACTIVE_ENV.iter().copied())
         .current_dir(&canon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1755,6 +1783,9 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
             .current_dir(&canon)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for (k, v) in AGENT_NONINTERACTIVE_ENV {
+            builder.env(k, v);
+        }
         if let Some(path) = work_exec_path().await {
             builder.env("PATH", path);
         }
@@ -1816,8 +1847,14 @@ async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDir
 }
 
 #[tauri::command]
-async fn work_read_file(root: String, path: String, max_bytes: Option<u64>) -> Result<WorkFileContent, String> {
-    work_read_file_logic(root, path, max_bytes).await
+async fn work_read_file(
+    root: String,
+    path: String,
+    max_bytes: Option<u64>,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<WorkFileContent, String> {
+    work_read_file_logic(root, path, max_bytes, offset, limit).await
 }
 
 #[tauri::command]
@@ -1979,6 +2016,9 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
         .current_dir(&canon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for (k, v) in AGENT_NONINTERACTIVE_ENV {
+        builder.env(k, v);
+    }
     #[cfg(not(windows))]
     if let Some(path) = work_exec_path().await {
         builder.env("PATH", path);
@@ -2228,6 +2268,10 @@ pub struct ShellRun {
     pub exit_code: Option<i32>,
     pub running: bool,
     pub truncated: bool,
+    /// Working directory after the command (best effort, from the exit probe).
+    pub cwd: Option<String>,
+    /// Wall-clock duration of the exec call in milliseconds.
+    pub duration_ms: Option<u64>,
 }
 
 struct AgentShell {
@@ -2238,14 +2282,37 @@ struct AgentShell {
     writer: Mutex<Box<dyn Write + Send>>,
     buf: Arc<Mutex<String>>,
     marker: String,
+    /// Exit-probe marker, also built from an env var so a re-enabled terminal
+    /// echo of the probe line can never be mistaken for its output.
+    exit_marker: String,
     alive: Arc<AtomicBool>,
     busy: AtomicBool,
+    /// Epoch seconds when the current command started (0 while idle). Used to
+    /// tell the model how long a blocked shell has been stuck.
+    busy_since: AtomicU64,
     last_used: AtomicU64,
 }
 
 impl AgentShell {
     fn touch(&self) {
         self.last_used.store(bg_now_secs(), Ordering::Relaxed);
+    }
+
+    fn mark_busy(&self) {
+        self.busy.store(true, Ordering::Relaxed);
+        self.busy_since.store(bg_now_secs(), Ordering::Relaxed);
+    }
+
+    fn mark_idle(&self) {
+        self.busy.store(false, Ordering::Relaxed);
+        self.busy_since.store(0, Ordering::Relaxed);
+    }
+
+    fn busy_secs(&self) -> u64 {
+        match self.busy_since.load(Ordering::Relaxed) {
+            0 => 0,
+            start => bg_now_secs().saturating_sub(start),
+        }
     }
 
     fn write_raw(&self, data: &str) -> Result<(), String> {
@@ -2280,7 +2347,7 @@ impl AgentShell {
 fn take_output(shell: &AgentShell) -> (String, bool) {
     let raw = shell.take_buf();
     if let Some(idx) = raw.find(&shell.marker) {
-        shell.busy.store(false, Ordering::Relaxed);
+        shell.mark_idle();
         (raw[..idx].to_string(), true)
     } else {
         (raw, false)
@@ -2392,6 +2459,23 @@ fn clean_shell_output(raw: &str, command: Option<&str>) -> (String, bool) {
     trunc_out(stripped.trim_end_matches('\n'))
 }
 
+/// Environment that keeps agent-run commands non-interactive. The persistent
+/// shell runs on a real PTY, so `git diff`, `git log`, `man`, etc. would
+/// otherwise launch a pager, take over the TTY and swallow every subsequent
+/// command as keystrokes. Disabling pagers/editors up front is the only
+/// reliable fix; a stuck pager cannot be trusted to exit on Ctrl-C.
+const AGENT_NONINTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+    ("LESS", "FRX"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", "true"),
+    ("GIT_SEQUENCE_EDITOR", "true"),
+    ("GIT_MERGE_AUTOEDIT", "no"),
+];
+
 async fn spawn_agent_shell(root: &str) -> Result<AgentShell, String> {
     let canon = work_canonical_root(root.trim())?;
     let cwd = work_display_string(&canon);
@@ -2442,9 +2526,16 @@ async fn spawn_agent_shell(root: &str) -> Result<AgentShell, String> {
             .unwrap_or(0)
     );
     cmd.env("VICUNA_READY_TOKEN", &token);
+    // Same anti-echo trick for the exit probe: the typed line only ever
+    // contains the env-var name, while the real output expands to the marker.
+    let exit_token = format!("{token}x");
+    cmd.env("VICUNA_EXIT_TOKEN", &exit_token);
     cmd.env("TERM", "dumb");
     cmd.env("NO_COLOR", "1");
     cmd.env("CLICOLOR", "0");
+    for (k, v) in AGENT_NONINTERACTIVE_ENV {
+        cmd.env(k, v);
+    }
     let mut child = pair
         .slave
         .spawn_command(cmd)
@@ -2482,14 +2573,17 @@ async fn spawn_agent_shell(root: &str) -> Result<AgentShell, String> {
         let _ = child.wait();
     });
     let marker = format!("__VICUNA_READY_{token}__");
+    let exit_marker = format!("__VICUNA_EXIT_{exit_token}__");
     let shell = AgentShell {
         pid,
         _master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         buf,
         marker: marker.clone(),
+        exit_marker,
         alive,
         busy: AtomicBool::new(false),
+        busy_since: AtomicU64::new(0),
         last_used: AtomicU64::new(bg_now_secs()),
     };
     #[cfg(windows)]
@@ -2582,11 +2676,11 @@ async fn wait_for_marker(shell: &AgentShell, deadline: std::time::Instant) -> Sh
     loop {
         acc.push_str(&shell.take_buf());
         if let Some(idx) = acc.find(&shell.marker) {
-            shell.busy.store(false, Ordering::Relaxed);
+            shell.mark_idle();
             return ShellWait::Done(acc[..idx].to_string());
         }
         if !shell.alive.load(Ordering::Relaxed) {
-            shell.busy.store(false, Ordering::Relaxed);
+            shell.mark_idle();
             return ShellWait::Dead(acc);
         }
         if std::time::Instant::now() >= deadline {
@@ -2596,30 +2690,118 @@ async fn wait_for_marker(shell: &AgentShell, deadline: std::time::Instant) -> Sh
     }
 }
 
-/// Read `$?` / `$?` right after a command finished (before any other input).
-async fn probe_exit_code(shell: &AgentShell) -> Option<i32> {
+/// Read `$?` and the cwd right after a command finished (before any other
+/// input). Returns (exit code, cwd).
+async fn probe_exit_status(shell: &AgentShell) -> (Option<i32>, Option<String>) {
     if !shell.alive.load(Ordering::Relaxed) {
-        return None;
+        return (None, None);
     }
     shell.drain();
     #[cfg(windows)]
-    let probe = "Write-Output ('__VICUNA_EXIT__' + $(if ($?) {0} else {1}))";
+    let probe = "Write-Output ('__VICUNA_EXIT_' + $env:VICUNA_EXIT_TOKEN + '__' + $(if ($?) {0} else {1}) + '|' + (Get-Location).Path)";
     #[cfg(not(windows))]
-    let probe = "printf '__VICUNA_EXIT__%s\\n' \"$?\"";
+    let probe = "printf '__VICUNA_EXIT_%s__%s|%s\\n' \"$VICUNA_EXIT_TOKEN\" \"$?\" \"$PWD\"";
     if shell.write_line(probe).is_err() {
-        return None;
+        return (None, None);
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     match wait_for_marker(shell, deadline).await {
         ShellWait::Done(raw) => {
             let plain = strip_ansi(&raw);
-            plain
-                .split("__VICUNA_EXIT__")
-                .nth(1)
-                .and_then(|s| s.trim().parse::<i32>().ok())
+            // Last occurrence: a re-enabled echo of the probe line contains the
+            // literal prefix but not the expanded token.
+            if !plain.contains(&shell.exit_marker) {
+                return (None, None);
+            }
+            let tail = plain.rsplit(&shell.exit_marker).next().unwrap_or("").trim();
+            let mut parts = tail.splitn(2, '|');
+            let code = parts.next().and_then(|s| s.trim().parse::<i32>().ok());
+            let cwd = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            (code, cwd)
         }
-        _ => None,
+        _ => (None, None),
     }
+}
+
+/// Commands are typed into an interactive PTY. A multi-line payload (heredoc,
+/// pasted script) is re-parsed line by line and mangled, so route it through
+/// the `write` tool instead of pretending it ran.
+fn reject_multiline_command(cmd: &str) -> Option<String> {
+    if cmd.contains('\n') || cmd.contains('\r') {
+        Some(
+            "exec takes one command line — this one contains a newline or heredoc, which the \
+             interactive shell corrupts. Put the content in a file with the write tool (or \
+             write a script with write), then run it, e.g. exec {\"command\": \"sh script.sh\"}."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn format_elapsed_secs(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Best-effort name of the pty's foreground process (Unix). macOS/Linux `ps`
+/// exposes the terminal foreground pgid via `tpgid`.
+#[cfg(not(windows))]
+fn foreground_process_name(shell_pid: Option<u32>) -> Option<String> {
+    let pid = shell_pid?;
+    let out = std::process::Command::new("ps")
+        .args(["-o", "tpgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let pgid = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok()?;
+    if pgid == 0 {
+        return None;
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pgid.to_string()])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(windows)]
+fn foreground_process_name(_shell_pid: Option<u32>) -> Option<String> {
+    None
+}
+
+fn shell_busy_error(shell: &AgentShell) -> String {
+    let mut msg = String::from("the shell is still running a command");
+    let secs = shell.busy_secs();
+    if secs > 0 {
+        msg.push_str(&format!(" (busy {})", format_elapsed_secs(secs)));
+    }
+    if let Some(fg) = foreground_process_name(shell.pid) {
+        let base = fg.rsplit(['/', '\\']).next().unwrap_or(&fg).to_lowercase();
+        let hint = match base.as_str() {
+            "less" | "more" | "most" | "man" | "vi" | "vim" | "nvim" | "top" | "htop" => {
+                " — a pager/TUI owns the terminal: quit it with exec_input {\"text\": \"q\"}"
+            }
+            _ => "",
+        };
+        msg.push_str(&format!("; foreground={fg}{hint}"));
+    }
+    msg.push_str(
+        ". Poll with exec_status, answer a prompt with exec_input, or interrupt with exec_kill first.",
+    );
+    msg
 }
 
 /// Run a command in the workspace's persistent shell.
@@ -2637,36 +2819,51 @@ pub async fn agent_shell_exec(
     if cmd.len() > 8000 {
         return Err("command too long".to_string());
     }
+    if let Some(err) = reject_multiline_command(cmd) {
+        return Err(err);
+    }
     if let Some(frag) = refuse_full_disk_scan(cmd) {
         return Err(full_disk_scan_error(&frag));
     }
     let shell = shell_for(state, &root, &key).await?;
     let (_pending, finished) = take_output(&shell);
     if shell.busy.load(Ordering::Relaxed) && !finished {
-        return Err(
-            "the shell is still running a command — poll with exec_status, answer with exec_input, or interrupt with exec_kill first"
-                .to_string(),
-        );
+        return Err(shell_busy_error(&shell));
     }
-    shell.busy.store(true, Ordering::Relaxed);
+    shell.mark_busy();
+    let started = std::time::Instant::now();
     shell.write_line(cmd)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000).clamp(1000, 120000));
     match wait_for_marker(&shell, std::time::Instant::now() + timeout).await {
         ShellWait::Done(raw) => {
-            shell.busy.store(false, Ordering::Relaxed);
+            shell.mark_idle();
             shell.touch();
-            let exit_code = probe_exit_code(&shell).await;
+            let (exit_code, cwd) = probe_exit_status(&shell).await;
             let (output, truncated) = clean_shell_output(&raw, Some(cmd));
-            Ok(ShellRun { output, exit_code, running: false, truncated })
+            Ok(ShellRun {
+                output,
+                exit_code,
+                running: false,
+                truncated,
+                cwd,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+            })
         }
         ShellWait::TimedOut(raw) => {
             // Leave the command running: the model may answer a prompt with
             // exec_input, poll with exec_status, or interrupt with exec_kill.
             let (output, truncated) = clean_shell_output(&raw, Some(cmd));
-            Ok(ShellRun { output, exit_code: None, running: true, truncated })
+            Ok(ShellRun {
+                output,
+                exit_code: None,
+                running: true,
+                truncated,
+                cwd: None,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+            })
         }
         ShellWait::Dead(raw) => {
-            shell.busy.store(false, Ordering::Relaxed);
+            shell.mark_idle();
             let (output, _) = clean_shell_output(&raw, Some(cmd));
             Err(format!("agent shell exited unexpectedly.\n{output}"))
         }
@@ -2693,25 +2890,48 @@ pub async fn agent_shell_status(
                 exit_code: None,
                 running: false,
                 truncated: false,
+                cwd: None,
+                duration_ms: None,
             })
         }
     };
     shell.touch();
     if !shell.busy.load(Ordering::Relaxed) {
         let (out, truncated) = clean_shell_output(&shell.take_buf(), None);
-        return Ok(ShellRun { output: out, exit_code: None, running: false, truncated });
+        return Ok(ShellRun {
+            output: out,
+            exit_code: None,
+            running: false,
+            truncated,
+            cwd: None,
+            duration_ms: None,
+        });
     }
     let deadline = std::time::Instant::now() + Duration::from_millis(250);
     match wait_for_marker(&shell, deadline).await {
         ShellWait::Done(raw) => {
-            shell.busy.store(false, Ordering::Relaxed);
-            let exit_code = probe_exit_code(&shell).await;
+            shell.mark_idle();
+            let (exit_code, cwd) = probe_exit_status(&shell).await;
             let (output, truncated) = clean_shell_output(&raw, None);
-            Ok(ShellRun { output, exit_code, running: false, truncated })
+            Ok(ShellRun {
+                output,
+                exit_code,
+                running: false,
+                truncated,
+                cwd,
+                duration_ms: None,
+            })
         }
         ShellWait::TimedOut(raw) | ShellWait::Dead(raw) => {
             let (output, truncated) = clean_shell_output(&raw, None);
-            Ok(ShellRun { output, exit_code: None, running: true, truncated })
+            Ok(ShellRun {
+                output,
+                exit_code: None,
+                running: true,
+                truncated,
+                cwd: None,
+                duration_ms: None,
+            })
         }
     }
 }
@@ -2765,17 +2985,60 @@ pub async fn agent_shell_interrupt(
             exit_code: None,
             running: false,
             truncated: false,
+            cwd: None,
+            duration_ms: None,
         });
     }
+    // Normal foreground jobs die on Ctrl-C. Full-screen pagers do not: less
+    // treats it as "interrupt" and may even open its help screen, so after a
+    // failed interrupt try quitting a pager explicitly before giving up.
     shell.write_raw("\u{3}")?;
-    shell.write_line("")?;
-    match wait_for_marker(&shell, std::time::Instant::now() + Duration::from_secs(3)).await {
-        ShellWait::Done(raw) | ShellWait::TimedOut(raw) | ShellWait::Dead(raw) => {
-            shell.busy.store(false, Ordering::Relaxed);
-            let (output, truncated) = clean_shell_output(&raw, None);
-            Ok(ShellRun { output, exit_code: None, running: false, truncated })
+    let mut acc = String::new();
+    match wait_for_marker(&shell, std::time::Instant::now() + Duration::from_millis(1500)).await {
+        ShellWait::Done(raw) | ShellWait::Dead(raw) => {
+            acc.push_str(&raw);
+            let (output, truncated) = clean_shell_output(&acc, None);
+            return Ok(ShellRun {
+                output,
+                exit_code: None,
+                running: false,
+                truncated,
+                cwd: None,
+                duration_ms: None,
+            });
+        }
+        ShellWait::TimedOut(raw) => acc.push_str(&raw),
+    }
+    for _ in 0..3 {
+        shell.write_raw("q")?;
+        match wait_for_marker(&shell, std::time::Instant::now() + Duration::from_millis(800)).await {
+            ShellWait::Done(raw) | ShellWait::Dead(raw) => {
+                acc.push_str(&raw);
+                let (output, truncated) = clean_shell_output(&acc, None);
+                return Ok(ShellRun {
+                    output,
+                    exit_code: None,
+                    running: false,
+                    truncated,
+                    cwd: None,
+                    duration_ms: None,
+                });
+            }
+            ShellWait::TimedOut(raw) => acc.push_str(&raw),
         }
     }
+    // Still owned by a TUI: report the truth so the next exec refuses instead
+    // of typing a command into it.
+    let (mut output, truncated) = clean_shell_output(&acc, None);
+    output.push_str("\n[interrupt did not return the prompt — a pager/TUI may still be open; try exec_input {\"text\": \"q\"}]");
+    Ok(ShellRun {
+        output,
+        exit_code: None,
+        running: true,
+        truncated,
+        cwd: None,
+        duration_ms: None,
+    })
 }
 
 /// Persistent-shell command wrappers (same IPC naming pattern as the rest).
@@ -2844,6 +3107,11 @@ pub struct UndoState {
     turns: Mutex<HashMap<String, Vec<UndoTurn>>>,
     /// Frames popped by /undo, newest last; cleared by a new agent turn.
     redo: Mutex<HashMap<String, Vec<UndoTurn>>>,
+    /// `git status --porcelain` captured at the previous turn start, per session.
+    /// Used to tell the agent what was already dirty before it touched anything
+    /// (and what changed since its last turn) so it cannot honestly blame
+    /// itself for the user's edits — or claim it changed nothing.
+    git_baseline: Mutex<HashMap<String, String>>,
 }
 
 /// Session key for the undo stack: the session id when present, else the
@@ -2854,6 +3122,92 @@ pub fn undo_key(session_id: Option<&str>, workspace: &str) -> String {
         Some(s) => s.to_string(),
         None => workspace.trim().to_string(),
     }
+}
+
+const GIT_NOTE_MAX_LINES: usize = 40;
+
+fn git_note_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn git_note_block(lines: &[String]) -> String {
+    let shown = lines.len().min(GIT_NOTE_MAX_LINES);
+    let mut out = lines[..shown].join("\n");
+    if lines.len() > shown {
+        out.push_str(&format!("\n…(+{} more)", lines.len() - shown));
+    }
+    out
+}
+
+/// Summarize `git status --porcelain` at the start of a Work turn. The agent
+/// is told what was already dirty before it acted, and (after the first turn)
+/// what changed since its previous turn, so it can distinguish the user's
+/// edits from its own instead of making false attribution claims.
+/// Returns `None` outside a git work tree (or when git cannot run).
+pub async fn workspace_git_note(state: &UndoState, key: &str, workspace: &str) -> Option<String> {
+    let res = work_exec_logic(
+        workspace.to_string(),
+        "git status --porcelain".to_string(),
+        Some(5000),
+    )
+    .await
+    .ok()?;
+    if res.timed_out || res.exit_code != Some(0) {
+        return None;
+    }
+    let current = git_note_lines(&res.stdout);
+    let previous = match state.git_baseline.lock() {
+        Ok(mut m) => m.insert(key.to_string(), current.join("\n")),
+        Err(_) => None,
+    };
+
+    if current.is_empty() {
+        return Some(match previous {
+            None => "Working tree is clean at turn start (git status --porcelain).".to_string(),
+            Some(prev) if prev.trim().is_empty() => {
+                "Working tree is clean at turn start (unchanged since your previous turn).".to_string()
+            }
+            Some(_) => "Working tree is clean at turn start — changes from your previous turn are gone (committed, reverted, or undone).".to_string(),
+        });
+    }
+
+    let Some(prev) = previous else {
+        return Some(format!(
+            "Working tree BEFORE this turn (git status --porcelain). These changes already existed when the turn started — they may be the user's or from an earlier turn, not necessarily yours:\n{}",
+            git_note_block(&current)
+        ));
+    };
+    let prev_lines = git_note_lines(&prev);
+    let prev_set: std::collections::HashSet<&str> =
+        prev_lines.iter().map(String::as_str).collect();
+    let current_set: std::collections::HashSet<&str> =
+        current.iter().map(String::as_str).collect();
+    let added: Vec<String> = current
+        .iter()
+        .filter(|line| !prev_set.contains(line.as_str()))
+        .map(|line| format!("+ {line}"))
+        .collect();
+    let removed: Vec<String> = prev_lines
+        .iter()
+        .filter(|line| !current_set.contains(line.as_str()))
+        .map(|line| format!("- {line}"))
+        .collect();
+    if added.is_empty() && removed.is_empty() {
+        return Some(format!(
+            "Working tree unchanged since your previous turn (still dirty):\n{}",
+            git_note_block(&current)
+        ));
+    }
+    let mut delta = added;
+    delta.extend(removed);
+    Some(format!(
+        "Working tree CHANGED since your previous turn (sampled before this turn; includes your own last-turn writes and the user's edits):\n{}",
+        git_note_block(&delta)
+    ))
 }
 
 /// Snapshot a file before the agent overwrites it. `Some((existed, bytes))`
@@ -4755,6 +5109,163 @@ mod work_tests {
         kill_agent_shells(&state);
     }
 
+    /// Shell environment must suppress pagers/editors: a pager would own the
+    /// PTY and swallow every later command.
+    /// Turn-start attribution: pre-existing user edits are surfaced, and a
+    /// later turn reports the delta instead of the model guessing.
+    #[tokio::test]
+    async fn git_note_reports_existing_dirt_and_turn_delta() {
+        let d = tmp_root("gitnote");
+        let inited = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&d)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !inited {
+            return; // git unavailable on this machine
+        }
+        let root = d.to_string_lossy().to_string();
+        std::fs::write(d.join("user-edit.txt"), "x").unwrap();
+        let state = UndoState::default();
+        let note = workspace_git_note(&state, "k", &root).await.unwrap();
+        assert!(note.contains("BEFORE this turn"), "{note}");
+        assert!(note.contains("?? user-edit.txt"), "{note}");
+        std::fs::write(d.join("agent-edit.txt"), "y").unwrap();
+        let note = workspace_git_note(&state, "k", &root).await.unwrap();
+        assert!(note.contains("CHANGED since your previous turn"), "{note}");
+        assert!(note.contains("+ ?? agent-edit.txt"), "{note}");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn agent_shell_sets_noninteractive_env() {
+        let d = tmp_root("agentshell-env");
+        let root = d.to_string_lossy().to_string();
+        let state = AgentShellState::default();
+        let r = agent_shell_exec(
+            &state,
+            root.clone(),
+            root.clone(),
+            "printf '%s|%s|%s|%s' \"$PAGER\" \"$GIT_PAGER\" \"$LESS\" \"$GIT_TERMINAL_PROMPT\"".into(),
+            Some(15000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.output.trim(), "cat|cat|FRX|0", "output: {:?}", r.output);
+        kill_agent_shells(&state);
+    }
+
+    /// Multi-line payloads cannot be typed into an interactive PTY; refuse
+    /// them before they corrupt anything and point at `write`.
+    #[tokio::test]
+    async fn agent_shell_rejects_multiline_and_heredocs() {
+        let d = tmp_root("agentshell-multiline");
+        let root = d.to_string_lossy().to_string();
+        let state = AgentShellState::default();
+        let err = agent_shell_exec(
+            &state,
+            root.clone(),
+            root.clone(),
+            "cat > f.txt <<'EOF'\nhello\nEOF".into(),
+            Some(5000),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("one command line"), "got {err:?}");
+        assert!(err.contains("write tool"), "got {err:?}");
+        kill_agent_shells(&state);
+    }
+
+    /// The result carries the real cwd and wall-clock duration.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn agent_shell_reports_cwd_and_duration() {
+        let d = tmp_root("agentshell-meta");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let root = d.to_string_lossy().to_string();
+        let state = AgentShellState::default();
+        agent_shell_exec(&state, root.clone(), root.clone(), "cd sub".into(), Some(15000))
+            .await
+            .unwrap();
+        let r = agent_shell_exec(&state, root.clone(), root.clone(), "pwd".into(), Some(15000))
+            .await
+            .unwrap();
+        let cwd = r.cwd.unwrap_or_default();
+        assert!(cwd.ends_with("sub"), "cwd was {cwd:?}");
+        assert!(r.duration_ms.is_some());
+        kill_agent_shells(&state);
+    }
+
+    /// Terminal echo can be re-enabled by a child program; the probe marker
+    /// must still parse (previously the echoed command line was mistaken for
+    /// the probe output, yielding "exit unknown" + a garbage cwd).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn agent_shell_exit_probe_survives_echo() {
+        let d = tmp_root("agentshell-exit-echo");
+        let root = d.to_string_lossy().to_string();
+        let state = AgentShellState::default();
+        agent_shell_exec(&state, root.clone(), root.clone(), "stty echo".into(), Some(15000))
+            .await
+            .unwrap();
+        let ok = agent_shell_exec(&state, root.clone(), root.clone(), "true".into(), Some(15000))
+            .await
+            .unwrap();
+        assert_eq!(ok.exit_code, Some(0), "output={:?} cwd={:?}", ok.output, ok.cwd);
+        assert!(
+            ok.cwd.as_deref().unwrap_or("").contains("agentshell-exit-echo"),
+            "cwd was {:?}",
+            ok.cwd
+        );
+        let bad = agent_shell_exec(&state, root.clone(), root.clone(), "false".into(), Some(15000))
+            .await
+            .unwrap();
+        assert_eq!(bad.exit_code, Some(1), "output={:?} cwd={:?}", bad.output, bad.cwd);
+        kill_agent_shells(&state);
+    }
+
+    /// A busy shell reports how long it has been stuck (and, when available,
+    /// which foreground process owns the TTY).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn agent_shell_busy_error_is_actionable() {
+        let d = tmp_root("agentshell-busy");
+        let root = d.to_string_lossy().to_string();
+        let state = AgentShellState::default();
+        let r = agent_shell_exec(&state, root.clone(), root.clone(), "sleep 4".into(), Some(1000))
+            .await
+            .unwrap();
+        assert!(r.running);
+        let err = agent_shell_exec(&state, root.clone(), root.clone(), "echo nope".into(), Some(5000))
+            .await
+            .unwrap_err();
+        assert!(err.contains("busy"), "got {err:?}");
+        assert!(err.contains("exec_status"), "got {err:?}");
+        agent_shell_interrupt(&state, root.clone(), root.clone()).await.unwrap();
+        kill_agent_shells(&state);
+    }
+
+    /// Ranged reads make large files inspectable instead of blind-write-only.
+    #[tokio::test]
+    async fn read_offset_limit_pages_long_files() {
+        let d = tmp_root("readrange");
+        let d_str = d.to_string_lossy().to_string();
+        let body: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(d.join("big.txt"), body).unwrap();
+        let r = work_read_file_logic(d_str.clone(), "big.txt".into(), None, Some(50), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "line 50\nline 51\nline 52\nline 53\nline 54\n");
+        assert!(r.truncated);
+        let all = work_read_file_logic(d_str, "big.txt".into(), None, None, None)
+            .await
+            .unwrap();
+        assert!(!all.truncated);
+        assert!(all.content.starts_with("line 1\n"));
+        assert!(all.content.ends_with("line 200\n"));
+    }
+
     #[test]
     fn join_rejects_escapes() {
         let d = tmp_root("join");
@@ -4817,7 +5328,7 @@ mod work_tests {
             .unwrap();
         let entries = work_list_dir(root.clone(), None).await.unwrap();
         assert!(entries.iter().any(|e| e.name == "hello.py" && !e.is_dir));
-        let content = work_read_file(root.clone(), "hello.py".into(), None)
+        let content = work_read_file(root.clone(), "hello.py".into(), None, None, None)
             .await
             .unwrap();
         assert_eq!(content.content, "print('hi')\n");
@@ -4825,7 +5336,7 @@ mod work_tests {
         let hits = work_grep(root.clone(), "print".into(), None).await.unwrap();
         assert!(hits.iter().any(|h| h.path == "hello.py" && h.line == 1));
         // outside-root access rejected at every entry point
-        assert!(work_read_file(root.clone(), "../outside.txt".into(), None)
+        assert!(work_read_file(root.clone(), "../outside.txt".into(), None, None, None)
             .await
             .is_err());
     }
@@ -4984,7 +5495,7 @@ mod work_tests {
         assert!(work_read_image(root.clone(), "../outside.png".into()).await.is_err());
         // text reader now points binaries at view_image
         std::fs::write(d.join("raw.bin"), [0u8, 1, 2, 3]).unwrap();
-        let err = work_read_file(root.clone(), "raw.bin".into(), None).await.unwrap_err();
+        let err = work_read_file(root.clone(), "raw.bin".into(), None, None, None).await.unwrap_err();
         assert!(err.contains("view_image"));
     }
 
@@ -5316,10 +5827,10 @@ mod work_tests {
             .await
             .unwrap();
         assert!(p.ends_with("new.txt"));
-        assert!(work_read_file(root.clone(), "sub/new.txt".into(), None)
+        assert!(work_read_file(root.clone(), "sub/new.txt".into(), None, None, None)
             .await
             .is_ok());
-        assert!(work_read_file(root.clone(), "sub/old.txt".into(), None)
+        assert!(work_read_file(root.clone(), "sub/old.txt".into(), None, None, None)
             .await
             .is_err());
         // rejects escapes, missing sources, slashed/off-root names, clashes
@@ -5339,7 +5850,7 @@ mod work_tests {
             .await
             .unwrap();
         work_delete(root.clone(), "dir".into()).await.unwrap();
-        assert!(work_read_file(root.clone(), "dir/f.txt".into(), None)
+        assert!(work_read_file(root.clone(), "dir/f.txt".into(), None, None, None)
             .await
             .is_err());
         work_write_file(root.clone(), "gone.txt".into(), "y".into())

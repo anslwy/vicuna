@@ -34,8 +34,10 @@ Use the provided function tools to act — do not invent results, do not emit ma
 - Narrate BEFORE you act: every response that calls tools must open with one or two plain-text lines saying what you are about to do and why. The user sees only a small tool label, not your reasoning, so a silent chain of tool calls looks broken. If you cannot emit text alongside tool calls, make the first call \`say\` with that narration.
 - After a tool result arrives, continue reasoning and either call the next tool or answer.
 - When the task is done, answer normally with NO further tool calls.
-- Never repeat a tool call with the same name and arguments — the result is already in the transcript. Repeating finished work instead of summarizing is a failure.
-- Keep file reads targeted; prefer list/grep before reading big files.
+- Never repeat a finished tool call with the same name and arguments — the result is already in the transcript. Repeating finished work instead of summarizing is a failure. (exec_status / exec_input / exec_kill are interactive and may be repeated while a command is still running.)
+- Keep file reads targeted; prefer list/grep before reading big files. \`read\` accepts offset (1-based line) and limit (line count) — use them to page through files larger than 64KB instead of guessing or rewriting blind.
+- File content goes through \`write\`, never through exec. exec takes ONE command line: heredocs and multi-line bodies are rejected because the interactive shell corrupts them. To run a script, create it with write, then exec {"command": "sh script.sh"}.
+- Pagers and full-screen TUIs are disabled/unsafe in the agent shell (git/less/man are configured non-interactive). Do not launch \`less\`, \`vim\`, \`top\`, etc.; they take over the terminal and block every later command.
 - Images: \`read\` is text-only and refuses binaries. To SEE a workspace picture
   (png/jpg/webp/gif — e.g. a screenshot the user mentions), call \`view_image\`
   with its path: the picture is fed to you as vision input alongside the tool
@@ -86,11 +88,15 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "read",
-      description: "Read a workspace-relative text file (64KB cap).",
+      description: "Read a workspace-relative text file. Large files: pass offset (1-based line) and limit (line count) to page through them; the default read caps at 64KB.",
       parameters: {
         type: "object",
         required: ["path"],
-        properties: { path: { type: "string", description: "relative file path" } }
+        properties: {
+          path: { type: "string", description: "relative file path" },
+          offset: { type: "integer", description: "1-based line to start at (default 1)" },
+          limit: { type: "integer", description: "maximum lines to return" }
+        }
       }
     }
   },
@@ -140,7 +146,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run a command in the workspace's persistent shell (cwd, env vars and activated environments persist between calls). Windows uses PowerShell, macOS/Linux use POSIX sh. Waits up to timeout_ms; if the command is still running, use exec_status to poll, exec_input to answer a prompt, or exec_kill to interrupt. Never access paths outside the workspace without asking first or scan from filesystem/home roots. Pass background:true for slow commands (tests, builds) that should run detached.",
+      description: "Run ONE command line in the workspace's persistent shell (cwd, env vars and activated environments persist between calls). Windows uses PowerShell, macOS/Linux use POSIX sh. Multi-line commands/heredocs are rejected — use write for file content, then run the file. Waits up to timeout_ms; if the command is still running, use exec_status to poll, exec_input to answer a prompt, or exec_kill to interrupt. Never access paths outside the workspace without asking first or scan from filesystem/home roots. Pass background:true for slow commands (tests, builds) that should run detached.",
       parameters: {
         type: "object",
         required: ["command"],
@@ -169,7 +175,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec_kill",
-      description: "Interrupt. With id: stop a background job. Without id: send Ctrl-C to the command running in the persistent shell and wait for the prompt.",
+      description: "Interrupt. With id: stop a background job. Without id: send Ctrl-C to the command running in the persistent shell; if a pager/TUI survives it, quit it with q. Waits for the prompt and reports honestly if the shell is still busy.",
       parameters: {
         type: "object",
         properties: {
@@ -747,10 +753,12 @@ export async function dispatchWorkTool(
       case "read": {
         if (!str(a.path)) return "Error: read needs {\"path\": \"...\"}.";
         if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        const offset = typeof a.offset === "number" ? a.offset : null;
+        const limit = typeof a.limit === "number" ? a.limit : null;
         const res = await invokeCmd<{ content: string; truncated: boolean; size: number }>(
-          "work_read_file", { root: ctx.workspace, path: str(a.path), maxBytes: null }
+          "work_read_file", { root: ctx.workspace, path: str(a.path), maxBytes: null, offset, limit }
         );
-        return res.content + (res.truncated ? `\n…[truncated, ${res.size}B total]` : "");
+        return res.content + (res.truncated ? `\n…[more text, ${res.size}B total — read another range with offset/limit]` : "");
       }
       case "grep": {
         if (!str(a.pattern)) return "Error: grep needs {\"pattern\": \"...\"}.";
@@ -779,12 +787,27 @@ export async function dispatchWorkTool(
             return `Error: ${e?.message ?? String(e)}`;
           }
         }
-        const res = await invokeCmd<{ output: string; exit_code: number | null; running: boolean; truncated: boolean }>(
+        const res = await invokeCmd<{
+          output: string;
+          exit_code: number | null;
+          running: boolean;
+          truncated: boolean;
+          cwd?: string | null;
+          duration_ms?: number | null;
+        }>(
           "work_shell_exec", { root: ctx.workspace, command: str(a.command), timeoutMs: typeof a.timeout_ms === "number" ? a.timeout_ms : null }
         );
         const parts: string[] = [];
         if (res.output.trim()) parts.push(res.output);
-        parts.push(res.running ? "[still running — poll with exec_status, answer a prompt with exec_input, or interrupt with exec_kill]" : `[exit ${res.exit_code}]`);
+        if (res.running) {
+          parts.push("[still running — poll with exec_status, answer a prompt with exec_input, or interrupt with exec_kill]");
+        } else {
+          const code = res.exit_code == null ? "unknown (signal or probe timeout)" : String(res.exit_code);
+          let tag = `[exit ${code}`;
+          if (res.duration_ms != null) tag += ` · ${res.duration_ms}ms`;
+          if (res.cwd && res.cwd.trim()) tag += ` · cwd=${res.cwd}`;
+          parts.push(tag + "]");
+        }
         return parts.join("\n");
       }
       case "exec_input": {
