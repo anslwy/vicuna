@@ -1083,11 +1083,93 @@ pub fn work_canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
 /// Join a session-relative path onto a canonical root, rejecting escapes.
 /// Empty/`"."` resolves to the root itself.
 pub fn work_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    work_join_inner(root, rel, false)
+}
+
+/// File tools (read/list/write/view_image) also accept absolute paths under
+/// the system temp dir, so agents have a sanctioned place for scratch files
+/// that is not the repository. Everything else outside the workspace stays
+/// refused; exec is unaffected.
+pub fn work_join_allow_temp(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    work_join_inner(root, rel, true)
+}
+
+fn canonicalize_lenient(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut base) => {
+                for part in tail.iter().rev() {
+                    base.push(part);
+                }
+                return Some(base);
+            }
+            Err(_) => {
+                let name = current.file_name()?.to_os_string();
+                tail.push(name);
+                if !current.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn temp_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        let c = std::fs::canonicalize(&p).unwrap_or(p);
+        if !roots.contains(&c) {
+            roots.push(c);
+        }
+    };
+    push(std::env::temp_dir());
+    // Agents commonly reach for /tmp even when TMPDIR is unset (Rust's
+    // temp_dir() uses the per-user Darwin temp dir on macOS); accept both.
+    #[cfg(unix)]
+    {
+        push(std::path::PathBuf::from("/tmp"));
+        push(std::path::PathBuf::from("/private/tmp"));
+    }
+    roots
+}
+
+fn path_is_under_temp(path: &std::path::Path) -> bool {
+    let resolved = canonicalize_lenient(path).unwrap_or_else(|| path.to_path_buf());
+    temp_roots()
+        .iter()
+        .any(|root| resolved.starts_with(root) || path.starts_with(root))
+}
+
+fn resolve_temp_absolute(abs: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    if abs.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("path escapes the temp dir".to_string());
+    }
+    let resolved = canonicalize_lenient(abs).ok_or_else(|| "invalid path".to_string())?;
+    if !temp_roots().iter().any(|root| resolved.starts_with(root)) {
+        return Err(
+            "absolute paths are only allowed under the system temp dir — use workspace-relative paths elsewhere"
+                .to_string(),
+        );
+    }
+    Ok(resolved)
+}
+
+fn work_join_inner(
+    root: &std::path::Path,
+    rel: &str,
+    allow_temp: bool,
+) -> Result<std::path::PathBuf, String> {
     let rel = rel.trim();
     if rel.is_empty() || rel == "." || rel == "./" {
         return Ok(root.to_path_buf());
     }
     if std::path::Path::new(rel).is_absolute() {
+        if allow_temp {
+            return resolve_temp_absolute(std::path::Path::new(rel));
+        }
         return Err("absolute paths are not allowed — use workspace-relative paths".to_string());
     }
     let mut cur = root.to_path_buf();
@@ -1144,7 +1226,7 @@ pub struct WorkDirEntry {
 /// are still listed — the model decides what matters.
 pub async fn work_list_dir_logic(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
     let canon = work_canonical_root(root.trim())?;
-    let dir = work_join(&canon, path.as_deref().unwrap_or(""))?;
+    let dir = work_join_allow_temp(&canon, path.as_deref().unwrap_or(""))?;
     if !dir.is_dir() {
         return Err("not a folder".to_string());
     }
@@ -1350,7 +1432,7 @@ pub async fn work_read_file_logic(
     limit: Option<u64>,
 ) -> Result<WorkFileContent, String> {
     let canon = work_canonical_root(root.trim())?;
-    let full = work_join(&canon, &path)?;
+    let full = work_join_allow_temp(&canon, &path)?;
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
     if !meta.is_file() {
         return Err("not a file".to_string());
@@ -1404,7 +1486,7 @@ pub struct WorkImageContent {
 /// agent actually SEES the picture instead of getting a binary-dump error.
 pub async fn work_read_image_logic(root: String, path: String) -> Result<WorkImageContent, String> {
     let canon = work_canonical_root(root.trim())?;
-    let full = work_join(&canon, &path)?;
+    let full = work_join_allow_temp(&canon, &path)?;
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
     if !meta.is_file() {
         return Err("not a file".to_string());
@@ -1538,12 +1620,12 @@ pub async fn work_write_file_logic(root: String, path: String, content: String) 
         return Err("content too large (max ~512KB per write)".to_string());
     }
     let canon = work_canonical_root(root.trim())?;
-    let full = work_join(&canon, &path)?;
+    let full = work_join_allow_temp(&canon, &path)?;
     if full.is_dir() {
         return Err("cannot overwrite a folder".to_string());
     }
     if let Some(parent) = full.parent() {
-        if !parent.starts_with(&canon) {
+        if !parent.starts_with(&canon) && !path_is_under_temp(parent) {
             return Err("path escapes the workspace".to_string());
         }
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folders: {e}"))?;
@@ -1786,6 +1868,7 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
         for (k, v) in AGENT_NONINTERACTIVE_ENV {
             builder.env(k, v);
         }
+        builder.env("TMPDIR", std::env::temp_dir());
         if let Some(path) = work_exec_path().await {
             builder.env("PATH", path);
         }
@@ -2019,6 +2102,7 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
     for (k, v) in AGENT_NONINTERACTIVE_ENV {
         builder.env(k, v);
     }
+    builder.env("TMPDIR", std::env::temp_dir());
     #[cfg(not(windows))]
     if let Some(path) = work_exec_path().await {
         builder.env("PATH", path);
@@ -2530,6 +2614,9 @@ async fn spawn_agent_shell(root: &str) -> Result<AgentShell, String> {
     // contains the env-var name, while the real output expands to the marker.
     let exit_token = format!("{token}x");
     cmd.env("VICUNA_EXIT_TOKEN", &exit_token);
+    // Point the agent shell at the same temp root the file tools accept, so
+    // `mktemp -d "$TMPDIR/..."` always yields a writable scratch path.
+    cmd.env("TMPDIR", std::env::temp_dir());
     cmd.env("TERM", "dumb");
     cmd.env("NO_COLOR", "1");
     cmd.env("CLICOLOR", "0");
@@ -3189,7 +3276,15 @@ pub async fn workspace_git_note(state: &UndoState, key: &str, workspace: &str) -
     let added: Vec<String> = current
         .iter()
         .filter(|line| !prev_set.contains(line.as_str()))
-        .map(|line| format!("+ {line}"))
+        .map(|line| {
+            if line.starts_with("?? ") {
+                format!(
+                    "+ {line}  (appeared during your previous turn — if you created this, move scratch to the system temp dir)"
+                )
+            } else {
+                format!("+ {line}")
+            }
+        })
         .collect();
     let removed: Vec<String> = prev_lines
         .iter()
@@ -5135,6 +5230,7 @@ mod work_tests {
         let note = workspace_git_note(&state, "k", &root).await.unwrap();
         assert!(note.contains("CHANGED since your previous turn"), "{note}");
         assert!(note.contains("+ ?? agent-edit.txt"), "{note}");
+        assert!(note.contains("move scratch to the system temp dir"), "{note}");
     }
 
     #[cfg(not(windows))]
@@ -5147,12 +5243,18 @@ mod work_tests {
             &state,
             root.clone(),
             root.clone(),
-            "printf '%s|%s|%s|%s' \"$PAGER\" \"$GIT_PAGER\" \"$LESS\" \"$GIT_TERMINAL_PROMPT\"".into(),
+            "printf '%s|%s|%s|%s|%s' \"$PAGER\" \"$GIT_PAGER\" \"$LESS\" \"$GIT_TERMINAL_PROMPT\" \"$TMPDIR\"".into(),
             Some(15000),
         )
         .await
         .unwrap();
-        assert_eq!(r.output.trim(), "cat|cat|FRX|0", "output: {:?}", r.output);
+        let out = r.output.trim();
+        assert!(out.starts_with("cat|cat|FRX|0|"), "output: {out:?}");
+        let tmp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+        assert!(
+            out.trim_end_matches('/').ends_with(&tmp),
+            "TMPDIR should match the file tools' temp root: {out:?} vs {tmp:?}"
+        );
         kill_agent_shells(&state);
     }
 
@@ -5274,6 +5376,61 @@ mod work_tests {
         assert!(work_join(&canon, "a/b/../c.txt").unwrap().starts_with(&canon));
         assert!(work_join(&canon, "../../etc/passwd").is_err());
         assert!(work_join(&canon, "/etc/passwd").is_err());
+    }
+
+    /// File tools can reach only the system temp dir outside the workspace —
+    /// the sanctioned scratch location — and nothing else.
+    #[test]
+    fn join_allows_temp_but_keeps_the_boundary() {
+        let d = tmp_root("join-temp");
+        let canon = work_canonical_root(d.to_str().unwrap()).unwrap();
+        let scratch = std::env::temp_dir().join("vicuna-join-temp-check.txt");
+        let scratch_s = scratch.to_string_lossy().to_string();
+        assert!(work_join_allow_temp(&canon, &scratch_s).is_ok(), "{scratch_s}");
+        #[cfg(unix)]
+        assert!(work_join_allow_temp(&canon, "/tmp/vicuna-join-temp-check.txt").is_ok());
+        assert!(work_join(&canon, &scratch_s).is_err());
+        assert!(work_join_allow_temp(&canon, "/etc/hosts").is_err());
+        assert!(
+            work_join_allow_temp(&canon, &format!("{}/../escape", std::env::temp_dir().display()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_tools_reach_temp_but_not_other_abs_paths() {
+        let d = tmp_root("scratch-tools");
+        let root = d.to_string_lossy().to_string();
+        let scratch = std::env::temp_dir().join(format!(
+            "vicuna-scratch-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let spec = scratch.join("spec.json");
+        let spec_s = spec.to_string_lossy().to_string();
+
+        work_write_file_logic(root.clone(), spec_s.clone(), "{\"ok\":true}".into())
+            .await
+            .unwrap();
+        let read = work_read_file_logic(root.clone(), spec_s.clone(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(read.content, "{\"ok\":true}");
+        let listed = work_list_dir_logic(root.clone(), Some(scratch.to_string_lossy().to_string()))
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|e| e.name == "spec.json"));
+
+        assert!(work_write_file_logic(root.clone(), "/etc/hosts".into(), "nope".into())
+            .await
+            .is_err());
+        assert!(work_read_file_logic(root, "/etc/hosts".into(), None, None, None)
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[tokio::test]

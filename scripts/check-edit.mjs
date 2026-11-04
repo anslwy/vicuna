@@ -67,6 +67,21 @@ check(
   `${nestedRes.stdout ?? ""}${nestedRes.stderr ?? ""}`,
 );
 
+reset();
+const inline = spawnSync(
+  process.execPath,
+  [tool, "--edits-json", JSON.stringify({ file: base, edits: [{ find: "beta", replace: "BETA" }] })],
+  { encoding: "utf8" },
+);
+check("--edits-json works without a spec file", inline.status === 0 && body().includes("BETA"), `${inline.stdout ?? ""}${inline.stderr ?? ""}`);
+
+reset();
+const viaStdin = spawnSync(process.execPath, [tool, "-"], {
+  input: JSON.stringify({ file: base, edits: [{ find: "beta", replace: "BETA" }] }),
+  encoding: "utf8",
+});
+check("stdin spec works", viaStdin.status === 0 && body().includes("BETA"), `${viaStdin.stdout ?? ""}${viaStdin.stderr ?? ""}`);
+
 reset("a\nx\nx\nx\nz\n");
 r = run(base, [{ find: "x", replace: "y", count: 3 }]);
 check("count>1 without --allow-multi fails", r.code === 1 && body() === "a\nx\nx\nx\nz\n", r.out);

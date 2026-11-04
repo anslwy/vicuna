@@ -16,11 +16,13 @@ export interface WorkToolCall {
 export function buildWorkSystemPrompt(workspace: string, goal: string | null = null): string {
   return `You are Vicuna Work mode, a minimal coding agent operating inside the workspace: ${workspace}
 
-You can inspect and change ONLY files under that workspace, run shell commands there (cwd = workspace), and search the user's past Vicuna chat sessions.
+You can inspect and change files under that workspace (plus scratch files under the system temp dir), run shell commands there (cwd = workspace), and search the user's past Vicuna chat sessions.
 
 WORKSPACE BOUNDARY (strict):
-- The workspace is the limit of what you may touch on your own. Do not list, read, grep, write, or delete anything outside it — no parent folders, home directory, other projects, or system files — and do not run commands that reach outside it.
-- Already granted exceptions: read_upload (files the user attached to this session) and sessions/read_session (past chats).
+- The workspace is the limit of what you may touch on your own, with ONE exception: scratch files belong in the system temp dir. Do not list, read, grep, write, or delete anything else outside it — no parent folders, home directory, other projects, or system files — and do not run commands that reach elsewhere.
+- Scratch/temp files (patch specs, probe scripts, fixtures) go in the system temp dir, never in the workspace. Find it with exec {"command": "printf %s \"$TMPDIR\""} (macOS/Linux; Windows: $env:TEMP) and create a subdir there. Never create scratch files or dot-directories (e.g. .foo/) inside the repo; keeping \`git status\` clean is your responsibility.
+- read/list/write/view_image accept workspace-relative paths or absolute paths under the system temp dir; every other absolute path is refused. Use write for scratch content (exec can create it too, but heredocs/multi-line commands are rejected, so only a single-line redirect works there).
+- Already granted exceptions: read_upload (files the user attached to this session), sessions/read_session (past chats), and the system temp dir for scratch.
 - If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
 - Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
 - Commands run in ONE persistent shell per workspace: cwd, exported variables, and activated environments (venv/conda/nvm) carry over between exec calls. Do not re-cd or re-activate on every call.
@@ -77,7 +79,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "list",
-      description: "List a workspace-relative directory (default '.').",
+      description: "List a workspace-relative directory (default '.') or an absolute directory under the system temp dir.",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "relative dir, default '.'" } }
@@ -88,7 +90,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "read",
-      description: "Read a workspace-relative text file. Large files: pass offset (1-based line) and limit (line count) to page through them; the default read caps at 64KB.",
+      description: "Read a workspace-relative text file (or an absolute path under the system temp dir). Large files: pass offset (1-based line) and limit (line count) to page through them; the default read caps at 64KB.",
       parameters: {
         type: "object",
         required: ["path"],
@@ -104,7 +106,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "view_image",
-      description: "View a workspace image file (png/jpg/webp/gif, 10MB cap). The picture is fed to you as vision input — use when the user mentions an image in the workspace or `list` shows an image file. Describe what you see afterwards.",
+      description: "View an image file in the workspace (or under the system temp dir) — png/jpg/webp/gif, 10MB cap. The picture is fed to you as vision input — use when the user mentions an image in the workspace or `list` shows an image file. Describe what you see afterwards.",
       parameters: {
         type: "object",
         required: ["path"],
@@ -131,7 +133,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "write",
-      description: "Create/overwrite a workspace-relative file with full new text. Read first before overwriting.",
+      description: "Create/overwrite a workspace-relative file (or an absolute path under the system temp dir) with full new text. Read first before overwriting. Use the temp dir for scratch, never the repo.",
       parameters: {
         type: "object",
         required: ["path", "content"],
@@ -146,7 +148,7 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run ONE command line in the workspace's persistent shell (cwd, env vars and activated environments persist between calls). Windows uses PowerShell, macOS/Linux use POSIX sh. Multi-line commands/heredocs are rejected — use write for file content, then run the file. Waits up to timeout_ms; if the command is still running, use exec_status to poll, exec_input to answer a prompt, or exec_kill to interrupt. Never access paths outside the workspace without asking first or scan from filesystem/home roots. Pass background:true for slow commands (tests, builds) that should run detached.",
+      description: "Run ONE command line in the workspace's persistent shell (cwd, env vars and activated environments persist between calls). Windows uses PowerShell, macOS/Linux use POSIX sh. Multi-line commands/heredocs are rejected — use write for file content, then run the file. Waits up to timeout_ms; if the command is still running, use exec_status to poll, exec_input to answer a prompt, or exec_kill to interrupt. Never touch anything outside the workspace except scratch under the system temp dir; never scan from filesystem/home roots. Pass background:true for slow commands (tests, builds) that should run detached.",
       parameters: {
         type: "object",
         required: ["command"],

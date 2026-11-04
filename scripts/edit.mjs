@@ -2,6 +2,8 @@
 // Exact-anchor patcher for files too large to rewrite whole.
 //
 //   node scripts/edit.mjs <edits.json> [--check] [--diff] [--backup]
+//   node scripts/edit.mjs --edits-json '<json>' [...]
+//   printf '%s' '<json>' | node scripts/edit.mjs - [...]
 //
 // edits.json:
 //   { "file": "src/lib/ChatApp.svelte",
@@ -38,25 +40,56 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
-const argv = process.argv.slice(2);
-const flags = new Set(argv.filter((a) => a.startsWith("--")));
-const positional = argv.filter((a) => !a.startsWith("--"));
-
 const die = (msg) => {
   console.error(`edit: ${msg}`);
   process.exit(1);
 };
 
-if (positional.length !== 1) {
-  die("usage: node scripts/edit.mjs <edits.json> [--check] [--diff] [--backup]");
+// One spec source: a file path, `--edits-json '<json>'`, or `-` (stdin).
+// Inline/stdin specs avoid routing multi-line JSON through exec/heredocs.
+const argv = process.argv.slice(2);
+const flags = new Set();
+const positional = [];
+let inlineSpec = null;
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--edits-json") {
+    inlineSpec = argv[++i];
+    if (inlineSpec == null) die("--edits-json needs a JSON value");
+  } else if (a.startsWith("--edits-json=")) {
+    inlineSpec = a.slice("--edits-json=".length);
+  } else if (a.startsWith("--")) {
+    flags.add(a);
+  } else {
+    positional.push(a);
+  }
+}
+if (inlineSpec != null && positional.length > 0) {
+  die("pass either <edits.json> or --edits-json, not both");
+}
+if (inlineSpec == null && positional.length !== 1) {
+  die("usage: node scripts/edit.mjs <edits.json>|--edits-json '<json>'|'-' [--check|--diff|--backup]");
 }
 
-const specPath = resolve(positional[0]);
-if (!existsSync(specPath)) die(`no such spec file: ${relative(process.cwd(), specPath)}`);
+let specPath = null;
+let rawSpec;
+if (inlineSpec != null) {
+  rawSpec = inlineSpec;
+} else if (positional[0] === "-") {
+  try {
+    rawSpec = readFileSync(0, "utf8");
+  } catch (e) {
+    die(`cannot read stdin: ${e.message}`);
+  }
+} else {
+  specPath = resolve(positional[0]);
+  if (!existsSync(specPath)) die(`no such spec file: ${relative(process.cwd(), specPath)}`);
+  rawSpec = readFileSync(specPath, "utf8");
+}
 
 let spec;
 try {
-  spec = JSON.parse(readFileSync(specPath, "utf8"));
+  spec = JSON.parse(rawSpec);
 } catch (e) {
   die(`spec is not valid JSON: ${e.message}`);
 }
@@ -72,7 +105,7 @@ if (!Array.isArray(spec.edits) || spec.edits.length === 0) {
 // spec file too, so `cd fixtures && node ../../scripts/edit.mjs spec.json`
 // does not silently break every spec.
 const fromCwd = resolve(spec.file);
-const fromSpecDir = resolve(dirname(specPath), spec.file);
+const fromSpecDir = resolve(specPath ? dirname(specPath) : process.cwd(), spec.file);
 const target = existsSync(fromCwd) ? fromCwd : existsSync(fromSpecDir) ? fromSpecDir : null;
 if (!target) {
   die(
