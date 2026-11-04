@@ -4946,6 +4946,20 @@ async fn browser_mcp_command(app: AppHandle) -> Result<Vec<String>, String> {
     browser::browser_mcp_command(dir.as_deref())
 }
 
+/// Window/tray title of the running shell. `tauri dev` builds with
+/// `debug_assertions`, and so does a local `cargo build`, so debug builds are
+/// labelled "Vicuna (Dev)": on macOS a dev window is otherwise
+/// indistinguishable from the installed Vicuna.App. The frontend `<title>` in
+/// `app.html` stays plain "Vicuna" on purpose — `scripts/desktop-dev.sh`
+/// probes for it to tell our own dev server from a foreign :1420 occupant.
+pub fn app_title() -> &'static str {
+    if cfg!(debug_assertions) {
+        "Vicuna (Dev)"
+    } else {
+        "Vicuna"
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5042,6 +5056,12 @@ pub fn run() {
             work_agent::work_agent_answer
         ])
         .setup(|app| {
+            // Debug builds say so in the window title (`npm run desktop:dev`
+            // → `tauri dev`), so a dev window can't be mistaken for the
+            // installed Vicuna.App on the Mac. Release builds keep "Vicuna".
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_title(app_title());
+            }
             // System tray: closing the window hides here (streams keep
             // running); only Quit exits. The menu opens on either click;
             // Show reopens the window.
@@ -5049,7 +5069,7 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon().cloned() {
                 TrayIconBuilder::with_id("main")
                     .icon(icon)
-                    .tooltip("Vicuna")
+                    .tooltip(app_title())
                     .menu(&menu)
                     .show_menu_on_left_click(true)
                     .on_menu_event(|app, event| match event.id.as_ref() {
@@ -5116,6 +5136,17 @@ mod work_tests {
         let dir = std::env::temp_dir().join(format!("vicuna-work-test-{tag}-{n}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `npm run desktop:dev` (debug build) must be distinguishable from the
+    /// installed app, and a release build must keep the plain name.
+    #[test]
+    fn dev_builds_are_titled_vicuna_dev() {
+        if cfg!(debug_assertions) {
+            assert_eq!(app_title(), "Vicuna (Dev)");
+        } else {
+            assert_eq!(app_title(), "Vicuna");
+        }
     }
 
     #[test]
