@@ -1144,9 +1144,10 @@
     const kind = isWorkRunning(id) ? "Working" : "Streaming";
     return `${kind} · ${formatLiveElapsed(ms)}`;
   }
-  // advance the live clock while a turn runs so elapsed tooltips stay current
+  // advance the live clock while a turn runs (or a browser start is in
+  // flight) so elapsed tooltips/labels stay current
   $effect(() => {
-    if (!streaming && !workRunning) return;
+    if (!streaming && !workRunning && !browserStarting) return;
     const t = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -2140,9 +2141,67 @@
     renamingId = null;
     ctxMenu = {
       chatId: id,
-      x: Math.min(e.clientX, window.innerWidth - 170),
-      y: Math.min(e.clientY, window.innerHeight - 120)
+      x: Math.min(e.clientX, window.innerWidth - 280),
+      y: Math.min(e.clientY, window.innerHeight - 160)
     };
+  }
+
+  /** Folder pill inside the session menu ("Continue in Work" row): change
+   *  the last-used work folder before forking. Desktop keeps the menu open
+   *  (native dialog is OS-modal) so Continue is one more click; plain
+   *  browsers have no folder dialog, so an inline path form opens inside
+   *  the menu instead — the pick persists to defaultWorkspace. */
+  async function pickContinueWorkspace(e?: MouseEvent) {
+    e?.stopPropagation();
+    e?.preventDefault();
+    if (!isTauriRuntime()) {
+      workspaceDraft = (defaultWorkspace || pendingWorkspace).trim();
+      workspaceError = null;
+      workspacePickerOpen = true;
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const hint = (defaultWorkspace || pendingWorkspace).trim();
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: hint && !(isWindows && hint === "/") ? hint : undefined
+      });
+      if (typeof picked !== "string" || !picked) return; // cancelled — menu stays open
+      pendingWorkspace = picked;
+      workspaceError = await validateWorkspace(picked);
+      if (!workspaceError) {
+        defaultWorkspace = picked;
+        persistPrefs();
+      } else {
+        error = workspaceError;
+      }
+    } catch (err: any) {
+      error = typeof err === "string" ? err : (err?.message ?? String(err));
+    }
+  }
+
+  /** Browser equivalent of the session-menu folder dialog: validates the
+   *  typed path and makes it the work folder for "Continue in Work". Never
+   *  touches the active session's own workspace (the menu may target any
+   *  chat in the sidebar). */
+  async function commitContinueWorkspace() {
+    const picked = workspaceDraft.trim();
+    if (!picked) {
+      workspacePickerOpen = false;
+      return;
+    }
+    const err = await validateWorkspace(picked);
+    if (err) {
+      workspaceError = err;
+      return;
+    }
+    workspaceError = null;
+    pendingWorkspace = picked;
+    defaultWorkspace = picked;
+    persistPrefs();
+    workspacePickerOpen = false;
   }
 
   function copySessionLink(id: string) {
@@ -4379,6 +4438,9 @@
   let browserError = $state<string | null>(null);
   /** starting-view label: plain starts vs button restarts/takeovers. */
   let browserStartLabel = $state("Starting browser…");
+  /** wall-clock start of the in-flight start drive: the starting view shows
+   *  elapsed seconds so a slow Windows first launch never reads as frozen. */
+  let browserStartedAt = $state<number | null>(null);
   /** iframe key: bumped whenever the daemon behind a live frame is (re)started,
    *  so the frame re-navigates instead of sitting on a failed navigation. */
   let browserFrameRev = $state(0);
@@ -4406,22 +4468,69 @@
   }
   /** one-time CloakBrowser fetch with an honest label (backend start
    *  ensures internally too — this pre-warm exists so a minutes-long first
-   *  download doesn't sit under "Starting browser…" looking stuck). */
+   *  download doesn't sit under "Starting browser…" looking stuck).
+   *  Best-effort: a failed/blocked download must not abort the start, since
+   *  the backend falls back to an installed system Chromium. */
   async function prewarmBrowserEngine() {
     browserStartLabel = "Downloading browser engine (one-time setup)…";
-    await browserEnsureEngine();
+    try {
+      await browserEnsureEngine();
+    } catch {
+      /* fall through: the start path falls back to a system Chromium */
+    }
   }
+
+  /** Seconds the start drive has been running (0 while idle). */
+  const browserStartSeconds = $derived.by(() => {
+    if (!browserStarting || browserStartedAt == null) return 0;
+    return Math.max(0, Math.floor((now - browserStartedAt) / 1000));
+  });
+  /** Starting label + elapsed tick ("Starting browser… (12s)"). */
+  const browserStartDisplay = $derived.by(() => {
+    return browserStartSeconds >= 3
+      ? `${browserStartLabel} (${browserStartSeconds}s)`
+      : browserStartLabel;
+  });
+
+  /** Reject `p` after `ms` so a blocked backend call can never leave the tab
+   *  spinning forever (Windows antivirus/SmartScreen can stall a first launch
+   *  far past every backend timeout). The backend attempt keeps running and a
+   *  later poll adopts the daemon if it did come up. */
+  function withBrowserTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), ms);
+      p.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      );
+    });
+  }
+
+  const BROWSER_START_TIMEOUT_MS = 4 * 60 * 1000;
+  const BROWSER_START_TIMEOUT_MESSAGE =
+    "The browser engine did not respond within 4 minutes. On Windows this is usually antivirus blocking the engine binary — click Retry, or set VICUNA_BROWSER_CHROME to a Chrome/Edge path and relaunch Vicuna.";
 
   async function driveBrowserDaemon(): Promise<BrowserStatus> {
     browserStartLabel = "Starting browser…";
     browserStarting = true;
+    browserStartedAt = Date.now();
     browserError = null;
     try {
       let st = await browserStatus();
       if (!st.running) {
         await prewarmBrowserEngine();
         browserStartLabel = "Starting browser…";
-        st = await browserStart();
+        st = await withBrowserTimeout(
+          browserStart(),
+          BROWSER_START_TIMEOUT_MS,
+          BROWSER_START_TIMEOUT_MESSAGE
+        );
       }
       browserDaemon = st;
       if (!browserMcpArgv && st.bin) {
@@ -4458,6 +4567,7 @@
       throw e;
     } finally {
       browserStarting = false;
+      browserStartedAt = null;
     }
   }
 
@@ -4469,17 +4579,23 @@
     browserStartLabel = "Restarting browser…";
     browserDaemon = null;
     browserStarting = true;
+    browserStartedAt = Date.now();
     browserError = null;
     try {
       await prewarmBrowserEngine();
       browserStartLabel = "Restarting browser…";
-      browserDaemon = await browserRestart();
+      browserDaemon = await withBrowserTimeout(
+        browserRestart(),
+        BROWSER_START_TIMEOUT_MS,
+        BROWSER_START_TIMEOUT_MESSAGE
+      );
       browserFrameRev += 1;
     } catch (e: any) {
       browserError = e?.message ?? String(e);
       browserDaemon = null;
     } finally {
       browserStarting = false;
+      browserStartedAt = null;
     }
   }
 
@@ -4516,10 +4632,15 @@
       browserStartLabel = "Restarting browser…";
       browserDaemon = null;
       browserStarting = true;
+      browserStartedAt = Date.now();
       try {
         await prewarmBrowserEngine();
         browserStartLabel = "Restarting browser…";
-        browserDaemon = await browserRestart();
+        browserDaemon = await withBrowserTimeout(
+          browserRestart(),
+          BROWSER_START_TIMEOUT_MS,
+          BROWSER_START_TIMEOUT_MESSAGE
+        );
         browserError = null;
         browserFrameRev += 1;
       } catch (e: any) {
@@ -4528,6 +4649,7 @@
         browserDaemon = await browserStatus().catch(() => null);
       } finally {
         browserStarting = false;
+        browserStartedAt = null;
       }
       return;
     }
@@ -4551,12 +4673,17 @@
     browserStartLabel = "Taking over browser…";
     browserDaemon = null;
     browserStarting = true;
+    browserStartedAt = Date.now();
     try {
       // pre-warm BEFORE the kill: a failed download must not cost their tabs
       // (backend takeover ensures pre-kill too — this is the honest label)
       await prewarmBrowserEngine();
       browserStartLabel = "Taking over browser…";
-      browserDaemon = await browserTakeover();
+      browserDaemon = await withBrowserTimeout(
+        browserTakeover(),
+        BROWSER_START_TIMEOUT_MS,
+        BROWSER_START_TIMEOUT_MESSAGE
+      );
       browserError = null;
       browserFrameRev += 1;
     } catch (e: any) {
@@ -4564,6 +4691,7 @@
       browserDaemon = await browserStatus().catch(() => null);
     } finally {
       browserStarting = false;
+      browserStartedAt = null;
     }
   }
 
@@ -5879,6 +6007,7 @@
     // never aborts anything (the source keeps running in the background)
     if (!src || isSessionBusy(id)) return;
     ctxMenu = null;
+    workspacePickerOpen = false;
     const ws = defaultWorkspace || pendingWorkspace || "";
     const seedContext: ChatMsg[] = [
       ...compactedHistory(src.messages.slice(-20)),
@@ -6395,10 +6524,14 @@
           class="ctx-backdrop"
           data-testid="session-menu-backdrop"
           aria-label="Close menu"
-          onclick={() => (ctxMenu = null)}
+          onclick={() => {
+            ctxMenu = null;
+            workspacePickerOpen = false;
+          }}
           oncontextmenu={(e) => {
             e.preventDefault();
             ctxMenu = null;
+            workspacePickerOpen = false;
           }}
           tabindex="-1"
         ></button>
@@ -6409,7 +6542,47 @@
         >
           <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
           <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
-          <button class="ctx-item" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
+          <div class="ctx-continue-row">
+            <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
+            <button
+              class="ctx-ws-pill"
+              data-testid="continue-work-workspace"
+              title={defaultWorkspace ? `Work folder: ${displayWorkspace(defaultWorkspace)} — click to change` : "Pick a work folder"}
+              aria-label="Change work folder"
+              onclick={(e) => void pickContinueWorkspace(e)}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span class="ctx-ws-name">{workspaceBase(defaultWorkspace || pendingWorkspace) || "Folder"}</span>
+            </button>
+          </div>
+          {#if workspacePickerOpen && !isTauriRuntime()}
+            <form
+              class="ctx-ws-form"
+              data-testid="continue-work-workspace-form"
+              onsubmit={(e) => {
+                e.preventDefault();
+                void commitContinueWorkspace();
+              }}
+            >
+              <input
+                class="pull-input"
+                data-testid="continue-work-workspace-input"
+                placeholder={isWindows ? "C:\\path\\to\\workspace" : "/absolute/path/to/workspace"}
+                bind:value={workspaceDraft}
+                spellcheck={false}
+                onkeydown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    workspacePickerOpen = false;
+                  }
+                }}
+              />
+              {#if workspaceError}
+                <div class="goto-error" data-testid="continue-work-workspace-error">{workspaceError}</div>
+              {/if}
+            </form>
+          {/if}
           <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
         </div>
       {/if}
@@ -6995,7 +7168,7 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
               <span class="model-name">{wsName || "Workspace"}</span>
             </button>
-            {#if workspacePickerOpen && !isTauriRuntime()}
+            {#if workspacePickerOpen && !isTauriRuntime() && !ctxMenu}
               <span class="model-pill-wrap">
                 <button class="model-backdrop" data-testid="workspace-picker-backdrop" aria-label="Close workspace picker" onclick={dismissWorkspacePicker} tabindex="-1"></button>
                 <form
@@ -7808,6 +7981,15 @@
                   <span>{browserDaemon.warning ?? "Browser engine is outdated."}</span>
                   <button class="mini-btn" data-testid="browser-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
                 </div>
+              {:else if browserDaemon.warning}
+                <!-- engine fallback (CloakBrowser unavailable → system Chromium):
+                     running is correct, but say which engine and how to retry -->
+                <div class="browser-stale" data-testid="browser-warning" role="status">
+                  <span>{browserDaemon.warning}</span>
+                  {#if browserDaemon.owned}
+                    <button class="mini-btn" data-testid="browser-fallback-retry" onclick={() => void restartBrowserDaemon()}>Retry built-in engine</button>
+                  {/if}
+                </div>
               {/if}
               <!-- allow-same-origin is load-bearing: without it the frame
                    gets an opaque origin, lb's UI throws on localStorage at
@@ -7825,7 +8007,15 @@
               {/key}
               {/if}
             {:else if browserStarting}
-              <div class="exp-empty">{browserStartLabel}</div>
+              <div class="exp-empty" data-testid="browser-starting">
+                <div>{browserStartDisplay}</div>
+                {#if browserStartSeconds >= 20}
+                  <div class="browser-start-hint">
+                    First launch can take a minute while antivirus scans the engine. If this never finishes, the start
+                    path falls back to an installed Chrome/Edge automatically — retry from the restart button above.
+                  </div>
+                {/if}
+              </div>
             {:else if browserError}
               <div class="exp-empty browser-error" data-testid="browser-error">
                 <span>{browserError}</span>
@@ -8562,6 +8752,13 @@
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
+  .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
+  .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
+  .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  .ctx-ws-pill:hover { background: var(--hover-3); color: var(--text); border-color: var(--border-3); }
+  .ctx-ws-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ctx-ws-form { display: flex; flex-direction: column; gap: 6px; padding: 4px 8px 6px 8px; }
+  .ctx-ws-form .pull-input { width: 100%; box-sizing: border-box; }
   .confirm-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 50; }
   .confirm-card { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); z-index: 51; background: var(--card); border-radius: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.18); padding: 26px 26px 22px 26px; width: 340px; max-width: calc(100vw - 48px); box-sizing: border-box; }
   .modal-x { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border: none; background: transparent; border-radius: 50%; cursor: pointer; color: var(--icon-dim); font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center; }
@@ -8941,6 +9138,7 @@
   .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: #fff; }
   .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
   .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .browser-start-hint { margin-top: 8px; font-size: 12px; line-height: 1.45; color: var(--muted); opacity: 0.85; }
   @keyframes browser-restart-spin { to { transform: rotate(360deg); } }
   .browser-restarting svg { animation: browser-restart-spin 1s linear infinite; }
   .browser-kill-armed { color: var(--danger); }
