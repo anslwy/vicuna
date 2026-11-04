@@ -74,6 +74,11 @@ pub struct BrowserState {
     /// fast-path skips the `--version` re-probe while it matches, so the
     /// 3s tab poll doesn't spawn a process every tick.
     spawned_id: Mutex<Option<(u64, u64)>>,
+    /// Set when the owned daemon is running on a system Chromium because the
+    /// CloakBrowser engine was unavailable (failed/slow download, blocked
+    /// first launch). Surfaced as the status warning so the tab explains the
+    /// fallback instead of silently looking normal.
+    fallback: Mutex<Option<String>>,
 }
 
 fn remember_bin(state: &BrowserState, bin: &Path) {
@@ -247,6 +252,124 @@ pub fn find_cloak_in(cache: &Path) -> Option<PathBuf> {
 
 pub fn find_cloak_browser() -> Option<PathBuf> {
     cloak_cache_dir().and_then(|c| find_cloak_in(&c))
+}
+
+/// Chromium-family binaries that ship with the machine, in preference order.
+/// Vicuna still launches CloakBrowser first; these exist only as a launch
+/// fallback. Windows also lists Edge — it is Chromium, present on every
+/// Windows 10/11 box, and immune to the unsigned-binary stalls that make a
+/// first CloakBrowser launch hang behind SmartScreen/Defender scans.
+pub fn system_chrome_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            dirs.push(PathBuf::from(pf));
+        }
+        // The env var name literally contains parentheses.
+        if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
+            dirs.push(PathBuf::from(pf86));
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local));
+        }
+        for base in &dirs {
+            out.push(base.join("Google").join("Chrome").join("Application").join("chrome.exe"));
+        }
+        for base in &dirs {
+            out.push(base.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots: Vec<PathBuf> = vec![PathBuf::from("/Applications")];
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        for root in &roots {
+            out.push(root.join("Google Chrome.app").join("Contents").join("MacOS").join("Google Chrome"));
+            out.push(root.join("Chromium.app").join("Contents").join("MacOS").join("Chromium"));
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        for p in [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+        ] {
+            out.push(PathBuf::from(p));
+        }
+    }
+    out
+}
+
+/// Only binaries that actually exist (a candidate list is guesses).
+pub fn existing_binaries(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    candidates.into_iter().filter(|p| p.is_file()).collect()
+}
+
+/// Explicit engine override: `VICUNA_BROWSER_CHROME=/path/to/chrome`. Skips
+/// the CloakBrowser download entirely and launches that Chromium first — the
+/// manual escape hatch for a machine where the bundled engine cannot start.
+pub fn user_chrome_override() -> Option<PathBuf> {
+    std::env::var_os("VICUNA_BROWSER_CHROME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+/// Ordered attempt list for `--chrome`: CloakBrowser first, then each installed
+/// system Chromium. Pure so the ordering is testable without a daemon.
+pub fn start_attempts(engine: Option<&Path>, system: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(e) = engine {
+        out.push(e.display().to_string());
+    }
+    for p in system {
+        let s = p.display().to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Is this a CloakBrowser engine path (lb derives its profile kind from the
+/// same heuristic: `cloak` → a `-cloak` profile sibling).
+pub fn is_cloak_engine(path: &str) -> bool {
+    path.contains(".cloakbrowser") || path.contains("cloak")
+}
+
+/// Human label for a browser binary in fallback messages.
+pub fn engine_label(path: &str) -> &'static str {
+    if is_cloak_engine(path) {
+        "CloakBrowser"
+    } else if path.to_ascii_lowercase().contains("msedge") {
+        "Microsoft Edge"
+    } else if path.to_ascii_lowercase().contains("chromium") {
+        "Chromium"
+    } else {
+        "Google Chrome"
+    }
+}
+
+/// Warning shown in the tab when the owned daemon runs on a system Chromium.
+pub fn fallback_warning(engine: &str, engine_error: Option<&str>) -> String {
+    let why = engine_error
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let short: String = e.chars().take(200).collect();
+            format!(" (built-in engine failed: {short})")
+        })
+        .unwrap_or_default();
+    format!(
+        "Running on {} instead of Vicuna's built-in CloakBrowser engine{why} — use this tab's restart button to retry the built-in engine once it can launch.",
+        engine_label(engine)
+    )
 }
 
 /// lb's cache base, mirrored (`%LOCALAPPDATA%` / `~/Library/Caches` /
@@ -436,13 +559,18 @@ pub struct EngineInfo {
 }
 
 /// Ensure the CloakBrowser engine exists, downloading it (one-time) when
-/// the cache is empty. Vicuna is cloak-only: system Chrome is never
-/// launched (real profiles, picker settings, and running-instance joins
-/// caused all the Windows trouble), so a failed download is a hard error,
-/// not a fallback trigger. Idempotent — warm cache returns instantly.
+/// the cache is empty. CloakBrowser is the preferred engine; when it cannot
+/// be fetched or launched, `browser_start_logic` falls back to an installed
+/// system Chromium with an explicit `--chrome` + private `--profile` (so the
+/// original real-profile / running-instance-join trouble can't return).
+/// `VICUNA_BROWSER_CHROME` short-circuits this entirely. Idempotent — a
+/// warm cache returns instantly.
 pub async fn browser_ensure_engine_logic(
     resource_dir: Option<PathBuf>,
 ) -> Result<EngineInfo, String> {
+    if let Some(hit) = user_chrome_override() {
+        return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+    }
     let (bin, _) = resource_dir
         .as_deref()
         .and_then(|r| resolve_lb_bin(Some(r)))
@@ -591,6 +719,13 @@ pub async fn browser_status_logic(
             }
         }
     }
+    // Engine skew outranks the fallback note (it needs a restart); the
+    // fallback note only makes sense for our own daemon.
+    let fallback_warning = if owned {
+        state.fallback.lock().ok().and_then(|g| g.clone())
+    } else {
+        None
+    };
     let base = BrowserStatus {
         running: false,
         owned,
@@ -599,7 +734,7 @@ pub async fn browser_status_logic(
         bin: resolved.as_ref().map(|(p, _)| p.display().to_string()),
         source: resolved.as_ref().map(|(_, s)| s.as_str().to_string()),
         health: None,
-        warning: stale_warning,
+        warning: stale_warning.or(fallback_warning),
     };
     match probe_daemon(&client).await {
         Probe::Free => Ok(base),
@@ -641,16 +776,51 @@ pub async fn browser_start_logic(
     if source == LbSource::Bundled {
         ensure_exec_bit(&bin);
     }
-    // Cloak-only: ensure the engine (downloads on first run), then
-    // launch with it explicit. There is deliberately no plain attempt —
-    // system Chrome is never used (real profiles, picker settings, and
-    // running-instance joins caused all the Windows trouble).
-    let engine = browser_ensure_engine_logic(resource_dir.clone()).await?;
-    let attempts: Vec<Vec<String>> =
-        vec![vec!["--chrome".to_string(), engine.path.clone()]];
+    // CloakBrowser first (Vicuna's default engine; downloaded on first run),
+    // then any installed system Chromium. The fallback exists because a
+    // Windows first launch of the unsigned CloakBrowser binary can stall for
+    // minutes behind SmartScreen/Defender — the tab used to sit at
+    // "Starting browser…" with no recourse. An explicit `--chrome` plus our
+    // private `--profile` keeps lb from auto-detecting, joining a running
+    // instance, or touching a real profile (the original cloak-only reason).
+    let mut engine_error: Option<String> = None;
+    let override_chrome = user_chrome_override();
+    // An explicit override means "use this Chromium", not "download one
+    // first": skip the engine fetch so a blocked download can't delay it.
+    let engine = if override_chrome.is_some() {
+        None
+    } else {
+        match browser_ensure_engine_logic(resource_dir.clone()).await {
+            Ok(info) => Some(PathBuf::from(info.path)),
+            Err(e) => {
+                engine_error = Some(e);
+                None
+            }
+        }
+    };
+    let mut system: Vec<PathBuf> = override_chrome.clone().into_iter().collect();
+    system.extend(existing_binaries(system_chrome_candidates()));
+    let attempts = start_attempts(engine.as_deref(), &system);
+    if attempts.is_empty() {
+        return Err(format!(
+            "no browser engine could be used: {} — install Google Chrome/Edge, or retry the built-in CloakBrowser download",
+            engine_error.unwrap_or_else(|| "no CloakBrowser engine".to_string())
+        ));
+    }
+    // Reap orphaned Chromium left on OUR private profile by a crash / hard
+    // kill / app reinstall: their daemon is gone but they still hold the
+    // profile SingletonLock, so the next launch dies instantly (hit live;
+    // reproduced as `Failed to create .../profile-vicuna-cloak/SingletonLock`).
+    // The port is free here (we adopted above otherwise), and `stop` is scoped
+    // to the pidfile + our profile dirs. A live pidfile is left alone: `stop`
+    // would TERM that PID, which may have been recycled by an unrelated app.
+    if !daemon_pidfile_alive_at(&daemon_pidfile_path()) {
+        graceful_stop(&bin).await;
+    }
     let mut last_err = String::from("no attempt ran");
-    for extra in &attempts {
-        match spawn_attempt(&bin, source, extra, &client).await {
+    for target in &attempts {
+        let extra = vec!["--chrome".to_string(), target.clone()];
+        match spawn_attempt(&bin, source, &extra, &client).await {
             Ok(child) => {
                 state
                     .child
@@ -666,6 +836,14 @@ pub async fn browser_start_logic(
                 if let Ok(mut g) = state.spawned_id.lock() {
                     *g = id;
                 }
+                if let Ok(mut g) = state.fallback.lock() {
+                    let explicit = override_chrome.as_deref() == Some(Path::new(target.as_str()));
+                    *g = if is_cloak_engine(target) || explicit {
+                        None
+                    } else {
+                        Some(fallback_warning(target, engine_error.as_deref()))
+                    };
+                }
                 return browser_status_logic(resource_dir, state).await;
             }
             Err(e) => {
@@ -678,29 +856,126 @@ pub async fn browser_start_logic(
             }
         }
     }
+    let tried: Vec<String> = attempts
+        .iter()
+        .map(|a| {
+            if is_cloak_engine(a) {
+                return "CloakBrowser".to_string();
+            }
+            Path::new(a)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| a.clone())
+        })
+        .collect();
     Err(format!(
-        "`lb web` failed to start ({last_err}). The CloakBrowser engine is installed but wouldn't launch — retry, or run `lb web --port {}` in a terminal for details",
+        "`lb web` failed to start ({last_err}). Tried: {}. Install Chrome/Edge, or run `lb web --port {}` in a terminal for details",
+        tried.join(", "),
         lb_port()
     ))
+}
+
+/// Where our foreground daemon's own stdout/stderr go. Matches lb's detached
+/// log naming so `lb web --port P stop` and plain `lb` tooling stay coherent,
+/// and so a Windows launch stall leaves a tail we can quote in the error
+/// (without a console window, there is no other way to see it).
+pub fn daemon_log_path() -> PathBuf {
+    lb_cache_base()
+        .join("live-browser")
+        .join(format!("daemon-{}.log", lb_port()))
+}
+
+/// Strip ANSI SGR/CSI escapes (lb's tracing writes colors even to a file).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // CSI: params/intermediates end at a byte in @..~
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: ends at BEL or ESC \
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Last `lines` non-empty lines of the daemon log (bounded; "" when absent).
+pub fn log_tail(path: &Path, lines: usize) -> String {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let clean = strip_ansi(&text);
+    let all: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = all.len().saturating_sub(lines);
+    let tail = all[start..].join("\n");
+    tail.chars().take(1200).collect()
 }
 
 /// One `lb web --port P --foreground` spawn; resolves with the live child
 /// once /api/health serves lb. A timing-out child is killed AND reaped
 /// (`stop`'s stale-pidfile path) so its half-launched Chromium can't wedge
 /// the next attempt with a SingletonLock.
+///
+/// Readiness waits up to `READY_TIMEOUT`: the daemon allows Chrome 60s to
+/// come up, and a Windows first launch of the unsigned CloakBrowser binary
+/// adds an antivirus scan on top — the old 20s window reported a healthy
+/// engine as broken.
 async fn spawn_attempt(
     bin: &Path,
     source: LbSource,
     extra: &[String],
     client: &reqwest::Client,
 ) -> Result<Child, String> {
+    const READY_TIMEOUT: Duration = Duration::from_secs(90);
+    let log_path = daemon_log_path();
+    if let Some(dir) = log_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Append (not truncate): a prior attempt's tail stays available when the
+    // fallback also fails.
+    let log_out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    let log_err = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
     let mut cmd = Command::new(bin);
     cmd.args(["web", "--port", &lb_port().to_string(), "--foreground"])
         .args(["--profile", &vicuna_profile_dir().display().to_string()])
         .args(extra)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(log_out)
+        .stderr(log_err);
     // the bundled binary finds its web UI via its cwd fast-path
     // (`lb-sidecar/web/dist` ships next to it)
     if source == LbSource::Bundled {
@@ -711,14 +986,15 @@ async fn spawn_attempt(
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
     let mut child = cmd.spawn().map_err(|e| format!("could not spawn: {e}"))?;
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if matches!(probe_daemon(client).await, Probe::Lb(_)) {
             return Ok(child);
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Err(format!("exited ({status})"));
+                return Err(with_log_tail(format!("exited ({status})"), &log_path));
             }
             Ok(None) => {}
             Err(e) => {
@@ -729,7 +1005,22 @@ async fn spawn_attempt(
     }
     let _ = child.kill();
     graceful_stop(bin).await;
-    Err("did not become ready in time".to_string())
+    Err(with_log_tail(
+        format!(
+            "engine did not become ready within {}s",
+            READY_TIMEOUT.as_secs()
+        ),
+        &log_path,
+    ))
+}
+
+/// Append the daemon log tail to a failure message (best-effort).
+fn with_log_tail(msg: String, log_path: &Path) -> String {
+    let tail = log_tail(log_path, 8);
+    if tail.is_empty() {
+        return msg;
+    }
+    format!("{msg} — daemon log: {tail}")
 }
 
 /// Graceful `lb web --port P stop` (TERM→KILL the daemon plus reaping
@@ -737,7 +1028,12 @@ async fn spawn_attempt(
 /// the port is ours then, so `stop` can't hit a foreign daemon).
 async fn graceful_stop(bin: &Path) {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.args(["web", "--port", &lb_port().to_string(), "stop"])
+    // `--profile` matters: `stop` reaps browsers holding THAT profile. Without
+    // it lb reaps its default profile dir, leaving our private
+    // `profile-vicuna(-cloak)` Chromium alive to lock the next launch.
+    cmd.args(["web", "--port", &lb_port().to_string()])
+        .args(["--profile", &vicuna_profile_dir().display().to_string()])
+        .arg("stop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -745,6 +1041,48 @@ async fn graceful_stop(bin: &Path) {
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
     let run = cmd.output();
     let _ = tokio::time::timeout(Duration::from_secs(15), run).await;
+}
+
+/// Is `pid` a live process? Mirrors lb's own liveness probe (never signals).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd.output()
+        .map(|o| o.status.success() && o.stdout.windows(4).any(|w| w == b".exe"))
+        .unwrap_or(false)
+}
+
+/// Does the daemon pidfile for our port name a LIVE process? `stop` trusts a
+/// live pid and TERMs it, so a recycled PID (Windows recycles aggressively)
+/// must block the pre-start orphan reap rather than kill an unrelated app.
+fn daemon_pidfile_alive_at(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    pid > 0 && pid_alive(pid)
+}
+
+fn daemon_pidfile_path() -> PathBuf {
+    lb_cache_base()
+        .join("live-browser")
+        .join(format!("daemon-{}.pid", lb_port()))
 }
 
 /// Stop the daemon Vicuna itself started. Refuses adopted/foreign ones
@@ -776,6 +1114,9 @@ pub async fn browser_stop_logic(state: &BrowserState) -> Result<BrowserStatus, S
         g.take();
     }
     if let Ok(mut g) = state.spawned_id.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.fallback.lock() {
         g.take();
     }
     if let Some(bin) = owned_bin(state) {
@@ -815,7 +1156,11 @@ pub async fn browser_takeover_logic(
 ) -> Result<BrowserStatus, String> {
     // Engine first: never kill the adopted session before knowing our own
     // replacement can start (a failed download must not cost their tabs).
-    browser_ensure_engine_logic(resource_dir.clone()).await?;
+    // Best-effort: a failed CloakBrowser download now falls back to a system
+    // Chromium in `browser_start_logic`, so it must not block the takeover.
+    if let Err(e) = browser_ensure_engine_logic(resource_dir.clone()).await {
+        let _ = e;
+    }
     let client = probe_client();
     match probe_daemon(&client).await {
         Probe::Free => {}
@@ -842,6 +1187,9 @@ pub async fn browser_takeover_logic(
         g.take();
     }
     if let Ok(mut g) = state.spawned_version.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.fallback.lock() {
         g.take();
     }
     browser_start_logic(resource_dir, state).await
@@ -892,7 +1240,9 @@ pub fn browser_mcp_command(resource_dir: Option<&Path>) -> Result<Vec<String>, S
 pub fn kill_owned(state: &BrowserState) {
     if let Some(bin) = owned_bin(state) {
         let mut reap = Command::new(&bin);
-        reap.args(["web", "--port", &lb_port().to_string(), "stop"])
+        reap.args(["web", "--port", &lb_port().to_string()])
+            .args(["--profile", &vicuna_profile_dir().display().to_string()])
+            .arg("stop")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1090,5 +1440,109 @@ mod tests {
         assert_eq!(stale_engine_warning(None, Some("0.4.17")), None);
         assert_eq!(stale_engine_warning(Some("0.4.16"), None), None);
         assert_eq!(stale_engine_warning(None, None), None);
+    }
+
+    #[test]
+    fn start_attempts_put_cloak_first_then_system() {
+        let cloak = PathBuf::from("/home/u/.cloakbrowser/chromium-146/chrome");
+        let chrome = PathBuf::from("/usr/bin/google-chrome");
+        let edge = PathBuf::from("/usr/bin/microsoft-edge");
+        let a = start_attempts(Some(&cloak), &[chrome.clone(), edge.clone()]);
+        assert_eq!(
+            a,
+            vec![
+                cloak.display().to_string(),
+                chrome.display().to_string(),
+                edge.display().to_string()
+            ]
+        );
+        // no cloak (failed download): system engines only, order kept
+        let b = start_attempts(None, &[chrome.clone(), edge.clone()]);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0], chrome.display().to_string());
+        // a duplicate path is never attempted twice
+        let c = start_attempts(Some(&chrome), &[chrome.clone()]);
+        assert_eq!(c, vec![chrome.display().to_string()]);
+        // nothing at all: empty (caller errors with the engine reason)
+        assert!(start_attempts(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn existing_binaries_filters_missing_paths() {
+        let dir = std::env::temp_dir().join("vicuna-browser-candidates");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdirs");
+        let real = dir.join("chrome.exe");
+        std::fs::write(&real, "x").expect("write fake chrome");
+        let kept = existing_binaries(vec![dir.join("nope.exe"), real.clone()]);
+        assert_eq!(kept, vec![real]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine_labels_and_fallback_warning() {
+        assert_eq!(engine_label("/home/u/.cloakbrowser/chromium-146/chrome"), "CloakBrowser");
+        assert_eq!(engine_label(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), "Microsoft Edge");
+        assert_eq!(engine_label("/usr/bin/chromium"), "Chromium");
+        assert_eq!(engine_label("/usr/bin/google-chrome"), "Google Chrome");
+        assert!(is_cloak_engine("/x/.cloakbrowser/y"));
+        assert!(!is_cloak_engine("/usr/bin/google-chrome"));
+
+        let w = fallback_warning("/Program Files/Google/Chrome/Application/chrome.exe", Some("download timed out"));
+        assert!(w.contains("Google Chrome"), "{w}");
+        assert!(w.contains("download timed out"), "{w}");
+        assert!(w.contains("CloakBrowser"), "{w}");
+        // no reason still explains the fallback
+        let w2 = fallback_warning("C:\\x\\msedge.exe", None);
+        assert!(w2.contains("Microsoft Edge") && w2.contains("CloakBrowser"), "{w2}");
+        assert!(!w2.contains("failed:"), "no empty reason: {w2}");
+    }
+
+    #[test]
+    fn daemon_pidfile_liveness_parses_safely() {
+        let dir = std::env::temp_dir().join("vicuna-lb-pidfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdirs");
+        let f = dir.join("daemon-1.pid");
+        // our own live pid is trusted
+        std::fs::write(&f, format!("{}\n", std::process::id())).expect("write pid");
+        assert!(daemon_pidfile_alive_at(&f));
+        // garbage / missing / pid 0 are all "not our live daemon"
+        std::fs::write(&f, "not-a-pid").expect("write garbage");
+        assert!(!daemon_pidfile_alive_at(&f));
+        std::fs::write(&f, "0").expect("write zero");
+        assert!(!daemon_pidfile_alive_at(&f));
+        assert!(!daemon_pidfile_alive_at(&dir.join("missing.pid")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_osc() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(
+            strip_ansi("\u{1b}[2m2026-01-01\u{1b}[0m INFO done"),
+            "2026-01-01 INFO done"
+        );
+        assert_eq!(strip_ansi("a\u{1b}[38;5;196mred\u{1b}[0mb"), "aredb");
+        // OSC sequence terminated by BEL
+        assert_eq!(strip_ansi("x\u{1b}]0;title\u{7}y"), "xy");
+        // unterminated escape is swallowed, not echoed as garbage
+        assert_eq!(strip_ansi("tail\u{1b}["), "tail");
+    }
+
+    #[test]
+    fn log_tail_keeps_last_lines_and_is_bounded() {
+        let dir = std::env::temp_dir().join("vicuna-lb-logtail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdirs");
+        let f = dir.join("daemon.log");
+        let body: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        std::fs::write(&f, body.join("\n")).expect("write log");
+        let tail = log_tail(&f, 3);
+        assert!(tail.ends_with("line 19"), "{tail}");
+        assert!(tail.contains("line 17"), "{tail}");
+        assert!(!tail.contains("line 16"), "{tail}");
+        assert!(log_tail(&dir.join("missing.log"), 3).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
