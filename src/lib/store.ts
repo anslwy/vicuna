@@ -625,11 +625,14 @@ export interface Prefs {
    *  and the default Settings list (the live catalog has 400+ entries).
    *  Added/removed per row; search browses the full catalog. */
   openrouterAdded: string[];
+  /** Sidebar scope: "all", "chat", or a workspace root (see
+   *  src/lib/sidebar.ts). Persisted so the sidebar reopens how it was left. */
+  sessionFilter: string;
 }
 
 export const DEFAULT_STOP_WORDS = ["\nUser:", "\nAssistant:", "<end_of_turn>", "<|im_end|>"];
 
-export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw", openrouterApiKey: "", openrouterAdded: [] };
+export const DEFAULT_PREFS: Prefs = { theme: "light", accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw", openrouterApiKey: "", openrouterAdded: [], sessionFilter: "all" };
 const LS_PREFS = "vicuna-prefs";
 
 /** Normalize a stored workspace for the current platform: strip Rust's
@@ -661,7 +664,8 @@ export function readLocalPrefs(): Prefs {
       thinkLevel: typeof p.thinkLevel === "string" && p.thinkLevel.length > 0 ? p.thinkLevel : DEFAULT_PREFS.thinkLevel,
       continueMode: normalizeContinueMode(p.continueMode),
       openrouterApiKey: typeof p.openrouterApiKey === "string" ? p.openrouterApiKey : DEFAULT_PREFS.openrouterApiKey,
-      openrouterAdded: Array.isArray(p.openrouterAdded) ? p.openrouterAdded.filter((s): s is string => typeof s === "string") : [...DEFAULT_PREFS.openrouterAdded]
+      openrouterAdded: Array.isArray(p.openrouterAdded) ? p.openrouterAdded.filter((s): s is string => typeof s === "string") : [...DEFAULT_PREFS.openrouterAdded],
+      sessionFilter: typeof p.sessionFilter === "string" ? p.sessionFilter : DEFAULT_PREFS.sessionFilter
     };
   } catch {
     return { ...DEFAULT_PREFS, defaultWorkspace: normalizeStoredWorkspace(DEFAULT_PREFS.defaultWorkspace) };
@@ -672,7 +676,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
   const db = await Database.load(DB_PATH);
   const rows = await db.select<{ key: string; value: string }[]>(
-    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level', 'pref_continue_mode', 'pref_openrouter_key', 'pref_openrouter_added')"
+    "SELECT key, value FROM meta WHERE key IN ('pref_theme', 'pref_accent', 'pref_font_size', 'pref_sidebar', 'pref_stop_words', 'pref_ollama_base', 'pref_zoom', 'pref_default_workspace', 'pref_think_level', 'pref_continue_mode', 'pref_openrouter_key', 'pref_openrouter_added', 'pref_session_filter')"
   );
   const out: Partial<Prefs> = {};
   for (const r of rows) {
@@ -700,6 +704,7 @@ async function readSqlitePrefs(): Promise<Partial<Prefs>> {
     if (r.key === "pref_think_level" && typeof r.value === "string" && r.value.length > 0) out.thinkLevel = r.value;
     if (r.key === "pref_continue_mode") out.continueMode = normalizeContinueMode(r.value);
     if (r.key === "pref_openrouter_key" && typeof r.value === "string") out.openrouterApiKey = r.value;
+    if (r.key === "pref_session_filter" && typeof r.value === "string") out.sessionFilter = r.value;
     if (r.key === "pref_openrouter_added") {
       try {
         const arr = JSON.parse(r.value);
@@ -727,6 +732,7 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_continue_mode', $1)", [p.continueMode]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_openrouter_key', $1)", [p.openrouterApiKey ?? ""]);
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_openrouter_added', $1)", [JSON.stringify(p.openrouterAdded ?? [])]);
+  await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_session_filter', $1)", [p.sessionFilter ?? "all"]);
 }
 
 export async function loadPrefs(): Promise<Prefs> {

@@ -40,6 +40,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
+  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey } from "$lib/sidebar";
   import {
     captureViewAnchor,
     followAfterScroll,
@@ -58,7 +59,7 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[] };
+  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[], sessionFilter: "all" };
   // the chat/Work transports read the key from the openrouter module
   setOpenRouterApiKey(initialPrefs.openrouterApiKey ?? "");
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
@@ -1482,6 +1483,9 @@
    *  Added chip — the live catalog is 400+ entries. Any other chip or a
    *  search query browses the full catalog for discovery. */
   let openrouterAdded = $state<string[]>([...(initialPrefs.openrouterAdded ?? [])]);
+  /** Sidebar scope ("all", "chat", or a workspace root). Resolved against the
+   *  live folders below, so a stale value can never blank the list. */
+  let sessionFilterRaw = $state<string>(initialPrefs.sessionFilter ?? ALL_FILTER);
   const openrouterAddedSet = $derived(new Set(openrouterAdded));
   const openrouterBrowsing = $derived(openrouterCat !== "added" || openrouterQuery.trim() !== "");
   const filteredOpenRouterModels = $derived.by(() => {
@@ -1981,7 +1985,7 @@
   }
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded, sessionFilter: sessionFilterRaw });
   }
 
   function setOllamaHost(text: string) {
@@ -2571,30 +2575,38 @@
   const forkInfo = $derived(activeChat?.forkedFrom ?? null);
   const forkNoteIndex = $derived(activeChat?.forkFromIndex ?? null);
 
-  const grouped = $derived.by(() => {
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const startOfYesterday = startOfToday - 24 * 3600 * 1000;
-    const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
-    const today: Chat[] = [];
-    const yesterday: Chat[] = [];
-    const week: Chat[] = [];
-    const older: Chat[] = [];
-    // order by last user-message time, not creation: a reply to an old
-    // session brings it back to the top (and into Today)
-    const ordered = [...chats].sort((a, b) => chatActivity(b) - chatActivity(a));
-    for (const c of ordered) {
-      // empty drafts are never listed: a session appears only after the
-      // first message is sent
-      if (c.messages.length === 0) continue;
-      const t = chatActivity(c);
-      if (t >= startOfToday) today.push(c);
-      else if (t >= startOfYesterday) yesterday.push(c);
-      else if (t >= weekAgo) week.push(c);
-      else older.push(c);
+  // The sidebar is scoped by where a session lives (plain chat vs. a work
+  // workspace), so every chip offered here comes from the sessions
+  // themselves. Order by last user-message time, not creation: a reply to an
+  // old session brings it back to the top (and into Today).
+  const orderedChats = $derived([...chats].sort((a, b) => chatActivity(b) - chatActivity(a)));
+  const folderRows = $derived(folderOptions(orderedChats));
+  const sessionFilter = $derived(resolveSessionFilter(sessionFilterRaw, folderRows));
+  // full path of the chosen scope: a native <select> can only tooltip the
+  // control, not each option, so the closed state carries the path instead
+  const scopeTitle = $derived(folderRows.find((f) => f.key === sessionFilter)?.title ?? "");
+  const grouped = $derived(groupByDate(filterChats(orderedChats, sessionFilter), Date.now()));
+
+  /** Choose the sidebar scope. Picking a workspace also makes it where New
+   *  starts: the last-used work folder and the composer's pending workspace
+   *  both follow the dropdown, so a new session lands in the scope you are
+   *  looking at instead of whichever folder was used last. */
+  function setSessionFilter(key: string) {
+    sessionFilterRaw = key;
+    const ws = workspaceOfFolderKey(key);
+    if (ws !== null) {
+      defaultWorkspace = ws;
+      pendingWorkspace = ws;
+      pendingMode = "work";
+      workspaceError = null;
+      const c = activeChat;
+      if (c && c.messages.length === 0) {
+        c.mode = "work";
+        c.workspace = ws;
+      }
     }
-    return { today, yesterday, week, older };
-  });
+    persistPrefs();
+  }
 
   async function refreshModels() {
     try {
@@ -6347,6 +6359,7 @@
       openrouterKeyDraft = openrouterKey;
       setOpenRouterApiKey(openrouterKey);
       openrouterAdded = [...(prefs.openrouterAdded ?? [])];
+      sessionFilterRaw = prefs.sessionFilter ?? ALL_FILTER;
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
       chats = await loadChats();
@@ -6500,6 +6513,23 @@
         </button>
       </div>
 
+      <div class="scope-row">
+        <label class="scope-label" for="scope-select">Scope</label>
+        <select
+          id="scope-select"
+          class="scope-select"
+          data-testid="scope-select"
+          aria-label="Scope sessions"
+          title={scopeTitle || "Every session"}
+          value={sessionFilter}
+          onchange={(e) => setSessionFilter(e.currentTarget.value)}
+        >
+          {#each folderRows as f (f.key)}
+            <option value={f.key}>{f.label} · {f.count}</option>
+          {/each}
+        </select>
+      </div>
+
       <div class="history">
         {#snippet chatList(items: Chat[])}
           {#each items as c (c.id)}
@@ -6562,8 +6592,8 @@
           {@render chatList(grouped.older)}
         {/if}
         {#if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0}
-          <div class="group-label">Today</div>
-          <div class="empty-hint">No chats yet</div>
+          <div class="group-label">{sessionFilter === ALL_FILTER ? "Today" : "No matches"}</div>
+          <div class="empty-hint">{sessionFilter === ALL_FILTER ? "No chats yet" : "No sessions in this scope yet"}</div>
         {/if}
       </div>
       <div class="side-footer">
@@ -8788,6 +8818,11 @@
   .search-card .goto-error { margin: 4px 10px 6px 10px; }
   .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
   
+  .scope-row { display: flex; align-items: center; gap: 6px; margin: 0 4px 10px 4px; }
+  .scope-label { font-size: 12px; color: var(--muted); flex: none; }
+  .scope-select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 9px; font-size: 12px; font-family: inherit; line-height: 1.5; color: var(--text-dim); cursor: pointer; text-overflow: ellipsis; }
+  .scope-select:hover { background: var(--hover-2); }
+  .scope-select:focus { outline: none; border-color: var(--accent); }
   .history { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
   .group-label { font-size: 12px; color: var(--muted); margin: 12px 4px 6px 4px; }
   .chat-item { display: flex; justify-content: space-between; align-items: center; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
