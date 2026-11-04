@@ -28,7 +28,7 @@ use vicuna_lib::work_agent::{
     agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, run_loop, ChatSnapshot,
     McpRoute, TurnState, WorkAgentState, WorkAgentEvent,
 };
-use vicuna_lib::{BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
+use vicuna_lib::{AgentShellState, BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
 
 const EVENT_CAP: usize = 2000;
 const BODY_CAP: u64 = 32 * 1024 * 1024;
@@ -37,6 +37,7 @@ type EventQueues = Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>;
 
 pub struct BridgeState {
     pub bg: Arc<BgExecState>,
+    pub shell: Arc<AgentShellState>,
     pub mcp: McpManager,
     pub agent: WorkAgentState,
     // Arc so work_agent turns can hold it across the detached run_loop
@@ -50,6 +51,7 @@ impl Default for BridgeState {
     fn default() -> Self {
         Self {
             bg: Arc::new(BgExecState::default()),
+            shell: Arc::new(AgentShellState::default()),
             mcp: McpManager::default(),
             agent: WorkAgentState::default(),
             browser: Arc::new(BrowserState::default()),
@@ -132,6 +134,7 @@ async fn dispatch(
             let turn = Arc::new(TurnState::new());
             let turn_id = st.agent.next_turn(turn.clone());
             let bg = st.bg.clone();
+            let shell = st.shell.clone();
             let mcp = st.mcp.clone();
             let browser = st.browser.clone();
             let undo = st.undo.clone();
@@ -160,7 +163,7 @@ async fn dispatch(
             tokio::spawn(async move {
                 run_loop(
                     turn, model, provider, api_key, context_length, workspace, messages, think, tools, session_id,
-                    goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &mcp, &tid,
+                    goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &shell, &mcp, &tid,
                     browser_resource_dir, &browser, &undo,
                 )
                 .await;
@@ -237,6 +240,44 @@ async fn dispatch(
         "work_exec_status" => {
             let r: BgJobStatus = vicuna_lib::bg_snapshot(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
+        }
+        "work_shell_exec" => {
+            let timeout = args.get("timeoutMs").and_then(|v| v.as_u64());
+            Ok(serde_json::json!(
+                vicuna_lib::agent_shell_exec(
+                    &st.shell,
+                    s("root")?,
+                    arg_opt_str(args, "key").unwrap_or_else(|| s("root").unwrap_or_default()),
+                    s("command")?,
+                    timeout,
+                )
+                .await?
+            ))
+        }
+        "work_shell_status" => {
+            Ok(serde_json::json!(vicuna_lib::agent_shell_status(
+                &st.shell,
+                s("root")?,
+                arg_opt_str(args, "key").unwrap_or_else(|| s("root").unwrap_or_default()),
+            )
+            .await?))
+        }
+        "work_shell_input" => {
+            Ok(serde_json::json!(vicuna_lib::agent_shell_input(
+                &st.shell,
+                s("root")?,
+                arg_opt_str(args, "key").unwrap_or_else(|| s("root").unwrap_or_default()),
+                s("text")?,
+            )
+            .await?))
+        }
+        "work_shell_interrupt" => {
+            Ok(serde_json::json!(vicuna_lib::agent_shell_interrupt(
+                &st.shell,
+                s("root")?,
+                arg_opt_str(args, "key").unwrap_or_else(|| s("root").unwrap_or_default()),
+            )
+            .await?))
         }
         "work_exec_list" => {
             let l: Vec<BgJobSummary> = vicuna_lib::bg_list(&st.bg)?;

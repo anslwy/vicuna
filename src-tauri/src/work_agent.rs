@@ -27,13 +27,13 @@ use tauri::{ipc::Channel, AppHandle, Manager, State};
 use tokio::sync::oneshot;
 
 use super::{
-    bg_kill, bg_list, bg_snapshot, bg_start, parse_show_context_length,
-    undo_begin_turn, undo_capture_prev, undo_key, undo_record, undo_record_write,
-    upload_read_file_logic as upload_read_file, work_exec_logic as work_exec,
+    agent_shell_exec, agent_shell_input, agent_shell_interrupt, agent_shell_status, bg_kill,
+    bg_snapshot, bg_start, parse_show_context_length, undo_begin_turn, undo_capture_prev, undo_key,
+    undo_record, undo_record_write, upload_read_file_logic as upload_read_file,
     work_fetch_url_logic as work_fetch_url, work_grep_logic as work_grep,
     work_list_dir_logic as work_list_dir, work_read_file_logic as work_read_file,
     work_read_image_logic as work_read_image, work_write_file_logic as work_write_file,
-    BgExecState, ChatMessage, OLLAMA_BASE, UndoOp, UndoState,
+    AgentShellState, BgExecState, ChatMessage, OLLAMA_BASE, UndoOp, UndoState,
 };
 use crate::browser::{browser_mcp_command, browser_start_logic, lb_server_url, BrowserState};
 use crate::mcp::{
@@ -624,8 +624,9 @@ fn round_tps(r: &RoundResult, wall_ms: u64) -> Option<f64> {
 fn tool_label(name: &str, args: &serde_json::Value) -> String {
     let summary = match name {
         "exec" => args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-        "exec_status" => args.get("id").and_then(|v| v.as_str()).unwrap_or("(list)"),
-        "exec_kill" => args.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "exec_input" => args.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+        "exec_status" => args.get("id").and_then(|v| v.as_str()).unwrap_or("(shell)"),
+        "exec_kill" => args.get("id").and_then(|v| v.as_str()).unwrap_or("(shell)"),
         "read" | "write" | "list" | "view_image" => args.get("path").and_then(|v| v.as_str()).unwrap_or("."),
         "grep" => args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
         "sessions" => args.get("query").and_then(|v| v.as_str()).unwrap_or(""),
@@ -646,6 +647,17 @@ fn tool_label(name: &str, args: &serde_json::Value) -> String {
 
 fn str_arg(args: &serde_json::Value, key: &str) -> String {
     args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+/// One shell per (session, workspace): parallel sessions never share cwd/env,
+/// and switching the workspace inside a session gets a fresh shell.
+fn shell_key(session_id: Option<&str>, workspace: &str) -> String {
+    format!("{}::{workspace}", session_id.unwrap_or(""))
+}
+
+fn running_shell_note() -> String {
+    "[still running — poll with exec_status, answer a prompt with exec_input, or interrupt with exec_kill]"
+        .to_string()
 }
 
 fn fmt_bg(s: &super::BgJobStatus) -> String {
@@ -1344,6 +1356,7 @@ async fn dispatch_tool(
     session_id: Option<&str>,
     chats: &[ChatSnapshot],
     bg: &BgExecState,
+    shell: &AgentShellState,
     mcp: &McpManager,
     mcp_routes: &HashMap<String, McpRoute>,
     turn: &TurnState,
@@ -1458,24 +1471,31 @@ async fn dispatch_tool(
                 }
             } else {
                 let timeout = args.get("timeout_ms").and_then(|v| v.as_u64());
-                match work_exec(workspace.to_string(), cmd, timeout).await {
+                match agent_shell_exec(shell, workspace.to_string(), shell_key(session_id, workspace), cmd.clone(), timeout).await {
                     Ok(r) => {
                         let mut parts = Vec::new();
-                        if !r.stdout.trim().is_empty() {
-                            parts.push(r.stdout);
+                        if !r.output.trim().is_empty() {
+                            parts.push(r.output);
                         }
-                        if !r.stderr.trim().is_empty() {
-                            parts.push(format!("[stderr]\n{}", r.stderr));
+                        if r.truncated {
+                            parts.push("[output truncated]".to_string());
                         }
-                        parts.push(if r.timed_out {
-                            "[timed out]".to_string()
+                        if r.running {
+                            parts.push(running_shell_note());
                         } else {
-                            format!("[exit {}]", r.exit_code.unwrap_or(-1))
-                        });
+                            parts.push(format!("[exit {}]", r.exit_code.unwrap_or(-1)));
+                        }
                         parts.join("\n")
                     }
                     Err(e) => format!("Error: {e}"),
                 }
+            }
+        }
+        "exec_input" => {
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            match agent_shell_input(shell, workspace.to_string(), shell_key(session_id, workspace), text.to_string()).await {
+                Ok(out) => out,
+                Err(e) => format!("Error: {e}"),
             }
         }
         "exec_status" => {
@@ -1485,23 +1505,20 @@ async fn dispatch_tool(
                     Err(e) => format!("Error: {e}"),
                 }
             } else {
-                match bg_list(bg) {
-                    Ok(jobs) => {
-                        if jobs.is_empty() {
-                            "No background jobs.".to_string()
-                        } else {
-                            jobs.iter()
-                                .map(|j| {
-                                    format!(
-                                        "{} {} — {}",
-                                        j.id,
-                                        if j.running { "(running)" } else { "(done)" },
-                                        j.command.chars().take(120).collect::<String>()
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
+                match agent_shell_status(shell, workspace.to_string(), shell_key(session_id, workspace)).await {
+                    Ok(r) => {
+                        let mut parts = Vec::new();
+                        if !r.output.trim().is_empty() {
+                            parts.push(r.output);
                         }
+                        parts.push(if r.running {
+                            running_shell_note()
+                        } else if let Some(code) = r.exit_code {
+                            format!("[prompt ready — last exit {code}]")
+                        } else {
+                            "[prompt ready]".to_string()
+                        });
+                        parts.join("\n")
                     }
                     Err(e) => format!("Error: {e}"),
                 }
@@ -1510,11 +1527,22 @@ async fn dispatch_tool(
         "exec_kill" => {
             let id = str_arg(args, "id");
             if id.is_empty() {
-                return "Error: exec_kill needs {\"id\": \"...\"}.".to_string();
-            }
-            match bg_kill(bg, &id) {
-                Ok(s) => fmt_bg(&s),
-                Err(e) => format!("Error: {e}"),
+                match agent_shell_interrupt(shell, workspace.to_string(), shell_key(session_id, workspace)).await {
+                    Ok(r) => {
+                        let mut parts = Vec::new();
+                        if !r.output.trim().is_empty() {
+                            parts.push(r.output);
+                        }
+                        parts.push("[interrupted]".to_string());
+                        parts.join("\n")
+                    }
+                    Err(e) => format!("Error: {e}"),
+                }
+            } else {
+                match bg_kill(bg, &id) {
+                    Ok(s) => fmt_bg(&s),
+                    Err(e) => format!("Error: {e}"),
+                }
             }
         }
         "say" => {
@@ -1852,6 +1880,7 @@ pub async fn run_loop(
     mcp_routes: HashMap<String, McpRoute>,
     on_event: Channel<WorkAgentEvent>,
     bg: &BgExecState,
+    shell: &AgentShellState,
     mcp: &McpManager,
     turn_id: &str,
     browser_resource_dir: Option<PathBuf>,
@@ -2258,7 +2287,7 @@ pub async fn run_loop(
             }
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: Some(tool_label(&name, &args)) });
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::ToolStart { name: name.clone(), args: args.clone() });
-            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, mcp, &mcp_routes, &turn, turn_id, &on_event, browser_resource_dir.as_deref(), browser, undo_state, &undo_key).await;
+            let out = dispatch_tool(&name, &args, &workspace, session_id.as_deref(), &chats, bg, shell, mcp, &mcp_routes, &turn, turn_id, &on_event, browser_resource_dir.as_deref(), browser, undo_state, &undo_key).await;
             emit_ev(&on_event, &turn.stop, WorkAgentEvent::Status { label: None });
             if out == "__CANCELLED__" {
                 break;
@@ -2399,11 +2428,13 @@ pub async fn work_agent_start(
     let browser_resource_dir = app.path().resource_dir().ok();
     tokio::spawn(async move {
         let bg = app.state::<BgExecState>();
+        let shell = app.state::<AgentShellState>();
         let mcp = app.state::<McpManager>();
         let browser_state = app.state::<BrowserState>();
         let undo_state = app.state::<UndoState>();
         // Hold the guards for the whole turn.
-        let (bg_ref, mcp_ref, browser_ref, undo_ref) = (&*bg, &*mcp, &*browser_state, &*undo_state);
+        let (bg_ref, shell_ref, mcp_ref, browser_ref, undo_ref) =
+            (&*bg, &*shell, &*mcp, &*browser_state, &*undo_state);
         run_loop(
             turn,
             model,
@@ -2421,6 +2452,7 @@ pub async fn work_agent_start(
             mcp_routes.unwrap_or_default(),
             on_event,
             bg_ref,
+            shell_ref,
             mcp_ref,
             &tid,
             browser_resource_dir,
@@ -2685,6 +2717,7 @@ mod agent_tests {
     #[tokio::test]
     async fn dispatch_mcp_management_rejects_before_io() {
         let bg = BgExecState::default();
+        let shell = AgentShellState::default();
         let mcp = McpManager::default();
         let turn = TurnState::new();
         let routes = HashMap::new();
@@ -2693,7 +2726,7 @@ mod agent_tests {
         let undo = UndoState::default();
         macro_rules! run {
             ($name:expr, $args:expr) => {
-                dispatch_tool($name, &$args, "/tmp", None, &[], &bg, &mcp, &routes, &turn, "turn-test", &ch, None, &browser, &undo, "").await
+                dispatch_tool($name, &$args, "/tmp", None, &[], &bg, &shell, &mcp, &routes, &turn, "turn-test", &ch, None, &browser, &undo, "").await
             };
         }
         let out = run!("mcp_add", serde_json::json!({"url": "https://example.com/mcp"}));
@@ -2772,6 +2805,7 @@ mod agent_tests {
             ChatMessage { role: "user".to_string(), content: "List the files here, then write hello.txt containing exactly: hi-from-agent. Reply with one short line when done.".to_string(), images: None, tool_calls: None, tool_name: None },
         ];
         let bg = BgExecState::default();
+        let shell = AgentShellState::default();
         let mcp = McpManager::default();
         let browser = BrowserState::default();
         let undo = UndoState::default();
@@ -2794,6 +2828,7 @@ mod agent_tests {
                 HashMap::new(),
                 ch,
                 &bg,
+                &shell,
                 &mcp,
                 "turn-e2e",
                 None,

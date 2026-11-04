@@ -23,7 +23,9 @@ WORKSPACE BOUNDARY (strict):
 - Already granted exceptions: read_upload (files the user attached to this session) and sessions/read_session (past chats).
 - If a task seems to need anything else outside the workspace (a sibling repo, another project's files, a path the user mentioned), STOP and ask the user for permission first: state the exact path or command you need and why, then wait for a yes.
 - Running globally installed tools (git, node, python, rg, …) is fine; using them to inspect or change data outside the workspace is not.
-- On macOS/Linux, Work shell commands remain non-login sh -c commands, but their PATH is initialized from the user's login-shell PATH (best effort, cached for the app session) with app-only PATH entries retained. If the login-shell probe fails, the runner falls back to the app's inherited PATH. This supplies PATH only; it does not load the login shell's other startup behavior. A failed command lookup or ‘not found’ result proves only that the tool is not on this runner's effective PATH — never conclude from that alone that the tool is not installed or unavailable on the machine. State the narrow result. If availability matters and the user reports it works elsewhere, verify with a bounded check; do not scan outside the workspace. Ask first if verification would leave the workspace.
+- Commands run in ONE persistent shell per workspace: cwd, exported variables, and activated environments (venv/conda/nvm) carry over between exec calls. Do not re-cd or re-activate on every call.
+- Windows runs PowerShell (the same shell the user sees), not cmd.exe. On Windows write PowerShell syntax (Get-ChildItem, $env:VAR, Remove-Item, ; chaining). On macOS/Linux write POSIX sh/bash. Never assume bash syntax on Windows.
+- A failed command lookup or ‘not found’ result proves only that the tool is not on this shell's PATH — never conclude from that alone that the tool is not installed or unavailable on the machine. State the narrow result. If availability matters and the user reports it works elsewhere, verify with a bounded check; do not scan outside the workspace. Ask first if verification would leave the workspace.
 - Never crawl from / or your home folder (\`find /\`, \`find ~\`, \`grep -r /\`): on macOS that walks privacy-protected folders (Documents, Downloads, Photos/Music libraries) and spams a consent dialog per folder. The harness refuses such commands — use \`command -v\`, \`ls\` on specific bin dirs, or \`ask\` instead.
 - Use \`ask\` when a decision is genuinely needed (which approach/file/scope, or before anything destructive) instead of guessing. It shows buttons plus an "Other" free-text field and waits for the answer.
 - Use \`say\` to show the user any narration, answer, or explanation between tool calls. Its text is rendered as normal assistant prose. Never put narration inside another tool's arguments — the \`ask\` question must be only the question.
@@ -44,9 +46,14 @@ SESSION GOAL: ${goal}
 - This session has an objective. Keep working until it is FULLY achieved — do not end the turn with a partial result.
 - When it is fully achieved, call \`done\` with a brief completion summary and emit no tool calls after it. Never call \`done\` for partial progress.
 ` : ``}
+INTERACTIVE SHELL:
+- exec waits up to timeout_ms (default 30s) for the command to finish. If it is still running, the result says so and the shell stays busy.
+- While a command is running, use exec_status to read new output, exec_input {"text": "..."} to answer a prompt or feed a REPL, and exec_kill (no id) to send Ctrl-C.
+- Use exec_input only for programs that are waiting on stdin; a command that finished does not need it.
+
 BACKGROUND COMMANDS (for slow work):
 - exec with {"background": true} starts a long command (tests, builds, long scripts) and returns a job id like bg-3 immediately — it does NOT wait.
-- Keep doing other useful work after starting one: read, grep, write, or start more jobs. Check progress with exec_status {"id": "bg-3"} (omit id to list all jobs); stop one with exec_kill {"id": "bg-3"}.
+- Background jobs run detached, not in the persistent shell (they do not inherit its cwd/env state). Keep doing other useful work after starting one: read, grep, write, or start more jobs. Check progress with exec_status {"id": "bg-3"} (omit id for the persistent shell); stop one with exec_kill {"id": "bg-3"}.
 - If you have nothing else to do while waiting, end your turn with a short status line and NO tool calls — you will be woken automatically with the job's result when it finishes. Do not poll in a tight loop.
 
 MCP SERVERS (add on request):
@@ -133,13 +140,13 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec",
-      description: "Run a shell command with cwd=workspace. On macOS/Linux, Work uses non-login sh but initializes PATH from the login-shell PATH (best effort, cached) and keeps app-only PATH entries; other shell startup behavior is not loaded. Prefer non-interactive, time-bounded commands. A failed `command -v <tool>` means only not found on this runner PATH, not that it is not installed; report that distinction and verify narrowly when relevant. Never access paths outside the workspace without asking first or scan from filesystem/home roots. Pass background:true for slow commands (tests, builds).",
+      description: "Run a command in the workspace's persistent shell (cwd, env vars and activated environments persist between calls). Windows uses PowerShell, macOS/Linux use POSIX sh. Waits up to timeout_ms; if the command is still running, use exec_status to poll, exec_input to answer a prompt, or exec_kill to interrupt. Never access paths outside the workspace without asking first or scan from filesystem/home roots. Pass background:true for slow commands (tests, builds) that should run detached.",
       parameters: {
         type: "object",
         required: ["command"],
         properties: {
-          command: { type: "string", description: "shell command" },
-          timeout_ms: { type: "integer", description: "timeout 1000-120000ms, default 30000 (ignored when background is true)" },
+          command: { type: "string", description: "shell command (PowerShell syntax on Windows)" },
+          timeout_ms: { type: "integer", description: "wait limit 1000-120000ms, default 30000 (ignored when background is true)" },
           background: { type: "boolean", description: "run detached in the background; returns a job id (bg-N) immediately" }
         }
       }
@@ -149,11 +156,11 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec_status",
-      description: "Check a background exec job's output (or list all jobs when id is omitted). Returns captured stdout/stderr so far plus whether it is still running.",
+      description: "Poll output. With id: status of that background job (bg-N). Without id: new output from the persistent shell plus whether a command is still running.",
       parameters: {
         type: "object",
         properties: {
-          id: { type: "string", description: "background job id, e.g. bg-3; omit to list all jobs" }
+          id: { type: "string", description: "background job id, e.g. bg-3; omit for the persistent shell" }
         }
       }
     }
@@ -162,12 +169,25 @@ export const WORK_TOOLS = [
     type: "function",
     function: {
       name: "exec_kill",
-      description: "Stop a running background exec job. Returns the latest captured output.",
+      description: "Interrupt. With id: stop a background job. Without id: send Ctrl-C to the command running in the persistent shell and wait for the prompt.",
       parameters: {
         type: "object",
-        required: ["id"],
         properties: {
-          id: { type: "string", description: "background job id, e.g. bg-3" }
+          id: { type: "string", description: "background job id, e.g. bg-3; omit to interrupt the persistent shell" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "exec_input",
+      description: "Send input to the command currently running in the persistent shell (answer a prompt, feed a REPL or password prompt). Adds a newline. Returns any output produced in the next moment.",
+      parameters: {
+        type: "object",
+        required: ["text"],
+        properties: {
+          text: { type: "string", description: "line to send to the running command" }
         }
       }
     }
@@ -759,14 +779,21 @@ export async function dispatchWorkTool(
             return `Error: ${e?.message ?? String(e)}`;
           }
         }
-        const res = await invokeCmd<{ stdout: string; stderr: string; exit_code: number | null; timed_out: boolean; truncated: boolean }>(
-          "work_exec", { root: ctx.workspace, command: str(a.command), timeoutMs: typeof a.timeout_ms === "number" ? a.timeout_ms : null }
+        const res = await invokeCmd<{ output: string; exit_code: number | null; running: boolean; truncated: boolean }>(
+          "work_shell_exec", { root: ctx.workspace, command: str(a.command), timeoutMs: typeof a.timeout_ms === "number" ? a.timeout_ms : null }
         );
         const parts: string[] = [];
-        if (res.stdout.trim()) parts.push(res.stdout);
-        if (res.stderr.trim()) parts.push(`[stderr]\n${res.stderr}`);
-        parts.push(`[exit ${res.timed_out ? "timed out" : res.exit_code}]`);
+        if (res.output.trim()) parts.push(res.output);
+        parts.push(res.running ? "[still running — poll with exec_status, answer a prompt with exec_input, or interrupt with exec_kill]" : `[exit ${res.exit_code}]`);
         return parts.join("\n");
+      }
+      case "exec_input": {
+        if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
+        try {
+          return await invokeCmd<string>("work_shell_input", { root: ctx.workspace, text: str(a.text) });
+        } catch (e: any) {
+          return `Error: ${e?.message ?? String(e)}`;
+        }
       }
       case "exec_status": {
         if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
@@ -778,18 +805,19 @@ export async function dispatchWorkTool(
           }
         }
         try {
-          const jobs = await backgroundList();
-          if (jobs.length === 0) return "No background jobs.";
-          return jobs.map((j) => `${j.id} ${j.running ? "(running)" : `(exit ${j.exit_code})`} — ${j.command.slice(0, 120)}`).join("\n");
+          const r = await invokeCmd<{ output: string; exit_code: number | null; running: boolean }>("work_shell_status", { root: ctx.workspace });
+          const parts: string[] = [];
+          if (r.output.trim()) parts.push(r.output);
+          parts.push(r.running ? "[still running]" : "[prompt ready]");
+          return parts.join("\n");
         } catch (e: any) {
           return `Error: ${e?.message ?? String(e)}`;
         }
       }
       case "exec_kill": {
-        if (!str(a.id)) return "Error: exec_kill needs {\"id\": \"...\"}.";
         if (!isTauriRuntime()) return "Error: workspace tools need the Vicuna desktop app.";
         try {
-          const s = await invokeCmd<BackgroundJobStatus>("work_exec_kill", { id: str(a.id) });
+          const s = await invokeCmd<BackgroundJobStatus>("work_exec_kill", { id: str(a.id) || null });
           return formatBackgroundStatus(s);
         } catch (e: any) {
           return `Error: ${e?.message ?? String(e)}`;
@@ -885,8 +913,9 @@ function escapeHtml(s: string): string {
  *  running indicator. */
 export function toolLabel(name: string, args: Record<string, any>): string {
   const argSummary = name === "exec" ? String(args.command ?? "") :
-    name === "exec_status" ? String(args.id ?? "(list)") :
-    name === "exec_kill" ? String(args.id ?? "") :
+    name === "exec_input" ? String(args.text ?? "") :
+    name === "exec_status" ? String(args.id ?? "(shell)") :
+    name === "exec_kill" ? String(args.id ?? "(shell)") :
     name === "read" || name === "write" || name === "list" || name === "view_image" ? String(args.path ?? ".") :
     name === "grep" ? String(args.pattern ?? "") :
     name === "sessions" ? String(args.query ?? "") :
