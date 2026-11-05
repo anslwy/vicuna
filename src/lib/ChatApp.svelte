@@ -8078,16 +8078,22 @@
             {#if browserDaemon?.running}
               {#if browserDaemon.health?.ui_ok === false}
                 <div class="exp-empty browser-error" data-testid="browser-broken-ui">
-                  <span>Browser engine files changed while it was running (usually an app update) — the view can't load. {#if browserDaemon.owned}Restart it to pick up the new files.{:else}Quit the app that started it (check the tray), then reopen this tab — or take it over with the restart button above (asks first).{/if}</span>
+                  <span>Browser engine files changed while it was running (usually an app update) — the view can't load. Restart the browser to pick up the new files.{#if !browserDaemon.owned} Vicuna didn't start this daemon; taking it over asks first and loses its tabs.{/if}</span>
                   {#if browserDaemon.owned}
                     <button class="mini-btn" data-testid="browser-broken-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
+                  {:else}
+                    <button class="mini-btn" data-testid="browser-broken-takeover-btn" onclick={() => void restartBrowserFromButton()}>Take over &amp; restart</button>
                   {/if}
                 </div>
               {:else}
-              {#if browserDaemon.engine_stale && browserDaemon.owned}
+              {#if browserDaemon.engine_stale}
                 <div class="browser-stale" data-testid="browser-stale" role="status">
                   <span>{browserDaemon.warning ?? "Browser engine is outdated."}</span>
-                  <button class="mini-btn" data-testid="browser-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
+                  {#if browserDaemon.owned}
+                    <button class="mini-btn" data-testid="browser-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
+                  {:else}
+                    <button class="mini-btn" data-testid="browser-stale-takeover-btn" onclick={() => void restartBrowserFromButton()}>Take over &amp; restart</button>
+                  {/if}
                 </div>
               {:else if browserDaemon.warning}
                 <!-- engine fallback (CloakBrowser unavailable → system Chromium):

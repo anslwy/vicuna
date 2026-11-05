@@ -428,7 +428,14 @@ fn spawn_fx(
     log_path: &Path,
 ) -> Result<(Arc<AcpClient>, mpsc::UnboundedReceiver<Value>, Child), String> {
     let mut cmd = Command::new(bin);
-    cmd.arg("acp")
+    // Project instructions auto-load in fx (the native loop left them to the
+    // model). Cap them so a huge AGENTS.md can't crowd out the 32K work
+    // window; the agent can still read the full file with its tools.
+    cmd.arg("--context-limit")
+        .arg("project_instruction_file_bytes=32768")
+        .arg("--context-limit")
+        .arg("project_instructions_total_bytes=65536")
+        .arg("acp")
         .arg("--log-file")
         .arg(log_path)
         .current_dir(workspace)
@@ -729,6 +736,14 @@ fn handle_session_update(
     match kind {
         "agent_message_chunk" => {
             if let Some(text) = update.get("content").and_then(content_text) {
+                // Defensive: fx versions that ignore session.notices send the
+                // context-truncation diagnostic as plain message text.
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("[context]")
+                    && (trimmed.contains("truncated") || trimmed.contains("project instruction"))
+                {
+                    return;
+                }
                 *output_chars += text.chars().count();
                 emit_ev(on_event, stop, WorkAgentEvent::Token { text });
             }
@@ -792,6 +807,10 @@ fn handle_session_update(
             }
         }
         "notice" => {
+            let severity = update
+                .get("severity")
+                .and_then(|s| s.as_str())
+                .unwrap_or("info");
             let title = update
                 .get("title")
                 .and_then(|t| t.as_str())
@@ -802,6 +821,17 @@ fn handle_session_update(
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .trim();
+            // fx's project-instruction/context truncation notice is noisy in
+            // the chat (it repeats on every turn for big AGENTS.md files).
+            // It is still in the fx log when someone needs to raise the limit.
+            let noise = format!("{title} {desc}").to_lowercase();
+            let context_noise = noise.contains("project instruction")
+                || noise.contains("truncated")
+                || noise.contains("context limit")
+                || noise.contains("context-limit");
+            if severity == "info" || context_noise {
+                return;
+            }
             let text = match (title.is_empty(), desc.is_empty()) {
                 (false, false) => format!("\n> {title} — {desc}\n"),
                 (false, true) => format!("\n> {title}\n"),
@@ -1021,7 +1051,10 @@ async fn run_fx_turn_inner(
                 "protocolVersion": PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false
+                    "terminal": false,
+                    // Structured notices keep fx's context/limit diagnostics
+                    // out of the assistant transcript (we can filter them).
+                    "session": { "notices": {} }
                 },
                 "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": "0.1.0" }
             }),
