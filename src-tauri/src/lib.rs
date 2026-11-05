@@ -16,6 +16,7 @@ use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+pub mod acp;
 pub mod browser;
 pub mod mcp;
 pub mod work_agent;
@@ -1966,6 +1967,11 @@ async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileCo
 }
 
 /// ---------- In-app update wrappers (same _logic pattern) ----------
+#[tauri::command]
+async fn work_engine_info(app: AppHandle) -> Result<acp::WorkEngineInfo, String> {
+    Ok(acp::engine_info(app.path().resource_dir().ok().as_deref()))
+}
+
 #[tauri::command]
 async fn app_build_info() -> Result<serde_json::Value, String> {
     app_build_info_logic().await
@@ -4973,6 +4979,7 @@ pub fn run() {
         .manage(AgentShellState::default())
         .manage(UndoState::default())
         .manage(work_agent::WorkAgentState::default())
+        .manage(acp::AcpState::default())
         .manage(AppQuitState::default())
         .manage(browser::BrowserState::default())
         .manage(mcp::McpManager::default())
@@ -5053,7 +5060,8 @@ pub fn run() {
             work_agent::work_agent_stop,
             work_agent::work_agent_queue,
             work_agent::work_agent_remove,
-            work_agent::work_agent_answer
+            work_agent::work_agent_answer,
+            work_engine_info
         ])
         .setup(|app| {
             // Debug builds say so in the window title (`npm run desktop:dev`

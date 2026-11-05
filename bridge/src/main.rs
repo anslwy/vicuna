@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
 
+use vicuna_lib::acp::AcpState;
 use vicuna_lib::browser::BrowserState;
 use vicuna_lib::mcp::McpManager;
 use vicuna_lib::work_agent::{
@@ -44,6 +45,7 @@ pub struct BridgeState {
     // (shared-ref arms below keep compiling via deref coercion)
     pub browser: Arc<BrowserState>,
     pub undo: Arc<UndoState>,
+    pub acp: Arc<AcpState>,
     pub events: EventQueues,
 }
 
@@ -56,6 +58,7 @@ impl Default for BridgeState {
             agent: WorkAgentState::default(),
             browser: Arc::new(BrowserState::default()),
             undo: Arc::new(UndoState::default()),
+            acp: Arc::new(AcpState::default()),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -138,10 +141,14 @@ async fn dispatch(
             let mcp = st.mcp.clone();
             let browser = st.browser.clone();
             let undo = st.undo.clone();
+            let acp = st.acp.clone();
             let browser_resource_dir = test_resource_dir();
             let tid = turn_id.clone();
             let model = s("model")?;
             let provider = arg_opt_str(args, "provider").unwrap_or_else(|| "ollama".to_string());
+            let engine = arg_opt_str(args, "engine").unwrap_or_else(|| "fx".to_string());
+            let ollama_base = arg_opt_str(args, "ollamaBase");
+            let fresh_session = args.get("freshSession").and_then(|v| v.as_bool()).unwrap_or(false);
             let api_key = arg_opt_str(args, "apiKey");
             let context_length = args.get("contextLength").and_then(|v| v.as_u64());
             let workspace = s("workspace")?;
@@ -161,6 +168,27 @@ async fn dispatch(
                     .map_err(|e| format!("bad mcpRoutes: {e}"))?;
             // leak the undo state for the detached turn (process-lifetime)
             tokio::spawn(async move {
+                if engine != "native"
+                    && provider != "openrouter"
+                    && vicuna_lib::acp::fx_available(browser_resource_dir.as_deref())
+                {
+                    vicuna_lib::acp::run_fx_turn(
+                        turn,
+                        model,
+                        workspace,
+                        messages,
+                        session_id,
+                        goal_text,
+                        context_length,
+                        ollama_base,
+                        fresh_session,
+                        on_event,
+                        browser_resource_dir,
+                        &acp,
+                    )
+                    .await;
+                    return;
+                }
                 run_loop(
                     turn, model, provider, api_key, context_length, workspace, messages, think, tools, session_id,
                     goal_text, goal_paused, chats, mcp_routes, on_event, &bg, &shell, &mcp, &tid,
@@ -170,6 +198,10 @@ async fn dispatch(
             });
             Ok(serde_json::json!(turn_id))
         }
+        "work_engine_info" => Ok(serde_json::to_value(
+            vicuna_lib::acp::engine_info(test_resource_dir().as_deref()),
+        )
+        .map_err(|e| e.to_string())?),
         "work_agent_stop" => {
             let turn = st.agent.get_turn(&s("turnId")?).ok_or("unknown turn")?;
             agent_stop(&turn);

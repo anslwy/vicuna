@@ -1089,6 +1089,16 @@ export function snapshotChats(chats: Chat[]): ChatSnapshot[] {
   }));
 }
 
+/** Which engine a Work turn will use, and where fx came from. */
+export interface WorkEngineInfo {
+  engine: "fx" | "native";
+  fxAvailable: boolean;
+  fxPath: string | null;
+  fxVersion: string | null;
+  settingsPath: string | null;
+  logPath: string | null;
+}
+
 /** MCP name → (server, real tool) routing for the backend dispatcher. */
 export interface McpRoute {
   server_id: string;
@@ -1099,6 +1109,12 @@ export interface WorkTurnParams {
   model: string;
   /** inference provider: Ollama /api/chat (default) or OpenRouter. */
   provider?: "ollama" | "openrouter";
+  /** Work engine: fx over ACP (default) or the built-in backend loop. */
+  engine?: "fx" | "native";
+  /** Ollama base URL, used to seed fx's private ACP profile. */
+  ollamaBase?: string;
+  /** Start a new fx session instead of resuming (regenerate/edit). */
+  freshSession?: boolean;
   /** OpenRouter bearer token (only read for provider === "openrouter"). */
   apiKey?: string;
   /** catalog context window, so the backend can compact without /api/show. */
@@ -1122,6 +1138,9 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
   const args = {
     model: p.model,
     provider: p.provider ?? "ollama",
+    engine: p.engine ?? "fx",
+    ollamaBase: p.ollamaBase ?? "",
+    freshSession: p.freshSession ?? false,
     apiKey: p.apiKey ?? null,
     contextLength: p.contextLength ?? null,
     workspace: p.workspace,

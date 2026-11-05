@@ -30,7 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, WORK_TOOLS, GOAL_DONE_TOOL, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, snapshotChats, type WorkTreeEntry, type WorkAgentEvent, type McpRoute } from "$lib/work";
+  import { buildWorkSystemPrompt, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, WORK_TOOLS, GOAL_DONE_TOOL, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, snapshotChats, type WorkTreeEntry, type WorkAgentEvent, type McpRoute, type WorkEngineInfo } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -1414,6 +1414,16 @@
    *  to ~/Downloads and opens it. Works in Tauri and plain-browser-with-
    *  bridge (see src/lib/update.ts + bridge). */
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
+  let workEngineInfo = $state<WorkEngineInfo | null>(null);
+
+  /** Backend truth for the Work engine row + header badge (fx vs built-in). */
+  async function refreshWorkEngine() {
+    try {
+      workEngineInfo = await invokeOrBridge<WorkEngineInfo>("work_engine_info", {});
+    } catch {
+      workEngineInfo = null;
+    }
+  }
   let updateRelease = $state<ReleaseInfo | null>(null);
   let updateOp = $state<null | "check" | "download">(null);
   let updateError = $state<string | null>(null);
@@ -1605,6 +1615,7 @@
     settingsOpen = true;
     void refreshCliStatus();
     void refreshBuildInfo();
+    void refreshWorkEngine();
   }
 
   /** Read this build's version + baked timestamp (silent unless it fails:
@@ -3070,7 +3081,7 @@
       }
       chat.messages = [...chat.messages, { role: "assistant", content: "", thinking: "", model: selectedModel }];
       chats = [...chats];
-      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace, [], { freshSession: true });
       return;
     }
     const history: ChatMsg[] = [
@@ -3399,7 +3410,7 @@
         error = "Work mode needs a workspace folder — pick one with the folder pill, then regenerate.";
         return;
       }
-      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace);
+      await runWorkTurn(chat, chat.messages.length - 1, chat.workspace, [], { freshSession: true });
       return;
     }
     await streamInto(chat, chat.messages.length - 1, freshHistory, true);
@@ -5666,7 +5677,7 @@
    *  markdown results for persistence, ask cards, steering bubbles) exactly
    *  like the old in-thread loop did. Settle paths (leftovers, follow-up
    *  turns, goal retirement, stats) are unchanged. */
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = []) {
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean } = {}) {
     const turnId = ++workTurnSeq;
     workTurnSeqByChat.set(chat.id, turnId);
     // a turn is live while it is still its session's newest: late events
@@ -6035,6 +6046,9 @@
       agentTurn = await startWorkAgentTurn({
         model: workModel,
         provider: workProvider,
+        engine: "fx",
+        ollamaBase,
+        freshSession: opts.freshSession ?? false,
         apiKey: workProvider === "openrouter" ? openrouterKey : "",
         contextLength: workModelInfo?.contextLength ?? null,
         workspace,
@@ -6426,6 +6440,7 @@
       ready = true;
     }
     refreshModels();
+    void refreshWorkEngine();
     // resume a stream interrupted by a refresh: the partial tokens persisted
     // via the regular save, the pending marker tells us how to continue it
     // (user-stopped streams clear the marker, so they never resume here)
@@ -6714,6 +6729,15 @@
           <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
         </div>
         <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
+        {#if pendingMode === "work"}
+          <p class="engine-line" data-testid="work-engine-line">
+            {#if workEngineInfo}
+              {workEngineInfo.engine === "fx" ? `Engine: fx acp ${workEngineInfo.fxVersion ?? ""}` : "Engine: built-in agent (fx sidecar not found)"}
+            {:else}
+              Engine: checking…
+            {/if}
+          </p>
+        {/if}
         <div class="suggest-grid" data-testid="empty-suggestions">
           {#each composerMode === "work" ? WORK_SUGGESTIONS : SUGGESTIONS as s, idx}
             <button class="suggest-card" data-testid="suggest-card" onclick={() => useSuggestion(s.prompt)}>
@@ -6731,6 +6755,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" title={workEngineInfo ? (workEngineInfo.engine === "fx" ? `fx acp ${workEngineInfo.fxVersion ?? ""} — ${workEngineInfo.fxPath ?? ""}` : "fx sidecar not found — using the built-in Work agent") : "Work engine"}>{workEngineInfo ? (workEngineInfo.engine === "fx" ? "fx" : "built-in") : "…"}</span>
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -8378,6 +8403,28 @@
       <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. For remote access use the https tailscale URL. The Tauri shell always uses its local Ollama.</span>
     </div>
     <div class="setting-stacked">
+      <span class="setting-label">Work engine</span>
+      <span class="setting-note" data-testid="work-engine-status">
+        {#if workEngineInfo}
+          {#if workEngineInfo.engine === "fx"}
+            fx acp {workEngineInfo.fxVersion ?? ""} · {workEngineInfo.fxPath ?? "bundled sidecar"}
+          {:else}
+            Built-in agent (fx sidecar not found)
+          {/if}
+        {:else}
+          Checking…
+        {/if}
+      </span>
+      {#if workEngineInfo?.engine === "fx"}
+        <span class="setting-note">Work mode runs `fx acp` over ACP. Ollama is registered as the `vicuna-local` connection in <code>{workEngineInfo.settingsPath ?? "~/.fx/settings.json"}</code>{workEngineInfo.logPath ? ` · log: ${workEngineInfo.logPath}` : ""}.</span>
+      {:else}
+        <span class="setting-note">Work mode is using the built-in agent. Run <code>scripts/fetch-fx-sidecar.sh</code> (macOS/Linux) to enable fx.</span>
+      {/if}
+      <div class="browse-actions">
+        <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
+      </div>
+    </div>
+    <div class="setting-stacked">
       <span class="setting-label">Continue method</span>
       <div class="seg" data-testid="continue-mode">
         {#each CONTINUE_MODES as m}
@@ -9169,6 +9216,8 @@
   .workspace-picker-drop { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
   .workspace-picker-label { font-size: 12px; color: var(--muted); }
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
+  .work-badge.engine-badge { background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
+  .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }

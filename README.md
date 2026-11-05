@@ -25,6 +25,8 @@ https://github.com/anslwy/vicuna/releases
 
 ```sh
 npm install
+sh scripts/fetch-fx-sidecar.sh   # Work mode's fx ACP engine (macOS/Linux)
+sh scripts/fetch-lb-sidecar.sh   # Browser tab's lb sidecar
 ```
 
 Web-only dev (fastest, uses the same UI against local Ollama):
@@ -58,6 +60,11 @@ npm run build   # static build to ./build
   commands and renders streamed `Channel` events (`token` / `think` / `done`);
   in a plain browser (`npm run dev`) it falls back to direct `fetch` so
   web-only dev works without the shell.
+- Work mode runs through the bundled [fx](https://github.com/vercel-labs/fx)
+  agent over ACP: `src-tauri/src/acp.rs` spawns `fx acp`, registers an
+  additive `vicuna-local` Ollama connection in `~/.fx/settings.json`, and
+  streams its ACP updates into the same UI event channel. A missing sidecar
+  (or Windows) falls back to the built-in agent loop.
 - Chat streaming returns the full text; `done_reason: "load"` retries up to
   3x after a 2s wait (model was reloading). Stop-button abort raises
   `AbortError` on the frontend; the backend request runs detached (no cancel

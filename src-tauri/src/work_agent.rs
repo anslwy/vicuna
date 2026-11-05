@@ -85,7 +85,7 @@ pub enum WorkAgentEvent {
 /// Best-effort event send: when the webview is gone (e.g. refresh mid-turn)
 /// the Channel breaks — mark the turn stopped so the backend loop unwinds
 /// instead of running headless (mirrors the old `client_gone` drain break).
-fn emit_ev(ch: &Channel<WorkAgentEvent>, stop: &AtomicBool, ev: WorkAgentEvent) {
+pub(crate) fn emit_ev(ch: &Channel<WorkAgentEvent>, stop: &AtomicBool, ev: WorkAgentEvent) {
     if ch.send(ev).is_err() {
         stop.store(true, Ordering::Relaxed);
     }
@@ -2468,6 +2468,9 @@ pub async fn work_agent_start(
     goal_paused: Option<bool>,
     chats: Option<Vec<ChatSnapshot>>,
     mcp_routes: Option<HashMap<String, McpRoute>>,
+    engine: Option<String>,
+    ollama_base: Option<String>,
+    fresh_session: Option<bool>,
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
 ) -> Result<String, String> {
@@ -2486,13 +2489,46 @@ pub async fn work_agent_start(
         let mcp = app.state::<McpManager>();
         let browser_state = app.state::<BrowserState>();
         let undo_state = app.state::<UndoState>();
+        let fx_state = app.state::<crate::acp::AcpState>();
+        let provider = provider.unwrap_or_else(|| "ollama".to_string());
+        let engine = engine.unwrap_or_else(|| "fx".to_string());
+        // Work mode calls fx over ACP. OpenRouter continues through the
+        // native loop (fx would need a separate custom connection), and
+        // builds without the sidecar (Windows, or a missing fetch) fall back
+        // with a visible note instead of failing the turn.
+        if engine != "native"
+            && provider != "openrouter"
+            && crate::acp::fx_available(browser_resource_dir.as_deref())
+        {
+            crate::acp::run_fx_turn(
+                turn,
+                model,
+                workspace,
+                messages,
+                session_id,
+                goal_text,
+                context_length,
+                ollama_base,
+                fresh_session.unwrap_or(false),
+                on_event,
+                browser_resource_dir.clone(),
+                &fx_state,
+            )
+            .await;
+            return;
+        }
+        if engine != "native" && provider != "openrouter" {
+            let _ = on_event.send(WorkAgentEvent::DisplayNote {
+                text: "\n> fx acp sidecar not found — using the built-in Work agent.\n".to_string(),
+            });
+        }
         // Hold the guards for the whole turn.
         let (bg_ref, shell_ref, mcp_ref, browser_ref, undo_ref) =
             (&*bg, &*shell, &*mcp, &*browser_state, &*undo_state);
         run_loop(
             turn,
             model,
-            provider.unwrap_or_else(|| "ollama".to_string()),
+            provider,
             api_key,
             context_length,
             workspace,

@@ -59,6 +59,10 @@ if [[ ! -d node_modules ]]; then
   npm install
 fi
 
+echo "==> Fetching pinned sidecars..."
+sh scripts/fetch-lb-sidecar.sh
+sh scripts/fetch-fx-sidecar.sh
+
 TARGET_DIR="src-tauri/target/release"
 TARGET_ARGS=()
 if [[ "$PROFILE" == "debug" ]]; then
