@@ -30,7 +30,7 @@ export interface CatalogEntry {
   variants: CatalogVariant[];
 }
 
-export const CATALOG_UPDATED = "2026-10-30";
+export const CATALOG_UPDATED = "2026-11-09";
 
 export const MODEL_CATALOG: CatalogEntry[] = [
   {
@@ -1681,15 +1681,6 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     ]
   },
   {
-    name: "minimax-m2.7",
-    blurb: "MiniMax's M2-series model for coding, agentic workflows, and professional productivity.",
-    params: "",
-    cats: ["chat", "reasoning"],
-    variants: [
-      { tag: "cloud", size: "cloud", sizeMB: 0 },
-    ]
-  },
-  {
     name: "minimax-m3",
     blurb: "MiniMax M3: Coding & Agentic Frontier. 1M context window. Native Multimodality.",
     params: "",
@@ -1727,15 +1718,6 @@ export const MODEL_CATALOG: CatalogEntry[] = [
     variants: [
       { tag: "latest", size: "~73 GB", sizeMB: 73220 },
       { tag: "123b", size: "~73 GB", sizeMB: 73220 },
-    ]
-  },
-  {
-    name: "mistral-large-3",
-    blurb: "A general-purpose multimodal mixture-of-experts model for production-grade tasks and enterprise workloads.",
-    params: "",
-    cats: ["chat", "vision"],
-    variants: [
-      { tag: "675b-cloud", size: "cloud", sizeMB: 0 },
     ]
   },
   {
@@ -1857,7 +1839,6 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "latest", size: "~24 GB", sizeMB: 24272 },
       { tag: "4b", size: "~2.8 GB", sizeMB: 2838 },
       { tag: "30b", size: "~24 GB", sizeMB: 24272 },
-      { tag: "30b-cloud", size: "cloud", sizeMB: 0 },
       { tag: "4b-mlx", size: "~2.9 GB", sizeMB: 2949 },
       { tag: "30b-a3b", size: "~24 GB", sizeMB: 24272 },
       { tag: "30b-a3b-mlx", size: "~18.3 GB", sizeMB: 18310 },
@@ -2889,6 +2870,64 @@ export const MODEL_CATALOG: CatalogEntry[] = [
       { tag: "latest", size: "~5.0 GB", sizeMB: 5037 },
       { tag: "1.5b", size: "~866 MB", sizeMB: 866 },
       { tag: "9b", size: "~5.0 GB", sizeMB: 5037 },
+    ]
+  },
+  {
+    name: "autotrust-jev",
+    blurb: "AutoTrust’s decision models return choices, yes/no probabilities, and ratings for the questions you supply",
+    params: "9B–35B",
+    cats: ["chat", "vision"],
+    variants: [
+      { tag: "latest", size: "~11.2 GB", sizeMB: 11231 },
+      { tag: "9b", size: "~11.2 GB", sizeMB: 11231 },
+      { tag: "35b", size: "~26 GB", sizeMB: 25619 },
+    ]
+  },
+  {
+    name: "kimi-k3.1-pro",
+    blurb: "Kimi K3.1 Pro is an open-weight, natively multimodal agentic model and our most capable 3T-class model to date, with a 1M-token context window and major gains in coding, 3D creation, financial research, and factual accuracy.",
+    params: "",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "cloud", size: "cloud", sizeMB: 0 },
+    ]
+  },
+  {
+    name: "mimo-v2.6",
+    blurb: "MiMo-V2.6-Distill-Qwen-9B is Xiaomi MiMo’s 9B model for code and agent workflows",
+    params: "9B",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "latest", size: "~6.6 GB", sizeMB: 6551 },
+      { tag: "9b", size: "~6.6 GB", sizeMB: 6551 },
+    ]
+  },
+  {
+    name: "mimo-v2.6-flash",
+    blurb: "Xiaomi's efficiency-balanced MiMo-V2.6 checkpoint, with 309B total parameters, 15B active, omnimodal input, and a 1M token context.",
+    params: "",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "cloud", size: "cloud", sizeMB: 0 },
+    ]
+  },
+  {
+    name: "mimo-v2.6-pro",
+    blurb: "Xiaomi's flagship MiMo-V2.6 checkpoint, with 1.02T total parameters, 42B active, omnimodal input, and a 1M token context.",
+    params: "",
+    cats: ["chat", "reasoning", "vision"],
+    variants: [
+      { tag: "cloud", size: "cloud", sizeMB: 0 },
+    ]
+  },
+  {
+    name: "pplx-decider-flash",
+    blurb: "pplx-decider-flash is a 4B decision model from Perplexity, built on Qwen3.5-4B",
+    params: "4B",
+    cats: ["chat", "vision"],
+    variants: [
+      { tag: "latest", size: "~5.6 GB", sizeMB: 5646 },
+      { tag: "4b", size: "~5.6 GB", sizeMB: 5646 },
     ]
   },
 ];
