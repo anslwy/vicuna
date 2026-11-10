@@ -30,7 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { buildWorkSystemPrompt, formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, WORK_TOOLS, GOAL_DONE_TOOL, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, snapshotChats, type WorkTreeEntry, type WorkAgentEvent, type McpRoute, type WorkEngineInfo } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, listOpencodeModels, setOpencodeModel, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -807,38 +807,6 @@
     await connectMcpServer(id);
   }
 
-  // Tools offered to the Work model this turn: every connected + enabled
-  // server's catalog, readable names, prefixed only when two servers collide.
-  // The route map translates the model's call back to (server, real name).
-  function assembleMcpTools(): { tools: import("$lib/ollama").OllamaToolDef[]; route: Map<string, { server: McpServerConfig; name: string }> } {
-    const tools: import("$lib/ollama").OllamaToolDef[] = [];
-    const route = new Map<string, { server: McpServerConfig; name: string }>();
-    // "done" is reserved too: the Goal Mode self-stop owns the bare name, so
-    // an MCP tool sanitizing to it must take the prefixed form — otherwise the
-    // backend would swallow the call as a goal self-stop instead of routing it.
-    const builtin = new Set([...WORK_TOOLS.map((t) => t.function.name), "done"]);
-    const seen = new Set<string>(builtin);
-    for (const s of mcpAllServers) {
-      const live = mcpLive[s.id];
-      if (!s.enabled || !live?.connected) continue;
-      for (const t of live.tools) {
-        let name = sanitizeToolName(t.name);
-        if (seen.has(name)) name = `${sanitizeToolName(s.name)}__${name}`;
-        if (seen.has(name)) continue;
-        seen.add(name);
-        route.set(name, { server: s, name: t.name });
-        tools.push({
-          type: "function",
-          function: {
-            name,
-            description: t.description ? `${t.description} (via ${s.name})` : `${t.name} (via ${s.name})`,
-            parameters: (t.inputSchema as Record<string, any> | undefined) ?? { type: "object" }
-          }
-        });
-      }
-    }
-    return { tools, route };
-  }
   /** prompts typed while a work turn is live: they join the context at the
    *  next round (after the tool results), never as a parallel turn */
   let queuedMsgs = $state<{ chatId: string; id: string; msg: ChatMsg }[]>([]);
@@ -1416,12 +1384,52 @@
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
   let workEngineInfo = $state<WorkEngineInfo | null>(null);
 
-  /** Backend truth for the Work engine row + header badge (fx vs built-in). */
+  /** Work mode = the user's opencode CLI over ACP, nothing else. Detection
+   *  re-runs at startup, on window focus, on Settings → Refresh and when the
+   *  model menu opens, so installing opencode while Vicuna runs is picked up. */
+  let workEngineChecked = $state(false);
   async function refreshWorkEngine() {
     try {
-      workEngineInfo = await invokeOrBridge<WorkEngineInfo>("work_engine_info", {});
+      workEngineInfo = await fetchWorkEngineInfo();
+      if (workEngineInfo.installed && workModel === null) workModel = workEngineInfo.model;
     } catch {
       workEngineInfo = null;
+    } finally {
+      workEngineChecked = true;
+    }
+  }
+  /** Send gate: no opencode → Work send disabled with the install hint. */
+  const workGate = $derived(
+    workEngineChecked && workEngineInfo === null
+      ? { blocked: true, reason: "Could not check for the opencode CLI (backend unavailable)." }
+      : workSendGate(workEngineInfo)
+  );
+  /** opencode's own model list (`opencode models`) for the Work picker. */
+  let ocModels = $state<OpencodeModels | null>(null);
+  let ocModelsLoading = $state(false);
+  let ocModelsError = $state<string | null>(null);
+  /** Work model pick, persisted backend-side (null = opencode's default). */
+  let workModel = $state<string | null>(null);
+  async function refreshOpencodeModels() {
+    if (!workEngineInfo?.installed || ocModelsLoading) return;
+    ocModelsLoading = true;
+    ocModelsError = null;
+    try {
+      ocModels = await listOpencodeModels();
+      workModel = ocModels.current;
+    } catch (e: any) {
+      ocModelsError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      ocModelsLoading = false;
+    }
+  }
+  async function pickWorkModel(id: string | null) {
+    workModel = id;
+    modelOpen = false;
+    try {
+      await setOpencodeModel(id);
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
     }
   }
   let updateRelease = $state<ReleaseInfo | null>(null);
@@ -2390,8 +2398,23 @@
   function toggleModel() {
     modelOpen = !modelOpen;
     if (modelOpen) modelQuery = "";
+    if (modelOpen && composerMode === "work") {
+      // Work models come from opencode itself: re-detect, then re-list
+      void refreshWorkEngine().then(() => refreshOpencodeModels());
+      return;
+    }
     if (modelOpen) void refreshRunners();
   }
+  /** Work picker rows (opencode's list, saved pick kept visible). */
+  const workModelChoices = $derived(opencodeModelChoices(ocModels, workModel, modelQuery));
+  // re-detect opencode whenever the window regains focus (installed in a
+  // terminal while Vicuna was open → Work unblocks without a restart)
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const onFocus = () => void refreshWorkEngine();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
 
   // reasoning effort, next to the model picker: string think levels are
   // per-model (gpt-oss low/med/high, qwen3.8 xhigh, deepseek max…), read
@@ -3500,6 +3523,9 @@
     // in another session never stops this one from sending (each session runs
     // its own stream/work turn concurrently)
     if (isCompacting(activeId ?? "")) return;
+    // Work mode needs the opencode CLI (no fallback engine); a live turn can
+    // still take queued messages
+    if (composerMode === "work" && workGate.blocked && !activeWorkRunning) return;
     // keep focus off the send/queue button: the streaming swap destroys it,
     // and Safari scrolls the thread to the top on the resulting focus loss
     parkComposerFocus();
@@ -4360,7 +4386,7 @@
   const workCtx = $derived.by(() => {
     const c = activeChat;
     if (!c || (c.mode ?? "chat") !== "work") return null;
-    const used = estimateWorkTokens([{ content: buildWorkSystemPrompt(c.workspace ?? "") }, ...compactedHistory(c.messages)]);
+    const used = estimateWorkTokens(compactedHistory(c.messages));
     const win = ctxWindow > 0 ? ctxWindow : 32768;
     return { used, win, frac: Math.min(1, used / win) };
   });
@@ -5777,18 +5803,11 @@
       }
     }
     const startGoal = chatGoal(live());
-    const native: ChatMsg[] = [
-      { role: "system", content: buildWorkSystemPrompt(workspace, startGoal?.text ?? null) },
-      ...seed,
-      ...baseHistory
-    ];
-    // MCP tools (Work mode only): same assembly as before — connected
-    // servers lend extra tools alongside the built-in workspace ones.
-    const mcp = assembleMcpTools();
-    const goalOffered = startGoal != null && !startGoal.paused;
-    const allTools = [...WORK_TOOLS, ...(goalOffered ? [GOAL_DONE_TOOL] : []), ...mcp.tools] as any;
-    const routes: Record<string, McpRoute> = {};
-    for (const [k, v] of mcp.route) routes[k] = { server_id: v.server.id, tool_name: v.name };
+    // visible history: opencode keeps its own session context; a fresh
+    // session (fork/restart/regenerate) gets this as a preamble backend-side.
+    // opencode brings its own tools; enabled MCP servers are handed to it in
+    // session/new by the backend.
+    const native: ChatMsg[] = [...seed, ...baseHistory];
     const think = effectiveThink();
 
     async function settle(stopped: boolean) {
@@ -5968,14 +5987,6 @@
               t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) };
               chats = [...chats];
             }
-            if (ev.name === "done" && goalOffered && t && t.goal) {
-              // self-stop (goal mode): the model declared the objective met —
-              // retire the goal and settle the turn with no wrap-up. Gated on
-              // the turn actually offering `done`: a stray call answered with
-              // an error must never retire a goal set mid-turn.
-              t.goal = null;
-              chats = [...chats];
-            }
           }
           scrollIfOpen();
           saveSoon();
@@ -6039,27 +6050,14 @@
     }
 
     let agentTurn: string;
-    const workProvider = isOpenRouterSelection(selectedModel) ? "openrouter" : "ollama";
-    const workModel = workProvider === "openrouter" ? openRouterModelId(selectedModel) : selectedModel;
-    const workModelInfo = findOpenRouterModel(openrouterModels, selectedModel);
     try {
       agentTurn = await startWorkAgentTurn({
-        model: workModel,
-        provider: workProvider,
-        engine: "fx",
-        ollamaBase,
+        model: workModel ?? "",
         freshSession: opts.freshSession ?? false,
-        apiKey: workProvider === "openrouter" ? openrouterKey : "",
-        contextLength: workModelInfo?.contextLength ?? null,
         workspace,
         messages: native,
-        think,
-        tools: allTools,
         sessionId: chat.id,
-        goalText: startGoal?.text ?? null,
-        goalPaused: startGoal?.paused ?? true,
-        chats: snapshotChats(chats),
-        mcpRoutes: routes,
+        goalText: startGoal && !startGoal.paused ? startGoal.text : null,
         onEvent: (ev) => handleEvent(ev)
       });
     } catch (e: any) {
@@ -6731,8 +6729,10 @@
         <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
         {#if pendingMode === "work"}
           <p class="engine-line" data-testid="work-engine-line">
-            {#if workEngineInfo}
-              {workEngineInfo.engine === "fx" ? `Engine: fx acp ${workEngineInfo.fxVersion ?? ""}` : "Engine: built-in agent (fx sidecar not found)"}
+            {#if workEngineInfo?.installed}
+              Engine: opencode {workEngineInfo.version ?? ""}
+            {:else if workEngineInfo}
+              Engine: opencode CLI not found
             {:else}
               Engine: checking…
             {/if}
@@ -6755,7 +6755,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" title={workEngineInfo ? (workEngineInfo.engine === "fx" ? `fx acp ${workEngineInfo.fxVersion ?? ""} — ${workEngineInfo.fxPath ?? ""}` : "fx sidecar not found — using the built-in Work agent") : "Work engine"}>{workEngineInfo ? (workEngineInfo.engine === "fx" ? "fx" : "built-in") : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" title={workEngineInfo?.installed ? `opencode ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : "opencode CLI not found"}>{workEngineInfo ? (workEngineInfo.installed ? "opencode" : "no opencode") : "…"}</span>
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -7089,6 +7089,15 @@
           {/if}
         </div>
       {/if}
+      {#if composerMode === "work" && workGate.blocked && workEngineChecked}
+        <div class="opencode-missing" data-testid="opencode-missing" role="status">
+          <span>{workGate.reason ?? "opencode CLI not found"}</span>
+          {#if workEngineInfo && !workEngineInfo.installed}
+            <button class="mini-btn" data-testid="opencode-install-link" onclick={() => void openExternal(workEngineInfo?.installUrl ?? "https://opencode.ai/docs/#install")}>Install guide</button>
+          {/if}
+          <button class="mini-btn" data-testid="opencode-recheck" onclick={() => void refreshWorkEngine()}>Check again</button>
+        </div>
+      {/if}
       <div
         class="composer {composerDropActive ? 'drop-active' : ''}"
         role="group"
@@ -7310,6 +7319,48 @@
               </span>
             {/if}
           {/if}
+          {#if composerMode === "work"}
+          <div class="model-pill-wrap">
+            <button class="model-pill" data-testid="model-selector" data-engine="opencode" title={workModel ?? "opencode default model"} disabled={!workEngineInfo?.installed} onclick={toggleModel}>
+              <span class="model-name" data-testid="work-model-name">{workModel ?? "opencode default"}</span>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
+            </button>
+            {#if modelOpen}
+              <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
+              <div class="model-drop" data-testid="model-dropdown" data-engine="opencode">
+                <input
+                  class="model-search"
+                  data-testid="model-search"
+                  placeholder="Find opencode model..."
+                  bind:value={modelQuery}
+                  autofocus
+                />
+                <div class="model-list-drop">
+                  {#if ocModelsLoading && !ocModels}
+                    <div class="no-match" data-testid="opencode-models-loading">Loading models from opencode…</div>
+                  {:else if ocModelsError}
+                    <div class="no-match" data-testid="opencode-models-error">{ocModelsError}</div>
+                  {/if}
+                  <div class="model-opt-row {workModel === null ? 'sel' : ''}">
+                    <button class="model-opt" data-testid="model-opt" data-model="" onclick={() => void pickWorkModel(null)}>
+                      <span class="model-opt-top"><span class="model-opt-name">opencode default</span></span>
+                      <span class="model-opt-id">whatever opencode's own config selects</span>
+                    </button>
+                  </div>
+                  {#each workModelChoices as choice (choice.id)}
+                    <div class="model-opt-row {choice.id === workModel ? 'sel' : ''}">
+                      <button class="model-opt" data-testid="model-opt" data-provider={choice.provider} data-model={choice.id} title={choice.id} onclick={() => void pickWorkModel(choice.id)}>
+                        <span class="model-opt-top"><span class="model-opt-name">{choice.id}</span></span>
+                      </button>
+                    </div>
+                  {:else}
+                    {#if ocModels}<div class="no-match">No matches</div>{/if}
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          </div>
+          {:else}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" onclick={toggleModel}>
               <span class="prov-ico" aria-hidden="true">
@@ -7376,7 +7427,8 @@
               </div>
             {/if}
           </div>
-          {#if thinkLevels.length > 0}
+          {/if}
+          {#if thinkLevels.length > 0 && composerMode !== "work"}
             <div class="model-pill-wrap">
               <button class="model-pill" data-testid="effort-selector" title="Reasoning effort for {selectedModel}" onclick={() => (effortOpen = !effortOpen)}>
                 <span class="model-name">{shownThink === "auto" ? `Auto${thinkDefault ? ` · ${capLevel(thinkDefault)}` : ""}` : shownThink === "off" ? "Off" : capLevel(shownThink)}</span>
@@ -7413,7 +7465,7 @@
           {:else if activeStreaming}
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
           {:else}
-            <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
+            <button class="send" data-testid="send-btn" aria-label="Send" title={composerMode === "work" && workGate.blocked ? (workGate.reason ?? "") : undefined} disabled={(input.trim() === "" && attachImages.length === 0) || (composerMode === "work" && workGate.blocked)} onclick={send}>↑</button>
           {/if}
         </div>
       </div>
@@ -8411,21 +8463,15 @@
     <div class="setting-stacked">
       <span class="setting-label">Work engine</span>
       <span class="setting-note" data-testid="work-engine-status">
-        {#if workEngineInfo}
-          {#if workEngineInfo.engine === "fx"}
-            fx acp {workEngineInfo.fxVersion ?? ""} · {workEngineInfo.fxPath ?? "bundled sidecar"}
-          {:else}
-            Built-in agent (fx sidecar not found)
-          {/if}
+        {#if workEngineInfo?.installed}
+          opencode {workEngineInfo.version ?? ""} · {workEngineInfo.path}
+        {:else if workEngineInfo}
+          opencode CLI not found, install it: {workEngineInfo.installUrl}
         {:else}
           Checking…
         {/if}
       </span>
-      {#if workEngineInfo?.engine === "fx"}
-        <span class="setting-note">Work mode runs `fx acp` over ACP. Ollama is registered as the `vicuna-local` connection in <code>{workEngineInfo.settingsPath ?? "~/.fx/settings.json"}</code>{workEngineInfo.logPath ? ` · log: ${workEngineInfo.logPath}` : ""}.</span>
-      {:else}
-        <span class="setting-note">Work mode is using the built-in agent. Run <code>scripts/fetch-fx-sidecar.sh</code> (macOS/Linux) to enable fx.</span>
-      {/if}
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI over ACP (one warm <code>opencode acp</code> process). Models, providers and credentials come from opencode; pick the model from the composer's model menu. Override the binary with <code>VICUNA_OPENCODE_BIN</code>.</span>
       <div class="browse-actions">
         <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
       </div>
@@ -9224,6 +9270,8 @@
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .work-badge.engine-badge { background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
   .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
+  .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
+  .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
