@@ -1,15 +1,19 @@
-// Vicuna Work mode via the Agent Client Protocol (ACP).
+// Vicuna Work mode = the user's opencode CLI, driven over the Agent Client
+// Protocol (ACP).
 //
-// `fx acp` (Vercel Labs fx, bundled as a ~5 MB native sidecar) is an ACP
-// agent server over stdio. This module is a deliberately small JSON-RPC
-// client: initialize -> session/new|resume -> session/prompt, translating
-// `session/update` notifications into the same WorkAgentEvent stream the
-// built-in loop emits, so ChatApp's rendering is unchanged.
+// One long-lived `opencode acp` process (spawned at startup when opencode is
+// installed, respawned on demand if it dies or the binary moves) serves every
+// Work session: `initialize` once, then per session `session/new` (cwd +
+// Vicuna's MCP servers) or `session/resume`/`session/load` for a saved
+// session, `session/set_config_option` for the model picked in Vicuna, and
+// `session/prompt`. `session/update` notifications are routed by sessionId and
+// translated into the WorkAgentEvent stream ChatApp already renders.
 //
 // No ACP SDK dependency: the wire format is newline-delimited JSON-RPC 2.0.
 // Client-side fs/terminal capabilities are advertised as unsupported because
-// fx runs its own tools; only permission requests need an answer, and those
-// are auto-approved (allow_once -> allow_always -> first allow).
+// opencode runs its own tools; permission requests are auto-approved
+// (allow_once -> allow_always -> first allow) and shown as a note.
+// There is no fallback engine: without opencode, Work mode is disabled.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,24 +24,38 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
+use super::opencode::{find_opencode, INSTALL_URL};
 use super::work_agent::{emit_ev, TurnState, WorkAgentEvent};
 use super::ChatMessage;
 
 const PROTOCOL_VERSION: u64 = 1;
-const INIT_TIMEOUT: Duration = Duration::from_secs(30);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const OUTPUT_CAP: usize = 32 * 1024;
 
-// ---------- state: fx session ids persisted across turns ----------
+pub fn not_found_message() -> String {
+    format!("opencode CLI not found, install it: {INSTALL_URL}")
+}
+
+// ---------- state: warm process + session ids persisted across turns ----------
+
+struct Proc {
+    client: Arc<AcpClient>,
+    bin: PathBuf,
+    // held so kill_on_drop ends the process when this Proc is replaced
+    _child: Child,
+}
 
 #[derive(Default)]
 pub struct AcpState {
     sessions: Mutex<HashMap<String, String>>,
     loaded: AtomicBool,
+    proc: tokio::sync::Mutex<Option<Proc>>,
 }
 
 impl AcpState {
@@ -62,10 +80,10 @@ impl AcpState {
         self.sessions.lock().ok()?.get(key).cloned()
     }
 
-    fn set(&self, key: String, fx_session: String) {
+    fn set(&self, key: String, acp_session: String) {
         let _ = self.load();
         if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(key, fx_session.clone());
+            sessions.insert(key, acp_session);
             if let Ok(path) = sessions_path() {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -73,6 +91,49 @@ impl AcpState {
                 let doc = serde_json::to_string_pretty(&*sessions).unwrap_or_default();
                 let _ = std::fs::write(path, doc);
             }
+        }
+    }
+
+    /// The warm, initialized `opencode acp` client; (re)spawned when there is
+    /// none, it died, or detection now resolves a different binary.
+    async fn client(&self) -> Result<Arc<AcpClient>, String> {
+        let bin = find_opencode().ok_or_else(not_found_message)?;
+        let mut guard = self.proc.lock().await;
+        if let Some(p) = guard.as_ref() {
+            if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin {
+                return Ok(p.client.clone());
+            }
+        }
+        *guard = None;
+        let (client, child) = spawn_opencode(&bin)?;
+        client
+            .call(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": env!("CARGO_PKG_VERSION") }
+                }),
+                INIT_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("opencode acp initialize failed: {e}"))?;
+        *guard = Some(Proc {
+            client: client.clone(),
+            bin,
+            _child: child,
+        });
+        Ok(client)
+    }
+
+    /// Start the warm process ahead of the first Work turn (app startup).
+    /// Silent when opencode is missing; the UI shows that state itself.
+    pub async fn prewarm(&self) {
+        if find_opencode().is_some() {
+            let _ = self.client().await;
         }
     }
 }
@@ -89,213 +150,18 @@ fn sessions_path() -> Result<PathBuf, String> {
     Ok(home_dir()?
         .join("vicuna")
         .join("config")
-        .join("fx-sessions.json"))
+        .join("opencode-sessions.json"))
 }
 
-fn session_key(session_id: Option<&str>, workspace: &str, model: &str) -> Option<String> {
-    session_id.map(|id| format!("{id}|{workspace}|{model}"))
+/// Keyed by chat + workspace only: the model is switched inside the session
+/// (set_config_option), so changing it keeps the conversation.
+fn session_key(session_id: Option<&str>, workspace: &str) -> Option<String> {
+    session_id.map(|id| format!("{id}|{workspace}"))
 }
 
-// ---------- sidecar resolution ----------
+// ---------- MCP servers handed to opencode in session/new ----------
 
-/// Binaries are arch-suffixed on macOS (universal app ships both); Linux uses
-/// `fx`. Debug builds prefer the source tree over `resource_dir()` so a
-/// rebuild can't race a stale copy (same reasoning as the lb sidecar).
-pub fn fx_binary_path(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("VICUNA_FX_PATH") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    #[cfg(debug_assertions)]
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fx-sidecar"));
-    if let Some(dir) = resource_dir {
-        dirs.push(dir.join("fx-sidecar"));
-        dirs.push(dir.to_path_buf());
-    }
-    for dir in dirs {
-        if let Some(p) = fx_binary_in(&dir) {
-            return Some(p);
-        }
-    }
-    // Last resort: a user-installed `fx` on PATH.
-    let name = if cfg!(windows) { "fx.exe" } else { "fx" };
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn fx_binary_in(dir: &Path) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    let names: &[&str] = if cfg!(target_arch = "aarch64") {
-        &["fx-arm64", "fx"]
-    } else {
-        &["fx-x64", "fx"]
-    };
-    #[cfg(not(target_os = "macos"))]
-    let names: &[&str] = if cfg!(windows) { &["fx.exe"] } else { &["fx"] };
-    for name in names {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-pub fn fx_available(resource_dir: Option<&Path>) -> bool {
-    fx_binary_path(resource_dir).is_some()
-}
-
-/// Diagnostics for Settings → General and the Work header: which engine a
-/// Work turn will actually use, where it came from, and its version.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkEngineInfo {
-    pub engine: String,
-    pub fx_available: bool,
-    pub fx_path: Option<String>,
-    pub fx_version: Option<String>,
-    pub settings_path: Option<String>,
-    pub log_path: Option<String>,
-}
-
-pub fn engine_info(resource_dir: Option<&Path>) -> WorkEngineInfo {
-    let path = fx_binary_path(resource_dir);
-    let fx_available = path.is_some();
-    let fx_version = path.as_deref().and_then(fx_version_of);
-    WorkEngineInfo {
-        engine: if fx_available { "fx" } else { "native" }.to_string(),
-        fx_available,
-        fx_path: path.as_ref().map(|p| p.display().to_string()),
-        fx_version,
-        settings_path: home_dir()
-            .ok()
-            .map(|h| h.join(".fx").join("settings.json").display().to_string()),
-        log_path: fx_log_path().ok().map(|p| p.display().to_string()),
-    }
-}
-
-fn fx_version_of(bin: &Path) -> Option<String> {
-    // Bundled sidecars carry a pin marker next to the binary.
-    if let Some(dir) = bin.parent() {
-        if let Ok(v) = std::fs::read_to_string(dir.join("FX_VERSION")) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    // PATH install: `fx --version` is a ~2 ms native call.
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let first = text.lines().next().unwrap_or("").trim().to_string();
-    if first.is_empty() {
-        None
-    } else {
-        Some(first)
-    }
-}
-
-// ---------- fx profile for Ollama ----------
-
-/// `http://host:11434` -> `http://host:11434/v1` (idempotent).
-pub fn ollama_v1_base(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    let base = if trimmed.is_empty() {
-        "http://localhost:11434"
-    } else {
-        trimmed
-    };
-    if base.ends_with("/v1") {
-        base.to_string()
-    } else {
-        format!("{base}/v1")
-    }
-}
-
-/// fx v0.0.16 predates `FX_HOME`, so Work mode registers an additive
-/// `vicuna-local` connection in the real `~/.fx/settings.json` and selects it
-/// with process-local `FX_PROVIDER`/`FX_MODEL` env vars. The user's own
-/// `provider`/`models.*` entries are preserved.
-fn fx_provider_entry(model: &str, base: &str, context_length: Option<u64>) -> Value {
-    let ctx = context_length.unwrap_or(32768).clamp(4096, 2_000_000);
-    let max_out = (ctx / 2).clamp(1024, 8192);
-    json!({
-        "protocol": "openai-chat-completions",
-        "base_url": base,
-        "auth": { "type": "none" },
-        "model_metadata": {
-            (model): {
-                "context_window": ctx,
-                "max_output_tokens": max_out,
-                "supports_tool_use": true,
-                "supports_vision": true
-            }
-        }
-    })
-}
-
-fn apply_fx_settings(doc: &mut Value, model: &str, base: &str, context_length: Option<u64>) {
-    let obj = doc.as_object_mut().expect("settings is an object");
-    obj.entry("providers")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("providers is an object")
-        .insert("vicuna-local".to_string(), fx_provider_entry(model, base, context_length));
-    obj.entry("models")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("models is an object")
-        .insert("vicuna-local".to_string(), json!(model));
-}
-
-fn write_fx_settings(model: &str, base: &str, context_length: Option<u64>) -> Result<PathBuf, String> {
-    let home = home_dir()?;
-    let dir = home.join(".fx");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create fx config folder: {e}"))?;
-    let path = dir.join("settings.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: Value = if text.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&text)
-            .map_err(|_| "fx settings.json is not valid JSON; refusing to overwrite it".to_string())?
-    };
-    if !doc.is_object() {
-        return Err("fx settings.json is not a JSON object; refusing to overwrite it".to_string());
-    }
-    // Do not clobber a non-object providers/models value either.
-    for key in ["providers", "models"] {
-        if doc.get(key).is_some_and(|v| !v.is_object()) {
-            return Err(format!("fx settings.json has a non-object `{key}`; refusing to overwrite it"));
-        }
-    }
-    apply_fx_settings(&mut doc, model, base, context_length);
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| format!("cannot write fx settings: {e}"))?;
-    Ok(path)
-}
-
-fn fx_log_path() -> Result<PathBuf, String> {
-    let dir = home_dir()?.join("vicuna").join("config");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create Vicuna config folder: {e}"))?;
-    Ok(dir.join("fx-acp.log"))
-}
-
-// ---------- MCP servers for the ACP session ----------
-
-fn mcp_servers_for_fx() -> Vec<Value> {
+fn mcp_servers() -> Vec<Value> {
     let Ok(servers) = crate::mcp::list_file_servers() else {
         return vec![];
     };
@@ -355,11 +221,31 @@ fn resolve_executable(name: &str) -> Option<String> {
 
 // ---------- JSON-RPC client ----------
 
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type Routes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>>;
+
 struct AcpClient {
     write_tx: mpsc::UnboundedSender<String>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: Pending,
+    /// sessionId -> the running turn's update channel
+    routes: Routes,
     next_id: AtomicU64,
     stderr_tail: Arc<Mutex<String>>,
+    closed: Arc<AtomicBool>,
+}
+
+/// Unregisters a session's update route when the turn ends.
+struct RouteGuard {
+    routes: Routes,
+    session: String,
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        if let Ok(mut r) = self.routes.lock() {
+            r.remove(&self.session);
+        }
+    }
 }
 
 impl AcpClient {
@@ -368,6 +254,9 @@ impl AcpClient {
         method: &str,
         params: Value,
     ) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(self.dead_error());
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -381,9 +270,7 @@ impl AcpClient {
             "params": params
         })
         .to_string();
-        self.write_tx
-            .send(line)
-            .map_err(|_| self.dead_error())?;
+        self.write_tx.send(line).map_err(|_| self.dead_error())?;
         Ok(rx)
     }
 
@@ -406,6 +293,20 @@ impl AcpClient {
         self.write_tx.send(line).map_err(|_| self.dead_error())
     }
 
+    fn route(&self, session: &str) -> (mpsc::UnboundedReceiver<Value>, RouteGuard) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Ok(mut r) = self.routes.lock() {
+            r.insert(session.to_string(), tx);
+        }
+        (
+            rx,
+            RouteGuard {
+                routes: self.routes.clone(),
+                session: session.to_string(),
+            },
+        )
+    }
+
     fn dead_error(&self) -> String {
         let tail = self
             .stderr_tail
@@ -414,81 +315,49 @@ impl AcpClient {
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if tail.is_empty() {
-            "fx acp exited unexpectedly".to_string()
+            "opencode acp exited unexpectedly".to_string()
         } else {
-            format!("fx acp exited unexpectedly:\n{tail}")
+            format!("opencode acp exited unexpectedly:\n{tail}")
         }
     }
 }
 
-fn spawn_fx(
-    bin: &Path,
-    workspace: &str,
-    model: &str,
-    log_path: &Path,
-) -> Result<(Arc<AcpClient>, mpsc::UnboundedReceiver<Value>, Child), String> {
-    let mut cmd = Command::new(bin);
-    // Project instructions auto-load in fx (the native loop left them to the
-    // model). Cap them so a huge AGENTS.md can't crowd out the 32K work
-    // window; the agent can still read the full file with its tools.
-    cmd.arg("--context-limit")
-        .arg("project_instruction_file_bytes=32768")
-        .arg("--context-limit")
-        .arg("project_instructions_total_bytes=65536")
-        .arg("acp")
-        .arg("--log-file")
-        .arg(log_path)
-        .current_dir(workspace)
-        .env("FX_PROVIDER", "vicuna-local")
-        .env("FX_MODEL", model)
-        .env("FX_SOUND", "off")
-        .env("FX_AUTO_UPGRADE", "0")
-        .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
+fn spawn_opencode(bin: &Path) -> Result<(Arc<AcpClient>, Child), String> {
+    let mut cmd = super::opencode::command(bin);
+    cmd.arg("acp").stdin(std::process::Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot start fx acp ({}): {e}", bin.display()))?;
-    let mut stdin = child.stdin.take().ok_or("fx acp: no stdin")?;
-    let stdout = child.stdout.take().ok_or("fx acp: no stdout")?;
-    let stderr = child.stderr.take().ok_or("fx acp: no stderr")?;
+        .map_err(|e| format!("cannot start opencode acp ({}): {e}", bin.display()))?;
+    let mut stdin = child.stdin.take().ok_or("opencode acp: no stdin")?;
+    let stdout = child.stdout.take().ok_or("opencode acp: no stdout")?;
+    let stderr = child.stderr.take().ok_or("opencode acp: no stderr")?;
 
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         while let Some(line) = write_rx.recv().await {
-            if stdin.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            if stdin.write_all(b"\n").await.is_err() {
-                break;
-            }
-            if stdin.flush().await.is_err() {
+            if stdin.write_all(line.as_bytes()).await.is_err()
+                || stdin.write_all(b"\n").await.is_err()
+                || stdin.flush().await.is_err()
+            {
                 break;
             }
         }
     });
 
-    let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let stderr_tail = Arc::new(Mutex::new(String::new()));
-    let (updates_tx, updates_rx) = mpsc::unbounded_channel::<Value>();
+    let closed = Arc::new(AtomicBool::new(false));
 
-    let pending_reader = pending.clone();
-    let write_reader = write_tx.clone();
+    let (pending_r, routes_r, write_r, closed_r) =
+        (pending.clone(), routes.clone(), write_tx.clone(), closed.clone());
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            let id = msg.get("id").and_then(|v| v.as_u64());
+            let id = msg.get("id").cloned().filter(|v| !v.is_null());
             let method = msg.get("method").and_then(|m| m.as_str()).map(str::to_string);
             match (id, method) {
                 (Some(id), Some(method)) => {
@@ -502,10 +371,16 @@ fn spawn_fx(
                             "error": { "code": -32601, "message": error }
                         }),
                     };
-                    let _ = write_reader.send(reply.to_string());
+                    let _ = write_r.send(reply.to_string());
+                    if method == "session/request_permission" {
+                        if let Some(note) = permission_note(&params) {
+                            forward(&routes_r, &params, note);
+                        }
+                    }
                 }
                 (Some(id), None) => {
-                    if let Some(tx) = pending_reader.lock().ok().and_then(|mut m| m.remove(&id)) {
+                    let Some(id) = id.as_u64() else { continue };
+                    if let Some(tx) = pending_r.lock().ok().and_then(|mut m| m.remove(&id)) {
                         let result = match msg.get("error") {
                             Some(err) => Err(jsonrpc_error_text(err)),
                             None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
@@ -515,17 +390,23 @@ fn spawn_fx(
                 }
                 (None, Some(method)) => {
                     if method == "session/update" {
-                        let _ = updates_tx.send(msg);
+                        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                        forward(&routes_r, &params, msg);
                     }
                 }
                 (None, None) => {}
             }
         }
-        // EOF: unblock every waiter.
-        if let Ok(mut m) = pending_reader.lock() {
+        // EOF: the process is gone. Unblock every waiter and every turn; the
+        // next turn respawns.
+        closed_r.store(true, Ordering::Relaxed);
+        if let Ok(mut m) = pending_r.lock() {
             for (_, tx) in m.drain() {
-                let _ = tx.send(Err("fx acp closed the connection".to_string()));
+                let _ = tx.send(Err("opencode acp closed the connection".to_string()));
             }
+        }
+        if let Ok(mut r) = routes_r.lock() {
+            r.clear();
         }
     });
 
@@ -552,19 +433,39 @@ fn spawn_fx(
     let client = Arc::new(AcpClient {
         write_tx,
         pending,
+        routes,
         next_id: AtomicU64::new(0),
         stderr_tail,
+        closed,
     });
-    Ok((client, updates_rx, child))
+    Ok((client, child))
+}
+
+/// Deliver a message to the turn that owns `params.sessionId` (dropped when no
+/// turn is listening, e.g. history replayed by session/load).
+fn forward(routes: &Routes, params: &Value, msg: Value) {
+    let Some(sid) = params.get("sessionId").and_then(|s| s.as_str()) else {
+        return;
+    };
+    if let Some(tx) = routes.lock().ok().and_then(|r| r.get(sid).cloned()) {
+        let _ = tx.send(msg);
+    }
 }
 
 fn jsonrpc_error_text(err: &Value) -> String {
-    let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
     let message = err
         .get("message")
         .and_then(|m| m.as_str())
         .unwrap_or("unknown error");
-    format!("fx acp error {code}: {message}")
+    let detail = err
+        .get("data")
+        .and_then(|d| d.get("message").or_else(|| d.get("details")))
+        .and_then(|m| m.as_str())
+        .filter(|d| !d.is_empty() && *d != message);
+    match detail {
+        Some(d) => format!("{message}: {d}"),
+        None => message.to_string(),
+    }
 }
 
 /// Client-side fs/terminal capabilities are not advertised, so only
@@ -577,32 +478,12 @@ fn handle_agent_request(method: &str, params: &Value) -> Result<Value, String> {
                 .and_then(|o| o.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let pick = |kind: &str| {
-                options.iter().find_map(|opt| {
-                    let k = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                    if k == kind {
-                        opt.get("optionId")
-                            .and_then(|id| id.as_str())
-                            .map(|id| id.to_string())
-                    } else {
-                        None
-                    }
-                })
-            };
+            let kind_of = |opt: &Value| opt.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+            let id_of = |opt: &Value| opt.get("optionId").and_then(|id| id.as_str()).map(str::to_string);
+            let pick = |kind: &str| options.iter().find(|o| kind_of(o) == kind).and_then(id_of);
             let id = pick("allow_once")
                 .or_else(|| pick("allow_always"))
-                .or_else(|| {
-                    options.iter().find_map(|opt| {
-                        let k = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                        if k.starts_with("allow") {
-                            opt.get("optionId")
-                                .and_then(|id| id.as_str())
-                                .map(|id| id.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                });
+                .or_else(|| options.iter().find(|o| kind_of(o).starts_with("allow")).and_then(id_of));
             match id {
                 Some(option_id) => Ok(json!({
                     "outcome": { "outcome": "selected", "optionId": option_id }
@@ -614,7 +495,25 @@ fn handle_agent_request(method: &str, params: &Value) -> Result<Value, String> {
     }
 }
 
-// ---------- prompt + update translation ----------
+/// A synthetic update so the transcript says what was auto-approved.
+fn permission_note(params: &Value) -> Option<Value> {
+    let title = params
+        .pointer("/toolCall/title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "params": {
+            "sessionId": params.get("sessionId").cloned().unwrap_or(Value::Null),
+            "update": { "sessionUpdate": "vicuna_permission", "title": title }
+        }
+    }))
+}
+
+// ---------- update translation ----------
 
 fn content_text(value: &Value) -> Option<String> {
     match value {
@@ -679,7 +578,7 @@ fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (String, Val
         .get("command")
         .or_else(|| raw.get("cmd"))
         .and_then(|c| c.as_str());
-    // fx's glob/search tools can arrive as kind "read" with a pattern in
+    // opencode glob/search tools can arrive as kind "read" with a pattern in
     // rawInput; show them as a search instead of "read — <title>".
     let pattern = raw
         .get("pattern")
@@ -718,7 +617,6 @@ struct ToolState {
     ended: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_session_update(
     msg: &Value,
     on_event: &Channel<WorkAgentEvent>,
@@ -736,14 +634,6 @@ fn handle_session_update(
     match kind {
         "agent_message_chunk" => {
             if let Some(text) = update.get("content").and_then(content_text) {
-                // Defensive: fx versions that ignore session.notices send the
-                // context-truncation diagnostic as plain message text.
-                let trimmed = text.trim_start();
-                if trimmed.starts_with("[context]")
-                    && (trimmed.contains("truncated") || trimmed.contains("project instruction"))
-                {
-                    return;
-                }
                 *output_chars += text.chars().count();
                 emit_ev(on_event, stop, WorkAgentEvent::Token { text });
             }
@@ -774,7 +664,7 @@ fn handle_session_update(
                 .get("kind")
                 .and_then(|k| k.as_str())
                 .unwrap_or("other");
-            if kind == "tool_call" && !tools.contains_key(&id) {
+            if !tools.contains_key(&id) {
                 let raw = update.get("rawInput").cloned().unwrap_or_else(|| json!({}));
                 let (name, args) = tool_name_and_args(kind_hint, title, &raw);
                 tools.insert(
@@ -786,12 +676,8 @@ fn handle_session_update(
                 );
                 emit_ev(on_event, stop, WorkAgentEvent::ToolStart { name, args });
             }
-            let terminal = matches!(status, "completed" | "failed" | "cancelled");
-            if terminal {
-                let entry = tools.entry(id).or_insert_with(|| ToolState {
-                    name: tool_name_and_args(kind_hint, title, &json!({})).0,
-                    ended: false,
-                });
+            if matches!(status, "completed" | "failed" | "cancelled") {
+                let entry = tools.get_mut(&id).expect("inserted above");
                 if !entry.ended {
                     entry.ended = true;
                     let mut output = tool_output(update);
@@ -806,40 +692,15 @@ fn handle_session_update(
                 }
             }
         }
-        "notice" => {
-            let severity = update
-                .get("severity")
-                .and_then(|s| s.as_str())
-                .unwrap_or("info");
-            let title = update
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .trim();
-            let desc = update
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .trim();
-            // fx's project-instruction/context truncation notice is noisy in
-            // the chat (it repeats on every turn for big AGENTS.md files).
-            // It is still in the fx log when someone needs to raise the limit.
-            let noise = format!("{title} {desc}").to_lowercase();
-            let context_noise = noise.contains("project instruction")
-                || noise.contains("truncated")
-                || noise.contains("context limit")
-                || noise.contains("context-limit");
-            if severity == "info" || context_noise {
-                return;
-            }
-            let text = match (title.is_empty(), desc.is_empty()) {
-                (false, false) => format!("\n> {title} — {desc}\n"),
-                (false, true) => format!("\n> {title}\n"),
-                (true, false) => format!("\n> {desc}\n"),
-                (true, true) => String::new(),
-            };
-            if !text.is_empty() {
-                emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text });
+        "vicuna_permission" => {
+            if let Some(title) = update.get("title").and_then(|t| t.as_str()) {
+                emit_ev(
+                    on_event,
+                    stop,
+                    WorkAgentEvent::DisplayNote {
+                        text: format!("\n> Auto-approved: {title}\n"),
+                    },
+                );
             }
         }
         _ => {}
@@ -875,8 +736,8 @@ fn last_user_message(messages: &[ChatMessage]) -> Option<&ChatMessage> {
     messages.iter().rev().find(|m| m.role == "user")
 }
 
-/// On a brand-new fx session with existing Vicuna history (fork, app
-/// restart), hand fx the visible transcript so the work continues in context.
+/// On a brand-new opencode session with existing Vicuna history (fork, app
+/// restart), hand opencode the visible transcript so the work continues in context.
 fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage) -> String {
     let mut lines: Vec<String> = Vec::new();
     for m in messages {
@@ -953,60 +814,32 @@ fn messages_text(messages: &[ChatMessage]) -> (String, Option<Vec<String>>) {
     (text, images)
 }
 
-/// fx steering accepts text blocks only; over-long or image-bearing queued
-/// messages are sent as a normal follow-up prompt instead.
-fn steer_body(messages: &[ChatMessage]) -> Option<String> {
-    if messages
-        .iter()
-        .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-    {
-        return None;
-    }
-    let (text, _) = messages_text(messages);
-    if text.trim().is_empty() || text.chars().count() > 60_000 {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn stop_and_wait(child: &mut Child) {
-    let _ = child.start_kill();
-}
 
 // ---------- public entry point ----------
 
-/// Run one Work turn through `fx acp`. Emits the same event stream as the
-/// built-in loop; internal failures are surfaced as an Error event so the
-/// frontend always settles.
+/// Run one Work turn through the warm `opencode acp` process. Internal
+/// failures are surfaced as an Error event so the frontend always settles.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_fx_turn(
+pub async fn run_turn(
     turn: Arc<TurnState>,
-    model: String,
+    model: Option<String>,
     workspace: String,
     messages: Vec<ChatMessage>,
     session_id: Option<String>,
     goal_text: Option<String>,
-    context_length: Option<u64>,
-    ollama_base: Option<String>,
     fresh_session: bool,
     on_event: Channel<WorkAgentEvent>,
-    resource_dir: Option<PathBuf>,
     state: &AcpState,
 ) {
-    if let Err(message) = run_fx_turn_inner(
+    if let Err(message) = run_turn_inner(
         &turn,
-        &turn.stop,
-        &model,
+        model.as_deref(),
         &workspace,
         &messages,
         session_id.as_deref(),
         goal_text.as_deref(),
-        context_length,
-        ollama_base.as_deref(),
         fresh_session,
         &on_event,
-        resource_dir.as_deref(),
         state,
     )
     .await
@@ -1015,98 +848,110 @@ pub async fn run_fx_turn(
     }
 }
 
+/// Resume the chat's saved opencode session (resume, then load), else start
+/// a new one. Returns (sessionId, resumed).
+async fn open_session(
+    client: &AcpClient,
+    saved: Option<String>,
+    workspace: &str,
+    mcp: &[Value],
+) -> Result<(String, bool), String> {
+    if let Some(prev) = saved {
+        for method in ["session/resume", "session/load"] {
+            let ok = client
+                .call(
+                    method,
+                    json!({ "sessionId": prev, "cwd": workspace, "mcpServers": mcp }),
+                    SESSION_TIMEOUT,
+                )
+                .await
+                .is_ok();
+            if ok {
+                return Ok((prev, true));
+            }
+        }
+        // Saved session disappeared (data purge / version change): start
+        // clean; the history preamble keeps the context.
+    }
+    let result = client
+        .call(
+            "session/new",
+            json!({ "cwd": workspace, "mcpServers": mcp }),
+            SESSION_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("opencode could not start a session: {e}"))?;
+    let sid = result
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "opencode acp: session/new returned no sessionId".to_string())?;
+    Ok((sid, false))
+}
+
+/// Model to run: the turn's explicit pick, else the one saved in Vicuna's
+/// picker, else opencode's own default (None).
+fn effective_model(requested: Option<&str>) -> Option<String> {
+    requested
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(super::opencode::saved_model)
+}
+
+fn friendly_prompt_error(e: String) -> String {
+    let low = e.to_lowercase();
+    if low.contains("auth") || low.contains("api key") || low.contains("unauthorized") || low.contains("401") {
+        format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model.")
+    } else {
+        e
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_fx_turn_inner(
+async fn run_turn_inner(
     turn: &Arc<TurnState>,
-    stop: &AtomicBool,
-    model: &str,
+    model: Option<&str>,
     workspace: &str,
     messages: &[ChatMessage],
     session_id: Option<&str>,
     goal_text: Option<&str>,
-    context_length: Option<u64>,
-    ollama_base: Option<&str>,
     fresh_session: bool,
     on_event: &Channel<WorkAgentEvent>,
-    resource_dir: Option<&Path>,
     state: &AcpState,
 ) -> Result<(), String> {
-    let bin = fx_binary_path(resource_dir).ok_or_else(|| {
-        "fx acp sidecar not found. Run scripts/fetch-fx-sidecar.sh (or install fx).".to_string()
-    })?;
+    let stop = &turn.stop;
     let last_user = last_user_message(messages)
-        .ok_or_else(|| "fx acp: no user message to send".to_string())?;
-    let base = ollama_v1_base(ollama_base.unwrap_or(""));
-    write_fx_settings(model, &base, context_length)?;
-    let log_path = fx_log_path()?;
+        .ok_or_else(|| "Work mode: no user message to send".to_string())?;
+    let client = state.client().await?;
+    let mcp = mcp_servers();
 
-    let mcp = mcp_servers_for_fx();
-    let (client, mut updates, mut child) = spawn_fx(&bin, workspace, model, &log_path)?;
-
-    // initialize
-    let init = client
-        .call(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false,
-                    // Structured notices keep fx's context/limit diagnostics
-                    // out of the assistant transcript (we can filter them).
-                    "session": { "notices": {} }
-                },
-                "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": "0.1.0" }
-            }),
-            INIT_TIMEOUT,
-        )
-        .await
-        .map_err(|e| {
-            format!("fx acp initialize failed: {e}. Check the Ollama endpoint and that the bundled fx sidecar runs.")
-        })?;
-    let _ = init;
-
-    let key = session_key(session_id, workspace, model);
-    let mut resumed = false;
-    let fx_session: String;
-    if let Some(prev) = if fresh_session {
+    let key = session_key(session_id, workspace);
+    let saved = if fresh_session {
         None
     } else {
         key.as_deref().and_then(|k| state.get(k))
-    } {
-        let resume = client
-            .call(
-                "session/resume",
-                json!({
-                    "sessionId": prev,
-                    "cwd": workspace,
-                    "mcpServers": mcp
-                }),
-                SESSION_TIMEOUT,
-            )
-            .await;
-        match resume {
-            Ok(_) => {
-                fx_session = prev;
-                resumed = true;
-            }
-            Err(_) => {
-                // Saved fx session disappeared (profile purge / version
-                // change). Start clean; history preamble keeps context.
-                fx_session = new_session(&client, workspace, mcp.clone(), goal_text, session_id).await?;
-            }
-        }
-    } else {
-        fx_session = new_session(&client, workspace, mcp.clone(), goal_text, session_id).await?;
-    }
+    };
+    let (acp_session, resumed) = open_session(&client, saved, workspace, &mcp).await?;
     if let Some(k) = key {
-        state.set(k, fx_session.clone());
+        state.set(k, acp_session.clone());
+    }
+    let (mut updates, _route) = client.route(&acp_session);
+
+    if let Some(m) = effective_model(model) {
+        client
+            .call(
+                "session/set_config_option",
+                json!({ "sessionId": acp_session, "configId": "model", "value": m }),
+                CONFIG_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("opencode could not switch to model {m}: {e}"))?;
     }
 
-    // First prompt: on a fresh fx session, prepend the visible transcript
-    // (forks/restarts). Resumed sessions already hold the conversation.
-    // The goal is repeated on every turn because a resumed fx session keeps
-    // its original system prompt.
+    // First prompt: on a fresh session, Vicuna's workspace rules plus the
+    // visible transcript (forks/restarts). Resumed sessions already hold the
+    // conversation. The goal is repeated every turn.
     let goal_note = goal_text
         .filter(|g| !g.trim().is_empty())
         .map(|g| format!("\n\n[Session goal: {g} — keep working until it is fully achieved.]"))
@@ -1115,15 +960,16 @@ async fn run_fx_turn_inner(
     let text = if resumed {
         base_text
     } else {
-        format!("{}{}", history_preamble(messages, last_user), base_text)
+        format!(
+            "{}\n\n---\n{}{}",
+            system_prompt(workspace, None, session_id).trim(),
+            history_preamble(messages, last_user),
+            base_text
+        )
     };
     let mut blocks = prompt_blocks(&text, &last_user.images);
 
     let mut first_round = true;
-    let mut carry: Vec<ChatMessage> = Vec::new();
-    let (steer_tx, mut steer_results) = mpsc::unbounded_channel::<(u64, Result<Value, String>)>();
-    let mut steer_seq = 0u64;
-    let mut steer_in_flight: Option<u64> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1138,140 +984,41 @@ async fn run_fx_turn_inner(
         let started = Instant::now();
         let rx = client.request(
             "session/prompt",
-            json!({ "sessionId": fx_session, "prompt": blocks }),
+            json!({ "sessionId": acp_session, "prompt": blocks }),
         )?;
         tokio::pin!(rx);
         let mut output_chars = 0usize;
         let mut tools: HashMap<String, ToolState> = HashMap::new();
         let mut cancelled = false;
-        let mut cancel_deadline: Option<Instant> = None;
-        let mut steer_msgs: Vec<ChatMessage> = Vec::new();
+        let mut cancel_at: Option<Instant> = None;
         let outcome: Result<Value, String> = loop {
             tokio::select! {
                 update = updates.recv() => {
                     match update {
-                        Some(msg) => handle_session_update(
-                            &msg, on_event, stop, &mut tools, &mut output_chars
-                        ),
-                        None => break Err("fx acp closed the connection".to_string()),
+                        Some(msg) => handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars),
+                        None => break Err(client.dead_error()),
                     }
                 }
                 result = &mut rx => break result.map_err(|_| "acp: response channel dropped".to_string()).and_then(|r| r),
-                steer = steer_results.recv() => {
-                    if let Some((id, res)) = steer {
-                        if steer_in_flight == Some(id) {
-                            steer_in_flight = None;
-                            let absorbed = match &res {
-                                Ok(v) => v.pointer("/_meta/fx/steering").and_then(|s| s.as_str()) != Some("dropped"),
-                                Err(_) => false,
-                            };
-                            if absorbed {
-                                steer_msgs.clear();
-                            } else {
-                                carry.extend(std::mem::take(&mut steer_msgs));
-                            }
-                        }
-                    }
-                }
                 _ = tokio::time::sleep(Duration::from_millis(120)) => {
                     if stop.load(Ordering::Relaxed) && !cancelled {
                         cancelled = true;
-                        cancel_deadline = Some(Instant::now());
-                        let _ = client.notify("session/cancel", json!({ "sessionId": fx_session }));
+                        cancel_at = Some(Instant::now());
+                        let _ = client.notify("session/cancel", json!({ "sessionId": acp_session }));
                     }
-                    if let Some(deadline) = cancel_deadline {
-                        if deadline.elapsed() > CANCEL_GRACE {
-                            break Ok(json!({ "stopReason": "cancelled" }));
-                        }
-                    }
-                    // Mid-turn steering: fx accepts a second session/prompt
-                    // with _meta.fx.steer:true and folds it into the running
-                    // turn. Only one may be in flight; dropped steers become
-                    // the next prompt in this turn.
-                    if !stop.load(Ordering::Relaxed) && steer_in_flight.is_none() {
-                        let queued = take_queue(turn);
-                        if !queued.is_empty() {
-                            let ids: Vec<String> = queued.iter().map(|(id, _)| id.clone()).collect();
-                            let drained: Vec<ChatMessage> = queued.into_iter().map(|(_, m)| m).collect();
-                            let body = steer_body(&drained);
-                            emit_ev(
-                                on_event,
-                                stop,
-                                WorkAgentEvent::QueueDrained { ids, messages: drained.clone() },
-                            );
-                            match body {
-                                Some(text) => {
-                                    match client.request(
-                                        "session/prompt",
-                                        json!({
-                                            "sessionId": fx_session,
-                                            "prompt": [{ "type": "text", "text": text }],
-                                            "_meta": { "fx": { "steer": true } }
-                                        }),
-                                    ) {
-                                        Ok(srx) => {
-                                            steer_seq += 1;
-                                            let id = steer_seq;
-                                            steer_in_flight = Some(id);
-                                            steer_msgs = drained;
-                                            let tx = steer_tx.clone();
-                                            tokio::spawn(async move {
-                                                let res = match srx.await {
-                                                    Ok(r) => r,
-                                                    Err(_) => Err("acp: steering response dropped".to_string()),
-                                                };
-                                                let _ = tx.send((id, res));
-                                            });
-                                        }
-                                        Err(_) => carry.extend(drained),
-                                    }
-                                }
-                                None => carry.extend(drained),
-                            }
-                        }
+                    if cancel_at.is_some_and(|t| t.elapsed() > CANCEL_GRACE) {
+                        break Ok(json!({ "stopReason": "cancelled" }));
                     }
                 }
             }
         };
-        // A steer still in flight when the main prompt settled: wait briefly
-        // for its verdict; dropped messages re-run as the next prompt.
-        if let Some(id) = steer_in_flight.take() {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut absorbed = false;
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                match tokio::time::timeout(left, steer_results.recv()).await {
-                    Ok(Some((got, Ok(v)))) if got == id => {
-                        absorbed = v
-                            .pointer("/_meta/fx/steering")
-                            .and_then(|s| s.as_str())
-                            != Some("dropped");
-                        break;
-                    }
-                    Ok(Some(_)) => continue, // stale result from an earlier steer
-                    _ => break,
-                }
-            }
-            if absorbed {
-                steer_msgs.clear();
-            } else {
-                carry.extend(std::mem::take(&mut steer_msgs));
-            }
-        }
         // Drain trailing updates that arrived before the prompt response.
         while let Ok(msg) = updates.try_recv() {
             handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
         }
         let gen_ms = started.elapsed().as_millis() as u64;
         let secs = (gen_ms as f64 / 1000.0).max(0.001);
-        let gen_tps = if output_chars > 0 {
-            Some((output_chars as f64 / 4.0) / secs)
-        } else {
-            None
-        };
+        let gen_tps = (output_chars > 0).then(|| (output_chars as f64 / 4.0) / secs);
         emit_ev(
             on_event,
             stop,
@@ -1298,32 +1045,28 @@ async fn run_fx_turn_inner(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                return Err(e);
+                return Err(friendly_prompt_error(e));
             }
         }
 
-        // Anything queued after the last poll: fresh bubbles, emit them.
+        // opencode has no mid-turn steering: messages queued while it worked
+        // run as the next prompt of this same turn.
         let queued = take_queue(turn);
-        if !queued.is_empty() {
-            let ids: Vec<String> = queued.iter().map(|(id, _)| id.clone()).collect();
-            let drained: Vec<ChatMessage> = queued.into_iter().map(|(_, m)| m).collect();
-            emit_ev(
-                on_event,
-                stop,
-                WorkAgentEvent::QueueDrained { ids, messages: drained.clone() },
-            );
-            carry.extend(drained);
-        }
-        if carry.is_empty() {
+        if queued.is_empty() {
             break;
         }
-        let drained = std::mem::take(&mut carry);
+        let ids: Vec<String> = queued.iter().map(|(id, _)| id.clone()).collect();
+        let drained: Vec<ChatMessage> = queued.into_iter().map(|(_, m)| m).collect();
+        emit_ev(
+            on_event,
+            stop,
+            WorkAgentEvent::QueueDrained { ids, messages: drained.clone() },
+        );
         let (next_text, next_images) = messages_text(&drained);
         blocks = prompt_blocks(&next_text, &next_images);
         first_round = false;
     }
 
-    stop_and_wait(&mut child);
     emit_ev(
         on_event,
         stop,
@@ -1334,110 +1077,19 @@ async fn run_fx_turn_inner(
     Ok(())
 }
 
-async fn new_session(
-    client: &AcpClient,
-    workspace: &str,
-    mcp: Vec<Value>,
-    goal_text: Option<&str>,
-    session_id: Option<&str>,
-) -> Result<String, String> {
-    let prompt = system_prompt(workspace, goal_text, session_id);
-    let result = client
-        .call(
-            "session/new",
-            json!({
-                "cwd": workspace,
-                "mcpServers": mcp,
-                "systemPrompt": [{ "type": "text", "text": prompt }]
-            }),
-            SESSION_TIMEOUT,
-        )
-        .await?;
-    result
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "fx acp: session/new returned no sessionId".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ollama_base_normalization() {
-        assert_eq!(ollama_v1_base(""), "http://localhost:11434/v1");
-        assert_eq!(
-            ollama_v1_base("http://localhost:11434/"),
-            "http://localhost:11434/v1"
-        );
-        assert_eq!(
-            ollama_v1_base("http://localhost:11434/v1"),
-            "http://localhost:11434/v1"
-        );
-        assert_eq!(
-            ollama_v1_base("https://box.ts.net/ollama"),
-            "https://box.ts.net/ollama/v1"
-        );
-    }
-
-    #[test]
-    fn settings_add_vicuna_provider_without_touching_user_choices() {
-        let mut doc = json!({
-            "provider": "gateway",
-            "models": { "gateway": "spacexai/grok-4.7" },
-            "providers": { "work": { "protocol": "openai-chat-completions", "base_url": "https://example.test/v1" } }
-        });
-        apply_fx_settings(&mut doc, "qwen3.8:27b", "http://localhost:11434/v1", Some(65536));
-        assert_eq!(doc["provider"], "gateway");
-        assert_eq!(doc["models"]["gateway"], "spacexai/grok-4.7");
-        assert_eq!(doc["models"]["vicuna-local"], "qwen3.8:27b");
-        assert_eq!(
-            doc["providers"]["vicuna-local"]["base_url"],
-            "http://localhost:11434/v1"
-        );
-        assert_eq!(
-            doc["providers"]["vicuna-local"]["protocol"],
-            "openai-chat-completions"
-        );
-        assert_eq!(
-            doc["providers"]["vicuna-local"]["model_metadata"]["qwen3.8:27b"]["context_window"],
-            65536
-        );
-        assert_eq!(doc["providers"]["work"]["base_url"], "https://example.test/v1");
-    }
-
-    #[test]
-    fn binary_lookup_prefers_arch_suffix() {
-        let dir = std::env::temp_dir().join(format!("vicuna-fx-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let name = if cfg!(target_os = "macos") {
-            if cfg!(target_arch = "aarch64") { "fx-arm64" } else { "fx-x64" }
-        } else if cfg!(windows) {
-            "fx.exe"
-        } else {
-            "fx"
-        };
-        let path = dir.join(name);
-        std::fs::write(&path, b"x").unwrap();
-        assert_eq!(fx_binary_in(&dir), Some(path.clone()));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
-    }
 
     #[test]
     fn tool_mapping_reads_like_native_names() {
         let (name, args) = tool_name_and_args("execute", "Run tests", &json!({ "command": "cargo test" }));
         assert_eq!(name, "exec");
         assert_eq!(args["command"], "cargo test");
-        let (name, args) = tool_name_and_args("read", "src/main.rs", &json!({ "path": "src/main.rs" }));
+        let (name, args) = tool_name_and_args("read", "src/main.rs", &json!({ "filePath": "src/main.rs" }));
         assert_eq!(name, "read");
         assert_eq!(args["path"], "src/main.rs");
-        let (name, args) = tool_name_and_args(
-            "read",
-            "Matching",
-            &json!({ "pattern": "**/*.md", "path": "." }),
-        );
+        let (name, args) = tool_name_and_args("search", "Matching", &json!({ "pattern": "**/*.md", "path": "." }));
         assert_eq!(name, "grep");
         assert_eq!(args["pattern"], "**/*.md");
     }
@@ -1445,12 +1097,65 @@ mod tests {
     #[test]
     fn permission_auto_approves_allow_once() {
         let params = json!({
+            "sessionId": "s1",
+            "toolCall": { "title": "bash: rm -rf build" },
             "options": [
                 { "kind": "allow_always", "optionId": "always" },
-                { "kind": "allow_once", "optionId": "once" }
+                { "kind": "allow_once", "optionId": "once" },
+                { "kind": "reject_once", "optionId": "reject" }
             ]
         });
         let out = handle_agent_request("session/request_permission", &params).unwrap();
         assert_eq!(out["outcome"]["optionId"], "once");
+        let note = permission_note(&params).unwrap();
+        assert_eq!(note["params"]["sessionId"], "s1");
+        assert_eq!(note["params"]["update"]["title"], "bash: rm -rf build");
+    }
+
+    #[test]
+    fn permission_without_allow_cancels() {
+        let params = json!({ "options": [{ "kind": "reject_once", "optionId": "r" }] });
+        let out = handle_agent_request("session/request_permission", &params).unwrap();
+        assert_eq!(out["outcome"]["outcome"], "cancelled");
+        assert!(handle_agent_request("fs/read_text_file", &json!({})).is_err());
+    }
+
+    #[test]
+    fn updates_route_by_session_and_drop_unrouted() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        routes.lock().unwrap().insert("a".into(), tx);
+        forward(&routes, &json!({ "sessionId": "a" }), json!(1));
+        forward(&routes, &json!({ "sessionId": "b" }), json!(2));
+        forward(&routes, &json!({}), json!(3));
+        assert_eq!(rx.try_recv().unwrap(), json!(1));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn route_guard_unregisters() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        routes.lock().unwrap().insert("a".into(), mpsc::unbounded_channel().0);
+        drop(RouteGuard { routes: routes.clone(), session: "a".into() });
+        assert!(routes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_key_ignores_model() {
+        assert_eq!(session_key(Some("chat1"), "/w"), Some("chat1|/w".to_string()));
+        assert_eq!(session_key(None, "/w"), None);
+    }
+
+    #[test]
+    fn explicit_model_wins_and_blank_is_ignored() {
+        assert_eq!(effective_model(Some(" ollama/x ")), Some("ollama/x".to_string()));
+    }
+
+    #[test]
+    fn rpc_error_text_includes_detail() {
+        let e = json!({ "code": -32603, "message": "Internal error", "data": { "message": "model not found" } });
+        assert_eq!(jsonrpc_error_text(&e), "Internal error: model not found");
+        assert_eq!(jsonrpc_error_text(&json!({ "message": "x" })), "x");
+        assert!(friendly_prompt_error("401 Unauthorized".into()).contains("opencode auth login"));
     }
 }

@@ -37,9 +37,6 @@ jobs:
       - name: Fetch lb browser sidecar (pinned)
         run: sh scripts/fetch-lb-sidecar.sh
 
-      - name: Fetch fx Work sidecar (pinned)
-        run: sh scripts/fetch-fx-sidecar.sh
-
       - run: npx tauri build --target universal-apple-darwin --bundles dmg
 
       - name: Upload DMG to rolling release
@@ -99,10 +96,6 @@ jobs:
         shell: bash
         run: sh scripts/fetch-lb-sidecar.sh
 
-      - name: Fetch fx Work sidecar (pinned)
-        shell: bash
-        run: sh scripts/fetch-fx-sidecar.sh
-
       # nsis = single self-contained setup.exe (the default "all" target
       # would also build an .msi, which needs a WiX toolchain on the runner)
       - run: npx tauri build --bundles nsis
@@ -113,8 +106,7 @@ jobs:
         shell: bash
         run: |
           gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --title "Latest dev build" || true
-          # fx (the Work-mode ACP engine) has no Windows release, so Windows
-          # falls back to the built-in agent. Keep the existing setup.exe
+          # Keep the existing setup.exe
           # asset instead of replacing a known-good Windows build on every
           # main push; publish a new exe only when the release has none yet.
           # To force a new Windows build, delete the setup.exe asset from `latest`.
@@ -150,9 +142,6 @@ jobs:
 
       - name: Fetch lb browser sidecar (pinned)
         run: sh scripts/fetch-lb-sidecar.sh
-
-      - name: Fetch fx Work sidecar (pinned)
-        run: sh scripts/fetch-fx-sidecar.sh
 
       - run: npx tauri build --bundles appimage,deb
 

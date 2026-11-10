@@ -12,11 +12,6 @@ src-tauri/lb-sidecar/lb-arm64
 src-tauri/lb-sidecar/lb-x64
 src-tauri/lb-sidecar/web/
 src-tauri/lb-sidecar/LB_VERSION
-# fx-sidecar build artifact (see src-tauri/fx-sidecar/README.md): keep the dir + README
-src-tauri/fx-sidecar/fx
-src-tauri/fx-sidecar/fx-arm64
-src-tauri/fx-sidecar/fx-x64
-src-tauri/fx-sidecar/FX_VERSION
 .env
 .env.*
 !.env.example
