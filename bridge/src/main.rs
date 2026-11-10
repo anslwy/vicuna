@@ -147,9 +147,12 @@ async fn dispatch(
                     .map_err(|e| format!("bad messages: {e}"))?;
             let session_id = arg_opt_str(args, "sessionId");
             let goal_text = arg_opt_str(args, "goalText");
+            let mcp_snapshot =
+                vicuna_lib::acp::McpSnapshot::capture(&st.mcp, test_resource_dir().as_deref()).await;
             tokio::spawn(async move {
                 vicuna_lib::acp::run_turn(
                     turn, model, workspace, messages, session_id, goal_text, fresh_session, on_event, &acp,
+                    mcp_snapshot,
                 )
                 .await;
             });

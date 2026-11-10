@@ -159,14 +159,170 @@ fn session_key(session_id: Option<&str>, workspace: &str) -> Option<String> {
     session_id.map(|id| format!("{id}|{workspace}"))
 }
 
-// ---------- session parameters ----------
+// ---------- session parameters + MCP servers handed to opencode ----------
 
-/// Params for session/new, resume and load. Vicuna injects NO tools: the
-/// agent gets exactly opencode's built-ins plus the MCP servers the user
-/// configured in opencode itself. (Forwarding Vicuna's own MCP servers here
-/// pushed some providers past their 128-tool request limit.)
-fn session_params(workspace: &str, session_id: Option<&str>) -> Value {
-    let mut v = json!({ "cwd": workspace, "mcpServers": [] });
+/// Providers reject requests with more than this many tools (OpenAI-style
+/// "Invalid value for 'tools': maximum number of items is 128").
+pub const PROVIDER_TOOL_LIMIT: usize = 128;
+/// Headroom kept for opencode's own built-in tools (~20 today) plus slack.
+pub const OPENCODE_TOOL_RESERVE: usize = 32;
+/// The MCP dialog's id for the synthetic built-in browser row.
+pub const BROWSER_MCP_ID: &str = "browser";
+
+/// What Vicuna's MCP dialog currently shows, captured when a turn starts:
+/// connected server id -> advertised tool count, plus the absolute `lb mcp`
+/// argv for the built-in browser row (when `lb` resolves).
+#[derive(Debug, Clone, Default)]
+pub struct McpSnapshot {
+    pub tool_counts: HashMap<String, usize>,
+    pub browser_command: Option<Vec<String>>,
+    pub browser_server_url: String,
+}
+
+impl McpSnapshot {
+    pub async fn capture(mcp: &crate::mcp::McpManager, resource_dir: Option<&Path>) -> Self {
+        let tool_counts = mcp.tool_counts().await;
+        let browser_command = if tool_counts.contains_key(BROWSER_MCP_ID) {
+            crate::browser::browser_mcp_command(resource_dir).ok()
+        } else {
+            None
+        };
+        Self {
+            tool_counts,
+            browser_command,
+            browser_server_url: crate::browser::lb_server_url(),
+        }
+    }
+}
+
+/// One MCP server Vicuna would hand to opencode.
+#[derive(Debug, Clone)]
+struct PlannedServer {
+    name: String,
+    entry: Value,
+    /// Known tool count (server connected in Vicuna), else unknown.
+    tools: Option<usize>,
+}
+
+fn name_value_list(map: Option<HashMap<String, String>>) -> Vec<Value> {
+    let mut v: Vec<(String, String)> = map.unwrap_or_default().into_iter().collect();
+    v.sort();
+    v.into_iter().map(|(k, val)| json!({ "name": k, "value": val })).collect()
+}
+
+/// ACP `McpServer` entry for a stdio server (absolute command when it
+/// resolves on PATH: macOS GUI apps and opencode may not share the shell's).
+fn stdio_entry(name: &str, command: &[String], env: Option<HashMap<String, String>>) -> Option<Value> {
+    let first = command.first().filter(|c| !c.trim().is_empty())?;
+    let exe = resolve_executable(first).unwrap_or_else(|| first.clone());
+    Some(json!({
+        "name": name,
+        "command": exe,
+        "args": command[1..],
+        "env": name_value_list(env),
+    }))
+}
+
+/// ACP `McpServer` entry for a remote (streamable HTTP) server. A stored
+/// Vicuna OAuth login rides along as a Bearer header unless the user set
+/// their own Authorization header.
+fn http_entry(name: &str, url: &str, headers: Option<HashMap<String, String>>, bearer: Option<String>) -> Value {
+    let mut headers = headers.unwrap_or_default();
+    let has_auth = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+    if let (false, Some(token)) = (has_auth, bearer) {
+        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+    }
+    json!({ "type": "http", "name": name, "url": url, "headers": name_value_list(Some(headers)) })
+}
+
+/// Keep servers in order while the known tool total stays within `budget`.
+/// Servers with an unknown count (not connected in Vicuna) are kept; the
+/// provider-error hint covers the rare case they push past the limit.
+fn fit_tool_budget(servers: Vec<PlannedServer>, budget: usize) -> (Vec<PlannedServer>, Vec<PlannedServer>) {
+    let mut used = 0usize;
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for s in servers {
+        let n = s.tools.unwrap_or(0);
+        if used + n <= budget {
+            used += n;
+            kept.push(s);
+        } else {
+            skipped.push(s);
+        }
+    }
+    (kept, skipped)
+}
+
+fn skipped_note(skipped: &[PlannedServer]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = skipped
+        .iter()
+        .map(|s| format!("{} ({} tools)", s.name, s.tools.unwrap_or(0)))
+        .collect();
+    Some(format!(
+        "MCP servers not available this turn: {}. Together with opencode's own tools they would exceed the model's {}-tool limit; turn some servers off in the MCP dialog to make room.",
+        list.join(", "),
+        PROVIDER_TOOL_LIMIT
+    ))
+}
+
+/// Vicuna's MCP dialog, as opencode `mcpServers`: every enabled vicuna.json
+/// server plus the built-in browser row when it is connected, trimmed to
+/// the tool budget. Returns the entries and an optional note for the user.
+async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Option<String>) {
+    let files = crate::mcp::list_file_servers().unwrap_or_default();
+    let mut planned = Vec::new();
+    for s in files.iter().filter(|s| s.enabled) {
+        let tools = snap.tool_counts.get(&s.id).copied();
+        let entry = if s.normalized_transport() == "stdio" {
+            match s.command.as_deref().and_then(|c| stdio_entry(&s.name, c, s.env.clone())) {
+                Some(e) => e,
+                None => continue,
+            }
+        } else {
+            let Some(url) = s.url.as_deref().filter(|u| !u.is_empty()) else { continue };
+            http_entry(&s.name, url, s.headers.clone(), crate::mcp::bearer_token(&s.name).await)
+        };
+        planned.push(PlannedServer { name: s.name.clone(), entry, tools });
+    }
+    let file_has_browser = files.iter().any(|s| s.id == BROWSER_MCP_ID || s.name == BROWSER_MCP_ID);
+    if !file_has_browser {
+        if let Some(cmd) = &snap.browser_command {
+            let env = HashMap::from([("LB_SERVER".to_string(), snap.browser_server_url.clone())]);
+            if let Some(entry) = stdio_entry(BROWSER_MCP_ID, cmd, Some(env)) {
+                planned.push(PlannedServer {
+                    name: BROWSER_MCP_ID.to_string(),
+                    entry,
+                    tools: snap.tool_counts.get(BROWSER_MCP_ID).copied(),
+                });
+            }
+        }
+    }
+    let (kept, skipped) = fit_tool_budget(planned, PROVIDER_TOOL_LIMIT - OPENCODE_TOOL_RESERVE);
+    (kept.into_iter().map(|s| s.entry).collect(), skipped_note(&skipped))
+}
+
+fn resolve_executable(name: &str) -> Option<String> {
+    let p = Path::new(name);
+    if p.is_absolute() && p.is_file() {
+        return Some(name.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Params for session/new, resume and load.
+fn session_params(workspace: &str, session_id: Option<&str>, mcp: &[Value]) -> Value {
+    let mut v = json!({ "cwd": workspace, "mcpServers": mcp });
     if let Some(id) = session_id {
         v["sessionId"] = json!(id);
     }
@@ -198,10 +354,10 @@ fn is_tool_limit_error(e: &str) -> bool {
             || low.contains("at most 128"))
 }
 
-pub(crate) const TOOL_LIMIT_HINT: &str = "The model's provider rejected the request because opencode sent too many tools. \
-Vicuna adds no tools of its own, so they come from the MCP servers in your opencode config \
+pub(crate) const TOOL_LIMIT_HINT: &str = "The model's provider rejected the request because it carried too many tools. \
+Vicuna keeps the MCP servers it passes from its MCP dialog under the limit, so the rest come from MCP servers in your opencode config \
 (see `opencode mcp list`; ~/.config/opencode/opencode.json, \"mcp\" section, or the workspace's opencode.json). \
-Disable some MCP servers there (\"enabled\": false) or pick a different model.";
+Turn off some servers in Vicuna's MCP dialog or in your opencode config, or pick a different model.";
 
 // ---------- JSON-RPC client ----------
 
@@ -814,6 +970,7 @@ pub async fn run_turn(
     fresh_session: bool,
     on_event: Channel<WorkAgentEvent>,
     state: &AcpState,
+    mcp_snapshot: McpSnapshot,
 ) {
     if let Err(message) = run_turn_inner(
         &turn,
@@ -825,6 +982,7 @@ pub async fn run_turn(
         fresh_session,
         &on_event,
         state,
+        &mcp_snapshot,
     )
     .await
     {
@@ -838,11 +996,12 @@ async fn open_session(
     client: &AcpClient,
     saved: Option<String>,
     workspace: &str,
+    mcp: &[Value],
 ) -> Result<(String, bool, Option<String>), String> {
     if let Some(prev) = saved {
         for method in ["session/resume", "session/load"] {
             if let Ok(r) = client
-                .call(method, session_params(workspace, Some(&prev)), SESSION_TIMEOUT)
+                .call(method, session_params(workspace, Some(&prev), mcp), SESSION_TIMEOUT)
                 .await
             {
                 let model = current_model(&r);
@@ -853,7 +1012,7 @@ async fn open_session(
         // clean; the history preamble keeps the context.
     }
     let result = client
-        .call("session/new", session_params(workspace, None), SESSION_TIMEOUT)
+        .call("session/new", session_params(workspace, None, mcp), SESSION_TIMEOUT)
         .await
         .map_err(|e| format!("opencode could not start a session: {e}"))?;
     let sid = result
@@ -896,6 +1055,7 @@ async fn run_turn_inner(
     fresh_session: bool,
     on_event: &Channel<WorkAgentEvent>,
     state: &AcpState,
+    mcp_snapshot: &McpSnapshot,
 ) -> Result<(), String> {
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
@@ -908,7 +1068,11 @@ async fn run_turn_inner(
     } else {
         key.as_deref().and_then(|k| state.get(k))
     };
-    let (acp_session, resumed, mut used_model) = open_session(&client, saved, workspace).await?;
+    let (mcp, mcp_note) = mcp_servers_for_turn(mcp_snapshot).await;
+    if let Some(note) = mcp_note {
+        emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
+    }
+    let (acp_session, resumed, mut used_model) = open_session(&client, saved, workspace, &mcp).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
     }
@@ -1141,16 +1305,51 @@ mod tests {
         assert!(friendly_prompt_error("401 Unauthorized".into()).contains("opencode auth login"));
     }
 
-    /// Regression: Vicuna used to forward its own MCP servers into every
-    /// session, which pushed requests past providers' 128-tool limit.
     #[test]
-    fn sessions_inject_no_tools() {
-        for p in [session_params("/w", None), session_params("/w", Some("s1"))] {
-            assert_eq!(p["mcpServers"], json!([]), "{p}");
-            assert_eq!(p["cwd"], "/w");
-        }
-        assert_eq!(session_params("/w", Some("s1"))["sessionId"], "s1");
-        assert!(session_params("/w", None).get("sessionId").is_none());
+    fn session_params_carry_mcp_servers() {
+        let mcp = vec![json!({ "name": "searchapi", "type": "http", "url": "https://x", "headers": [] })];
+        let p = session_params("/w", None, &mcp);
+        assert_eq!(p["mcpServers"], json!(mcp));
+        assert_eq!(p["cwd"], "/w");
+        assert!(p.get("sessionId").is_none());
+        assert_eq!(session_params("/w", Some("s1"), &[])["sessionId"], "s1");
+    }
+
+    fn planned(name: &str, tools: Option<usize>) -> PlannedServer {
+        PlannedServer { name: name.into(), entry: json!({ "name": name }), tools }
+    }
+
+    /// Regression for the 128-tool error: servers past the budget are
+    /// dropped (in dialog order) and named in a note; unknown counts pass.
+    #[test]
+    fn tool_budget_skips_servers_that_would_overflow() {
+        let budget = PROVIDER_TOOL_LIMIT - OPENCODE_TOOL_RESERVE;
+        let (kept, skipped) = fit_tool_budget(
+            vec![planned("searchapi", Some(3)), planned("big", Some(140)), planned("browser", Some(33)), planned("unknown", None)],
+            budget,
+        );
+        let names: Vec<_> = kept.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["searchapi", "browser", "unknown"]);
+        assert_eq!(skipped.len(), 1);
+        let note = skipped_note(&skipped).unwrap();
+        assert!(note.contains("big (140 tools)") && note.contains("MCP dialog"), "{note}");
+        assert!(skipped_note(&[]).is_none());
+        assert!(kept.iter().map(|s| s.tools.unwrap_or(0)).sum::<usize>() + OPENCODE_TOOL_RESERVE <= PROVIDER_TOOL_LIMIT);
+    }
+
+    #[test]
+    fn mcp_entries_match_acp_shape() {
+        let e = stdio_entry("browser", &["/abs/lb".into(), "mcp".into()], Some(HashMap::from([("LB_SERVER".into(), "http://127.0.0.1:18765".into())]))).unwrap();
+        assert_eq!(e["command"], "/abs/lb");
+        assert_eq!(e["args"], json!(["mcp"]));
+        assert_eq!(e["env"], json!([{ "name": "LB_SERVER", "value": "http://127.0.0.1:18765" }]));
+        assert!(stdio_entry("x", &[], None).is_none());
+        let h = http_entry("searchapi", "https://mcp.example/mcp", None, Some("tok".into()));
+        assert_eq!(h["type"], "http");
+        assert_eq!(h["headers"], json!([{ "name": "Authorization", "value": "Bearer tok" }]));
+        // a user-set Authorization header wins over the stored login
+        let own = http_entry("s", "https://u", Some(HashMap::from([("authorization".into(), "Key k".into())])), Some("tok".into()));
+        assert_eq!(own["headers"], json!([{ "name": "authorization", "value": "Key k" }]));
     }
 
     /// Regression: the exact upstream error the owner hit must carry the
@@ -1161,7 +1360,7 @@ mod tests {
         assert!(is_tool_limit_error(raw));
         let msg = friendly_prompt_error(raw.into());
         assert!(msg.starts_with(raw));
-        assert!(msg.contains("opencode mcp list") && msg.contains("Vicuna adds no tools"), "{msg}");
+        assert!(msg.contains("opencode mcp list") && msg.contains("MCP dialog"), "{msg}");
         assert!(!is_tool_limit_error("Internal error: model not found"));
         assert_eq!(friendly_prompt_error("model not found".into()), "model not found");
     }

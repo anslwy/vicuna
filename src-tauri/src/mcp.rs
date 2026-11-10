@@ -57,7 +57,7 @@ fn default_enabled() -> bool {
 }
 
 impl McpServerConfig {
-    fn normalized_transport(&self) -> &str {
+    pub(crate) fn normalized_transport(&self) -> &str {
         match self.transport.as_str() {
             "local" => "stdio",
             "remote" => "http",
@@ -602,6 +602,18 @@ impl McpManager {
         }
     }
 
+    /// Connected server id -> number of tools it advertised at connect
+    /// (cached, no network). Work mode uses it to stay under providers'
+    /// tool-count limits when handing servers to opencode.
+    pub async fn tool_counts(&self) -> HashMap<String, usize> {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .map(|(id, c)| (id.clone(), c.tools.len()))
+            .collect()
+    }
+
     /// Ids with a live connection (for the agent's `mcp_list` status column).
     pub async fn connected_ids(&self) -> Vec<String> {
         self.inner.lock().await.keys().cloned().collect()
@@ -795,6 +807,12 @@ fn now_secs() -> u64 {
 async fn http_bearer(server_name: &str) -> Option<String> {
     let path = auth_config_path().ok()?;
     http_bearer_in(server_name, &path).await
+}
+
+/// Public form of the stored-login lookup (refreshing when expired), so Work
+/// mode can hand an OAuth-signed-in remote server to opencode with its token.
+pub async fn bearer_token(server_name: &str) -> Option<String> {
+    http_bearer(server_name).await
 }
 
 async fn http_bearer_in(server_name: &str, auth_path: &Path) -> Option<String> {

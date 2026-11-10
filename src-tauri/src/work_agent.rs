@@ -167,6 +167,12 @@ pub async fn work_agent_start(
     }
     let turn = Arc::new(TurnState::new());
     let turn_id = agent_state.next_turn(turn.clone());
+    // the MCP dialog's servers (+ built-in browser) go to opencode
+    let mcp_snapshot = crate::acp::McpSnapshot::capture(
+        &app.state::<crate::mcp::McpManager>(),
+        app.path().resource_dir().ok().as_deref(),
+    )
+    .await;
     tokio::spawn(async move {
         let acp = app.state::<crate::acp::AcpState>();
         crate::acp::run_turn(
@@ -179,6 +185,7 @@ pub async fn work_agent_start(
             fresh_session.unwrap_or(false),
             on_event,
             &acp,
+            mcp_snapshot,
         )
         .await;
     });
