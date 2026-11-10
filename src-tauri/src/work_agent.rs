@@ -22,6 +22,8 @@ pub enum WorkAgentEvent {
     Think { text: String },
     Status { label: Option<String> },
     RoundStart { mode: String },
+    /// The opencode model this turn actually runs on (reply label).
+    Model { model: String },
     RoundEnd { gen_ms: u64, gen_tps: Option<f64>, gen_cost: Option<f64> },
     DisplayNote { text: String },
     QueueDrained { ids: Vec<String>, messages: Vec<ChatMessage> },

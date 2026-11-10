@@ -3,7 +3,7 @@
 // which has no Node typings here; Node runs this file directly (type stripping).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workSendGate, opencodeModelChoices, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
+import { workSendGate, opencodeModelChoices, workReplyModel, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
 
 const base: WorkEngineInfo = {
   installed: true,
@@ -54,4 +54,13 @@ test("a saved pick missing from opencode's list stays visible", () => {
 test("no list yet => only the saved pick", () => {
   assert.deepEqual(opencodeModelChoices(null, null, ""), []);
   assert.equal(opencodeModelChoices(null, "ollama/x", "").length, 1);
+});
+
+// Regression: Work replies were labelled with the Chat model
+// (e.g. muse-glimmer:30b-mlx) while the turn ran on opencode/beam-free.
+test("Work reply label is the opencode model, never the Chat model", () => {
+  assert.equal(workReplyModel("opencode/beam-free", "ollama/x"), "opencode/beam-free");
+  assert.equal(workReplyModel(null, "opencode/beam-free"), "opencode/beam-free");
+  assert.equal(workReplyModel(undefined, null), "opencode");
+  assert.equal(workReplyModel("  ", ""), "opencode");
 });

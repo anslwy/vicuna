@@ -30,7 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, listOpencodeModels, setOpencodeModel, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listOpencodeModels, setOpencodeModel, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -5704,6 +5704,17 @@
    *  like the old in-thread loop did. Settle paths (leftovers, follow-up
    *  turns, goal retirement, stats) are unchanged. */
   async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean } = {}) {
+    // reply label: the opencode model this turn runs on (refined by the
+    // backend's "model" event), never the Chat-mode model
+    let turnModel = workReplyModel(null, workModel);
+    {
+      const c0 = chats.find((x) => x.id === chat.id);
+      const m0 = c0?.messages[index];
+      if (c0 && m0 && m0.role === "assistant") {
+        c0.messages[index] = { ...m0, model: turnModel };
+        chats = [...chats];
+      }
+    }
     const turnId = ++workTurnSeq;
     workTurnSeqByChat.set(chat.id, turnId);
     // a turn is live while it is still its session's newest: late events
@@ -5745,7 +5756,7 @@
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[curIndex]) {
         const m = c.messages[curIndex];
-        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
+        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: turnModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
@@ -5840,7 +5851,7 @@
           if (c) {
             c.updatedAt = Date.now();
             for (const q of leftovers) {
-              c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: selectedModel }];
+              c.messages = [...c.messages, q, { role: "assistant", content: "", thinking: "", model: turnModel }];
             }
             chats = [c, ...chats.filter((x) => x.id !== c.id)];
             save();
@@ -5889,6 +5900,17 @@
           save();
           armStall();
           break;
+        case "model": {
+          turnModel = workReplyModel(ev.model, workModel);
+          const t = live();
+          const m = t?.messages[curIndex];
+          if (t && m && m.role === "assistant" && m.model !== turnModel) {
+            t.messages[curIndex] = { ...m, model: turnModel };
+            chats = [...chats];
+            saveSoon();
+          }
+          break;
+        }
         case "roundend": {
           clearStall();
           dropStallHint();
@@ -5925,7 +5947,7 @@
               t.messages = [
                 ...t.messages,
                 { role: "user", content: q.content, ...(q.images ? { images: q.images } : {}) },
-                { role: "assistant", content: "", thinking: "", model: selectedModel }
+                { role: "assistant", content: "", thinking: "", model: turnModel }
               ];
             }
             chats = [t, ...chats.filter((x) => x.id !== t.id)];

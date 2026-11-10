@@ -159,65 +159,49 @@ fn session_key(session_id: Option<&str>, workspace: &str) -> Option<String> {
     session_id.map(|id| format!("{id}|{workspace}"))
 }
 
-// ---------- MCP servers handed to opencode in session/new ----------
+// ---------- session parameters ----------
 
-fn mcp_servers() -> Vec<Value> {
-    let Ok(servers) = crate::mcp::list_file_servers() else {
-        return vec![];
-    };
-    servers
-        .into_iter()
-        .filter(|s| s.enabled)
-        .filter_map(|s| {
-            if s.transport == "stdio" {
-                let command = s.command.clone()?;
-                if command.is_empty() {
-                    return None;
-                }
-                let exe = resolve_executable(&command[0])?;
-                let mut v = json!({
-                    "name": s.name,
-                    "command": exe,
-                    "args": command[1..],
-                });
-                if let Some(env) = s.env {
-                    let env: Vec<Value> = env
-                        .into_iter()
-                        .map(|(k, val)| json!({ "name": k, "value": val }))
-                        .collect();
-                    v["env"] = Value::Array(env);
-                }
-                Some(v)
-            } else {
-                let url = s.url?;
-                let mut v = json!({ "type": "http", "name": s.name, "url": url });
-                if let Some(headers) = s.headers {
-                    let headers: Vec<Value> = headers
-                        .into_iter()
-                        .map(|(k, val)| json!({ "name": k, "value": val }))
-                        .collect();
-                    v["headers"] = Value::Array(headers);
-                }
-                Some(v)
-            }
-        })
-        .collect()
+/// Params for session/new, resume and load. Vicuna injects NO tools: the
+/// agent gets exactly opencode's built-ins plus the MCP servers the user
+/// configured in opencode itself. (Forwarding Vicuna's own MCP servers here
+/// pushed some providers past their 128-tool request limit.)
+fn session_params(workspace: &str, session_id: Option<&str>) -> Value {
+    let mut v = json!({ "cwd": workspace, "mcpServers": [] });
+    if let Some(id) = session_id {
+        v["sessionId"] = json!(id);
+    }
+    v
 }
 
-fn resolve_executable(name: &str) -> Option<String> {
-    let p = Path::new(name);
-    if p.is_absolute() && p.is_file() {
-        return Some(name.to_string());
-    }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-    None
+/// The model opencode reports as current in a configOptions-bearing result
+/// (session/new, resume/load, set_config_option).
+fn current_model(result: &Value) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model"))?
+        .get("currentValue")?
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
 }
+
+/// Provider rejections caused by too many tools in the request (OpenAI-style
+/// "maximum number of items is 128" on `tools`, and similar wordings).
+fn is_tool_limit_error(e: &str) -> bool {
+    let low = e.to_lowercase();
+    low.contains("tools")
+        && (low.contains("maximum number of items")
+            || low.contains("too many tools")
+            || low.contains("maximum of 128")
+            || low.contains("at most 128"))
+}
+
+pub(crate) const TOOL_LIMIT_HINT: &str = "The model's provider rejected the request because opencode sent too many tools. \
+Vicuna adds no tools of its own, so they come from the MCP servers in your opencode config \
+(see `opencode mcp list`; ~/.config/opencode/opencode.json, \"mcp\" section, or the workspace's opencode.json). \
+Disable some MCP servers there (\"enabled\": false) or pick a different model.";
 
 // ---------- JSON-RPC client ----------
 
@@ -854,31 +838,22 @@ async fn open_session(
     client: &AcpClient,
     saved: Option<String>,
     workspace: &str,
-    mcp: &[Value],
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool, Option<String>), String> {
     if let Some(prev) = saved {
         for method in ["session/resume", "session/load"] {
-            let ok = client
-                .call(
-                    method,
-                    json!({ "sessionId": prev, "cwd": workspace, "mcpServers": mcp }),
-                    SESSION_TIMEOUT,
-                )
+            if let Ok(r) = client
+                .call(method, session_params(workspace, Some(&prev)), SESSION_TIMEOUT)
                 .await
-                .is_ok();
-            if ok {
-                return Ok((prev, true));
+            {
+                let model = current_model(&r);
+                return Ok((prev, true, model));
             }
         }
         // Saved session disappeared (data purge / version change): start
         // clean; the history preamble keeps the context.
     }
     let result = client
-        .call(
-            "session/new",
-            json!({ "cwd": workspace, "mcpServers": mcp }),
-            SESSION_TIMEOUT,
-        )
+        .call("session/new", session_params(workspace, None), SESSION_TIMEOUT)
         .await
         .map_err(|e| format!("opencode could not start a session: {e}"))?;
     let sid = result
@@ -886,7 +861,7 @@ async fn open_session(
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .ok_or_else(|| "opencode acp: session/new returned no sessionId".to_string())?;
-    Ok((sid, false))
+    Ok((sid, false, current_model(&result)))
 }
 
 /// Model to run: the turn's explicit pick, else the one saved in Vicuna's
@@ -901,7 +876,9 @@ fn effective_model(requested: Option<&str>) -> Option<String> {
 
 fn friendly_prompt_error(e: String) -> String {
     let low = e.to_lowercase();
-    if low.contains("auth") || low.contains("api key") || low.contains("unauthorized") || low.contains("401") {
+    if is_tool_limit_error(&e) {
+        format!("{e}\n{TOOL_LIMIT_HINT}")
+    } else if low.contains("auth") || low.contains("api key") || low.contains("unauthorized") || low.contains("401") {
         format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model.")
     } else {
         e
@@ -924,7 +901,6 @@ async fn run_turn_inner(
     let last_user = last_user_message(messages)
         .ok_or_else(|| "Work mode: no user message to send".to_string())?;
     let client = state.client().await?;
-    let mcp = mcp_servers();
 
     let key = session_key(session_id, workspace);
     let saved = if fresh_session {
@@ -932,14 +908,14 @@ async fn run_turn_inner(
     } else {
         key.as_deref().and_then(|k| state.get(k))
     };
-    let (acp_session, resumed) = open_session(&client, saved, workspace, &mcp).await?;
+    let (acp_session, resumed, mut used_model) = open_session(&client, saved, workspace).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
     }
     let (mut updates, _route) = client.route(&acp_session);
 
     if let Some(m) = effective_model(model) {
-        client
+        let r = client
             .call(
                 "session/set_config_option",
                 json!({ "sessionId": acp_session, "configId": "model", "value": m }),
@@ -947,6 +923,12 @@ async fn run_turn_inner(
             )
             .await
             .map_err(|e| format!("opencode could not switch to model {m}: {e}"))?;
+        used_model = current_model(&r).or(Some(m));
+    }
+    // Tell the UI which opencode model this turn really runs on (the reply
+    // label must never show the Chat-mode model).
+    if let Some(m) = used_model {
+        emit_ev(on_event, stop, WorkAgentEvent::Model { model: m });
     }
 
     // First prompt: on a fresh session, Vicuna's workspace rules plus the
@@ -1157,5 +1139,43 @@ mod tests {
         assert_eq!(jsonrpc_error_text(&e), "Internal error: model not found");
         assert_eq!(jsonrpc_error_text(&json!({ "message": "x" })), "x");
         assert!(friendly_prompt_error("401 Unauthorized".into()).contains("opencode auth login"));
+    }
+
+    /// Regression: Vicuna used to forward its own MCP servers into every
+    /// session, which pushed requests past providers' 128-tool limit.
+    #[test]
+    fn sessions_inject_no_tools() {
+        for p in [session_params("/w", None), session_params("/w", Some("s1"))] {
+            assert_eq!(p["mcpServers"], json!([]), "{p}");
+            assert_eq!(p["cwd"], "/w");
+        }
+        assert_eq!(session_params("/w", Some("s1"))["sessionId"], "s1");
+        assert!(session_params("/w", None).get("sessionId").is_none());
+    }
+
+    /// Regression: the exact upstream error the owner hit must carry the
+    /// opencode-config hint instead of a bare provider message.
+    #[test]
+    fn tool_limit_error_points_at_opencode_config() {
+        let raw = "Internal error: Upstream request failed: [invalid_value] Invalid value for 'tools': maximum number of items is 128.";
+        assert!(is_tool_limit_error(raw));
+        let msg = friendly_prompt_error(raw.into());
+        assert!(msg.starts_with(raw));
+        assert!(msg.contains("opencode mcp list") && msg.contains("Vicuna adds no tools"), "{msg}");
+        assert!(!is_tool_limit_error("Internal error: model not found"));
+        assert_eq!(friendly_prompt_error("model not found".into()), "model not found");
+    }
+
+    /// Regression: the reply label showed the Chat model. The model id the
+    /// turn reports comes from opencode's own configOptions.
+    #[test]
+    fn current_model_reads_config_options() {
+        let r = json!({ "sessionId": "s", "configOptions": [
+            { "id": "effort", "currentValue": "default" },
+            { "id": "model", "currentValue": "opencode/beam-free", "options": [] }
+        ]});
+        assert_eq!(current_model(&r).as_deref(), Some("opencode/beam-free"));
+        assert_eq!(current_model(&json!({ "sessionId": "s" })), None);
+        assert_eq!(current_model(&json!({ "configOptions": [{ "id": "model", "currentValue": "" }] })), None);
     }
 }

@@ -43,3 +43,13 @@ export function opencodeModelChoices(list: OpencodeModels | null, selected: stri
   return q ? rows.filter((m) => m.id.toLowerCase().includes(q)) : rows;
 }
 
+
+/** Label for a Work-mode reply: the model opencode reported for the turn,
+ *  else the Work picker's choice, else "opencode" (its own default). Never
+ *  the Chat-mode model. */
+export function workReplyModel(reported: string | null | undefined, picked: string | null | undefined): string {
+  const r = reported?.trim();
+  if (r) return r;
+  const p = picked?.trim();
+  return p ? p : "opencode";
+}

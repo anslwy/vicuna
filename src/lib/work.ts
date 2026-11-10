@@ -8,7 +8,7 @@ import { isTauriRuntime } from "./ollama";
 import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
-export { workSendGate, opencodeModelChoices } from "./workGate";
+export { workSendGate, opencodeModelChoices, workReplyModel } from "./workGate";
 export type { WorkEngineInfo, OpencodeModel, OpencodeModels } from "./workGate";
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {
@@ -442,6 +442,7 @@ export type WorkAgentEvent =
   | { type: "think"; text: string }
   | { type: "status"; label: string | null }
   | { type: "roundstart"; mode: string }
+  | { type: "model"; model: string }
   | { type: "roundend"; gen_ms: number; gen_tps: number | null; gen_cost?: number | null }
   | { type: "displaynote"; text: string }
   | { type: "queuedrained"; ids: string[]; messages: ChatMsg[] }

@@ -61,7 +61,7 @@ npm run build   # static build to ./build
   web-only dev works without the shell.
 - Work mode runs on the user's installed [opencode](https://opencode.ai) CLI
   over ACP: `src-tauri/src/acp.rs` keeps one warm `opencode acp` process,
-  opens a session per chat (workspace cwd + Vicuna's MCP servers), applies
+  opens a session per chat (workspace cwd; MCP tools come from your own opencode config), applies
   the model picked in Vicuna (listed from `opencode models`) and streams ACP
   updates into the same UI event channel. Nothing is bundled and there is no
   fallback: without opencode, Work mode shows an install link and Send is
