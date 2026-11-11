@@ -32,7 +32,7 @@ const EXE_NAMES: &[&str] = &["opencode"];
 
 // ---------- detection ----------
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE");
     #[cfg(not(windows))]
@@ -42,7 +42,7 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Install locations checked after PATH (official installer, npm/bun/pnpm
 /// globals, Homebrew). Order matters: first hit wins.
-fn common_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn common_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(h) = home {
         dirs.push(h.join(".opencode").join("bin"));
@@ -66,7 +66,7 @@ fn common_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-fn is_executable(p: &Path) -> bool {
+pub(crate) fn is_executable(p: &Path) -> bool {
     if !p.is_file() {
         return false;
     }
@@ -88,6 +88,17 @@ pub fn find_opencode_in(
     path_var: Option<OsString>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
+    find_exe_in(EXE_NAMES, override_bin, path_var, &common_dirs(home))
+}
+
+/// Shared lookup for every Work engine binary: an exclusive override, then
+/// PATH, then `extra_dirs` (install locations a GUI app's PATH misses).
+pub(crate) fn find_exe_in(
+    names: &[&str],
+    override_bin: Option<&str>,
+    path_var: Option<OsString>,
+    extra_dirs: &[PathBuf],
+) -> Option<PathBuf> {
     if let Some(o) = override_bin.map(str::trim).filter(|o| !o.is_empty()) {
         let p = PathBuf::from(o);
         return is_executable(&p).then_some(p);
@@ -95,9 +106,9 @@ pub fn find_opencode_in(
     let mut dirs: Vec<PathBuf> = path_var
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    dirs.extend(common_dirs(home));
+    dirs.extend(extra_dirs.iter().cloned());
     for dir in dirs {
-        for name in EXE_NAMES {
+        for name in names {
             let candidate = dir.join(name);
             if is_executable(&candidate) {
                 return Some(candidate);
@@ -127,7 +138,20 @@ pub fn resolve() -> Option<crate::exe_resolve::Resolved> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkEngineInfo {
+    /// Engine id: "opencode" or "claude".
+    #[serde(default)]
+    pub id: String,
+    /// Display name ("opencode", "Claude Code").
+    #[serde(default)]
+    pub label: String,
     pub installed: bool,
+    /// Why the engine can't run, with the install hint (None when installed).
+    #[serde(default)]
+    pub missing: Option<String>,
+    /// Every engine Vicuna knows (filled by `work_engine_info`), so the UI can
+    /// offer an engine picker when more than one is installed.
+    #[serde(default)]
+    pub engines: Vec<EngineSummary>,
     pub path: Option<String>,
     pub version: Option<String>,
     pub install_url: String,
@@ -140,10 +164,27 @@ pub struct WorkEngineInfo {
     /// Non-blocking warning, e.g. the version is older than MIN_VERSION.
     #[serde(default)]
     pub warning: Option<String>,
+    /// Tool approval mode: true = ask the user, false = auto-approve.
+    #[serde(default)]
+    pub ask_permission: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSummary {
+    pub id: String,
+    pub label: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub missing: Option<String>,
 }
 
 pub fn not_installed_info() -> WorkEngineInfo {
     WorkEngineInfo {
+        id: "opencode".to_string(),
+        label: "opencode".to_string(),
+        missing: Some(format!("opencode CLI not found, install it: {INSTALL_URL}")),
+        engines: Vec::new(),
         installed: false,
         path: None,
         version: None,
@@ -152,6 +193,7 @@ pub fn not_installed_info() -> WorkEngineInfo {
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: Vec::new(),
         warning: None,
+        ask_permission: false,
     }
 }
 
@@ -186,6 +228,7 @@ pub async fn engine_info() -> WorkEngineInfo {
     let warning = version.as_deref().and_then(outdated_warning);
     WorkEngineInfo {
         installed: true,
+        missing: None,
         path: Some(found.path.display().to_string()),
         version,
         others,
@@ -247,6 +290,14 @@ pub fn clean_error(err: &str) -> String {
 /// - `autoupdate=false`: a background self-update must not replace the binary
 ///   under a long-lived Work process.
 pub fn config_content(existing: Option<&str>) -> String {
+    config_content_with(existing, false)
+}
+
+/// `ask`: Vicuna's "ask before running tools" mode. opencode allows every
+/// tool by default and so never sends permission requests; ask mode makes
+/// edits, shell commands and web fetches ask (only when the user's own
+/// config sets no `permission` of its own).
+pub fn config_content_with(existing: Option<&str>, ask: bool) -> String {
     let mut config = existing
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .filter(Value::is_object)
@@ -260,6 +311,9 @@ pub fn config_content(existing: Option<&str>) -> String {
         .expect("inserted above")
         .insert("location_idle_timeout".into(), Value::Bool(false));
     obj.insert("autoupdate".into(), Value::Bool(false));
+    if ask && !obj.contains_key("permission") {
+        obj.insert("permission".into(), json!({ "edit": "ask", "bash": "ask", "webfetch": "ask" }));
+    }
     config.to_string()
 }
 
@@ -267,7 +321,10 @@ pub fn config_content(existing: Option<&str>) -> String {
 pub fn process_env() -> Vec<(String, String)> {
     let existing = std::env::var(CONFIG_CONTENT_ENV).ok();
     vec![
-        (CONFIG_CONTENT_ENV.to_string(), config_content(existing.as_deref())),
+        (
+            CONFIG_CONTENT_ENV.to_string(),
+            config_content_with(existing.as_deref(), crate::work_engine::approval_ask()),
+        ),
         ("NO_COLOR".to_string(), "1".to_string()),
     ]
 }
@@ -297,7 +354,7 @@ pub fn command(bin: &Path) -> Command {
     cmd
 }
 
-async fn run_capture(bin: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(crate) async fn run_capture(bin: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = command(bin);
     cmd.args(args);
     let out = tokio::time::timeout(timeout, cmd.output())
@@ -319,9 +376,13 @@ async fn run_capture(bin: &Path, args: &[&str], timeout: Duration) -> Result<Str
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct OpencodeModel {
-    /// `provider/model` exactly as opencode accepts it.
+    /// `provider/model` exactly as opencode accepts it (Claude: the `--model`
+    /// value the CLI lists in its initialize response, e.g. "haiku").
     pub id: String,
     pub provider: String,
+    /// Display name when the engine provides one (Claude).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -361,6 +422,7 @@ pub fn parse_models_output(stdout: &str) -> Vec<OpencodeModel> {
             out.push(OpencodeModel {
                 id: line.to_string(),
                 provider: provider.to_string(),
+                name: None,
             });
         }
     }
@@ -618,6 +680,18 @@ mod tests {
         assert_eq!(outdated_warning(MIN_VERSION), None);
         assert_eq!(outdated_warning("2.10.0"), None);
         assert_eq!(outdated_warning("garbage"), None);
+    }
+
+
+    #[test]
+    fn ask_mode_makes_opencode_ask_unless_user_set_permission() {
+        let v: Value = serde_json::from_str(&config_content_with(None, true)).unwrap();
+        assert_eq!(v["permission"]["bash"], "ask");
+        assert_eq!(v["permission"]["edit"], "ask");
+        let auto: Value = serde_json::from_str(&config_content_with(None, false)).unwrap();
+        assert!(auto.get("permission").is_none());
+        let own: Value = serde_json::from_str(&config_content_with(Some(r#"{"permission":{"bash":"allow"}}"#), true)).unwrap();
+        assert_eq!(own["permission"]["bash"], "allow");
     }
 
 }
