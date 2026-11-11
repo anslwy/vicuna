@@ -33,6 +33,8 @@ export interface WorkEngineInfo {
   others?: string[];
   /** non-blocking warning, e.g. older than the tested minimum version */
   warning?: string | null;
+  /** tool approval: true = ask in the chat, false = auto-approve */
+  askPermission?: boolean;
 }
 
 /** Send gate for Work mode: no opencode, no turn (there is no fallback).

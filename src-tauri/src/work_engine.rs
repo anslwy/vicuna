@@ -102,12 +102,41 @@ pub fn read_engine_from(path: &Path) -> Option<Engine> {
     Engine::parse(v.get("engine")?.as_str()?)
 }
 
-pub fn write_engine_to(path: &Path, engine: Engine) -> Result<(), String> {
+fn update_prefs(path: &Path, key: &str, value: Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(&json!({ "engine": engine.id() })).unwrap_or_default();
+    let mut doc = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    doc[key] = value;
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+pub fn write_engine_to(path: &Path, engine: Engine) -> Result<(), String> {
+    update_prefs(path, "engine", json!(engine.id()))
+}
+
+/// Tool approval: "auto" (default; every permission request is approved and
+/// noted in the transcript) or "ask" (each request becomes an ask card in the
+/// chat; the user picks Allow / Reject).
+pub fn read_ask_from(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("approval").and_then(|a| a.as_str()).map(|a| a == "ask"))
+        .unwrap_or(false)
+}
+
+pub fn write_ask_to(path: &Path, ask: bool) -> Result<(), String> {
+    update_prefs(path, "approval", json!(if ask { "ask" } else { "auto" }))
+}
+
+pub fn approval_ask() -> bool {
+    prefs_path().is_some_and(|p| read_ask_from(&p))
 }
 
 pub fn saved_engine() -> Option<Engine> {
@@ -152,6 +181,7 @@ pub async fn engines_info() -> WorkEngineInfo {
         .map(|(_, i)| i)
         .expect("every engine has info");
     info.engines = summaries;
+    info.ask_permission = approval_ask();
     info
 }
 
@@ -176,6 +206,12 @@ pub async fn select_engine(engine: &str) -> Result<WorkEngineInfo, String> {
     Ok(engines_info().await)
 }
 
+pub async fn set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
+    let path = prefs_path().ok_or("cannot locate home folder")?;
+    write_ask_to(&path, ask)?;
+    Ok(engines_info().await)
+}
+
 pub fn set_model(engine: Option<&str>, model: Option<&str>) -> Result<(), String> {
     effective_engine(engine).save_model(model)
 }
@@ -190,6 +226,11 @@ pub async fn work_engine_select(engine: String) -> Result<WorkEngineInfo, String
 #[tauri::command]
 pub async fn work_models(engine: Option<String>, acp: State<'_, crate::acp::AcpState>) -> Result<OpencodeModels, String> {
     list_models(effective_engine(engine.as_deref()), &acp).await
+}
+
+#[tauri::command]
+pub async fn work_set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
+    set_approval(ask).await
 }
 
 #[tauri::command]
@@ -237,5 +278,13 @@ mod tests {
         assert_eq!(read_engine_from(&p), Some(Engine::Claude));
         write_engine_to(&p, Engine::Opencode).unwrap();
         assert_eq!(read_engine_from(&p), Some(Engine::Opencode));
+        // approval mode lives in the same file and survives engine switches
+        assert!(!read_ask_from(&p));
+        write_ask_to(&p, true).unwrap();
+        write_engine_to(&p, Engine::Claude).unwrap();
+        assert!(read_ask_from(&p));
+        assert_eq!(read_engine_from(&p), Some(Engine::Claude));
+        write_ask_to(&p, false).unwrap();
+        assert!(!read_ask_from(&p));
     }
 }

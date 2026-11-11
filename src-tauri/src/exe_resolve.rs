@@ -400,6 +400,10 @@ mod tests {
         assert_eq!(parse_semver("2.1.322 (Claude Code)"), Some(vec![2, 1, 322]));
         assert_eq!(parse_semver("1.10.0-beta.3"), Some(vec![1, 10, 0]));
         assert!(parse_semver("1.10.0").unwrap() > parse_semver("1.9.12").unwrap());
+        // owner's Mac: ~/.opencode/bin 2.2.7 vs nvm 1.18.35 -> 2.2.7 is newer
+        assert!(parse_semver("2.2.7").unwrap() > parse_semver("1.18.35").unwrap());
+        assert!(parse_semver("1.18.35").unwrap() > parse_semver("1.9.0").unwrap());
+        assert!(parse_semver("2.10.0").unwrap() > parse_semver("2.9.99").unwrap());
         assert_eq!(parse_semver("no version"), None);
     }
 

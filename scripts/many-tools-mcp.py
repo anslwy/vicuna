@@ -13,7 +13,7 @@ TOOLS = [
     {
         "name": f"noop_{i:03d}",
         "description": f"No-op test tool {i}.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {"note": {"type": "string", "description": "optional note"}}},
     }
     for i in range(N)
 ]

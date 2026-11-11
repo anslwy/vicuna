@@ -180,6 +180,7 @@ pub async fn engine_info() -> WorkEngineInfo {
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: other_labels,
         warning: None,
+        ask_permission: false,
     }
 }
 

@@ -6,6 +6,7 @@
 #   scripts/work-acceptance.sh present <model> [engine]  # models listed, turn 1 + resumed turn 2
 #   scripts/work-acceptance.sh mcp <model> [engine]      # a Vicuna MCP server's tool actually runs
 #   scripts/work-acceptance.sh toolcap <model> [engine]  # MCP servers reach the engine, under 128 tools
+#   scripts/work-acceptance.sh approve <model> [engine]  # 'ask' mode: a shell command waits for Allow, then runs
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #
 #   engine = opencode (default) | claude
@@ -17,7 +18,7 @@
 #      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CLAUDE_ACP_BIN
 #      (default: found on PATH).
 # Billed turns (by the provider; opencode/beam-free is free): present = 2,
-# mcp = 1, toolcap = 1. Every mode runs the bridge with a temporary HOME so
+# mcp = 1, approve = 1, toolcap = 1. Every mode runs the bridge with a temporary HOME so
 # the user's real ~/vicuna/config is never touched; opencode keeps its real
 # XDG config/auth and Claude its real ~/.claude login (symlinked in).
 set -euo pipefail
@@ -217,7 +218,7 @@ PY
     start_bridge
     r="$(invoke mcp_connect "{\"config\":{\"id\":\"vicuna_probe\",\"name\":\"vicuna_probe\",\"transport\":\"stdio\",\"command\":[\"python3\",\"$srv\",\"3\"],\"env\":{\"MANY_TOOLS_LOG\":\"$work/probe.log\"},\"enabled\":true}}")"
     python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print("mcp_connect vicuna_probe:", len(r["data"]["tools"]), "tools")' "$r"
-    run_turn "mcp-$$" true "Call the MCP tool named noop_001 (from the vicuna_probe server) exactly once, then reply with the single word DONE."
+    run_turn "mcp-$$" true "Call the MCP tool named noop_001 (from the vicuna_probe server) exactly once with the argument note set to \"vicuna-args-check\", then reply with the single word DONE."
     python3 - "$work" <<'PY'
 import json, sys
 work = sys.argv[1]
@@ -232,6 +233,66 @@ assert calls.count("initialize") >= 2, "the engine never started the MCP server"
 assert "tools/call" in calls, "the MCP tool was not called"
 assert starts, "no tool card was shown"
 print("PASS a Vicuna MCP server's tool ran inside the engine's turn")
+probe = [e for e in starts if "noop_001" in str(e.get("name")) or "noop_001" in json.dumps(e.get("args"))]
+assert probe and "vicuna-args-check" in json.dumps(probe[-1].get("args")), f"tool card args missing: {starts}"
+print("PASS the tool card shows the real arguments:", json.dumps(probe[-1].get("args"))[:100])
+PY
+    ;;
+  approve)
+    [ -n "$model" ] || { echo "usage: $0 approve <model> [engine]"; exit 2; }
+    # "Ask before running tools": the engine's permission request becomes an
+    # ask card; the turn waits until the user answers. Answer Allow, then the
+    # command must run and the transcript must say "Approved".
+    start_bridge
+    r="$(invoke work_set_approval '{"ask":true}')"
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"] and r["data"]["askPermission"] is True, r; print("approval mode: ask")' "$r"
+    start="$(invoke work_agent_start "$(turn_args "ap-$$" true "Use your shell/bash tool to run exactly this one command (it writes a file, so it needs approval): mkdir -p approve-test && echo vicuna-approve-ok > approve-test/out.txt && cat approve-test/out.txt. Then reply with its output.")")"
+    echo "work_agent_start: $start"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    answered=""
+    for _ in $(seq 1 600); do
+      curl -sS "$base/poll/ap-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      if [ -z "$answered" ]; then
+        ask="$(python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e.get("type") == "askrequest":
+        opts = e["options"]
+        pick = next((o for o in opts if o.lower() in ("allow", "allow once", "yes")), None) or next((o for o in opts if "allow" in o.lower() and "always" not in o.lower()), opts[0])
+        print(json.dumps({"askId": e["ask_id"], "answer": pick, "question": e["question"], "options": opts}))
+        break
+PY
+)"
+        if [ -n "$ask" ]; then
+          echo "ask card: $ask"
+          aid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["askId"])' "$ask")"
+          ans="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["answer"])' "$ask")"
+          invoke work_agent_answer "{\"turnId\":\"$turn_id\",\"askId\":\"$aid\",\"answer\":\"$ans\"}" >/dev/null
+          answered=1
+        fi
+      fi
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    invoke work_set_approval '{"ask":false}' >/dev/null
+    python3 - "$work/events.jsonl" "$answered" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+assert sys.argv[2] == "1", "no ask card appeared: the command was not held for approval"
+notes = "".join(e.get("text", "") for e in evs if e.get("type") == "displaynote")
+assert "Approved:" in notes and "Auto-approved" not in notes, notes
+outs = " ".join(e.get("output", "") for e in evs if e.get("type") == "toolend")
+text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
+assert "vicuna-approve-ok" in outs + text, (outs[:300], text[:300])
+import os
+print("PASS ask mode: the command waited for the ask card, ran after Allow, transcript says Approved")
 PY
     ;;
   toolcap)
@@ -352,5 +413,5 @@ print("PASS its model-menu error is clean and starts with the upgrade hint:", er
 PY
     ;;
   *)
-    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | toolcap <model> [engine] | finder"; exit 2 ;;
+    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | finder"; exit 2 ;;
 esac

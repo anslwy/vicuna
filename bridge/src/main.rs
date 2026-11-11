@@ -170,6 +170,10 @@ async fn dispatch(
             Ok(serde_json::to_value(vicuna_lib::work_engine::list_models(engine, &st.acp).await?)
                 .map_err(|e| e.to_string())?)
         }
+        "work_set_approval" => {
+            let ask = args.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(serde_json::to_value(vicuna_lib::work_engine::set_approval(ask).await?).map_err(|e| e.to_string())?)
+        }
         "work_set_model" => {
             vicuna_lib::work_engine::set_model(
                 arg_opt_str(args, "engine").as_deref(),

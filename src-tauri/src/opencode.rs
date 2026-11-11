@@ -167,6 +167,9 @@ pub struct WorkEngineInfo {
     /// Non-blocking warning, e.g. the version is older than MIN_VERSION.
     #[serde(default)]
     pub warning: Option<String>,
+    /// Tool approval mode: true = ask the user, false = auto-approve.
+    #[serde(default)]
+    pub ask_permission: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -194,6 +197,7 @@ pub fn not_installed_info() -> WorkEngineInfo {
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: Vec::new(),
         warning: None,
+        ask_permission: false,
     }
 }
 
@@ -290,6 +294,14 @@ pub fn clean_error(err: &str) -> String {
 /// - `autoupdate=false`: a background self-update must not replace the binary
 ///   under a long-lived Work process.
 pub fn config_content(existing: Option<&str>) -> String {
+    config_content_with(existing, false)
+}
+
+/// `ask`: Vicuna's "ask before running tools" mode. opencode allows every
+/// tool by default and so never sends permission requests; ask mode makes
+/// edits, shell commands and web fetches ask (only when the user's own
+/// config sets no `permission` of its own).
+pub fn config_content_with(existing: Option<&str>, ask: bool) -> String {
     let mut config = existing
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .filter(Value::is_object)
@@ -303,6 +315,9 @@ pub fn config_content(existing: Option<&str>) -> String {
         .expect("inserted above")
         .insert("location_idle_timeout".into(), Value::Bool(false));
     obj.insert("autoupdate".into(), Value::Bool(false));
+    if ask && !obj.contains_key("permission") {
+        obj.insert("permission".into(), json!({ "edit": "ask", "bash": "ask", "webfetch": "ask" }));
+    }
     config.to_string()
 }
 
@@ -310,7 +325,10 @@ pub fn config_content(existing: Option<&str>) -> String {
 pub fn process_env() -> Vec<(String, String)> {
     let existing = std::env::var(CONFIG_CONTENT_ENV).ok();
     vec![
-        (CONFIG_CONTENT_ENV.to_string(), config_content(existing.as_deref())),
+        (
+            CONFIG_CONTENT_ENV.to_string(),
+            config_content_with(existing.as_deref(), crate::work_engine::approval_ask()),
+        ),
         ("NO_COLOR".to_string(), "1".to_string()),
     ]
 }
@@ -666,6 +684,18 @@ mod tests {
         assert_eq!(outdated_warning(MIN_VERSION), None);
         assert_eq!(outdated_warning("2.10.0"), None);
         assert_eq!(outdated_warning("garbage"), None);
+    }
+
+
+    #[test]
+    fn ask_mode_makes_opencode_ask_unless_user_set_permission() {
+        let v: Value = serde_json::from_str(&config_content_with(None, true)).unwrap();
+        assert_eq!(v["permission"]["bash"], "ask");
+        assert_eq!(v["permission"]["edit"], "ask");
+        let auto: Value = serde_json::from_str(&config_content_with(None, false)).unwrap();
+        assert!(auto.get("permission").is_none());
+        let own: Value = serde_json::from_str(&config_content_with(Some(r#"{"permission":{"bash":"allow"}}"#), true)).unwrap();
+        assert_eq!(own["permission"]["bash"], "allow");
     }
 
 }

@@ -481,6 +481,12 @@ export async function setWorkModel(engine: string, model: string | null): Promis
   await invokeCmd<void>("work_set_model", { engine, model });
 }
 
+/** Tool approval mode: true = each permission request becomes an ask card
+ *  in the chat; false = auto-approve (noted in the transcript). */
+export async function setWorkApproval(ask: boolean): Promise<WorkEngineInfo> {
+  return await invokeCmd<WorkEngineInfo>("work_set_approval", { ask });
+}
+
 /** Switch the Work engine; returns fresh detection for the new choice. */
 export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> {
   return await invokeCmd<WorkEngineInfo>("work_engine_select", { engine });

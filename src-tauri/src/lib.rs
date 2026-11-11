@@ -5076,7 +5076,8 @@ pub fn run() {
             opencode::opencode_set_model,
             work_engine::work_engine_select,
             work_engine::work_models,
-            work_engine::work_set_model
+            work_engine::work_set_model,
+            work_engine::work_set_approval
         ])
         .setup(|app| {
             // Warm the long-lived `opencode acp` process so the first Work

@@ -47,6 +47,9 @@ pub fn not_found_message() -> String {
 
 struct Proc {
     client: Arc<AcpClient>,
+    /// Approval mode the process was started under (opencode's config
+    /// depends on it, so a toggle respawns).
+    ask: bool,
     /// The binary this process was started from (opencode, or the adapter).
     bin: PathBuf,
     // held so kill_on_drop ends the process when this Proc is replaced
@@ -117,7 +120,8 @@ impl AcpState {
         };
         let mut guard = self.procs.lock().await;
         if let Some(p) = guard.get(&engine) {
-            if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin {
+            let ask_now = engine == Engine::Opencode && super::work_engine::approval_ask();
+            if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin && p.ask == ask_now {
                 return Ok(p.client.clone());
             }
         }
@@ -146,6 +150,7 @@ impl AcpState {
             engine,
             Proc {
                 client: client.clone(),
+                ask: engine == Engine::Opencode && super::work_engine::approval_ask(),
                 bin,
                 _child: child,
             },
@@ -533,6 +538,12 @@ impl AcpClient {
         self.write_tx.send(line).map_err(|_| self.dead_error())
     }
 
+    /// Answer an agent -> client request (permission asked in the UI).
+    fn respond(&self, id: Value, result: Value) -> Result<(), String> {
+        let line = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+        self.write_tx.send(line).map_err(|_| self.dead_error())
+    }
+
     fn route(&self, session: &str) -> (mpsc::UnboundedReceiver<Value>, RouteGuard) {
         let (tx, rx) = mpsc::unbounded_channel();
         if let Ok(mut r) = self.routes.lock() {
@@ -606,6 +617,16 @@ fn spawn_acp(
                 (Some(id), Some(method)) => {
                     // Agent -> client request.
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                    // "ask" mode: hand the permission request to the turn
+                    // that owns the session; it asks the user and responds.
+                    if method == "session/request_permission"
+                        && super::work_engine::approval_ask()
+                        && has_route(&routes_r, &params)
+                    {
+                        let fwd = json!({ "vicuna_permission_request": { "id": id, "params": params.clone() } });
+                        forward(&routes_r, &params, fwd);
+                        continue;
+                    }
                     let reply = match handle_agent_request(&method, &params) {
                         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                         Err(error) => json!({
@@ -683,6 +704,92 @@ fn spawn_acp(
         label,
     });
     Ok((client, child))
+}
+
+fn has_route(routes: &Routes, params: &Value) -> bool {
+    params
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .is_some_and(|sid| routes.lock().map(|r| r.contains_key(sid)).unwrap_or(false))
+}
+
+/// Option labels for the ask card, and the response for a user's answer:
+/// an exact label match, else an allow/deny reading of free text; anything
+/// else (dismiss, Stop) rejects, or cancels when there is no reject option.
+fn permission_options(params: &Value) -> Vec<(String, String, String)> {
+    params
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    let id = o.get("optionId")?.as_str()?.to_string();
+                    let kind = o.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+                    let name = o.get("name").and_then(|n| n.as_str()).map(str::to_string).unwrap_or_else(|| kind.clone());
+                    Some((id, kind, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn permission_answer(params: &Value, answer: &str) -> (Value, bool) {
+    let opts = permission_options(params);
+    let a = answer.trim().to_lowercase();
+    let by_kind = |pref: &str| opts.iter().find(|(_, k, _)| k.starts_with(pref));
+    let chosen = opts
+        .iter()
+        .find(|(_, _, n)| n.to_lowercase() == a)
+        .or_else(|| {
+            if ["allow", "yes", "y", "ok", "approve"].contains(&a.as_str()) {
+                by_kind("allow_once").or_else(|| by_kind("allow"))
+            } else {
+                None
+            }
+        })
+        .or_else(|| by_kind("reject"));
+    match chosen {
+        Some((id, kind, _)) => (
+            json!({ "outcome": { "outcome": "selected", "optionId": id } }),
+            kind.starts_with("allow"),
+        ),
+        None => (json!({ "outcome": { "outcome": "cancelled" } }), false),
+    }
+}
+
+/// Ask the user (ask card) and answer the agent's permission request.
+fn spawn_permission_ask(
+    req: &Value,
+    turn: Arc<TurnState>,
+    client: Arc<AcpClient>,
+    on_event: Channel<WorkAgentEvent>,
+) {
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let params = req.get("params").cloned().unwrap_or(Value::Null);
+    let title = params
+        .pointer("/toolCall/title")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("a tool call")
+        .to_string();
+    let labels: Vec<String> = permission_options(&params).into_iter().map(|(_, _, n)| n).collect();
+    let ask_id = format!("perm-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = oneshot::channel::<String>();
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.insert(ask_id.clone(), tx);
+    }
+    emit_ev(
+        &on_event,
+        &turn.stop,
+        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: labels },
+    );
+    tokio::spawn(async move {
+        let answer = rx.await.unwrap_or_else(|_| "cancelled".to_string());
+        let (result, allowed) = permission_answer(&params, &answer);
+        let _ = client.respond(id, result);
+        let verdict = if allowed { "Approved" } else { "Denied" };
+        emit_ev(&on_event, &turn.stop, WorkAgentEvent::DisplayNote { text: format!("\n> {verdict}: {title}\n") });
+    });
 }
 
 /// Deliver a message to the turn that owns `params.sessionId` (dropped when no
@@ -859,7 +966,70 @@ fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (String, Val
 
 struct ToolState {
     name: String,
+    /// ToolStart sent (deferred until the call's input is known).
+    started: bool,
     ended: bool,
+    kind: String,
+    title: String,
+    raw: Value,
+}
+
+fn has_input(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Object(m) => !m.is_empty(),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => true,
+    }
+}
+
+/// Tool-call updates -> ToolStart / ToolEnd. Agents often announce a call
+/// before its input is known (`rawInput` empty, status pending) and fill it
+/// in a later `tool_call_update`; the card waits for the input (or for the
+/// call to start running / finish) so it shows real arguments, not `{}`.
+fn tool_events(update: &Value, tools: &mut HashMap<String, ToolState>) -> Vec<WorkAgentEvent> {
+    let mut out = Vec::new();
+    let Some(id) = update.get("toolCallId").and_then(|i| i.as_str()).filter(|i| !i.is_empty()) else {
+        return out;
+    };
+    let status = update.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    let entry = tools.entry(id.to_string()).or_insert_with(|| ToolState {
+        name: String::new(),
+        started: false,
+        ended: false,
+        kind: "other".to_string(),
+        title: "tool".to_string(),
+        raw: json!({}),
+    });
+    if let Some(k) = update.get("kind").and_then(|k| k.as_str()) {
+        entry.kind = k.to_string();
+    }
+    if let Some(t) = update.get("title").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
+        entry.title = t.to_string();
+    }
+    if let Some(r) = update.get("rawInput").filter(|r| has_input(r)) {
+        entry.raw = r.clone();
+    }
+    let finished = matches!(status, "completed" | "failed" | "cancelled");
+    if !entry.started && (has_input(&entry.raw) || status == "in_progress" || finished) {
+        let (name, args) = tool_name_and_args(&entry.kind, &entry.title, &entry.raw);
+        entry.name = name.clone();
+        entry.started = true;
+        out.push(WorkAgentEvent::ToolStart { name, args });
+    }
+    if finished && !entry.ended {
+        entry.ended = true;
+        let mut output = tool_output(update);
+        if status == "failed" && !output.starts_with("Error:") {
+            output = format!("Error: {output}");
+        }
+        if output.trim().is_empty() {
+            output = format!("[{status}]");
+        }
+        out.push(WorkAgentEvent::ToolEnd { name: entry.name.clone(), output });
+    }
+    out
 }
 
 fn handle_session_update(
@@ -889,52 +1059,8 @@ fn handle_session_update(
             }
         }
         "tool_call" | "tool_call_update" => {
-            let id = update
-                .get("toolCallId")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string();
-            if id.is_empty() {
-                return;
-            }
-            let status = update
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("pending");
-            let title = update
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("tool");
-            let kind_hint = update
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .unwrap_or("other");
-            if !tools.contains_key(&id) {
-                let raw = update.get("rawInput").cloned().unwrap_or_else(|| json!({}));
-                let (name, args) = tool_name_and_args(kind_hint, title, &raw);
-                tools.insert(
-                    id.clone(),
-                    ToolState {
-                        name: name.clone(),
-                        ended: false,
-                    },
-                );
-                emit_ev(on_event, stop, WorkAgentEvent::ToolStart { name, args });
-            }
-            if matches!(status, "completed" | "failed" | "cancelled") {
-                let entry = tools.get_mut(&id).expect("inserted above");
-                if !entry.ended {
-                    entry.ended = true;
-                    let mut output = tool_output(update);
-                    if status == "failed" && !output.starts_with("Error:") {
-                        output = format!("Error: {output}");
-                    }
-                    if output.trim().is_empty() {
-                        output = format!("[{status}]");
-                    }
-                    let name = entry.name.clone();
-                    emit_ev(on_event, stop, WorkAgentEvent::ToolEnd { name, output });
-                }
+            for ev in tool_events(update, tools) {
+                emit_ev(on_event, stop, ev);
             }
         }
         "vicuna_permission" => {
@@ -1253,7 +1379,13 @@ async fn run_turn_inner(
             tokio::select! {
                 update = updates.recv() => {
                     match update {
-                        Some(msg) => handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars),
+                        Some(msg) => {
+                            if let Some(req) = msg.get("vicuna_permission_request") {
+                                spawn_permission_ask(req, turn.clone(), client.clone(), on_event.clone());
+                            } else {
+                                handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
+                            }
+                        }
                         None => break Err(client.dead_error()),
                     }
                 }
@@ -1521,4 +1653,62 @@ mod tests {
         assert_eq!(current_model(&json!({ "sessionId": "s" })), None);
         assert_eq!(current_model(&json!({ "configOptions": [{ "id": "model", "currentValue": "" }] })), None);
     }
+
+    /// QA FAIL (PR #6): cards showed `{}` because ToolStart went out with
+    /// the first, input-less announcement. Now the card waits for the input.
+    #[test]
+    fn tool_card_waits_for_real_input() {
+        let mut tools = HashMap::new();
+        let announce = json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "mcp__browser__open", "kind": "other", "status": "pending", "rawInput": {} });
+        assert!(tool_events(&announce, &mut tools).is_empty(), "no card before the input is known");
+        let filled = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "rawInput": { "url": "http://127.0.0.1:1421/health" } });
+        let evs = tool_events(&filled, &mut tools);
+        match &evs[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "mcp__browser__open");
+                assert_eq!(args["url"], "http://127.0.0.1:1421/health");
+            }
+            other => panic!("{other:?}"),
+        }
+        let done = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed", "content": [{ "type": "content", "content": { "type": "text", "text": "opened" } }] });
+        assert!(matches!(&tool_events(&done, &mut tools)[..], [WorkAgentEvent::ToolEnd { .. }]));
+        // a call that never reports input still gets a card once it runs
+        let bare = json!({ "sessionUpdate": "tool_call", "toolCallId": "t2", "title": "Run tests", "kind": "execute", "status": "pending" });
+        assert!(tool_events(&bare, &mut tools).is_empty());
+        let running = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "in_progress", "rawInput": { "command": "cargo test" } });
+        match &tool_events(&running, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "exec");
+                assert_eq!(args["command"], "cargo test");
+            }
+            other => panic!("{other:?}"),
+        }
+        // finishing without any start still yields start + end, in order
+        let quick = json!({ "sessionUpdate": "tool_call", "toolCallId": "t3", "title": "x", "status": "completed" });
+        let evs = tool_events(&quick, &mut tools);
+        assert!(matches!(&evs[..], [WorkAgentEvent::ToolStart { .. }, WorkAgentEvent::ToolEnd { .. }]));
+    }
+
+    /// QA FAIL (PR #6): "ask" mode maps the user's choice onto the agent's
+    /// permission options; dismiss/Stop rejects.
+    #[test]
+    fn permission_answers_map_to_options() {
+        let params = json!({ "sessionId": "s", "toolCall": { "title": "Bash: rm -rf build" }, "options": [
+            { "optionId": "a1", "kind": "allow_always", "name": "Always allow" },
+            { "optionId": "a0", "kind": "allow_once", "name": "Allow" },
+            { "optionId": "r0", "kind": "reject_once", "name": "Reject" }
+        ]});
+        let labels: Vec<_> = permission_options(&params).into_iter().map(|(_, _, n)| n).collect();
+        assert_eq!(labels, ["Always allow", "Allow", "Reject"]);
+        let pick = |a: &str| permission_answer(&params, a);
+        assert_eq!(pick("Always allow"), (json!({ "outcome": { "outcome": "selected", "optionId": "a1" } }), true));
+        assert_eq!(pick("allow").0["outcome"]["optionId"], "a0");
+        assert_eq!(pick("yes").0["outcome"]["optionId"], "a0");
+        assert_eq!(pick("Reject"), (json!({ "outcome": { "outcome": "selected", "optionId": "r0" } }), false));
+        assert_eq!(pick("cancelled").0["outcome"]["optionId"], "r0");
+        assert!(!pick("please no").1);
+        let no_reject = json!({ "options": [{ "optionId": "a0", "kind": "allow_once", "name": "Allow" }] });
+        assert_eq!(permission_answer(&no_reject, "cancelled"), (json!({ "outcome": { "outcome": "cancelled" } }), false));
+    }
+
 }

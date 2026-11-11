@@ -30,7 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -1420,6 +1420,14 @@
       const prev = workEngineInfo ? engineId(workEngineInfo) : null;
       applyWorkEngine(await selectWorkEngine(id), prev);
       if (modelOpen) void refreshOpencodeModels();
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+  async function toggleWorkApproval(ask: boolean) {
+    try {
+      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+      applyWorkEngine(await setWorkApproval(ask), prev);
     } catch (e: any) {
       error = typeof e === "string" ? e : (e?.message ?? String(e));
     }
@@ -8561,6 +8569,10 @@
         <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
       {/each}
       <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or Claude Code through its ACP adapter (<code>npm install -g @agentclientprotocol/claude-agent-acp</code>, using your own <code>claude</code> login). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code>, <code>VICUNA_CLAUDE_ACP_BIN</code>.</span>
+      <label class="setting-note approval-row" data-testid="work-approval">
+        <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
+        Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.
+      </label>
       <div class="browse-actions">
         <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
       </div>
@@ -9364,6 +9376,8 @@
   .engine-opt { flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
   .engine-opt:disabled { opacity: .5; cursor: default; }
+  .approval-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+  .approval-row input { margin-top: 2px; }
   .engine-chip { font-size: 11px; color: var(--muted-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin-right: 2px; }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
