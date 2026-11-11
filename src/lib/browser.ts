@@ -31,6 +31,7 @@ export interface BrowserStatus {
   url: string;
   bin?: string | null;
   source?: string | null;
+  lb_version?: string | null;
   health?: LbHealth | null;
   warning?: string | null;
 }

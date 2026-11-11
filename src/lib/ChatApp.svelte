@@ -1624,6 +1624,13 @@
     void refreshCliStatus();
     void refreshBuildInfo();
     void refreshWorkEngine();
+    void refreshBrowserEngine();
+  }
+
+  /** Browser engine row (Settings → Browser engine): which `lb` runs and
+   *  its version, from the backend status. Silent on failure. */
+  async function refreshBrowserEngine() {
+    browserDaemon = await browserStatus().catch(() => null);
   }
 
   /** Read this build's version + baked timestamp (silent unless it fails:
@@ -8535,6 +8542,15 @@
         onblur={() => setStopWords(stopWordsText)}
       ></textarea>
       <span class="setting-note">One per line. Use \n for newlines. Generation stops when the model outputs one of these.</span>
+    </div>
+    <div class="setting-stacked" data-testid="browser-engine">
+      <span class="setting-label">Browser engine</span>
+      {#if browserDaemon?.lb_version}
+        <span class="setting-note" data-testid="browser-engine-version">lb {browserDaemon.lb_version} · {browserDaemon.source === "bundled" ? "bundled with Vicuna" : "system PATH"} · port {new URL(browserDaemon.url).port}</span>
+        <span class="setting-note" data-testid="browser-engine-path" title={browserDaemon.bin ?? ""}>{browserDaemon.bin ?? "path unknown"}</span>
+      {:else}
+        <span class="setting-note">Not found: no bundled lb and none on PATH.</span>
+      {/if}
     </div>
     <div class="setting-stacked">
       <span class="setting-label">App updates</span>

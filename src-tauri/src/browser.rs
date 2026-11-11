@@ -27,12 +27,35 @@ use std::os::windows::process::CommandExt as _;
 /// `VICUNA_TEST_LB_PORT` overrides it (headless E2E only).
 pub const LB_PORT: u16 = 18765;
 
+/// Port of the daemon Vicuna runs or talks to. Normally the base port;
+/// moved to a free neighbour when another `lb` already holds the base
+/// port (see `browser_start_logic`), so Vicuna never reuses a daemon it
+/// did not start.
 pub fn lb_port() -> u16 {
+    match ACTIVE_PORT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => base_port(),
+        p => p,
+    }
+}
+
+static ACTIVE_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn set_active_port(p: u16) {
+    ACTIVE_PORT.store(p, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn base_port() -> u16 {
     std::env::var("VICUNA_TEST_LB_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(LB_PORT)
+}
+
+/// Fallback ports tried when the base port is held by another `lb`:
+/// the ten ports above the base, in order. Never the base itself.
+pub fn candidate_ports(base: u16) -> Vec<u16> {
+    (1..=10u16).filter_map(|i| base.checked_add(i)).collect()
 }
 
 pub fn lb_server_url() -> String {
@@ -448,12 +471,86 @@ pub fn resolve_lb_bin(resource_dir: Option<&Path>) -> Option<(PathBuf, LbSource)
 }
 
 fn resolve_in_roots(roots: &[PathBuf]) -> Option<(PathBuf, LbSource)> {
-    for root in roots {
-        if let Some(hit) = bundled_candidates(root).into_iter().find(|p| p.is_file()) {
-            return Some((hit, LbSource::Bundled));
+    let bundled = roots
+        .iter()
+        .find_map(|root| bundled_candidates(root).into_iter().find(|p| p.is_file()));
+    let path = find_on_path_dirs(LB_PATH_NAME, &path_search_dirs());
+    choose_lb(bundled, path, cached_lb_version)
+}
+
+/// Pick the `lb` to run. The bundled sidecar always wins, so a release
+/// build runs the engine it was tested with, never an older `lb` that
+/// happens to be on PATH. A PATH binary is used only when nothing is
+/// bundled (dev builds without a fetch) or when it is at least as new
+/// as the bundled one. `version` is consulted only when both exist.
+pub fn choose_lb(
+    bundled: Option<PathBuf>,
+    path: Option<PathBuf>,
+    version: impl Fn(&Path) -> Option<String>,
+) -> Option<(PathBuf, LbSource)> {
+    match (bundled, path) {
+        (Some(b), None) => Some((b, LbSource::Bundled)),
+        (None, Some(p)) => Some((p, LbSource::Path)),
+        (None, None) => None,
+        (Some(b), Some(p)) => {
+            let newer_or_equal = match (version(&p), version(&b)) {
+                (Some(pv), Some(bv)) => at_least_as_new(&pv, &bv),
+                _ => false,
+            };
+            if newer_or_equal {
+                Some((p, LbSource::Path))
+            } else {
+                Some((b, LbSource::Bundled))
+            }
         }
     }
-    find_on_path_dirs(LB_PATH_NAME, &path_search_dirs()).map(|p| (p, LbSource::Path))
+}
+
+/// `candidate >= reference` for dotted numeric versions (`0.4.20` vs
+/// `0.4.9`). Unparseable input is "not at least as new".
+pub fn at_least_as_new(candidate: &str, reference: &str) -> bool {
+    fn key(v: &str) -> Option<Vec<u64>> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect()
+    }
+    match (key(candidate), key(reference)) {
+        (Some(a), Some(b)) => {
+            let n = a.len().max(b.len());
+            let at = |v: &Vec<u64>, i: usize| v.get(i).copied().unwrap_or(0);
+            (0..n).map(|i| at(&a, i)).cmp((0..n).map(|i| at(&b, i))) != std::cmp::Ordering::Less
+        }
+        _ => false,
+    }
+}
+
+/// `lb --version` for a binary, cached per (path, size, mtime) so the
+/// 3s status poll doesn't spawn it every time. Blocking, but only on a
+/// cache miss, and only for the bundled-vs-PATH comparison.
+fn cached_lb_version(bin: &Path) -> Option<String> {
+    static CACHE: Mutex<Vec<(PathBuf, Option<(u64, u64)>, Option<String>)>> = Mutex::new(Vec::new());
+    let id = bin_id(bin);
+    if let Ok(g) = CACHE.lock() {
+        if let Some((_, _, v)) = g.iter().find(|(p, i, _)| p == bin && *i == id) {
+            return v.clone();
+        }
+    }
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let version = cmd
+        .output()
+        .ok()
+        .and_then(|o| parse_lb_version(&String::from_utf8_lossy(&o.stdout)));
+    if let Ok(mut g) = CACHE.lock() {
+        g.retain(|(p, _, _)| p != bin);
+        g.push((bin.to_path_buf(), id, version.clone()));
+    }
+    version
 }
 
 /// Bundled resources can lose the exec bit in some installers; restore it
@@ -481,30 +578,41 @@ enum Probe {
 }
 
 async fn probe_daemon(client: &reqwest::Client) -> Probe {
-    let res = match client
-        .get(format!("{}/api/health", lb_server_url()))
-        .send()
-        .await
-    {
+    probe_port(client, lb_port()).await
+}
+
+async fn probe_port(client: &reqwest::Client, port: u16) -> Probe {
+    let url = format!("http://127.0.0.1:{port}");
+    let res = match client.get(format!("{url}/api/health")).send().await {
         Ok(r) => r,
         Err(_) => return Probe::Free,
     };
     let body = res.text().await.unwrap_or_default();
     match parse_health_body(&body) {
         Ok(mut h) => {
-            h.ui_ok = ui_servable(client).await;
+            h.ui_ok = ui_servable_at(client, &url).await;
             Probe::Lb(h)
         }
         Err(e) => Probe::Foreign(e),
     }
 }
 
+/// First fallback port (see `candidate_ports`) that nothing answers on.
+async fn first_free_candidate(client: &reqwest::Client) -> Option<u16> {
+    for port in candidate_ports(base_port()) {
+        if matches!(probe_port(client, port).await, Probe::Free) {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// `globe.svg` is a stable dist filename, so a 200 proves the daemon's
 /// UI root is intact; 404 means startup-resolved files are gone (app
 /// reinstall under a live daemon) and the tab would render blank.
-async fn ui_servable(client: &reqwest::Client) -> bool {
+async fn ui_servable_at(client: &reqwest::Client, url: &str) -> bool {
     matches!(
-        client.get(format!("{}/globe.svg", lb_server_url())).send().await,
+        client.get(format!("{url}/globe.svg")).send().await,
         Ok(r) if r.status().is_success()
     )
 }
@@ -680,6 +788,9 @@ pub struct BrowserStatus {
     pub bin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// `lb --version` of `bin` (shown in Settings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lb_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<LbHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -733,11 +844,21 @@ pub async fn browser_status_logic(
         url: lb_server_url(),
         bin: resolved.as_ref().map(|(p, _)| p.display().to_string()),
         source: resolved.as_ref().map(|(_, s)| s.as_str().to_string()),
+        lb_version: resolved.as_ref().and_then(|(p, _)| cached_lb_version(p)),
         health: None,
         warning: stale_warning.or(fallback_warning),
     };
     match probe_daemon(&client).await {
         Probe::Free => Ok(base),
+        // A daemon we did not start is never reused: it may be another lb
+        // binary or version. Start runs ours on a free port instead.
+        Probe::Lb(_) if !owned => Ok(BrowserStatus {
+            warning: Some(format!(
+                "another live-browser is running on port {} (not started by Vicuna); Vicuna starts its own on a free port",
+                lb_port()
+            )),
+            ..base
+        }),
         Probe::Lb(h) => Ok(BrowserStatus { running: true, health: Some(h), ..base }),
         Probe::Foreign(e) => Ok(BrowserStatus {
             warning: Some(format!("port {} is busy ({e})", lb_port())),
@@ -760,7 +881,21 @@ pub async fn browser_start_logic(
 ) -> Result<BrowserStatus, String> {
     let client = probe_client();
     match probe_daemon(&client).await {
-        Probe::Lb(_) => return browser_status_logic(resource_dir, state).await,
+        Probe::Lb(_) if owned_child_alive(state) => {
+            return browser_status_logic(resource_dir, state).await;
+        }
+        Probe::Lb(_) => {
+            // Another lb (another binary or version, or a personal `lb web`)
+            // holds the base port. Never reuse it: run ours on a free port.
+            let port = first_free_candidate(&client).await.ok_or_else(|| {
+                format!(
+                    "port {} is held by another live-browser and no fallback port ({:?}) is free — stop that daemon first",
+                    lb_port(),
+                    candidate_ports(base_port())
+                )
+            })?;
+            set_active_port(port);
+        }
         Probe::Foreign(e) => {
             return Err(format!("port {} is busy ({e}) — stop it first", lb_port()));
         }
@@ -1295,9 +1430,13 @@ mod tests {
     fn bundled_prefers_native_arch_on_macos() {
         let root = PathBuf::from("/res");
         let arm = bundled_candidates_for_arch(&root, "aarch64");
-        assert_eq!(arm[0].file_name().unwrap(), "lb-arm64");
         #[cfg(target_os = "macos")]
-        assert_eq!(arm[1].file_name().unwrap(), "lb-x64");
+        {
+            assert_eq!(arm[0].file_name().unwrap(), "lb-arm64");
+            assert_eq!(arm[1].file_name().unwrap(), "lb-x64");
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(arm[0].file_name().unwrap(), "lb");
         let x64 = bundled_candidates_for_arch(&root, "x86_64");
         #[cfg(target_os = "macos")]
         assert_eq!(x64[0].file_name().unwrap(), "lb-x64");
@@ -1426,6 +1565,75 @@ mod tests {
         assert_eq!(p, PathBuf::from("/cache/live-browser/profile-vicuna"));
         // must differ from a personal daemon's default profile dir
         assert!(!p.ends_with("live-browser/profile"));
+    }
+
+    #[test]
+    fn bundled_sidecar_wins_over_older_path_lb() {
+        let b = PathBuf::from("/app/lb-sidecar/lb");
+        let p = PathBuf::from("/usr/local/bin/lb");
+        let older = |x: &Path| {
+            Some((if x == p.as_path() { "0.4.18" } else { "0.4.20" }).to_string())
+        };
+        // the owner's case: a release build with an older lb on PATH
+        assert_eq!(
+            choose_lb(Some(b.clone()), Some(p.clone()), older),
+            Some((b.clone(), LbSource::Bundled))
+        );
+        // PATH newer than the bundle: PATH wins
+        let newer = |x: &Path| {
+            Some((if x == p.as_path() { "0.4.21" } else { "0.4.20" }).to_string())
+        };
+        assert_eq!(
+            choose_lb(Some(b.clone()), Some(p.clone()), newer),
+            Some((p.clone(), LbSource::Path))
+        );
+        // equal counts as "at least as new"
+        let same = |_: &Path| Some("0.4.20".to_string());
+        assert_eq!(
+            choose_lb(Some(b.clone()), Some(p.clone()), same),
+            Some((p.clone(), LbSource::Path))
+        );
+        // unknown PATH version: keep the bundle
+        let unknown = |x: &Path| if x == p.as_path() { None } else { Some("0.4.20".to_string()) };
+        assert_eq!(
+            choose_lb(Some(b.clone()), Some(p.clone()), unknown),
+            Some((b.clone(), LbSource::Bundled))
+        );
+    }
+
+    #[test]
+    fn dev_build_without_sidecar_uses_path() {
+        let p = PathBuf::from("/usr/local/bin/lb");
+        assert_eq!(
+            choose_lb(None, Some(p.clone()), |_| None),
+            Some((p, LbSource::Path))
+        );
+        assert_eq!(choose_lb(None, None, |_| None), None);
+        let b = PathBuf::from("/app/lb-sidecar/lb");
+        assert_eq!(
+            choose_lb(Some(b.clone()), None, |_| None),
+            Some((b, LbSource::Bundled))
+        );
+    }
+
+    #[test]
+    fn version_compare_is_numeric() {
+        assert!(at_least_as_new("0.4.20", "0.4.18"));
+        assert!(at_least_as_new("0.4.10", "0.4.9"));
+        assert!(!at_least_as_new("0.4.9", "0.4.10"));
+        assert!(at_least_as_new("0.4.20", "0.4.20"));
+        assert!(at_least_as_new("v1.0", "0.9.9"));
+        assert!(!at_least_as_new("garbage", "0.4.20"));
+    }
+
+    #[test]
+    fn fallback_ports_skip_the_base_port() {
+        let ports = candidate_ports(18765);
+        assert_eq!(ports.len(), 10);
+        assert_eq!(ports.first(), Some(&18766));
+        assert_eq!(ports.last(), Some(&18775));
+        assert!(!ports.contains(&18765));
+        assert!(candidate_ports(u16::MAX).is_empty());
     }
 
     #[test]
