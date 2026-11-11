@@ -1,9 +1,9 @@
-// Vicuna Work mode = the user's opencode CLI, driven over the Agent Client
-// Protocol (ACP).
+// Vicuna Work mode = the user's agent CLI (opencode, or Claude Code through
+// its ACP adapter), driven over the Agent Client Protocol (ACP).
 //
-// One long-lived `opencode acp` process (spawned at startup when opencode is
-// installed, respawned on demand if it dies or the binary moves) serves every
-// Work session: `initialize` once, then per session `session/new` (cwd +
+// One long-lived ACP process per engine (`opencode acp`, or
+// `claude-agent-acp` pointed at the user's `claude`; spawned on demand,
+// respawned if it dies or the binary moves) serves every Work session: `initialize` once, then per session `session/new` (cwd +
 // Vicuna's MCP servers) or `session/resume`/`session/load` for a saved
 // session, `session/set_config_option` for the model picked in Vicuna, and
 // `session/prompt`. `session/update` notifications are routed by sessionId and
@@ -27,7 +27,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
-use super::opencode::{find_opencode, INSTALL_URL};
+use super::opencode::{find_opencode, OpencodeModel, INSTALL_URL};
+use super::work_engine::Engine;
 use super::work_agent::{emit_ev, TurnState, WorkAgentEvent};
 use super::ChatMessage;
 
@@ -46,6 +47,7 @@ pub fn not_found_message() -> String {
 
 struct Proc {
     client: Arc<AcpClient>,
+    /// The binary this process was started from (opencode, or the adapter).
     bin: PathBuf,
     // held so kill_on_drop ends the process when this Proc is replaced
     _child: Child,
@@ -55,7 +57,10 @@ struct Proc {
 pub struct AcpState {
     sessions: Mutex<HashMap<String, String>>,
     loaded: AtomicBool,
-    proc: tokio::sync::Mutex<Option<Proc>>,
+    procs: tokio::sync::Mutex<HashMap<Engine, Proc>>,
+    /// Claude's model list, read from a session's `model` config option;
+    /// cleared when the Claude process is respawned.
+    claude_models: tokio::sync::Mutex<Option<Vec<OpencodeModel>>>,
 }
 
 impl AcpState {
@@ -94,18 +99,34 @@ impl AcpState {
         }
     }
 
-    /// The warm, initialized `opencode acp` client; (re)spawned when there is
-    /// none, it died, or detection now resolves a different binary.
-    async fn client(&self) -> Result<Arc<AcpClient>, String> {
-        let bin = find_opencode().ok_or_else(not_found_message)?;
-        let mut guard = self.proc.lock().await;
-        if let Some(p) = guard.as_ref() {
+    /// The warm, initialized ACP client for `engine`; (re)spawned when there
+    /// is none, it died, or detection now resolves a different binary.
+    async fn client(&self, engine: Engine) -> Result<Arc<AcpClient>, String> {
+        let (bin, cmd) = match engine {
+            Engine::Opencode => {
+                let bin = find_opencode().ok_or_else(not_found_message)?;
+                let mut cmd = super::opencode::command(&bin);
+                cmd.arg("acp");
+                (bin, cmd)
+            }
+            Engine::Claude => {
+                let (cli, adapter) = super::claude::find_parts()?;
+                let cmd = super::claude::command(&adapter, &cli);
+                (adapter, cmd)
+            }
+        };
+        let mut guard = self.procs.lock().await;
+        if let Some(p) = guard.get(&engine) {
             if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin {
                 return Ok(p.client.clone());
             }
         }
-        *guard = None;
-        let (client, child) = spawn_opencode(&bin)?;
+        guard.remove(&engine);
+        if engine == Engine::Claude {
+            *self.claude_models.lock().await = None;
+        }
+        let label = engine_process_label(engine);
+        let (client, child) = spawn_acp(cmd, label, &bin)?;
         client
             .call(
                 "initialize",
@@ -120,22 +141,95 @@ impl AcpState {
                 INIT_TIMEOUT,
             )
             .await
-            .map_err(|e| format!("opencode acp initialize failed: {e}"))?;
-        *guard = Some(Proc {
-            client: client.clone(),
-            bin,
-            _child: child,
-        });
+            .map_err(|e| format!("{label} initialize failed: {e}"))?;
+        guard.insert(
+            engine,
+            Proc {
+                client: client.clone(),
+                bin,
+                _child: child,
+            },
+        );
         Ok(client)
     }
 
-    /// Start the warm process ahead of the first Work turn (app startup).
-    /// Silent when opencode is missing; the UI shows that state itself.
+    /// Start the current engine's warm process ahead of the first Work turn
+    /// (app startup). Silent when it is missing; the UI shows that state.
     pub async fn prewarm(&self) {
-        if find_opencode().is_some() {
-            let _ = self.client().await;
+        let engine = super::work_engine::current_engine();
+        if engine.is_present() {
+            let _ = self.client(engine).await;
         }
     }
+
+    /// Claude's selectable models, detected (not hardcoded): the adapter
+    /// lists them as the `model` config option of a session, so open a
+    /// throwaway session (no prompt, nothing billed) and read it.
+    pub async fn claude_models(&self) -> Result<Vec<OpencodeModel>, String> {
+        let client = self.client(Engine::Claude).await?;
+        if let Some(cached) = self.claude_models.lock().await.clone() {
+            return Ok(cached);
+        }
+        let cwd = super::opencode::home_dir()
+            .map(|h| h.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let r = client
+            .call("session/new", session_params(&cwd, None, &[]), SESSION_TIMEOUT)
+            .await
+            .map_err(|e| format!("Claude Code could not list models: {e}"))?;
+        if let Some(sid) = r.get("sessionId").and_then(|s| s.as_str()) {
+            // best effort: the adapter supports session/close
+            let _ = client.call("session/close", json!({ "sessionId": sid }), CONFIG_TIMEOUT).await;
+        }
+        let models = config_models(&r);
+        if models.is_empty() {
+            return Err("Claude Code reported no models (is `claude` logged in? run `claude` once and /login)".into());
+        }
+        *self.claude_models.lock().await = Some(models.clone());
+        Ok(models)
+    }
+}
+
+fn engine_process_label(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Opencode => "opencode acp",
+        Engine::Claude => "claude-agent-acp",
+    }
+}
+
+/// Model rows from a session's `model` config option (Claude adapter), minus
+/// the "default" pseudo-entry (the picker has its own default row).
+fn config_models(result: &Value) -> Vec<OpencodeModel> {
+    let Some(opt) = result
+        .get("configOptions")
+        .and_then(|o| o.as_array())
+        .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model")))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut push = |v: &Value| {
+        let Some(id) = v.get("value").and_then(|x| x.as_str()).filter(|x| !x.is_empty() && *x != "default") else {
+            return;
+        };
+        if out.iter().any(|m: &OpencodeModel| m.id == id) {
+            return;
+        }
+        out.push(OpencodeModel {
+            id: id.to_string(),
+            provider: "claude".to_string(),
+            name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
+        });
+    };
+    for o in opt.get("options").and_then(|o| o.as_array()).into_iter().flatten() {
+        // grouped options carry their own `options` list
+        if let Some(group) = o.get("options").and_then(|g| g.as_array()) {
+            group.iter().for_each(&mut push);
+        } else {
+            push(o);
+        }
+    }
+    out
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -155,8 +249,13 @@ fn sessions_path() -> Result<PathBuf, String> {
 
 /// Keyed by chat + workspace only: the model is switched inside the session
 /// (set_config_option), so changing it keeps the conversation.
-fn session_key(session_id: Option<&str>, workspace: &str) -> Option<String> {
-    session_id.map(|id| format!("{id}|{workspace}"))
+fn session_key(engine: Engine, session_id: Option<&str>, workspace: &str) -> Option<String> {
+    // opencode keeps the original key shape so sessions saved before Claude
+    // existed still resume
+    session_id.map(|id| match engine {
+        Engine::Opencode => format!("{id}|{workspace}"),
+        Engine::Claude => format!("claude|{id}|{workspace}"),
+    })
 }
 
 // ---------- session parameters + MCP servers handed to opencode ----------
@@ -372,6 +471,7 @@ struct AcpClient {
     next_id: AtomicU64,
     stderr_tail: Arc<Mutex<String>>,
     closed: Arc<AtomicBool>,
+    label: &'static str,
 }
 
 /// Unregisters a session's update route when the turn ends.
@@ -455,22 +555,25 @@ impl AcpClient {
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if tail.is_empty() {
-            "opencode acp exited unexpectedly".to_string()
+            format!("{} exited unexpectedly", self.label)
         } else {
-            format!("opencode acp exited unexpectedly:\n{tail}")
+            format!("{} exited unexpectedly:\n{tail}", self.label)
         }
     }
 }
 
-fn spawn_opencode(bin: &Path) -> Result<(Arc<AcpClient>, Child), String> {
-    let mut cmd = super::opencode::command(bin);
-    cmd.arg("acp").stdin(std::process::Stdio::piped());
+fn spawn_acp(
+    mut cmd: tokio::process::Command,
+    label: &'static str,
+    bin: &Path,
+) -> Result<(Arc<AcpClient>, Child), String> {
+    cmd.stdin(std::process::Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot start opencode acp ({}): {e}", bin.display()))?;
-    let mut stdin = child.stdin.take().ok_or("opencode acp: no stdin")?;
-    let stdout = child.stdout.take().ok_or("opencode acp: no stdout")?;
-    let stderr = child.stderr.take().ok_or("opencode acp: no stderr")?;
+        .map_err(|e| format!("cannot start {label} ({}): {e}", bin.display()))?;
+    let mut stdin = child.stdin.take().ok_or(format!("{label}: no stdin"))?;
+    let stdout = child.stdout.take().ok_or(format!("{label}: no stdout"))?;
+    let stderr = child.stderr.take().ok_or(format!("{label}: no stderr"))?;
 
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
@@ -542,7 +645,7 @@ fn spawn_opencode(bin: &Path) -> Result<(Arc<AcpClient>, Child), String> {
         closed_r.store(true, Ordering::Relaxed);
         if let Ok(mut m) = pending_r.lock() {
             for (_, tx) in m.drain() {
-                let _ = tx.send(Err("opencode acp closed the connection".to_string()));
+                let _ = tx.send(Err(format!("{label} closed the connection")));
             }
         }
         if let Ok(mut r) = routes_r.lock() {
@@ -577,6 +680,7 @@ fn spawn_opencode(bin: &Path) -> Result<(Arc<AcpClient>, Child), String> {
         next_id: AtomicU64::new(0),
         stderr_tail,
         closed,
+        label,
     });
     Ok((client, child))
 }
@@ -972,8 +1076,10 @@ pub async fn run_turn(
     on_event: Channel<WorkAgentEvent>,
     state: &AcpState,
     mcp_snapshot: McpSnapshot,
+    engine: Engine,
 ) {
     if let Err(message) = run_turn_inner(
+        engine,
         &turn,
         model.as_deref(),
         &workspace,
@@ -994,6 +1100,7 @@ pub async fn run_turn(
 /// Resume the chat's saved opencode session (resume, then load), else start
 /// a new one. Returns (sessionId, resumed).
 async fn open_session(
+    engine: Engine,
     client: &AcpClient,
     saved: Option<String>,
     workspace: &str,
@@ -1015,31 +1122,34 @@ async fn open_session(
     let result = client
         .call("session/new", session_params(workspace, None, mcp), SESSION_TIMEOUT)
         .await
-        .map_err(|e| format!("opencode could not start a session: {e}"))?;
+        .map_err(|e| format!("{} could not start a session: {e}", engine.label()))?;
     let sid = result
         .get("sessionId")
         .and_then(|s| s.as_str())
         .map(str::to_string)
-        .ok_or_else(|| "opencode acp: session/new returned no sessionId".to_string())?;
+        .ok_or_else(|| format!("{}: session/new returned no sessionId", engine_process_label(engine)))?;
     Ok((sid, false, current_model(&result)))
 }
 
 /// Model to run: the turn's explicit pick, else the one saved in Vicuna's
 /// picker, else opencode's own default (None).
-fn effective_model(requested: Option<&str>) -> Option<String> {
+fn effective_model(engine: Engine, requested: Option<&str>) -> Option<String> {
     requested
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
-        .or_else(super::opencode::saved_model)
+        .or_else(|| engine.saved_model())
 }
 
-fn friendly_prompt_error(e: String) -> String {
+fn friendly_prompt_error(engine: Engine, e: String) -> String {
     let low = e.to_lowercase();
     if is_tool_limit_error(&e) {
         format!("{e}\n{TOOL_LIMIT_HINT}")
-    } else if low.contains("auth") || low.contains("api key") || low.contains("unauthorized") || low.contains("401") {
-        format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model.")
+    } else if low.contains("auth") || low.contains("api key") || low.contains("unauthorized") || low.contains("401") || low.contains("login") {
+        match engine {
+            Engine::Opencode => format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model."),
+            Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
+        }
     } else {
         e
     }
@@ -1047,6 +1157,7 @@ fn friendly_prompt_error(e: String) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_inner(
+    engine: Engine,
     turn: &Arc<TurnState>,
     model: Option<&str>,
     workspace: &str,
@@ -1061,9 +1172,9 @@ async fn run_turn_inner(
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
         .ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let client = state.client().await?;
+    let client = state.client(engine).await?;
 
-    let key = session_key(session_id, workspace);
+    let key = session_key(engine, session_id, workspace);
     let saved = if fresh_session {
         None
     } else {
@@ -1073,13 +1184,13 @@ async fn run_turn_inner(
     if let Some(note) = mcp_note {
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
-    let (acp_session, resumed, mut used_model) = open_session(&client, saved, workspace, &mcp).await?;
+    let (acp_session, resumed, mut used_model) = open_session(engine, &client, saved, workspace, &mcp).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
     }
     let (mut updates, _route) = client.route(&acp_session);
 
-    if let Some(m) = effective_model(model) {
+    if let Some(m) = effective_model(engine, model) {
         let r = client
             .call(
                 "session/set_config_option",
@@ -1087,13 +1198,13 @@ async fn run_turn_inner(
                 CONFIG_TIMEOUT,
             )
             .await
-            .map_err(|e| format!("opencode could not switch to model {m}: {e}"))?;
+            .map_err(|e| format!("{} could not switch to model {m}: {e}", engine.label()))?;
         used_model = current_model(&r).or(Some(m));
     }
     // Tell the UI which opencode model this turn really runs on (the reply
     // label must never show the Chat-mode model).
     if let Some(m) = used_model {
-        emit_ev(on_event, stop, WorkAgentEvent::Model { model: m });
+        emit_ev(on_event, stop, WorkAgentEvent::Model { model: engine.reply_label(&m) });
     }
 
     // First prompt: on a fresh session, Vicuna's workspace rules plus the
@@ -1192,7 +1303,7 @@ async fn run_turn_inner(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                return Err(friendly_prompt_error(e));
+                return Err(friendly_prompt_error(engine, e));
             }
         }
 
@@ -1289,13 +1400,45 @@ mod tests {
 
     #[test]
     fn session_key_ignores_model() {
-        assert_eq!(session_key(Some("chat1"), "/w"), Some("chat1|/w".to_string()));
-        assert_eq!(session_key(None, "/w"), None);
+        assert_eq!(session_key(Engine::Opencode, Some("chat1"), "/w"), Some("chat1|/w".to_string()));
+        assert_eq!(session_key(Engine::Opencode, None, "/w"), None);
+        // engines never share a session id (switching engine starts fresh)
+        assert_eq!(session_key(Engine::Claude, Some("chat1"), "/w"), Some("claude|chat1|/w".to_string()));
+    }
+
+    /// Claude's models come from the adapter's `model` config option (shape
+    /// captured from claude-agent-acp 0.99.1), never a hardcoded list.
+    #[test]
+    fn claude_models_detected_from_config_option() {
+        let r = json!({ "sessionId": "s", "configOptions": [
+            { "id": "mode", "currentValue": "default", "options": [{ "value": "default", "name": "Default" }] },
+            { "id": "model", "currentValue": "opus", "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "opus", "name": "Opus" },
+                { "value": "haiku", "name": "Haiku" },
+                { "group": "Pinned", "name": "Pinned", "options": [{ "value": "claude-haiku-4-5-20251001", "name": "Haiku 4.5" }] },
+                { "value": "haiku", "name": "dup" }
+            ]}
+        ]});
+        let ids: Vec<_> = config_models(&r).into_iter().map(|m| (m.id, m.name, m.provider)).collect();
+        assert_eq!(ids, vec![
+            ("opus".to_string(), Some("Opus".to_string()), "claude".to_string()),
+            ("haiku".to_string(), Some("Haiku".to_string()), "claude".to_string()),
+            ("claude-haiku-4-5-20251001".to_string(), Some("Haiku 4.5".to_string()), "claude".to_string()),
+        ]);
+        assert!(config_models(&json!({ "sessionId": "s" })).is_empty());
+    }
+
+    #[test]
+    fn claude_login_errors_point_at_claude() {
+        let m = friendly_prompt_error(Engine::Claude, "Invalid API key · Please run /login".into());
+        assert!(m.contains("run `claude`") && m.contains("/login"), "{m}");
+        assert!(!m.contains("opencode"));
     }
 
     #[test]
     fn explicit_model_wins_and_blank_is_ignored() {
-        assert_eq!(effective_model(Some(" ollama/x ")), Some("ollama/x".to_string()));
+        assert_eq!(effective_model(Engine::Opencode, Some(" ollama/x ")), Some("ollama/x".to_string()));
     }
 
     #[test]
@@ -1303,7 +1446,7 @@ mod tests {
         let e = json!({ "code": -32603, "message": "Internal error", "data": { "message": "model not found" } });
         assert_eq!(jsonrpc_error_text(&e), "Internal error: model not found");
         assert_eq!(jsonrpc_error_text(&json!({ "message": "x" })), "x");
-        assert!(friendly_prompt_error("401 Unauthorized".into()).contains("opencode auth login"));
+        assert!(friendly_prompt_error(Engine::Opencode, "401 Unauthorized".into()).contains("opencode auth login"));
     }
 
     #[test]
@@ -1359,11 +1502,11 @@ mod tests {
     fn tool_limit_error_points_at_opencode_config() {
         let raw = "Internal error: Upstream request failed: [invalid_value] Invalid value for 'tools': maximum number of items is 128.";
         assert!(is_tool_limit_error(raw));
-        let msg = friendly_prompt_error(raw.into());
+        let msg = friendly_prompt_error(Engine::Opencode, raw.into());
         assert!(msg.starts_with(raw));
         assert!(msg.contains("opencode mcp list") && msg.contains("MCP dialog"), "{msg}");
         assert!(!is_tool_limit_error("Internal error: model not found"));
-        assert_eq!(friendly_prompt_error("model not found".into()), "model not found");
+        assert_eq!(friendly_prompt_error(Engine::Opencode, "model not found".into()), "model not found");
     }
 
     /// Regression: the reply label showed the Chat model. The model id the

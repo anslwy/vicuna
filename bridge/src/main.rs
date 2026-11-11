@@ -133,8 +133,9 @@ async fn dispatch(
                 .ok_or_else(|| "missing channel marker onEvent".to_string())?
                 .to_string();
             let on_event = channel_for(&st.events, &uuid);
-            if vicuna_lib::opencode::find_opencode().is_none() {
-                return Err(vicuna_lib::acp::not_found_message());
+            let engine = vicuna_lib::work_engine::effective_engine(arg_opt_str(args, "engine").as_deref());
+            if !engine.is_present() {
+                return Err(engine.missing_message());
             }
             let turn = Arc::new(TurnState::new());
             let turn_id = st.agent.next_turn(turn.clone());
@@ -152,14 +153,30 @@ async fn dispatch(
             tokio::spawn(async move {
                 vicuna_lib::acp::run_turn(
                     turn, model, workspace, messages, session_id, goal_text, fresh_session, on_event, &acp,
-                    mcp_snapshot,
+                    mcp_snapshot, engine,
                 )
                 .await;
             });
             Ok(serde_json::json!(turn_id))
         }
-        "work_engine_info" => Ok(serde_json::to_value(vicuna_lib::opencode::engine_info().await)
+        "work_engine_info" => Ok(serde_json::to_value(vicuna_lib::work_engine::engines_info().await)
             .map_err(|e| e.to_string())?),
+        "work_engine_select" => Ok(serde_json::to_value(
+            vicuna_lib::work_engine::select_engine(&s("engine")?).await?,
+        )
+        .map_err(|e| e.to_string())?),
+        "work_models" => {
+            let engine = vicuna_lib::work_engine::effective_engine(arg_opt_str(args, "engine").as_deref());
+            Ok(serde_json::to_value(vicuna_lib::work_engine::list_models(engine, &st.acp).await?)
+                .map_err(|e| e.to_string())?)
+        }
+        "work_set_model" => {
+            vicuna_lib::work_engine::set_model(
+                arg_opt_str(args, "engine").as_deref(),
+                arg_opt_str(args, "model").as_deref(),
+            )?;
+            Ok(serde_json::Value::Null)
+        }
         "opencode_models" => Ok(serde_json::to_value(vicuna_lib::opencode::list_models().await?)
             .map_err(|e| e.to_string())?),
         "opencode_set_model" => {

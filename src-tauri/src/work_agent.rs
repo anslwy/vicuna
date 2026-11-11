@@ -145,10 +145,11 @@ fn get_turn(agent_state: &WorkAgentState, turn_id: &str) -> Result<Arc<TurnState
 
 // ---------- commands ----------
 
-/// Start a Work turn on opencode. Resolves with the turn id at once; events
-/// stream through `on_event` until done/error. `model` is opencode's
-/// `provider/model` id (empty = the pick saved in Vicuna, else opencode's
-/// default). Unknown extra arguments from older frontends are ignored.
+/// Start a Work turn on `engine` ("opencode" | "claude"; absent = the saved
+/// choice). Resolves with the turn id at once; events stream through
+/// `on_event` until done/error. `model` is the engine's model id (opencode
+/// `provider/model`, Claude e.g. "haiku"; empty = the pick saved in Vicuna,
+/// else the engine's default). Unknown extra arguments are ignored.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn work_agent_start(
@@ -159,11 +160,13 @@ pub async fn work_agent_start(
     session_id: Option<String>,
     goal_text: Option<String>,
     fresh_session: Option<bool>,
+    engine: Option<String>,
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
 ) -> Result<String, String> {
-    if crate::opencode::find_opencode().is_none() {
-        return Err(crate::acp::not_found_message());
+    let engine = crate::work_engine::effective_engine(engine.as_deref());
+    if !engine.is_present() {
+        return Err(engine.missing_message());
     }
     let turn = Arc::new(TurnState::new());
     let turn_id = agent_state.next_turn(turn.clone());
@@ -186,6 +189,7 @@ pub async fn work_agent_start(
             on_event,
             &acp,
             mcp_snapshot,
+            engine,
         )
         .await;
     });
