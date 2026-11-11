@@ -11,6 +11,8 @@ export interface WorkEngineInfo {
   /** model saved from Vicuna's picker (null = opencode's own default) */
   model: string | null;
   configPath: string | null;
+  /** other installs detection found but did not pick ("path (version)") */
+  others?: string[];
 }
 
 /** Send gate for Work mode: no opencode, no turn (there is no fallback).

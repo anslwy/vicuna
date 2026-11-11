@@ -602,10 +602,11 @@ fn jsonrpc_error_text(err: &Value) -> String {
         .and_then(|d| d.get("message").or_else(|| d.get("details")))
         .and_then(|m| m.as_str())
         .filter(|d| !d.is_empty() && *d != message);
-    match detail {
+    let text = match detail {
         Some(d) => format!("{message}: {d}"),
         None => message.to_string(),
-    }
+    };
+    super::opencode::clean_error(&text)
 }
 
 /// Client-side fs/terminal capabilities are not advertised, so only
