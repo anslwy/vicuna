@@ -138,10 +138,10 @@ pub fn resolve() -> Option<crate::exe_resolve::Resolved> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkEngineInfo {
-    /// Engine id: "opencode" or "claude".
+    /// Engine id: "opencode", "claude" or "codex".
     #[serde(default)]
     pub id: String,
-    /// Display name ("OpenCode", "Claude Code").
+    /// Display name ("OpenCode", "Claude Code", "Codex").
     #[serde(default)]
     pub label: String,
     pub installed: bool,
