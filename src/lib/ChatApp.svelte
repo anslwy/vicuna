@@ -7111,6 +7111,12 @@
           {/if}
         </div>
       {/if}
+      {#if composerMode === "work" && !workGate.blocked && workEngineInfo?.warning}
+        <div class="opencode-missing" data-testid="opencode-outdated" role="status">
+          <span>{workEngineInfo.warning}</span>
+          <button class="mini-btn" data-testid="opencode-recheck-outdated" onclick={() => void refreshWorkEngine()}>Check again</button>
+        </div>
+      {/if}
       {#if composerMode === "work" && workGate.blocked && workEngineChecked}
         <div class="opencode-missing" data-testid="opencode-missing" role="status">
           <span>{workGate.reason ?? "opencode CLI not found"}</span>
@@ -8487,13 +8493,19 @@
       <span class="setting-note" data-testid="work-engine-status">
         {#if workEngineInfo?.installed}
           opencode {workEngineInfo.version ?? ""} · {workEngineInfo.path}
+          {#if workEngineInfo.warning}
+            <br /><span data-testid="work-engine-warning">⚠ {workEngineInfo.warning}</span>
+          {/if}
+          {#if (workEngineInfo.others ?? []).length > 0}
+            <br /><span data-testid="work-engine-others">Also found (not used; the newest version wins): {(workEngineInfo.others ?? []).join(", ")}</span>
+          {/if}
         {:else if workEngineInfo}
           opencode CLI not found, install it: {workEngineInfo.installUrl}
         {:else}
           Checking…
         {/if}
       </span>
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI over ACP (one warm <code>opencode acp</code> process). Models, providers and credentials come from opencode; pick the model from the composer's model menu. Override the binary with <code>VICUNA_OPENCODE_BIN</code>.</span>
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI over ACP (one warm <code>opencode acp</code> process). Vicuna looks for it like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models, providers and credentials come from opencode; pick the model from the composer's model menu. Override the binary with <code>VICUNA_OPENCODE_BIN</code>.</span>
       <div class="browse-actions">
         <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
       </div>

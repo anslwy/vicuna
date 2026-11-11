@@ -16,11 +16,14 @@ use tokio::process::Command;
 
 /// Where the "not installed" state points the user.
 pub const INSTALL_URL: &str = "https://opencode.ai/docs/#install";
+/// Oldest opencode Vicuna's Work mode is tested against (acceptance runs,
+/// QA). Older builds still run but get an "update opencode" warning: e.g.
+/// 1.3.17 (Apr 2026) rejects the config opencode.ai serves now.
+pub const MIN_VERSION: &str = "2.2.6";
 /// Explicit override for unusual installs (absolute path to the binary).
 pub const BIN_ENV: &str = "VICUNA_OPENCODE_BIN";
 const CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const MODELS_TIMEOUT: Duration = Duration::from_secs(60);
-const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(windows)]
 const EXE_NAMES: &[&str] = &["opencode.exe", "opencode.cmd", "opencode"];
@@ -107,10 +110,16 @@ pub fn find_opencode_in(
 /// Live lookup against this process's environment. Cheap (a few stats), so
 /// it runs at startup and again whenever the UI asks.
 pub fn find_opencode() -> Option<PathBuf> {
-    find_opencode_in(
+    resolve().map(|r| r.path)
+}
+
+/// Like the user's terminal: login-shell PATH + process PATH + install
+/// folders, newest `--version` when several exist (see exe_resolve.rs).
+pub fn resolve() -> Option<crate::exe_resolve::Resolved> {
+    crate::exe_resolve::resolve(
+        EXE_NAMES,
         std::env::var(BIN_ENV).ok().as_deref(),
-        std::env::var_os("PATH"),
-        home_dir().as_deref(),
+        &common_dirs(home_dir().as_deref()),
     )
 }
 
@@ -125,6 +134,12 @@ pub struct WorkEngineInfo {
     /// Model saved from Vicuna's picker (None = opencode's own default).
     pub model: Option<String>,
     pub config_path: Option<String>,
+    /// Other installs detection found but did not pick ("path (version)").
+    #[serde(default)]
+    pub others: Vec<String>,
+    /// Non-blocking warning, e.g. the version is older than MIN_VERSION.
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 pub fn not_installed_info() -> WorkEngineInfo {
@@ -135,6 +150,8 @@ pub fn not_installed_info() -> WorkEngineInfo {
         install_url: INSTALL_URL.to_string(),
         model: saved_model(),
         config_path: prefs_path().map(|p| p.display().to_string()),
+        others: Vec::new(),
+        warning: None,
     }
 }
 
@@ -148,18 +165,72 @@ pub fn parse_version(stdout: &str) -> Option<String> {
 }
 
 pub async fn engine_info() -> WorkEngineInfo {
-    let Some(bin) = find_opencode() else {
+    // resolution may run `--version` on several binaries: off the async pool
+    let Ok(Some(found)) = tokio::task::spawn_blocking(resolve).await else {
         return not_installed_info();
     };
-    let version = run_capture(&bin, &["--version"], VERSION_TIMEOUT)
-        .await
-        .ok()
-        .and_then(|out| parse_version(&out));
+    let describe = |p: &Path| {
+        let v = crate::exe_resolve::version_of(p).and_then(|o| parse_version(&o));
+        (v.clone(), match v {
+            Some(v) => format!("{} ({v})", p.display()),
+            None => p.display().to_string(),
+        })
+    };
+    let (path, others) = (found.path.clone(), found.others.clone());
+    let (version, others) = tokio::task::spawn_blocking(move || {
+        let version = describe(&path).0;
+        (version, others.iter().map(|o| describe(o).1).collect::<Vec<_>>())
+    })
+    .await
+    .unwrap_or((None, Vec::new()));
+    let warning = version.as_deref().and_then(outdated_warning);
     WorkEngineInfo {
         installed: true,
-        path: Some(bin.display().to_string()),
+        path: Some(found.path.display().to_string()),
         version,
+        others,
+        warning,
         ..not_installed_info()
+    }
+}
+
+/// Warning for a version below MIN_VERSION (None when new enough/unknown).
+pub fn outdated_warning(version: &str) -> Option<String> {
+    let have = crate::exe_resolve::parse_semver(version)?;
+    let min = crate::exe_resolve::parse_semver(MIN_VERSION)?;
+    (have < min).then(|| {
+        format!(
+            "opencode {version} is older than {MIN_VERSION}, the oldest version Vicuna is tested with; it may reject the current opencode config. Update it: opencode upgrade"
+        )
+    })
+}
+
+/// Old opencode builds reject the config opencode.ai now serves
+/// ("Configuration is invalid … Invalid option: expected one of …"). Turn
+/// that into a short, actionable hint naming the binary in use.
+pub fn outdated_hint(err: &str) -> Option<String> {
+    let low = err.to_lowercase();
+    if !(low.contains("configuration is invalid") || low.contains("invalid option: expected one of")) {
+        return None;
+    }
+    let which = find_opencode()
+        .map(|p| {
+            let v = crate::exe_resolve::version_of(&p).and_then(|o| parse_version(&o));
+            format!(" ({}{})", p.display(), v.map(|v| format!(", v{v}")).unwrap_or_default())
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "This opencode{which} looks outdated: it rejects the current opencode config. Update it: opencode upgrade (then Settings → Work engine → Refresh)."
+    ))
+}
+
+/// Strip terminal colours from an opencode error and add the upgrade hint
+/// when it is the outdated-config failure.
+pub fn clean_error(err: &str) -> String {
+    let clean = strip_ansi(err).trim().to_string();
+    match outdated_hint(&clean) {
+        Some(h) => format!("{h}\n\n{clean}"),
+        None => clean,
     }
 }
 
@@ -206,6 +277,11 @@ pub fn command(bin: &Path) -> Command {
     for (k, v) in process_env() {
         cmd.env(k, v);
     }
+    // the terminal's PATH (plus opencode's own dir: an nvm install needs its
+    // sibling `node`), so MCP servers opencode spawns resolve like in a shell
+    if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
+        cmd.env("PATH", p);
+    }
     if let Some(h) = home_dir() {
         cmd.current_dir(h);
     }
@@ -230,11 +306,11 @@ async fn run_capture(bin: &Path, args: &[&str], timeout: Duration) -> Result<Str
         .map_err(|e| format!("cannot run opencode ({}): {e}", bin.display()))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(format!(
+        return Err(clean_error(&format!(
             "opencode {} failed: {}",
             args.join(" "),
             if err.is_empty() { out.status.to_string() } else { err }
-        ));
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -256,25 +332,7 @@ pub struct OpencodeModels {
     pub current: Option<String>,
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for n in chars.by_ref() {
-                    if n.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
+use crate::exe_resolve::strip_ansi;
 
 /// `opencode models` prints one `provider/model` per line. Anything else (log
 /// noise, banners, blank lines, ANSI colour) is ignored; duplicates collapse
@@ -538,4 +596,28 @@ mod tests {
         write_model_to(&path, None).unwrap();
         assert_eq!(read_model_from(&path), None);
     }
+
+    /// The owner's release-build error: ANSI noise stripped and an
+    /// `opencode upgrade` hint put first.
+    #[test]
+    fn outdated_config_error_is_cleaned_with_upgrade_hint() {
+        let raw = "opencode models failed: \u{1b}[91m\u{1b}[1mError: \u{1b}[0mConfiguration is invalid at https://opencode.ai/console/api/config\n  Invalid option: expected one of \"alpha\"|\"beta\"|\"deprecated\" provider.opencode.models.beam-free.status";
+        let msg = clean_error(raw);
+        assert!(!msg.contains('\u{1b}'), "{msg}");
+        assert!(msg.starts_with("This opencode"), "{msg}");
+        assert!(msg.contains("opencode upgrade") && msg.contains("Configuration is invalid"), "{msg}");
+        assert_eq!(clean_error("\u{1b}[31mmodel not found\u{1b}[0m"), "model not found");
+    }
+
+
+    /// The owner's Mac ran opencode 1.3.17: warn below the tested minimum.
+    #[test]
+    fn versions_below_the_tested_minimum_warn() {
+        let w = outdated_warning("1.3.17").unwrap();
+        assert!(w.contains("1.3.17") && w.contains(MIN_VERSION) && w.contains("opencode upgrade"), "{w}");
+        assert_eq!(outdated_warning(MIN_VERSION), None);
+        assert_eq!(outdated_warning("2.10.0"), None);
+        assert_eq!(outdated_warning("garbage"), None);
+    }
+
 }

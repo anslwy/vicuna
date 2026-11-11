@@ -20,6 +20,7 @@ pub mod acp;
 pub mod browser;
 pub mod mcp;
 pub mod opencode;
+pub mod exe_resolve;
 pub mod work_agent;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
@@ -4971,6 +4972,9 @@ pub fn app_title() -> &'static str {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Finder/Dock launches get launchd's minimal PATH: read the user's shell
+    // PATH in the background so engine detection sees what a terminal sees.
+    exe_resolve::warm_up();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
