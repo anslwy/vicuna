@@ -1,7 +1,8 @@
 // Work engines: which external agent CLI a Work turn runs on.
 //
-// Both engines speak ACP through acp.rs; this module owns the choice between
-// them (persisted in ~/vicuna/config/work-engine.json), the combined
+// opencode speaks ACP (acp.rs), Claude Code stream-json (claude_cli.rs) and
+// Codex its app-server JSON-RPC (codex_cli.rs); this module owns the choice
+// between them (persisted in ~/vicuna/config/work-engine.json), the combined
 // detection the UI renders (engine picker when more than one is installed),
 // and per-engine model lists + saved model picks.
 
@@ -16,15 +17,17 @@ use crate::opencode::{home_dir, OpencodeModels, WorkEngineInfo};
 pub enum Engine {
     Opencode,
     Claude,
+    Codex,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Engine::Opencode, Engine::Claude];
+    pub const ALL: [Engine; 3] = [Engine::Opencode, Engine::Claude, Engine::Codex];
 
     pub fn id(self) -> &'static str {
         match self {
             Engine::Opencode => "opencode",
             Engine::Claude => "claude",
+            Engine::Codex => "codex",
         }
     }
 
@@ -32,6 +35,7 @@ impl Engine {
         match self {
             Engine::Opencode => "OpenCode",
             Engine::Claude => "Claude Code",
+            Engine::Codex => "Codex",
         }
     }
 
@@ -39,6 +43,7 @@ impl Engine {
         match s.trim().to_ascii_lowercase().as_str() {
             "opencode" => Some(Engine::Opencode),
             "claude" | "claude-code" | "claude_code" => Some(Engine::Claude),
+            "codex" | "codex-cli" => Some(Engine::Codex),
             _ => None,
         }
     }
@@ -48,6 +53,7 @@ impl Engine {
         match self {
             Engine::Opencode => crate::opencode::find_opencode().is_some(),
             Engine::Claude => crate::claude::find_claude().is_some(),
+            Engine::Codex => crate::codex::find_codex().is_some(),
         }
     }
 
@@ -55,6 +61,7 @@ impl Engine {
         match self {
             Engine::Opencode => crate::acp::not_found_message(),
             Engine::Claude => crate::claude::missing_message(),
+            Engine::Codex => crate::codex::missing_message(),
         }
     }
 
@@ -64,6 +71,7 @@ impl Engine {
         match self {
             Engine::Opencode => model.to_string(),
             Engine::Claude => format!("claude/{model}"),
+            Engine::Codex => format!("codex/{model}"),
         }
     }
 
@@ -71,6 +79,7 @@ impl Engine {
         match self {
             Engine::Opencode => crate::opencode::saved_model(),
             Engine::Claude => crate::claude::saved_model(),
+            Engine::Codex => crate::codex::saved_model(),
         }
     }
 
@@ -78,6 +87,7 @@ impl Engine {
         match self {
             Engine::Opencode => crate::opencode::save_model(model),
             Engine::Claude => crate::claude::save_model(model),
+            Engine::Codex => crate::codex::save_model(model),
         }
     }
 
@@ -85,6 +95,7 @@ impl Engine {
         match self {
             Engine::Opencode => crate::opencode::engine_info().await,
             Engine::Claude => crate::claude::engine_info().await,
+            Engine::Codex => crate::codex::engine_info().await,
         }
     }
 }
@@ -192,6 +203,10 @@ pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<
             models: crate::claude_cli::list_models().await?,
             current: crate::claude::saved_model(),
         }),
+        Engine::Codex => Ok(OpencodeModels {
+            models: crate::codex_cli::list_models().await?,
+            current: crate::codex::saved_model(),
+        }),
     }
 }
 
@@ -248,6 +263,8 @@ mod tests {
         assert_eq!(Engine::parse("Claude-Code"), Some(Engine::Claude));
         assert_eq!(Engine::parse("gpt"), None);
         assert_eq!(Engine::Claude.reply_label("haiku"), "claude/haiku");
+        assert_eq!(Engine::parse("Codex"), Some(Engine::Codex));
+        assert_eq!(Engine::Codex.reply_label("gpt-6-luna"), "codex/gpt-6-luna");
         assert_eq!(Engine::Opencode.reply_label("opencode/beam-free"), "opencode/beam-free");
     }
 
@@ -264,6 +281,9 @@ mod tests {
         // nothing installed: keep the saved pick so its install hint shows
         assert_eq!(choose(Some(Engine::Claude), none), Engine::Claude);
         assert_eq!(choose(None, none), Engine::Opencode);
+        let only_codex = |e: Engine| e == Engine::Codex;
+        assert_eq!(choose(Some(Engine::Claude), only_codex), Engine::Codex);
+        assert_eq!(choose(Some(Engine::Codex), both), Engine::Codex);
     }
 
     #[test]

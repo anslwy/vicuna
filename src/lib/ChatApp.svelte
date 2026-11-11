@@ -1384,8 +1384,9 @@
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
   let workEngineInfo = $state<WorkEngineInfo | null>(null);
 
-  /** Work mode = the user's own agent CLI: opencode (over ACP) or Claude
-   *  Code (its headless stream-json mode), nothing else. Detection re-runs at startup,
+  /** Work mode = the user's own agent CLI: opencode (over ACP), Claude
+   *  Code (its headless stream-json mode) or Codex (codex app-server),
+   *  nothing else. Detection re-runs at startup,
    *  on window focus, on Settings → Refresh and when the model menu opens,
    *  so installing an engine while Vicuna runs is picked up. */
   let workEngineChecked = $state(false);
@@ -6568,6 +6569,8 @@
 {#snippet engineIcon(id: string)}
   {#if id === "claude"}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
+  {:else if id === "codex"}
+    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7.5 9.5l3 2.5-3 2.5M12.5 15h4"/></svg>
   {:else}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
   {/if}
@@ -6833,7 +6836,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? (engineId(workEngineInfo) === "claude" ? "claude" : "opencode") : `no ${engineId(workEngineInfo)}`) : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -8583,7 +8586,7 @@
       {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
         <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
       {/each}
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or your <code>claude</code> CLI (headless <code>claude -p</code> stream-json, with your own login; nothing else to install). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code> and <code>VICUNA_CLAUDE_BIN</code>.</span>
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>), your <code>claude</code> CLI (headless <code>claude -p</code> stream-json) or your <code>codex</code> CLI (<code>codex app-server</code>), each with your own login and config; nothing else to install. Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code> and <code>VICUNA_CODEX_BIN</code>.</span>
       <label class="setting-note approval-row" data-testid="work-approval">
         <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
         Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.

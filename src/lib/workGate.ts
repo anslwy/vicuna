@@ -12,9 +12,9 @@ export interface EngineSummary {
 }
 
 /** Work engine detection (re-run on every call: Refresh, window focus): the
- *  current engine (opencode or Claude Code) plus a summary of all engines. */
+ *  current engine (opencode, Claude Code or Codex) plus a summary of all engines. */
 export interface WorkEngineInfo {
-  /** "opencode" | "claude" (older backends omit it: opencode) */
+  /** "opencode" | "claude" | "codex" (older backends omit it: opencode) */
   id?: string;
   label?: string;
   /** why the engine can't run, with the install hint */
@@ -50,7 +50,8 @@ export function engineId(info: WorkEngineInfo | null): string {
 }
 
 export function engineLabel(info: WorkEngineInfo | null): string {
-  return info?.label || (engineId(info) === "claude" ? "Claude Code" : "OpenCode");
+  const id = engineId(info);
+  return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : "OpenCode");
 }
 
 /** Engines the picker offers: the installed ones. The picker only shows
@@ -60,10 +61,10 @@ export function workEngineChoices(info: WorkEngineInfo | null): EngineSummary[] 
 }
 
 export interface OpencodeModel {
-  /** the engine's model id: opencode `provider/model`, Claude e.g. "haiku" */
+  /** the engine's model id: opencode `provider/model`, Claude e.g. "haiku", Codex e.g. "gpt-6-luna" */
   id: string;
   provider: string;
-  /** display name when the engine gives one (Claude) */
+  /** display name when the engine gives one (Claude, Codex) */
   name?: string;
 }
 
@@ -85,7 +86,8 @@ export function opencodeModelChoices(list: OpencodeModels | null, selected: stri
 
 
 /** Label for a Work-mode reply: the model the engine reported for the turn
- *  (backend sends opencode `provider/model` or `claude/<model>`), else the
+ *  (backend sends opencode `provider/model`, `claude/<model>` or
+ *  `codex/<model>`), else the
  *  Work picker's choice in the same shape, else the engine id. Never the
  *  Chat-mode model. */
 export function workReplyModel(
@@ -97,5 +99,5 @@ export function workReplyModel(
   if (r) return r;
   const p = picked?.trim();
   if (!p) return engine;
-  return engine === "claude" ? `claude/${p}` : p;
+  return engine === "claude" || engine === "codex" ? `${engine}/${p}` : p;
 }

@@ -101,3 +101,26 @@ test("Claude reply label is claude/<model>, never the Chat model", () => {
   assert.equal(workReplyModel(null, null, "claude"), "claude");
   assert.equal(workReplyModel(null, "opencode/beam-free", "opencode"), "opencode/beam-free");
 });
+
+// ---------- Codex as a third engine ----------
+test("Codex engine: label, reply label, gate and picker", () => {
+  const codex: WorkEngineInfo = {
+    id: "codex", label: "Codex", installed: true, path: "/usr/local/bin/codex", version: "0.166.0",
+    installUrl: "https://developers.openai.com/codex/cli", model: null, configPath: null,
+    engines: [
+      { id: "opencode", label: "opencode", installed: true, version: "2.2.6", missing: null },
+      { id: "claude", label: "Claude Code", installed: false, version: null, missing: "Claude Code CLI not found" },
+      { id: "codex", label: "Codex", installed: true, version: "0.166.0", missing: null },
+    ],
+  } as WorkEngineInfo;
+  assert.equal(engineId(codex), "codex");
+  assert.equal(engineLabel(codex), "Codex");
+  assert.equal(engineLabel({ ...codex, label: "" } as WorkEngineInfo), "Codex");
+  assert.deepEqual(workEngineChoices(codex).map((e) => e.id), ["opencode", "codex"]);
+  assert.equal(workSendGate(codex).blocked, false);
+  assert.equal(workReplyModel(null, "gpt-6-luna", "codex"), "codex/gpt-6-luna");
+  assert.equal(workReplyModel("codex/gpt-6.1-sol", null, "codex"), "codex/gpt-6.1-sol");
+  assert.equal(workReplyModel(null, null, "codex"), "codex");
+  const missing = { ...codex, installed: false, missing: "Codex CLI not found, install it: https://developers.openai.com/codex/cli" } as WorkEngineInfo;
+  assert.equal(workSendGate(missing).reason, missing.missing);
+});

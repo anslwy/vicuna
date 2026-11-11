@@ -161,6 +161,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
     match engine {
         Engine::Opencode => "opencode acp",
         Engine::Claude => "claude",
+        Engine::Codex => "codex app-server",
     }
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
     session_id.map(|id| match engine {
         Engine::Opencode => format!("{id}|{workspace}"),
         Engine::Claude => format!("claude|{id}|{workspace}"),
+        Engine::Codex => format!("codex|{id}|{workspace}"),
     })
 }
 
@@ -1145,6 +1147,20 @@ pub async fn run_turn(
             &mcp_snapshot,
         )
         .await
+    } else if engine == Engine::Codex {
+        super::codex_cli::run_turn_inner(
+            &turn,
+            model.as_deref(),
+            &workspace,
+            &messages,
+            session_id.as_deref(),
+            goal_text.as_deref(),
+            fresh_session,
+            &on_event,
+            state,
+            &mcp_snapshot,
+        )
+        .await
     } else {
         run_turn_inner(
         engine,
@@ -1218,6 +1234,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
         match engine {
             Engine::Opencode => format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model."),
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
+            Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
         }
     } else {
         e
@@ -1479,6 +1496,7 @@ mod tests {
         assert_eq!(session_key(Engine::Opencode, None, "/w"), None);
         // engines never share a session id (switching engine starts fresh)
         assert_eq!(session_key(Engine::Claude, Some("chat1"), "/w"), Some("claude|chat1|/w".to_string()));
+        assert_eq!(session_key(Engine::Codex, Some("chat1"), "/w"), Some("codex|chat1|/w".to_string()));
     }
 
     #[test]

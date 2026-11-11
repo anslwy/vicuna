@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Headless acceptance for Work mode (opencode or Claude Code over ACP),
+# Headless acceptance for Work mode (opencode over ACP, Claude Code via
+# `claude -p` stream-json, Codex via `codex app-server`),
 # through the real backend: the loopback bridge, no Tauri window needed.
 #
 #   scripts/work-acceptance.sh missing [engine]          # engine forced missing
@@ -7,27 +8,37 @@
 #   scripts/work-acceptance.sh mcp <model> [engine]      # a Vicuna MCP server's tool actually runs
 #   scripts/work-acceptance.sh toolcap <model> [engine]  # MCP servers reach the engine, under 128 tools
 #   scripts/work-acceptance.sh approve <model> [engine]  # 'ask' mode: a shell command waits for Allow, then runs
+#   scripts/work-acceptance.sh combo <model> [engine]    # ONE turn: MCP tool with real args + 'ask' approval of a shell command
+#   scripts/work-acceptance.sh stopq <model> [engine]    # a message queued mid-turn runs next; Stop interrupts a long reply
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
+#   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
 #
-#   engine = opencode (default) | claude
+#   engine = opencode (default) | claude | codex
 #   e.g.  present opencode/beam-free          present haiku claude
+#         present gpt-6-luna codex            combo gpt-6-luna codex
 #
 # Build the bridge first:  (cd bridge && cargo build)
 # Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
 #      src-tauri/target/debug/vicuna-bridge), PORT (default 1427),
-#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN
+#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN,
+#      VICUNA_CODEX_EFFORT (codex reasoning effort; default here: low),
+#      VICUNA_CODEX_FAKE=1: run the real `codex app-server` against
+#      scripts/fake-codex-provider.py (a scripted Responses API in a temp
+#      CODEX_HOME): threads, tools, sandbox, approvals, MCP and resume are
+#      real, no Codex quota is used; use model fake-codex.
 #      (default: found on PATH).
 # Billed turns (by the provider; opencode/beam-free is free): present = 2,
-# mcp = 1, approve = 1, toolcap = 1. Every mode runs the bridge with a temporary HOME so
+# mcp = 1, approve = 1, toolcap = 1, combo = 1 (Codex: present + combo = 3). Every mode runs the bridge with a temporary HOME so
 # the user's real ~/vicuna/config is never touched; opencode keeps its real
-# XDG config/auth and Claude its real ~/.claude login (symlinked in).
+# XDG config/auth, Claude its real ~/.claude login (symlinked in) and Codex
+# its real ~/.codex (CODEX_HOME).
 set -euo pipefail
 
 mode="${1:-}"
 model="${2:-}"
 engine="${3:-opencode}"
 [ "$mode" = "missing" ] && engine="${2:-opencode}"
-case "$engine" in opencode|claude) ;; *) echo "engine must be opencode or claude"; exit 2 ;; esac
+case "$engine" in opencode|claude|codex) ;; *) echo "engine must be opencode, claude or codex"; exit 2 ;; esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${PORT:-1427}"
 bridge="${BRIDGE:-}"
@@ -39,10 +50,11 @@ fi
 [ -x "${bridge:-}" ] || { echo "bridge binary not found; build it: (cd bridge && cargo build)"; exit 2; }
 
 base="http://127.0.0.1:$port"
-work="$(mktemp -d "${TMPDIR:-/tmp}/vicuna-accept.XXXXXX")"
+work="${KEEP_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/vicuna-accept.XXXXXX")}"; mkdir -p "$work"
 real_home="$HOME"
 pid=""
-cleanup() { [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; }
+fake_pid=""
+cleanup() { [ -n "$pid" ] && kill "$pid" 2>/dev/null; [ -n "$fake_pid" ] && kill "$fake_pid" 2>/dev/null; true; }
 trap cleanup EXIT
 
 # temp HOME with the engines' real logins linked in
@@ -52,6 +64,17 @@ for f in .claude .claude.json; do
 done
 oc_bin="${VICUNA_OPENCODE_BIN:-$(command -v opencode || true)}"
 cl_bin="${VICUNA_CLAUDE_BIN:-$(command -v claude || true)}"
+cx_bin="${VICUNA_CODEX_BIN:-$(command -v codex || true)}"
+codex_home="${CODEX_HOME:-$real_home/.codex}"
+if [ "$engine" = "codex" ] && [ -n "${VICUNA_CODEX_FAKE:-}" ]; then
+  fake_port=$((port + 1000))
+  codex_home="$work/codex-home"
+  mkdir -p "$codex_home"
+  printf 'model = "fake-codex"\nmodel_provider = "fake"\n[model_providers.fake]\nname = "fake"\nbase_url = "http://127.0.0.1:%s/v1"\nwire_api = "responses"\n' "$fake_port" >"$codex_home/config.toml"
+  python3 "$root/scripts/fake-codex-provider.py" "$fake_port" "$work/fake-provider.log" &
+  fake_pid=$!
+  echo "codex: scripted provider on :$fake_port (CODEX_HOME=$codex_home)"
+fi
 
 start_bridge() { # extra env assignments...
   env HOME="$work/home" \
@@ -61,6 +84,8 @@ start_bridge() { # extra env assignments...
     XDG_STATE_HOME="${XDG_STATE_HOME:-$real_home/.local/state}" \
     VICUNA_OPENCODE_BIN="${oc_bin:-/nonexistent/opencode}" \
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
+    VICUNA_CODEX_BIN="${cx_bin:-/nonexistent/codex}" \
+    CODEX_HOME="$codex_home" VICUNA_CODEX_EFFORT="${VICUNA_CODEX_EFFORT:-low}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 50); do
@@ -110,8 +135,8 @@ saved_session() { # the engine session id Vicuna saved for this chat
   python3 - "$work/home/vicuna/config/opencode-sessions.json" "$engine" "accept-$$|$work/ws" <<'PY'
 import json, sys
 path, engine, key = sys.argv[1:]
-if engine == "claude":
-    key = "claude|" + key
+if engine in ("claude", "codex"):
+    key = engine + "|" + key
 try:
     print(json.load(open(path)).get(key, ""))
 except FileNotFoundError:
@@ -119,7 +144,7 @@ except FileNotFoundError:
 PY
 }
 
-want_label() { [ "$engine" = "claude" ] && echo "claude/$model" || echo "$model"; }
+want_label() { case "$engine" in claude|codex) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
 
 check_turn() { # expect-substring label-check(yes|no)
   python3 - "$work/events.jsonl" "$1" "$2" "$(want_label)" <<'PY'
@@ -146,12 +171,8 @@ PY
 case "$mode" in
   missing)
     # exclusive overrides that do not exist: detection must report missing
-    if [ "$engine" = "claude" ]; then
-      start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude
-      invoke work_engine_select '{"engine":"claude"}' >/dev/null
-    else
-      start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude
-    fi
+    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex
+    [ "$engine" = "opencode" ] || invoke work_engine_select "{\"engine\":\"$engine\"}" >/dev/null
     info="$(invoke work_engine_info '{}')"
     echo "work_engine_info: $info"
     start="$(invoke work_agent_start "$(turn_args "miss-$$" true "hi")")"
@@ -165,6 +186,10 @@ assert all(not e["installed"] for e in d["engines"]), d["engines"]
 if engine == "claude":
     assert "Claude Code CLI not found, install it:" in d["missing"], d
     assert "Claude Code CLI not found, install it:" in start.get("error", ""), start
+elif engine == "codex":
+    assert d["label"] == "Codex" and d["installUrl"].startswith("https://developers.openai.com/codex"), d
+    assert "Codex CLI not found, install it:" in d["missing"], d
+    assert "Codex CLI not found, install it:" in start.get("error", ""), start
 else:
     assert d["path"] is None and d["installUrl"].startswith("https://opencode.ai/"), d
     assert "OpenCode CLI not found, install it:" in start.get("error", ""), start
@@ -185,7 +210,11 @@ assert sel["ok"] and sel["data"]["id"] == engine and sel["data"]["installed"], s
 ids = [m["id"] for m in models["data"]["models"]] if models.get("ok") else []
 assert models["ok"], models
 print(f"work_models ({engine}): {len(ids)} models, e.g. {ids[:6]}")
-assert ids and want in ids, f"{want} not in the engine's list"
+import os
+if os.environ.get("VICUNA_CODEX_FAKE") and engine == "codex":
+    print(f"  (scripted provider: {want} is not in Codex's catalog; that is expected)")
+else:
+    assert ids and want in ids, f"{want} not in the engine's list"
 print("PASS engine selected and models listed from the engine")
 PY
     # the pick persists (backend file) and comes back as `current`
@@ -340,6 +369,179 @@ assert "big_mcp (140 tools)" in notes, notes
 print("PASS 140-tool server skipped with a note:", notes.strip()[:160])
 PY
     ;;
+  combo)
+    [ -n "$model" ] || { echo "usage: $0 combo <model> [engine]"; exit 2; }
+    # One billed turn for tight quotas (Codex): 'ask' mode on, a Vicuna MCP
+    # server connected. The agent must call the MCP tool with real args and
+    # run a shell command that waits for Allow. Every ask card is answered
+    # Allow (an engine may also ask before the MCP call).
+    srv="$root/scripts/many-tools-mcp.py"
+    python3 - "$work" "$srv" <<'PY'
+import json, sys
+work, srv = sys.argv[1], sys.argv[2]
+json.dump({"mcp": {"vicuna_probe": {"type": "local", "command": ["python3", srv, "3"],
+           "env": {"MANY_TOOLS_LOG": f"{work}/probe.log"}, "enabled": True}}},
+          open(f"{work}/home/vicuna/config/vicuna.json", "w"))
+PY
+    start_bridge
+    r="$(invoke mcp_connect "{\"config\":{\"id\":\"vicuna_probe\",\"name\":\"vicuna_probe\",\"transport\":\"stdio\",\"command\":[\"python3\",\"$srv\",\"3\"],\"env\":{\"MANY_TOOLS_LOG\":\"$work/probe.log\"},\"enabled\":true}}")"
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print("mcp_connect vicuna_probe:", len(r["data"]["tools"]), "tools")' "$r"
+    r="$(invoke work_set_approval '{"ask":true}')"
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"] and r["data"]["askPermission"] is True, r; print("approval mode: ask")' "$r"
+    start="$(invoke work_agent_start "$(turn_args "co-$$" true "Do these two steps in order. 1) Call the MCP tool noop_001 (vicuna_probe server) exactly once with the argument note set to \"vicuna-args-check\". 2) Use your shell tool to run exactly: mkdir -p approve-test && echo vicuna-approve-ok > approve-test/out.txt && cat approve-test/out.txt . Then reply with the command's output.")")"
+    echo "work_agent_start: $start"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    : >"$work/answered"
+    for _ in $(seq 1 600); do
+      curl -sS "$base/poll/co-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      python3 - "$work/events.jsonl" "$work/answered" <<'PY' | while read -r aid; do
+import json, sys
+done_ids = set(open(sys.argv[2]).read().split())
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e.get("type") == "askrequest" and e["ask_id"] not in done_ids:
+        print(e["ask_id"])
+PY
+        echo "ask card $aid -> Allow"
+        invoke work_agent_answer "{\"turnId\":\"$turn_id\",\"askId\":\"$aid\",\"answer\":\"Allow\"}" >/dev/null
+        echo "$aid" >>"$work/answered"
+      done
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    invoke work_set_approval '{"ask":false}' >/dev/null
+    python3 - "$work" <<'PY'
+import json, os, sys
+work = sys.argv[1]
+evs = [json.loads(l) for l in open(f"{work}/events.jsonl") if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+asks = [e for e in evs if e.get("type") == "askrequest"]
+print("  ask cards:", [e["question"][:90] for e in asks])
+starts = [e for e in evs if e.get("type") == "toolstart"]
+print("  tool cards:", [(e.get("name"), json.dumps(e.get("args"))[:70]) for e in starts])
+calls = [l.strip() for l in open(f"{work}/probe.log")] if os.path.exists(f"{work}/probe.log") else []
+assert "tools/call" in calls, "the MCP tool was not called"
+probe = [e for e in starts if "noop_001" in str(e.get("name"))]
+assert probe and "vicuna-args-check" in json.dumps(probe[-1].get("args")), f"MCP card args missing: {starts}"
+print("PASS MCP: the engine called the Vicuna MCP tool; card args:", json.dumps(probe[-1].get("args")))
+assert any(any(w in e["question"] for w in ("exec", "Bash", "shell", "mkdir")) for e in asks), "the shell command was not held for approval"
+notes = "".join(e.get("text", "") for e in evs if e.get("type") == "displaynote")
+assert "Approved:" in notes and "Auto-approved" not in notes, notes
+outs = " ".join(e.get("output", "") for e in evs if e.get("type") == "toolend")
+text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
+assert "vicuna-approve-ok" in outs + text, (outs[:300], text[:300])
+assert os.path.exists(f"{work}/ws/approve-test/out.txt"), "the approved command did not write its file"
+print("PASS ask mode: the shell command waited for its ask card, ran after Allow; transcript says Approved")
+PY
+    ;;
+  finder-codex)
+    # Finder/Dock-style launch (env -i, PATH=/usr/bin:/bin): the real codex
+    # only under nvm (npm i -g @openai/codex), a stale one in ~/.codex/bin.
+    # Detection must pick the newest, list the other, and model/list must work
+    # (no model turn).
+    real_cx="$(command -v codex)" || { echo "codex not on PATH"; exit 2; }
+    fh="$work/finder-home"
+    nvm_bin="$fh/.nvm/versions/node/v24.14.1/bin"
+    mkdir -p "$fh/.codex/bin" "$nvm_bin"
+    printf '#!/bin/sh\necho "codex-cli 0.1.0"\n' >"$fh/.codex/bin/codex"
+    chmod +x "$fh/.codex/bin/codex"
+    ln -s "$real_cx" "$nvm_bin/codex"
+    printf '{"engine":"codex"}' >"$fh/work-engine.json"
+    mkdir -p "$fh/vicuna/config" && mv "$fh/work-engine.json" "$fh/vicuna/config/"
+    env -i HOME="$fh" SHELL=/bin/sh PATH=/usr/bin:/bin USER="${USER:-user}" CODEX_HOME="$codex_home" \
+      "$bridge" "$port" >"$work/bridge.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 50); do curl -fsS "$base/health" >/dev/null 2>&1 && break; sleep 0.2; done
+    info="$(invoke work_engine_info '{}')"
+    models="$(invoke work_models '{"engine":"codex"}')"
+    python3 - "$info" "$models" "$nvm_bin/codex" <<'PY'
+import json, sys
+info, models, want = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
+d = info["data"]
+print("work_engine_info:", json.dumps({k: d.get(k) for k in ("id", "installed", "path", "version", "others")}, indent=1))
+assert d["id"] == "codex" and d["installed"], d
+assert d["path"] == want, f"picked {d['path']}, want the nvm install {want}"
+assert d["version"] and d["version"] != "0.1.0", d
+assert any(".codex/bin/codex (0.1.0)" in o for o in d.get("others", [])), d.get("others")
+print("PASS Finder-style launch finds the nvm-only codex (newest), the stale one listed as 'also found'")
+assert models["ok"] and models["data"]["models"], models
+print(f"PASS model menu lists {len(models['data']['models'])} Codex models from model/list:", [m["id"] for m in models["data"]["models"]][:5])
+PY
+    ;;
+  stopq)
+    [ -n "$model" ] || { echo "usage: $0 stopq <model> [engine]"; exit 2; }
+    # Queue + Stop (billed: 2 turns; free with VICUNA_CODEX_FAKE=1).
+    # 1) a long reply; a message queued mid-turn must run as the next prompt
+    #    of the same turn (queuedrained, a second round, its answer).
+    # 2) a long reply; Stop mid-stream must end the turn as stopped, no error.
+    start_bridge
+    pull() { # channel: append new events
+      curl -sS "$base/poll/$1" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+    }
+    wait_token() { # channel: until the first token
+      for _ in $(seq 1 240); do
+        pull "$1"
+        grep -q '"type": "token"' "$work/events.jsonl" && return 0
+        grep -qE '"type": "(done|error)"' "$work/events.jsonl" && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+    finish() { # channel: until done/error
+      for _ in $(seq 1 600); do
+        pull "$1"
+        grep -qE '"type": "(done|error)"' "$work/events.jsonl" && return 0
+        sleep 0.25
+      done
+    }
+    : >"$work/events.jsonl"
+    start="$(invoke work_agent_start "$(turn_args "q-$$" true "Please count slowly from 1 to 60, numbers separated by spaces. Do not use any tools.")")"
+    tid="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    wait_token "q-$$" || { echo "FAIL no token"; cat "$work/events.jsonl"; exit 1; }
+    invoke work_agent_queue "{\"turnId\":\"$tid\",\"id\":\"qmsg-1\",\"message\":{\"role\":\"user\",\"content\":\"Now reply with exactly the word QUEUED and nothing else.\"}}" >/dev/null
+    echo "queued a message mid-turn"
+    finish "q-$$"
+    python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+types = [e["type"] for e in evs]
+assert "queuedrained" in types, types
+qi = types.index("queuedrained")
+after = "".join(e.get("text", "") for e in evs[qi:] if e.get("type") == "token")
+assert types.count("roundstart") >= 2 and "QUEUED" in after.upper(), (types, after[:200])
+assert [e for e in evs if e["type"] == "done"][-1]["stopped"] is False
+print("PASS queue: the message queued mid-turn ran as the next prompt; reply:", after.strip()[:40])
+PY
+    : >"$work/events.jsonl"
+    start="$(invoke work_agent_start "$(turn_args "s-$$" false "Please count slowly from 1 to 60 again, numbers separated by spaces. Do not use any tools.")")"
+    tid="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    wait_token "s-$$" || { echo "FAIL no token"; cat "$work/events.jsonl"; exit 1; }
+    t0=$(date +%s)
+    invoke work_agent_stop "{\"turnId\":\"$tid\"}" >/dev/null
+    finish "s-$$"
+    t1=$(date +%s)
+    python3 - "$work/events.jsonl" "$((t1 - t0))" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+done = [e for e in evs if e["type"] == "done"]
+assert done and done[-1]["stopped"] is True, done
+text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
+assert "60" not in text.split(), "the reply ran to the end: Stop did not interrupt"
+print(f"PASS stop: the turn ended as stopped {sys.argv[2]}s after Stop, reply cut at: ...{text.strip()[-20:]!r}")
+PY
+    ;;
   finder)
     # Reproduces the release-.dmg bug without a Mac. The bridge starts with
     # launchd's minimal environment (env -i, PATH=/usr/bin:/bin), like a
@@ -411,5 +613,5 @@ print("PASS its model-menu error is clean and starts with the upgrade hint:", er
 PY
     ;;
   *)
-    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | finder"; exit 2 ;;
+    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | combo <model> [engine] | stopq <model> [engine] | finder | finder-codex"; exit 2 ;;
 esac
