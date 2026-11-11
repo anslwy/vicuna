@@ -17,7 +17,7 @@ const base: WorkEngineInfo = {
 test("opencode missing => Work send disabled with the install link", () => {
   const gate = workSendGate({ ...base, installed: false, path: null, version: null });
   assert.equal(gate.blocked, true);
-  assert.equal(gate.reason, "opencode CLI not found, install it: https://opencode.ai/docs/#install");
+  assert.equal(gate.reason, "OpenCode CLI not found, install it: https://opencode.ai/docs/#install");
 });
 
 test("detection not answered yet => still disabled (no fallback engine)", () => {
@@ -91,7 +91,7 @@ test("engine picker lists only installed engines; older backends default to open
   assert.deepEqual(workEngineChoices(both).map((e) => e.id), ["opencode", "claude"]);
   const legacy: WorkEngineInfo = { installed: true, path: "/x", version: "1", installUrl: "u", model: null, configPath: null };
   assert.equal(engineId(legacy), "opencode");
-  assert.equal(engineLabel(legacy), "opencode");
+  assert.equal(engineLabel(legacy), "OpenCode");
   assert.deepEqual(workEngineChoices(legacy), []);
 });
 

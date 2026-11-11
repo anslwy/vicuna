@@ -141,7 +141,7 @@ pub struct WorkEngineInfo {
     /// Engine id: "opencode" or "claude".
     #[serde(default)]
     pub id: String,
-    /// Display name ("opencode", "Claude Code").
+    /// Display name ("OpenCode", "Claude Code").
     #[serde(default)]
     pub label: String,
     pub installed: bool,
@@ -182,8 +182,8 @@ pub struct EngineSummary {
 pub fn not_installed_info() -> WorkEngineInfo {
     WorkEngineInfo {
         id: "opencode".to_string(),
-        label: "opencode".to_string(),
-        missing: Some(format!("opencode CLI not found, install it: {INSTALL_URL}")),
+        label: "OpenCode".to_string(),
+        missing: Some(format!("OpenCode CLI not found, install it: {INSTALL_URL}")),
         engines: Vec::new(),
         installed: false,
         path: None,
@@ -431,7 +431,7 @@ pub fn parse_models_output(stdout: &str) -> Vec<OpencodeModel> {
 
 pub async fn list_models() -> Result<OpencodeModels, String> {
     let bin = find_opencode()
-        .ok_or_else(|| format!("opencode CLI not found, install it: {INSTALL_URL}"))?;
+        .ok_or_else(|| format!("OpenCode CLI not found, install it: {INSTALL_URL}"))?;
     let out = run_capture(&bin, &["models"], MODELS_TIMEOUT).await?;
     Ok(OpencodeModels {
         models: parse_models_output(&out),

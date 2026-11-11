@@ -50,7 +50,7 @@
     type ViewAnchor
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
-  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH } from "$lib/modelIcons";
+  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -6565,6 +6565,14 @@
 </script>
 
 {#if ready}
+{#snippet engineIcon(id: string)}
+  {#if id === "claude"}
+    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
+  {:else}
+    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
+  {/if}
+{/snippet}
+
 <div class="app">
   {#if sidebarOpen}
     <aside
@@ -7401,7 +7409,7 @@
           {#if composerMode === "work"}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" data-engine={engineId(workEngineInfo)} title={workModel ? `${workEngineLabel}: ${workModel}` : `${workEngineLabel} default model`} disabled={!workEngineInfo?.installed && workEngines.length === 0} onclick={toggleModel}>
-              {#if workEngines.length > 1}<span class="engine-chip" data-testid="work-engine-chip">{engineId(workEngineInfo) === "claude" ? "claude" : "opencode"}</span>{/if}
+              {#if workEngines.length > 1}<span class="engine-chip" data-testid="work-engine-chip" title={workEngineLabel}>{@render engineIcon(engineId(workEngineInfo))}</span>{/if}
               <span class="model-name" data-testid="work-model-name">{workModel ?? `${engineId(workEngineInfo)} default`}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
@@ -7411,7 +7419,7 @@
                 {#if workEngines.length > 1}
                   <div class="engine-switch" data-testid="work-engine-picker" role="radiogroup" aria-label="Work engine">
                     {#each workEngines as eng (eng.id)}
-                      <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => void pickWorkEngine(eng.id)}>{eng.label}</button>
+                      <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => void pickWorkEngine(eng.id)}>{@render engineIcon(eng.id)}<span>{eng.label}</span></button>
                     {/each}
                   </div>
                 {/if}
@@ -9389,12 +9397,14 @@
   .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
   .engine-switch { display: flex; gap: 4px; padding: 8px 8px 0; }
   .engine-switch.settings-engines { padding: 4px 0; }
-  .engine-opt { flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
+  .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
   .engine-opt:disabled { opacity: .5; cursor: default; }
   .approval-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
   .approval-row input { margin-top: 2px; }
-  .engine-chip { font-size: 11px; color: var(--muted-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin-right: 2px; }
+  .engine-ico { flex: none; display: block; }
+  .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
+  .engine-opt .engine-ico { transform: translateY(.5px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }

@@ -167,7 +167,7 @@ if engine == "claude":
     assert "Claude Code CLI not found, install it:" in start.get("error", ""), start
 else:
     assert d["path"] is None and d["installUrl"].startswith("https://opencode.ai/"), d
-    assert "opencode CLI not found, install it:" in start.get("error", ""), start
+    assert "OpenCode CLI not found, install it:" in start.get("error", ""), start
 assert not start["ok"]
 print(f"PASS missing ({engine}): installed=false, install hint shown, work_agent_start refused")
 print("     (UI: workSendGate(info) => send-btn disabled; covered by `npm test`)")

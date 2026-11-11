@@ -50,7 +50,7 @@ export function engineId(info: WorkEngineInfo | null): string {
 }
 
 export function engineLabel(info: WorkEngineInfo | null): string {
-  return info?.label || (engineId(info) === "claude" ? "Claude Code" : "opencode");
+  return info?.label || (engineId(info) === "claude" ? "Claude Code" : "OpenCode");
 }
 
 /** Engines the picker offers: the installed ones. The picker only shows

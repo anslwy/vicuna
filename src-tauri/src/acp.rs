@@ -41,7 +41,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const OUTPUT_CAP: usize = 32 * 1024;
 
 pub fn not_found_message() -> String {
-    format!("opencode CLI not found, install it: {INSTALL_URL}")
+    format!("OpenCode CLI not found, install it: {INSTALL_URL}")
 }
 
 // ---------- state: warm process + session ids persisted across turns ----------

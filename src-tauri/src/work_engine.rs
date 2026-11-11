@@ -30,7 +30,7 @@ impl Engine {
 
     pub fn label(self) -> &'static str {
         match self {
-            Engine::Opencode => "opencode",
+            Engine::Opencode => "OpenCode",
             Engine::Claude => "Claude Code",
         }
     }
