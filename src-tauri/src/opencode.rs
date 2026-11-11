@@ -314,6 +314,19 @@ pub fn config_content_with(existing: Option<&str>, ask: bool) -> String {
     if ask && !obj.contains_key("permission") {
         obj.insert("permission".into(), json!({ "edit": "ask", "bash": "ask", "webfetch": "ask" }));
     }
+    // opencode's own `question` tool needs ACP form elicitation, which Vicuna
+    // doesn't offer, so it always fails ("couldn't be shown to the user");
+    // hide it and let vicuna-mcp's ask_user take its place. A user's own
+    // `permission.question` (or a non-object `permission`) wins.
+    match obj.get_mut("permission") {
+        None => {
+            obj.insert("permission".into(), json!({ "question": "deny" }));
+        }
+        Some(Value::Object(p)) => {
+            p.entry("question").or_insert_with(|| json!("deny"));
+        }
+        Some(_) => {}
+    }
     config.to_string()
 }
 
@@ -689,9 +702,24 @@ mod tests {
         assert_eq!(v["permission"]["bash"], "ask");
         assert_eq!(v["permission"]["edit"], "ask");
         let auto: Value = serde_json::from_str(&config_content_with(None, false)).unwrap();
-        assert!(auto.get("permission").is_none());
+        assert_eq!(auto["permission"], json!({ "question": "deny" }), "auto mode only hides the question tool");
         let own: Value = serde_json::from_str(&config_content_with(Some(r#"{"permission":{"bash":"allow"}}"#), true)).unwrap();
         assert_eq!(own["permission"]["bash"], "allow");
+        assert!(own["permission"].get("edit").is_none());
+    }
+
+    /// opencode's native question tool can't render in Vicuna (no ACP form
+    /// elicitation): it is hidden so the model uses vicuna-mcp's ask_user.
+    #[test]
+    fn native_question_tool_is_hidden_unless_the_user_set_it() {
+        let v: Value = serde_json::from_str(&config_content_with(None, true)).unwrap();
+        assert_eq!(v["permission"]["question"], "deny");
+        let own: Value = serde_json::from_str(&config_content(Some(r#"{"permission":{"question":"allow","bash":"ask"}}"#))).unwrap();
+        assert_eq!(own["permission"]["question"], "allow");
+        let added: Value = serde_json::from_str(&config_content(Some(r#"{"permission":{"bash":"ask"}}"#))).unwrap();
+        assert_eq!(added["permission"], json!({ "bash": "ask", "question": "deny" }));
+        let flat: Value = serde_json::from_str(&config_content(Some(r#"{"permission":"allow"}"#))).unwrap();
+        assert_eq!(flat["permission"], "allow");
     }
 
 }

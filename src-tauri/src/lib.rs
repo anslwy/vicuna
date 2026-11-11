@@ -26,6 +26,7 @@ pub mod claude;
 pub mod claude_cli;
 pub mod work_engine;
 pub mod work_agent;
+pub mod vicuna_mcp;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
