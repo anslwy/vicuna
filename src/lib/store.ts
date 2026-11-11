@@ -291,6 +291,7 @@ function serializeImages(images: string[] | undefined): string | null {
 
 async function createSqliteBackend(): Promise<Backend> {
   const { default: Database } = await import("@tauri-apps/plugin-sql");
+  const { invoke } = await import("@tauri-apps/api/core");
   const db = await Database.load(DB_PATH);
   await db.execute(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -378,7 +379,21 @@ async function createSqliteBackend(): Promise<Backend> {
     execute(query: string, bindValues?: unknown[]): Promise<unknown>;
   };
   async function rewriteChats(db: SqlDb, chats: Chat[]): Promise<void> {
-    // full rewrite is simple and fast enough at this scale
+    // Atomic rewrite through Rust: one sqlx transaction on the plugin's own
+    // pool. The old per-statement JS loop was the data-loss bug: a page
+    // unload (right-click → Refresh on Windows) killed the awaiting loop
+    // right after the DELETEs landed, wiping all history (live loss,
+    // 2026-11-11). Each plugin execute() can grab a different pooled
+    // connection, so BEGIN/COMMIT from JS is unsafe — the transaction
+    // therefore lives in the `chats_save` command.
+    try {
+      await invoke("chats_save", { chats: toSavePayload(chats) });
+      return;
+    } catch (e) {
+      console.error("chats_save failed, falling back to statement loop:", e);
+    }
+    // fallback: old non-atomic statement loop (stale shell without
+    // chats_save). Never remove: keeps an old shell + new frontend working.
     await db.execute("DELETE FROM messages");
     await db.execute("DELETE FROM chats");
     for (const c of chats) {
@@ -394,6 +409,32 @@ async function createSqliteBackend(): Promise<Backend> {
         );
       }
     }
+  }
+
+  /** exact payload shape for the Rust chats_save command (camelCase keys) */
+  function toSavePayload(chats: Chat[]) {
+    return chats.map((c) => ({
+      id: c.id,
+      title: c.title,
+      createdAt: c.createdAt,
+      updatedAt: chatActivity(c),
+      forkedFrom: c.forkedFrom ? JSON.stringify(c.forkedFrom) : null,
+      forkFromIndex: c.forkFromIndex ?? null,
+      mode: c.mode ?? "chat",
+      workspace: c.workspace ?? null,
+      goal: c.goal ?? null,
+      messages: c.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        thinking: m.thinking ?? "",
+        model: m.model ?? null,
+        images: m.images?.length ? m.images : null,
+        genMs: m.genMs ?? null,
+        genTps: m.genTps ?? null,
+        genCost: m.genCost ?? null,
+        summary: m.summary ? true : null
+      }))
+    }));
   }
 
   return {
