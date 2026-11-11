@@ -1,0 +1,288 @@
+// Work engines: which external agent CLI a Work turn runs on.
+//
+// Both engines speak ACP through acp.rs; this module owns the choice between
+// them (persisted in ~/vicuna/config/work-engine.json), the combined
+// detection the UI renders (engine picker when more than one is installed),
+// and per-engine model lists + saved model picks.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+use tauri::State;
+
+use crate::opencode::{home_dir, OpencodeModels, WorkEngineInfo};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Engine {
+    Opencode,
+    Claude,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 2] = [Engine::Opencode, Engine::Claude];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Engine::Opencode => "opencode",
+            Engine::Claude => "claude",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Engine::Opencode => "opencode",
+            Engine::Claude => "Claude Code",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Engine> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "opencode" => Some(Engine::Opencode),
+            "claude" | "claude-code" | "claude_code" => Some(Engine::Claude),
+            _ => None,
+        }
+    }
+
+    /// Cheap presence check (stats only).
+    pub fn is_present(self) -> bool {
+        match self {
+            Engine::Opencode => crate::opencode::find_opencode().is_some(),
+            Engine::Claude => crate::claude::find_claude().is_some(),
+        }
+    }
+
+    pub fn missing_message(self) -> String {
+        match self {
+            Engine::Opencode => crate::acp::not_found_message(),
+            Engine::Claude => crate::claude::missing_message(),
+        }
+    }
+
+    /// The label prefix for a model id in reply footers: opencode ids are
+    /// already `provider/model`; Claude's are bare ("haiku" -> "claude/haiku").
+    pub fn reply_label(self, model: &str) -> String {
+        match self {
+            Engine::Opencode => model.to_string(),
+            Engine::Claude => format!("claude/{model}"),
+        }
+    }
+
+    pub fn saved_model(self) -> Option<String> {
+        match self {
+            Engine::Opencode => crate::opencode::saved_model(),
+            Engine::Claude => crate::claude::saved_model(),
+        }
+    }
+
+    pub fn save_model(self, model: Option<&str>) -> Result<(), String> {
+        match self {
+            Engine::Opencode => crate::opencode::save_model(model),
+            Engine::Claude => crate::claude::save_model(model),
+        }
+    }
+
+    async fn info(self) -> WorkEngineInfo {
+        match self {
+            Engine::Opencode => crate::opencode::engine_info().await,
+            Engine::Claude => crate::claude::engine_info().await,
+        }
+    }
+}
+
+// ---------- persisted engine choice ----------
+
+fn prefs_path() -> Option<PathBuf> {
+    Some(home_dir()?.join("vicuna").join("config").join("work-engine.json"))
+}
+
+pub fn read_engine_from(path: &Path) -> Option<Engine> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    Engine::parse(v.get("engine")?.as_str()?)
+}
+
+fn update_prefs(path: &Path, key: &str, value: Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut doc = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    doc[key] = value;
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+pub fn write_engine_to(path: &Path, engine: Engine) -> Result<(), String> {
+    update_prefs(path, "engine", json!(engine.id()))
+}
+
+/// Tool approval: "auto" (default; every permission request is approved and
+/// noted in the transcript) or "ask" (each request becomes an ask card in the
+/// chat; the user picks Allow / Reject).
+pub fn read_ask_from(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("approval").and_then(|a| a.as_str()).map(|a| a == "ask"))
+        .unwrap_or(false)
+}
+
+pub fn write_ask_to(path: &Path, ask: bool) -> Result<(), String> {
+    update_prefs(path, "approval", json!(if ask { "ask" } else { "auto" }))
+}
+
+pub fn approval_ask() -> bool {
+    prefs_path().is_some_and(|p| read_ask_from(&p))
+}
+
+pub fn saved_engine() -> Option<Engine> {
+    read_engine_from(&prefs_path()?)
+}
+
+/// The engine a turn or the UI uses: the saved pick while it is installed;
+/// otherwise the first installed engine (opencode first); otherwise the saved
+/// pick (or opencode) so the UI shows that engine's install hint.
+pub fn choose(saved: Option<Engine>, present: impl Fn(Engine) -> bool) -> Engine {
+    if let Some(e) = saved.filter(|e| present(*e)) {
+        return e;
+    }
+    Engine::ALL
+        .into_iter()
+        .find(|e| present(*e))
+        .unwrap_or(saved.unwrap_or(Engine::Opencode))
+}
+
+pub fn current_engine() -> Engine {
+    choose(saved_engine(), Engine::is_present)
+}
+
+/// A turn's engine: the one the frontend sent (it shows that engine's
+/// picker), else the current choice.
+pub fn effective_engine(requested: Option<&str>) -> Engine {
+    requested.and_then(Engine::parse).unwrap_or_else(current_engine)
+}
+
+/// Detection for the UI: the current engine's info plus a summary of all.
+pub async fn engines_info() -> WorkEngineInfo {
+    let mut infos = Vec::new();
+    for e in Engine::ALL {
+        infos.push((e, e.info().await));
+    }
+    let saved = saved_engine();
+    let chosen = choose(saved, |e| infos.iter().any(|(x, i)| *x == e && i.installed));
+    let summaries = infos.iter().map(|(_, i)| crate::claude::summary(i)).collect();
+    let mut info = infos
+        .into_iter()
+        .find(|(e, _)| *e == chosen)
+        .map(|(_, i)| i)
+        .expect("every engine has info");
+    info.engines = summaries;
+    info.ask_permission = approval_ask();
+    info
+}
+
+// ---------- models ----------
+
+pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
+    match engine {
+        Engine::Opencode => crate::opencode::list_models().await,
+        Engine::Claude => Ok(OpencodeModels {
+            models: crate::claude_cli::list_models().await?,
+            current: crate::claude::saved_model(),
+        }),
+    }
+}
+
+// ---------- shared logic (Tauri commands + headless bridge) ----------
+
+pub async fn select_engine(engine: &str) -> Result<WorkEngineInfo, String> {
+    let e = Engine::parse(engine).ok_or_else(|| format!("unknown Work engine: {engine}"))?;
+    let path = prefs_path().ok_or("cannot locate home folder")?;
+    write_engine_to(&path, e)?;
+    Ok(engines_info().await)
+}
+
+pub async fn set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
+    let path = prefs_path().ok_or("cannot locate home folder")?;
+    write_ask_to(&path, ask)?;
+    Ok(engines_info().await)
+}
+
+pub fn set_model(engine: Option<&str>, model: Option<&str>) -> Result<(), String> {
+    effective_engine(engine).save_model(model)
+}
+
+// ---------- Tauri commands ----------
+
+#[tauri::command]
+pub async fn work_engine_select(engine: String) -> Result<WorkEngineInfo, String> {
+    select_engine(&engine).await
+}
+
+#[tauri::command]
+pub async fn work_models(engine: Option<String>, acp: State<'_, crate::acp::AcpState>) -> Result<OpencodeModels, String> {
+    list_models(effective_engine(engine.as_deref()), &acp).await
+}
+
+#[tauri::command]
+pub async fn work_set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
+    set_approval(ask).await
+}
+
+#[tauri::command]
+pub async fn work_set_model(engine: Option<String>, model: Option<String>) -> Result<(), String> {
+    set_model(engine.as_deref(), model.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_ids_roundtrip_and_labels() {
+        for e in Engine::ALL {
+            assert_eq!(Engine::parse(e.id()), Some(e));
+        }
+        assert_eq!(Engine::parse("Claude-Code"), Some(Engine::Claude));
+        assert_eq!(Engine::parse("gpt"), None);
+        assert_eq!(Engine::Claude.reply_label("haiku"), "claude/haiku");
+        assert_eq!(Engine::Opencode.reply_label("opencode/beam-free"), "opencode/beam-free");
+    }
+
+    #[test]
+    fn choose_prefers_saved_installed_engine_then_any_installed() {
+        let both = |_: Engine| true;
+        let only_claude = |e: Engine| e == Engine::Claude;
+        let none = |_: Engine| false;
+        assert_eq!(choose(None, both), Engine::Opencode);
+        assert_eq!(choose(Some(Engine::Claude), both), Engine::Claude);
+        // saved opencode but it was uninstalled: fall over to claude
+        assert_eq!(choose(Some(Engine::Opencode), only_claude), Engine::Claude);
+        assert_eq!(choose(None, only_claude), Engine::Claude);
+        // nothing installed: keep the saved pick so its install hint shows
+        assert_eq!(choose(Some(Engine::Claude), none), Engine::Claude);
+        assert_eq!(choose(None, none), Engine::Opencode);
+    }
+
+    #[test]
+    fn engine_choice_persists() {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let p = base.join(format!("vicuna-engine-{n}")).join("work-engine.json");
+        assert_eq!(read_engine_from(&p), None);
+        write_engine_to(&p, Engine::Claude).unwrap();
+        assert_eq!(read_engine_from(&p), Some(Engine::Claude));
+        write_engine_to(&p, Engine::Opencode).unwrap();
+        assert_eq!(read_engine_from(&p), Some(Engine::Opencode));
+        // approval mode lives in the same file and survives engine switches
+        assert!(!read_ask_from(&p));
+        write_ask_to(&p, true).unwrap();
+        write_engine_to(&p, Engine::Claude).unwrap();
+        assert!(read_ask_from(&p));
+        assert_eq!(read_engine_from(&p), Some(Engine::Claude));
+        write_ask_to(&p, false).unwrap();
+        assert!(!read_ask_from(&p));
+    }
+}

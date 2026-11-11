@@ -30,7 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listOpencodeModels, setOpencodeModel, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -1384,24 +1384,60 @@
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
   let workEngineInfo = $state<WorkEngineInfo | null>(null);
 
-  /** Work mode = the user's opencode CLI over ACP, nothing else. Detection
-   *  re-runs at startup, on window focus, on Settings → Refresh and when the
-   *  model menu opens, so installing opencode while Vicuna runs is picked up. */
+  /** Work mode = the user's own agent CLI: opencode (over ACP) or Claude
+   *  Code (its headless stream-json mode), nothing else. Detection re-runs at startup,
+   *  on window focus, on Settings → Refresh and when the model menu opens,
+   *  so installing an engine while Vicuna runs is picked up. */
   let workEngineChecked = $state(false);
   async function refreshWorkEngine() {
     try {
-      workEngineInfo = await fetchWorkEngineInfo();
-      if (workEngineInfo.installed && workModel === null) workModel = workEngineInfo.model;
+      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+      const next = await fetchWorkEngineInfo();
+      applyWorkEngine(next, prev);
     } catch {
       workEngineInfo = null;
     } finally {
       workEngineChecked = true;
     }
   }
-  /** Send gate: no opencode → Work send disabled with the install hint. */
+  /** Adopt fresh detection; a different engine brings its own model list
+   *  and saved pick. */
+  function applyWorkEngine(next: WorkEngineInfo, prev: string | null) {
+    workEngineInfo = next;
+    if (prev !== null && prev !== engineId(next)) {
+      ocModels = null;
+      ocModelsError = null;
+      workModel = next.model;
+    } else if (next.installed && workModel === null) {
+      workModel = next.model;
+    }
+  }
+  /** Engine picker (composer model menu + Settings): shown when two or more
+   *  engines are installed. */
+  async function pickWorkEngine(id: string) {
+    if (workEngineInfo && engineId(workEngineInfo) === id) return;
+    try {
+      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+      applyWorkEngine(await selectWorkEngine(id), prev);
+      if (modelOpen) void refreshOpencodeModels();
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+  async function toggleWorkApproval(ask: boolean) {
+    try {
+      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+      applyWorkEngine(await setWorkApproval(ask), prev);
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+  const workEngineLabel = $derived(engineLabel(workEngineInfo));
+  const workEngines = $derived(workEngineChoices(workEngineInfo));
+  /** Send gate: no engine → Work send disabled with the install hint. */
   const workGate = $derived(
     workEngineChecked && workEngineInfo === null
-      ? { blocked: true, reason: "Could not check for the opencode CLI (backend unavailable)." }
+      ? { blocked: true, reason: "Could not check for the Work engine (backend unavailable)." }
       : workSendGate(workEngineInfo)
   );
   /** opencode's own model list (`opencode models`) for the Work picker. */
@@ -1414,9 +1450,12 @@
     if (!workEngineInfo?.installed || ocModelsLoading) return;
     ocModelsLoading = true;
     ocModelsError = null;
+    const eng = engineId(workEngineInfo);
     try {
-      ocModels = await listOpencodeModels();
-      workModel = ocModels.current;
+      const list = await listWorkModels(eng);
+      if (engineId(workEngineInfo) !== eng) return; // switched engine mid-fetch
+      ocModels = list;
+      workModel = list.current;
     } catch (e: any) {
       ocModelsError = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
@@ -1427,7 +1466,7 @@
     workModel = id;
     modelOpen = false;
     try {
-      await setOpencodeModel(id);
+      await setWorkModel(engineId(workEngineInfo), id);
     } catch (e: any) {
       error = typeof e === "string" ? e : (e?.message ?? String(e));
     }
@@ -5706,7 +5745,8 @@
   async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
-    let turnModel = workReplyModel(null, workModel);
+    const turnEngine = engineId(workEngineInfo);
+    let turnModel = workReplyModel(null, workModel, turnEngine);
     {
       const c0 = chats.find((x) => x.id === chat.id);
       const m0 = c0?.messages[index];
@@ -5901,7 +5941,7 @@
           armStall();
           break;
         case "model": {
-          turnModel = workReplyModel(ev.model, workModel);
+          turnModel = workReplyModel(ev.model, workModel, turnEngine);
           const t = live();
           const m = t?.messages[curIndex];
           if (t && m && m.role === "assistant" && m.model !== turnModel) {
@@ -6074,6 +6114,7 @@
     let agentTurn: string;
     try {
       agentTurn = await startWorkAgentTurn({
+        engine: turnEngine,
         model: workModel ?? "",
         freshSession: opts.freshSession ?? false,
         workspace,
@@ -6752,9 +6793,9 @@
         {#if pendingMode === "work"}
           <p class="engine-line" data-testid="work-engine-line">
             {#if workEngineInfo?.installed}
-              Engine: opencode {workEngineInfo.version ?? ""}
+              Engine: {workEngineLabel} {workEngineInfo.version ?? ""}
             {:else if workEngineInfo}
-              Engine: opencode CLI not found
+              Engine: {workEngineLabel} not found
             {:else}
               Engine: checking…
             {/if}
@@ -6777,7 +6818,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" title={workEngineInfo?.installed ? `opencode ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : "opencode CLI not found"}>{workEngineInfo ? (workEngineInfo.installed ? "opencode" : "no opencode") : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? (engineId(workEngineInfo) === "claude" ? "claude" : "opencode") : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -7119,10 +7160,13 @@
       {/if}
       {#if composerMode === "work" && workGate.blocked && workEngineChecked}
         <div class="opencode-missing" data-testid="opencode-missing" role="status">
-          <span>{workGate.reason ?? "opencode CLI not found"}</span>
+          <span>{workGate.reason ?? `${workEngineLabel} not found`}</span>
           {#if workEngineInfo && !workEngineInfo.installed}
             <button class="mini-btn" data-testid="opencode-install-link" onclick={() => void openExternal(workEngineInfo?.installUrl ?? "https://opencode.ai/docs/#install")}>Install guide</button>
           {/if}
+          {#each workEngines as eng (eng.id)}
+            <button class="mini-btn" data-testid="engine-fallback" data-engine={eng.id} onclick={() => void pickWorkEngine(eng.id)}>Use {eng.label}</button>
+          {/each}
           <button class="mini-btn" data-testid="opencode-recheck" onclick={() => void refreshWorkEngine()}>Check again</button>
         </div>
       {/if}
@@ -7349,36 +7393,45 @@
           {/if}
           {#if composerMode === "work"}
           <div class="model-pill-wrap">
-            <button class="model-pill" data-testid="model-selector" data-engine="opencode" title={workModel ?? "opencode default model"} disabled={!workEngineInfo?.installed} onclick={toggleModel}>
-              <span class="model-name" data-testid="work-model-name">{workModel ?? "opencode default"}</span>
+            <button class="model-pill" data-testid="model-selector" data-engine={engineId(workEngineInfo)} title={workModel ? `${workEngineLabel}: ${workModel}` : `${workEngineLabel} default model`} disabled={!workEngineInfo?.installed && workEngines.length === 0} onclick={toggleModel}>
+              {#if workEngines.length > 1}<span class="engine-chip" data-testid="work-engine-chip">{engineId(workEngineInfo) === "claude" ? "claude" : "opencode"}</span>{/if}
+              <span class="model-name" data-testid="work-model-name">{workModel ?? `${engineId(workEngineInfo)} default`}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
             {#if modelOpen}
               <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
-              <div class="model-drop" data-testid="model-dropdown" data-engine="opencode">
+              <div class="model-drop" data-testid="model-dropdown" data-engine={engineId(workEngineInfo)}>
+                {#if workEngines.length > 1}
+                  <div class="engine-switch" data-testid="work-engine-picker" role="radiogroup" aria-label="Work engine">
+                    {#each workEngines as eng (eng.id)}
+                      <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => void pickWorkEngine(eng.id)}>{eng.label}</button>
+                    {/each}
+                  </div>
+                {/if}
                 <input
                   class="model-search"
                   data-testid="model-search"
-                  placeholder="Find opencode model..."
+                  placeholder={`Find ${workEngineLabel} model...`}
                   bind:value={modelQuery}
                   autofocus
                 />
                 <div class="model-list-drop">
                   {#if ocModelsLoading && !ocModels}
-                    <div class="no-match" data-testid="opencode-models-loading">Loading models from opencode…</div>
+                    <div class="no-match" data-testid="opencode-models-loading">Loading models from {workEngineLabel}…</div>
                   {:else if ocModelsError}
                     <div class="no-match" data-testid="opencode-models-error">{ocModelsError}</div>
                   {/if}
                   <div class="model-opt-row {workModel === null ? 'sel' : ''}">
                     <button class="model-opt" data-testid="model-opt" data-model="" onclick={() => void pickWorkModel(null)}>
-                      <span class="model-opt-top"><span class="model-opt-name">opencode default</span></span>
-                      <span class="model-opt-id">whatever opencode's own config selects</span>
+                      <span class="model-opt-top"><span class="model-opt-name">{engineId(workEngineInfo)} default</span></span>
+                      <span class="model-opt-id">whatever {workEngineLabel}'s own config selects</span>
                     </button>
                   </div>
                   {#each workModelChoices as choice (choice.id)}
                     <div class="model-opt-row {choice.id === workModel ? 'sel' : ''}">
                       <button class="model-opt" data-testid="model-opt" data-provider={choice.provider} data-model={choice.id} title={choice.id} onclick={() => void pickWorkModel(choice.id)}>
-                        <span class="model-opt-top"><span class="model-opt-name">{choice.id}</span></span>
+                        <span class="model-opt-top"><span class="model-opt-name">{choice.name ?? choice.id}</span></span>
+                        {#if choice.name && choice.name !== choice.id}<span class="model-opt-id">{choice.id}</span>{/if}
                       </button>
                     </div>
                   {:else}
@@ -8490,9 +8543,16 @@
     </div>
     <div class="setting-stacked">
       <span class="setting-label">Work engine</span>
+      {#if (workEngineInfo?.engines ?? []).length > 0}
+        <div class="engine-switch settings-engines" data-testid="settings-engine-picker" role="radiogroup" aria-label="Work engine">
+          {#each workEngineInfo?.engines ?? [] as eng (eng.id)}
+            <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="settings-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={eng.installed ? `${eng.label} ${eng.version ?? ""}` : (eng.missing ?? "not installed")} onclick={() => void pickWorkEngine(eng.id)}>{eng.label}{eng.installed ? "" : " (not installed)"}</button>
+          {/each}
+        </div>
+      {/if}
       <span class="setting-note" data-testid="work-engine-status">
         {#if workEngineInfo?.installed}
-          opencode {workEngineInfo.version ?? ""} · {workEngineInfo.path}
+          {workEngineLabel} {workEngineInfo.version ?? ""} · {workEngineInfo.path}
           {#if workEngineInfo.warning}
             <br /><span data-testid="work-engine-warning">⚠ {workEngineInfo.warning}</span>
           {/if}
@@ -8500,12 +8560,19 @@
             <br /><span data-testid="work-engine-others">Also found (not used; the newest version wins): {(workEngineInfo.others ?? []).join(", ")}</span>
           {/if}
         {:else if workEngineInfo}
-          opencode CLI not found, install it: {workEngineInfo.installUrl}
+          {workEngineInfo.missing ?? `${workEngineLabel} not found, install it: ${workEngineInfo.installUrl}`}
         {:else}
           Checking…
         {/if}
       </span>
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI over ACP (one warm <code>opencode acp</code> process). Vicuna looks for it like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models, providers and credentials come from opencode; pick the model from the composer's model menu. Override the binary with <code>VICUNA_OPENCODE_BIN</code>.</span>
+      {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
+        <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
+      {/each}
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or your <code>claude</code> CLI (headless <code>claude -p</code> stream-json, with your own login; nothing else to install). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code> and <code>VICUNA_CLAUDE_BIN</code>.</span>
+      <label class="setting-note approval-row" data-testid="work-approval">
+        <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
+        Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.
+      </label>
       <div class="browse-actions">
         <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
       </div>
@@ -9304,6 +9371,14 @@
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .work-badge.engine-badge { background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
   .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
+  .engine-switch { display: flex; gap: 4px; padding: 8px 8px 0; }
+  .engine-switch.settings-engines { padding: 4px 0; }
+  .engine-opt { flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
+  .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
+  .engine-opt:disabled { opacity: .5; cursor: default; }
+  .approval-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+  .approval-row input { margin-top: 2px; }
+  .engine-chip { font-size: 11px; color: var(--muted-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin-right: 2px; }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }

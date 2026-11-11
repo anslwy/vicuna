@@ -21,6 +21,9 @@ pub mod browser;
 pub mod mcp;
 pub mod opencode;
 pub mod exe_resolve;
+pub mod claude;
+pub mod claude_cli;
+pub mod work_engine;
 pub mod work_agent;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
@@ -1972,8 +1975,9 @@ async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileCo
 #[tauri::command]
 async fn work_engine_info() -> Result<opencode::WorkEngineInfo, String> {
     // re-detects on every call: the UI's Refresh / window focus picks up an
-    // opencode installed while Vicuna is running
-    Ok(opencode::engine_info().await)
+    // engine installed while Vicuna is running. Returns the current engine
+    // (opencode or Claude Code) plus a summary of every engine.
+    Ok(work_engine::engines_info().await)
 }
 
 #[tauri::command]
@@ -5070,7 +5074,11 @@ pub fn run() {
             work_agent::work_agent_answer,
             work_engine_info,
             opencode::opencode_models,
-            opencode::opencode_set_model
+            opencode::opencode_set_model,
+            work_engine::work_engine_select,
+            work_engine::work_models,
+            work_engine::work_set_model,
+            work_engine::work_set_approval
         ])
         .setup(|app| {
             // Warm the long-lived `opencode acp` process so the first Work

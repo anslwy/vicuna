@@ -66,6 +66,13 @@ npm run build   # static build to ./build
   updates into the same UI event channel. Nothing is bundled and there is no
   fallback: without opencode, Work mode shows an install link and Send is
   disabled. Install: https://opencode.ai/docs/#install
+- Claude Code is the second Work engine: Vicuna drives your installed
+  `claude` CLI headless (`claude -p` with stream-json input/output, your own
+  login; no SDK or adapter, nothing else to install,
+  https://docs.claude.com/en/docs/claude-code/setup). When both engines are
+  installed, the Work model menu and Settings → Work engine let you switch;
+  models come from the engine itself, and replies are labelled
+  `claude/<model>` or opencode's `provider/model`.
 - Chat streaming returns the full text; `done_reason: "load"` retries up to
   3x after a 2s wait (model was reloading). Stop-button abort raises
   `AbortError` on the frontend; the backend request runs detached (no cancel
