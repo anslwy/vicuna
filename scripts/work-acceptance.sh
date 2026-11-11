@@ -7,6 +7,7 @@
 #   scripts/work-acceptance.sh mcp <model> [engine]      # a Vicuna MCP server's tool actually runs
 #   scripts/work-acceptance.sh toolcap <model> [engine]  # MCP servers reach the engine, under 128 tools
 #   scripts/work-acceptance.sh approve <model> [engine]  # 'ask' mode: a shell command waits for Allow, then runs
+#   scripts/work-acceptance.sh ask <model> [engine]      # agent question (vicuna-mcp ask_user): card, answer continues, Stop cancels
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #
 #   engine = opencode (default) | claude
@@ -18,7 +19,7 @@
 #      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN
 #      (default: found on PATH).
 # Billed turns (by the provider; opencode/beam-free is free): present = 2,
-# mcp = 1, approve = 1, toolcap = 1. Every mode runs the bridge with a temporary HOME so
+# mcp = 1, approve = 1, toolcap = 1, ask = 2. Every mode runs the bridge with a temporary HOME so
 # the user's real ~/vicuna/config is never touched; opencode keeps its real
 # XDG config/auth and Claude its real ~/.claude login (symlinked in).
 set -euo pipefail
@@ -291,6 +292,82 @@ text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
 assert "vicuna-approve-ok" in outs + text, (outs[:300], text[:300])
 import os
 print("PASS ask mode: the command waited for the ask card, ran after Allow, transcript says Approved")
+PY
+    ;;
+  ask)
+    [ -n "$model" ] || { echo "usage: $0 ask <model> [engine]"; exit 2; }
+    # The agent asks the user through vicuna-mcp's ask_user: the card shows
+    # the choices, the answer comes back as the tool result and the turn
+    # continues with it. Turn 2: Stop while the question is pending ends the
+    # turn cleanly (done stopped=true, no error).
+    start_bridge
+    ask_prompt='Before doing anything else, ask me which fruit to use. Ask with your ask_user tool (vicuna-mcp server), choices exactly: Mango, Kiwi, Papaya. After I answer, reply with exactly: FRUIT=<my answer>. Do not use any other tool.'
+    ask_turn() { # channel fresh answer|stop
+      local start turn_id handled=""
+      start="$(invoke work_agent_start "$(turn_args "$1" "$2" "$ask_prompt")")"
+      echo "work_agent_start: $start"
+      turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+      : >"$work/events.jsonl"
+      for _ in $(seq 1 600); do
+        curl -sS "$base/poll/$1" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+        if [ -z "$handled" ]; then
+          ask="$(python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e.get("type") == "askrequest" and e["ask_id"].startswith("ask-"):
+        print(json.dumps(e)); break
+PY
+)"
+          if [ -n "$ask" ]; then
+            echo "ask card: $ask"
+            python3 - "$ask" <<'PY'
+import json, sys
+e = json.loads(sys.argv[1])
+assert [o.lower() for o in e["options"]] == ["mango", "kiwi", "papaya"], e["options"]
+assert "fruit" in e["question"].lower(), e["question"]
+PY
+            aid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ask_id"])' "$ask")"
+            if [ "$3" = "stop" ]; then
+              sleep 2
+              invoke work_agent_stop "{\"turnId\":\"$turn_id\"}" >/dev/null
+            else
+              invoke work_agent_answer "{\"turnId\":\"$turn_id\",\"askId\":\"$aid\",\"answer\":\"Kiwi\"}" >/dev/null
+            fi
+            handled=1
+          fi
+        fi
+        if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+        sleep 0.5
+      done
+      [ -n "$handled" ] || { echo "FAIL no ask_user card appeared"; cat "$work/events.jsonl" | tail -20; exit 1; }
+    }
+    echo "turn 1 (answer Kiwi):"
+    ask_turn "ask1-$$" true answer
+    python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
+print("  assistant text:", repr(text[-200:]))
+assert "FRUIT=KIWI" in text.upper().replace(" ", ""), "the answer did not reach the agent"
+done = [e for e in evs if e.get("type") == "done"][-1]
+assert done["stopped"] is False, done
+print("PASS the agent asked via ask_user, the card had the choices, and the turn continued with the answer")
+PY
+    echo "turn 2 (Stop while the question is pending):"
+    ask_turn "ask2-$$" true stop
+    python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+done = [e for e in evs if e.get("type") == "done"]
+assert done and done[-1]["stopped"] is True, done
+print("PASS Stop while a question was pending ended the turn cleanly (done stopped=true, no error)")
 PY
     ;;
   toolcap)

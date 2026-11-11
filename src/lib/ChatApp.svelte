@@ -30,6 +30,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
+  import { isAgentQuestion, toggleChoice, multiAnswer } from "$lib/askCard";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
@@ -102,9 +103,13 @@
     index: number;
     question: string;
     options: string[];
+    /** multi-select question (vicuna-mcp ask_user `multiple`) */
+    multi: boolean;
+    /** the labels picked so far in a multi-select question */
+    picked: string[];
     other: string;
     otherOpen: boolean;
-    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel") => void;
+    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel", display?: string) => void;
   }
   let pendingAsks = $state<Record<string, PendingAsk>>({});
   /** the open session's ask card (null when it has none pending) */
@@ -5257,13 +5262,13 @@
 
   /** user answered a live ask card: resolve the blocked tool call (the work
    *  loop appends the visible record) */
-  function answerAsk(value: string) {
+  function answerAsk(value: string, display?: string) {
     const id = activeId;
     const a = id != null ? pendingAsks[id] : undefined;
     if (!id || !a) return;
     const { [id]: _, ...rest } = pendingAsks;
     pendingAsks = rest;
-    a.resolve(value, "answer");
+    a.resolve(value, "answer", display);
     scrollBottom();
   }
 
@@ -5876,6 +5881,9 @@
       flushTokens();
       clearStall();
       dropStallHint();
+      // the turn is over: a card still up (the engine dropped the call) can
+      // no longer be answered
+      if (isCurrentTurn() && pendingAsks[chat.id]) cancelPendingAsk(chat.id, "(the turn ended before an answer)");
       if (!unloading) clearPendingStreamFor(chat.id);
       save();
       if (escTimer) {
@@ -6090,14 +6098,28 @@
               index: curIndex,
               question: ev.question,
               options: ev.options,
+              multi: !!ev.multi,
+              picked: [],
               other: "",
               otherOpen: false,
-              resolve: (answer, outcome) => {
+              resolve: (answer, outcome, display) => {
                 // cancel (Stop / chat deleted) needs no backend call: the stop
                 // path already unblocked the waiting tool with no record
                 if (outcome === "cancel") return;
                 askOutcome = outcome;
                 askText = answer;
+                // vicuna-mcp questions: record the Q/A in the transcript here
+                // (permission asks get the backend's Approved/Denied note)
+                const t = live();
+                if (isAgentQuestion(ev.ask_id) && t?.messages[curIndex]) {
+                  const m = t.messages[curIndex];
+                  t.messages[curIndex] = {
+                    ...m,
+                    content: m.content + formatAskRecord(ev.question, display ?? answer, outcome === "dismiss")
+                  };
+                  chats = [...chats];
+                  saveSoon();
+                }
                 const tid = workTurnIds.get(chat.id);
                 if (tid) void answerWorkAgentAsk(tid, ev.ask_id, answer).catch(() => {});
                 scrollIfOpen();
@@ -7019,8 +7041,29 @@
                   <div class="ask-question">{askCard.question}</div>
                   <div class="ask-options">
                     {#each askCard.options as opt, oi}
-                      <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
+                      {#if askCard.multi}
+                        <button
+                          class="ask-option ask-option-multi"
+                          class:picked={askCard.picked.includes(opt)}
+                          data-testid="ask-option-{oi}"
+                          aria-pressed={askCard.picked.includes(opt)}
+                          onclick={() => (askCard.picked = toggleChoice(askCard.options, askCard.picked, opt))}
+                        ><span class="ask-check" aria-hidden="true">{askCard.picked.includes(opt) ? "✓" : ""}</span>{opt}</button>
+                      {:else}
+                        <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
+                      {/if}
                     {/each}
+                    {#if askCard.multi}
+                      <button
+                        class="ask-send ask-submit"
+                        data-testid="ask-submit"
+                        disabled={!askCard.picked.length}
+                        onclick={() => {
+                          const { answer, display } = multiAnswer(askCard.picked);
+                          answerAsk(answer, display);
+                        }}
+                      >Submit{askCard.picked.length ? ` (${askCard.picked.length})` : ""}</button>
+                    {/if}
                     {#if askCard.otherOpen}
                       <form
                         class="ask-other"
@@ -9117,6 +9160,11 @@
   .ask-options { display: flex; flex-direction: column; gap: 6px; }
   .ask-option { width: 100%; text-align: left; border: 1px solid var(--border-2); background: var(--bg); color: var(--text); border-radius: 10px; padding: 8px 11px; font: inherit; font-size: 13.5px; cursor: pointer; }
   .ask-option:hover { border-color: var(--accent); background: var(--hover-3); }
+  .ask-option-multi { display: flex; align-items: center; gap: 9px; }
+  .ask-option-multi.picked { border-color: var(--accent); }
+  .ask-check { width: 16px; height: 16px; flex: none; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border-3); border-radius: 4px; font-size: 11px; line-height: 1; color: var(--accent-fg); }
+  .ask-option-multi.picked .ask-check { background: var(--accent); border-color: var(--accent); }
+  .ask-submit { align-self: flex-start; padding: 8px 14px; }
   .ask-other-toggle { color: var(--muted); border-style: dashed; }
   .ask-other { display: flex; gap: 6px; }
   .ask-other-closed { align-items: stretch; }
