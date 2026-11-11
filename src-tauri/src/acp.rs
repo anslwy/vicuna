@@ -263,7 +263,7 @@ fn session_key(engine: Engine, session_id: Option<&str>, workspace: &str) -> Opt
 /// Providers reject requests with more than this many tools (OpenAI-style
 /// "Invalid value for 'tools': maximum number of items is 128").
 pub const PROVIDER_TOOL_LIMIT: usize = 128;
-/// Headroom kept for opencode's own built-in tools (~20 today) plus slack.
+/// Headroom kept for the engine's own built-in tools (~20 today) plus slack.
 pub const OPENCODE_TOOL_RESERVE: usize = 32;
 /// The MCP dialog's id for the synthetic built-in browser row.
 pub const BROWSER_MCP_ID: &str = "browser";
@@ -362,7 +362,7 @@ fn skipped_note(skipped: &[PlannedServer]) -> Option<String> {
         .map(|s| format!("{} ({} tools)", s.name, s.tools.unwrap_or(0)))
         .collect();
     Some(format!(
-        "MCP servers not available this turn: {}. Together with opencode's own tools they would exceed the model's {}-tool limit; turn some servers off in the MCP dialog to make room.",
+        "MCP servers not available this turn: {}. Together with the engine's own tools they would exceed the model's {}-tool limit; turn some servers off in the MCP dialog to make room.",
         list.join(", "),
         PROVIDER_TOOL_LIMIT
     ))

@@ -8,8 +8,8 @@ import { isTauriRuntime } from "./ollama";
 import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
-export { workSendGate, opencodeModelChoices, workReplyModel } from "./workGate";
-export type { WorkEngineInfo, OpencodeModel, OpencodeModels } from "./workGate";
+export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices } from "./workGate";
+export type { WorkEngineInfo, OpencodeModel, OpencodeModels, EngineSummary } from "./workGate";
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {
   // Tauri IPC when shelled, loopback bridge when plain-browser-with-bridge,
@@ -470,8 +470,26 @@ export async function setOpencodeModel(model: string | null): Promise<void> {
   await invokeCmd<void>("opencode_set_model", { model });
 }
 
+/** Work models of `engine` (opencode: `opencode models`; Claude: read from
+ *  the adapter's session config) plus that engine's saved pick. */
+export async function listWorkModels(engine: string): Promise<OpencodeModels> {
+  return await invokeCmd<OpencodeModels>("work_models", { engine });
+}
+
+/** Persist the Work model for `engine` (`null` = the engine's default). */
+export async function setWorkModel(engine: string, model: string | null): Promise<void> {
+  await invokeCmd<void>("work_set_model", { engine, model });
+}
+
+/** Switch the Work engine; returns fresh detection for the new choice. */
+export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> {
+  return await invokeCmd<WorkEngineInfo>("work_engine_select", { engine });
+}
+
 export interface WorkTurnParams {
-  /** opencode `provider/model`; empty = saved pick / opencode default */
+  /** "opencode" | "claude" (absent = the backend's saved choice) */
+  engine?: string;
+  /** engine model id; empty = saved pick / engine default */
   model: string;
   /** Start a new opencode session instead of resuming (regenerate/edit). */
   freshSession?: boolean;
@@ -487,6 +505,7 @@ export interface WorkTurnParams {
  *  shelled, loopback bridge when plain-browser-with-bridge. */
 export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
   const args = {
+    engine: p.engine ?? null,
     model: p.model,
     freshSession: p.freshSession ?? false,
     workspace: p.workspace,

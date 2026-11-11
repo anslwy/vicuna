@@ -64,3 +64,40 @@ test("Work reply label is the opencode model, never the Chat model", () => {
   assert.equal(workReplyModel(undefined, null), "opencode");
   assert.equal(workReplyModel("  ", ""), "opencode");
 });
+
+// ---------- Claude Code as a second engine ----------
+import { engineId, engineLabel, workEngineChoices } from "../src/lib/workGate.ts";
+
+const claudeMissing: WorkEngineInfo = {
+  id: "claude", label: "Claude Code", installed: false, path: null, version: null,
+  installUrl: "https://docs.claude.com/en/docs/claude-code/setup", model: null, configPath: null,
+  missing: "Claude ACP adapter not found, install it: npm install -g @agentclientprotocol/claude-agent-acp",
+  engines: [
+    { id: "opencode", label: "opencode", installed: true, version: "2.2.6", missing: null },
+    { id: "claude", label: "Claude Code", installed: false, version: "2.1.322", missing: "adapter" }
+  ]
+};
+
+test("Claude missing: Send blocked with the engine's own install hint", () => {
+  const g = workSendGate(claudeMissing);
+  assert.equal(g.blocked, true);
+  assert.match(g.reason ?? "", /npm install -g @agentclientprotocol\/claude-agent-acp/);
+  assert.equal(engineLabel(claudeMissing), "Claude Code");
+});
+
+test("engine picker lists only installed engines; older backends default to opencode", () => {
+  assert.deepEqual(workEngineChoices(claudeMissing).map((e) => e.id), ["opencode"]);
+  const both = { ...claudeMissing, engines: claudeMissing.engines!.map((e) => ({ ...e, installed: true })) };
+  assert.deepEqual(workEngineChoices(both).map((e) => e.id), ["opencode", "claude"]);
+  const legacy: WorkEngineInfo = { installed: true, path: "/x", version: "1", installUrl: "u", model: null, configPath: null };
+  assert.equal(engineId(legacy), "opencode");
+  assert.equal(engineLabel(legacy), "opencode");
+  assert.deepEqual(workEngineChoices(legacy), []);
+});
+
+test("Claude reply label is claude/<model>, never the Chat model", () => {
+  assert.equal(workReplyModel("claude/haiku", "sonnet", "claude"), "claude/haiku");
+  assert.equal(workReplyModel(null, "haiku", "claude"), "claude/haiku");
+  assert.equal(workReplyModel(null, null, "claude"), "claude");
+  assert.equal(workReplyModel(null, "opencode/beam-free", "opencode"), "opencode/beam-free");
+});

@@ -39,28 +39,16 @@ const ADAPTER_NAMES: &[&str] = &["claude-agent-acp", "claude-code-acp"];
 // ---------- detection ----------
 
 /// Install locations after PATH: Claude's own local install dir, then the
-/// shared list (npm/bun/pnpm globals, ~/.local/bin, Homebrew, /usr/local).
+/// shared list (~/.local/bin, Homebrew, /usr/local). Node version managers
+/// (nvm, fnm, volta, asdf, npm globals, where `npm -g` puts the adapter) are
+/// searched by exe_resolve for every engine.
 fn extra_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(h) = home {
         dirs.push(h.join(".claude").join("local"));
-        dirs.push(h.join(".volta").join("bin"));
     }
     dirs.extend(common_dirs(home));
-    dirs.extend(nvm_bins(home));
     dirs
-}
-
-/// `~/.nvm/versions/node/*/bin`, newest first (npm -g lands there with nvm).
-fn nvm_bins(home: Option<&Path>) -> Vec<PathBuf> {
-    let Some(h) = home else { return Vec::new() };
-    let Ok(rd) = std::fs::read_dir(h.join(".nvm").join("versions").join("node")) else {
-        return Vec::new();
-    };
-    let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path().join("bin")).filter(|p| p.is_dir()).collect();
-    v.sort();
-    v.reverse();
-    v
 }
 
 pub fn find_claude_in(override_bin: Option<&str>, path_var: Option<OsString>, home: Option<&Path>) -> Option<PathBuf> {
@@ -111,29 +99,28 @@ pub fn missing_reason(has_cli: bool, has_adapter: bool) -> Option<String> {
 
 // ---------- process ----------
 
-/// PATH for the adapter: it is a `#!/usr/bin/env node` script, and a macOS
-/// GUI app's PATH usually lacks node; put the adapter's and claude's own dirs
-/// plus the usual install dirs in front.
+/// PATH for the adapter: it is a `#!/usr/bin/env node` script, and a
+/// Finder-launched app's PATH lacks node. The adapter's own dir (and its
+/// symlink target's: npm/nvm keep `node` next to it) and claude's dir go
+/// first, then the terminal's PATH and the version-manager folders.
 fn child_path(adapter: &Path, cli: &Path) -> OsString {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut lists: Vec<OsString> = Vec::new();
     for p in [adapter, cli] {
-        // resolve npm's symlinked bin to find a co-installed node
         if let Some(d) = p.parent() {
-            dirs.push(d.to_path_buf());
+            lists.push(d.as_os_str().to_owned());
         }
-        if let Ok(real) = std::fs::canonicalize(p) {
-            if let Some(d) = real.parent() {
-                dirs.push(d.to_path_buf());
-            }
+        if let Some(d) = std::fs::canonicalize(p).ok().and_then(|r| r.parent().map(Path::to_path_buf)) {
+            lists.push(d.into_os_string());
         }
     }
-    dirs.extend(extra_dirs(home_dir().as_deref()));
-    if let Some(existing) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&existing));
+    if let Some(p) = crate::exe_resolve::child_path(None) {
+        lists.push(p);
     }
-    let mut seen = std::collections::HashSet::new();
-    dirs.retain(|d| seen.insert(d.clone()));
-    std::env::join_paths(dirs).unwrap_or_default()
+    let mut acc: Option<OsString> = None;
+    for l in lists {
+        acc = crate::exe_resolve::merge_paths(acc.as_ref(), Some(&l));
+    }
+    acc.unwrap_or_default()
 }
 
 pub fn command(adapter: &Path, cli: &Path) -> Command {
@@ -192,6 +179,7 @@ pub async fn engine_info() -> WorkEngineInfo {
         model: saved_model(),
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: other_labels,
+        warning: None,
     }
 }
 
