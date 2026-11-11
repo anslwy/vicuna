@@ -192,16 +192,21 @@ print("PASS 140-tool server skipped with a note:", notes.strip()[:160])
 PY
     ;;
   finder)
-    # Reproduces the release-.dmg bug without a Mac: the bridge starts with
-    # launchd's minimal environment (PATH=/usr/bin:/bin, like a Finder/Dock
-    # launch). A stale opencode sits in a fallback folder (~/.opencode/bin,
-    # prints the outdated-config error); the user's real, newer opencode is
-    # only on the login shell's PATH (~/.profile). Detection must pick the
-    # newer one, Settings must name it, and the stale one is listed as
-    # "also found". No model turn.
+    # Reproduces the release-.dmg bug without a Mac. The bridge starts with
+    # launchd's minimal environment (env -i, PATH=/usr/bin:/bin), like a
+    # Finder/Dock launch. Three installs, as on the owner's Mac and worse:
+    #   ~/.opencode/bin/opencode        0.3.1  stale fallback, prints the
+    #                                          outdated-config error
+    #   <login PATH dir>/opencode       1.0.0  on the shell PATH (~/.profile)
+    #   ~/.nvm/versions/node/v24.14.1/bin/opencode  the real, newest one; nvm
+    #                                          is NOT on any PATH (it loads
+    #                                          from ~/.zshrc on a Mac)
+    # Detection must pick the nvm one (newest), Settings must name it, the
+    # others are "also found", and the model menu must work. No model turn.
     real_oc="$(command -v opencode)" || { echo "opencode not on PATH"; exit 2; }
     fh="$work/finder-home"
-    mkdir -p "$fh/.opencode/bin" "$fh/login-bin"
+    nvm_bin="$fh/.nvm/versions/node/v24.14.1/bin"
+    mkdir -p "$fh/.opencode/bin" "$fh/login-bin" "$fh/.nvm/versions/node/v18.20.4/bin" "$nvm_bin"
     cat >"$fh/.opencode/bin/opencode" <<'SH'
 #!/bin/sh
 case "$1" in
@@ -209,8 +214,9 @@ case "$1" in
   *) printf '\033[91m\033[1mError: \033[0mConfiguration is invalid at https://opencode.ai/console/api/config\n  Invalid option: expected one of "alpha"|"beta"|"deprecated" provider.opencode.models.beam-free.status\n' >&2; exit 1 ;;
 esac
 SH
-    chmod +x "$fh/.opencode/bin/opencode"
-    ln -s "$real_oc" "$fh/login-bin/opencode"
+    printf '#!/bin/sh\necho 1.0.0\n' >"$fh/login-bin/opencode"
+    chmod +x "$fh/.opencode/bin/opencode" "$fh/login-bin/opencode"
+    ln -s "$real_oc" "$nvm_bin/opencode"
     printf 'export PATH="%s:$PATH"\n' "$fh/login-bin" >"$fh/.profile"
     env -i HOME="$fh" SHELL=/bin/sh PATH=/usr/bin:/bin USER="${USER:-user}" \
       XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share" \
@@ -220,16 +226,17 @@ SH
     for _ in $(seq 1 50); do curl -fsS "$base/health" >/dev/null 2>&1 && break; sleep 0.2; done
     info="$(invoke work_engine_info '{}')"
     models="$(invoke opencode_models '{}')"
-    python3 - "$info" "$models" "$fh" <<'PY'
+    python3 - "$info" "$models" "$nvm_bin/opencode" <<'PY'
 import json, sys
-info, models, fh = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
+info, models, want = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
 d = info["data"]
-print("work_engine_info:", {k: d.get(k) for k in ("installed", "path", "version", "others")})
+print("work_engine_info:", json.dumps({k: d.get(k) for k in ("installed", "path", "version", "others")}, indent=1))
 assert d["installed"], d
-assert d["path"] == f"{fh}/login-bin/opencode", f"picked {d['path']} (stale fallback?)"
-assert d["version"] and d["version"] != "0.3.1", d
-assert any(".opencode/bin/opencode (0.3.1)" in o for o in d.get("others", [])), d.get("others")
-print("PASS Finder-style launch resolves the login-shell opencode, newest version; stale one listed as 'also found'")
+assert d["path"] == want, f"picked {d['path']}, want the nvm install {want}"
+assert d["version"] and d["version"] not in ("0.3.1", "1.0.0"), d
+others = " ".join(d.get("others", []))
+assert ".opencode/bin/opencode (0.3.1)" in others and "login-bin/opencode (1.0.0)" in others, others
+print("PASS Finder-style launch finds the nvm-only opencode (newest), others listed as 'also found'")
 if not models["ok"]:
     raise SystemExit(f"opencode_models failed: {models}")
 print(f"PASS model menu lists {len(models['data']['models'])} models (no 'Configuration is invalid')")

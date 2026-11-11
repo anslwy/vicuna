@@ -6,11 +6,13 @@
 // (e.g. an old ~/.opencode/bin/opencode) while `npm run desktop`, started
 // from a terminal, used the newer one on the shell PATH. So:
 //
-// 1. Read the login shell's PATH once (`$SHELL -l -c 'printf … "$PATH"'`,
-//    like fix-path-env) and also export it to this process at startup, so
-//    engines and the MCP servers they spawn see the same PATH.
-// 2. Collect every candidate from the login PATH, the process PATH and the
-//    known install folders (deduplicated by real path).
+// 1. Read the shell's PATH once as a terminal sees it: `$SHELL -ilc`
+//    (interactive + login, so ~/.zshrc runs and nvm/fnm/asdf are loaded),
+//    falling back to `-lc`; like fix-path-env. Engines Vicuna starts get it
+//    as their PATH, so the MCP servers they spawn see it too.
+// 2. Collect every candidate from that PATH, the process PATH, the known
+//    install folders and the Node version managers' bin folders (nvm, fnm,
+//    volta, asdf, mise, npm/pnpm/yarn globals), deduplicated by real path.
 // 3. With more than one candidate, prefer the newest `--version`; ties keep
 //    the login-shell order (what `command -v` would return).
 
@@ -21,7 +23,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+const SHELL_TIMEOUT: Duration = Duration::from_secs(8);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(8);
 const MARK: &str = "__VICUNA_LOGIN_PATH__";
 
@@ -40,15 +42,25 @@ fn read_login_path() -> Option<OsString> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" }.to_string());
     let script = format!("printf '{MARK}%s{MARK}' \"$PATH\"");
-    let child = Command::new(&shell)
-        .args(["-l", "-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let out = wait_output(child, SHELL_TIMEOUT)?;
-    parse_marked_path(&String::from_utf8_lossy(&out))
+    // interactive first: nvm & co. are usually loaded from ~/.zshrc, which a
+    // login-only shell does not read
+    for flags in [["-i", "-l", "-c"], ["-l", "-c", ""]] {
+        let mut args: Vec<&str> = flags.iter().copied().filter(|f| !f.is_empty()).collect();
+        args.push(&script);
+        let Ok(child) = Command::new(&shell)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(p) = wait_output(child, SHELL_TIMEOUT).and_then(|o| parse_marked_path(&String::from_utf8_lossy(&o))) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[cfg(not(unix))]
@@ -80,15 +92,100 @@ pub fn merge_paths(login: Option<&OsString>, process: Option<&OsString>) -> Opti
     std::env::join_paths(dirs).ok()
 }
 
-/// Export the login PATH to this process (call once at startup, before any
-/// threads exist), so every child (engines, MCP servers) inherits it.
-pub fn import_login_path() {
-    let merged = merge_paths(login_shell_path().as_ref(), std::env::var_os("PATH").as_ref());
-    if let Some(m) = merged {
-        // SAFETY: called at the top of `run()`, before Tauri or tokio start
-        // any threads, so nothing reads the environment concurrently.
-        unsafe { std::env::set_var("PATH", m) };
+/// Read the shell PATH in the background at startup, so the first detection
+/// doesn't wait for the user's shell rc files.
+pub fn warm_up() {
+    std::thread::spawn(|| {
+        let _ = login_shell_path();
+    });
+}
+
+/// PATH for engine processes Vicuna starts: `first` (the engine's own dir,
+/// so a node shim's sibling `node` wins), the shell PATH, the process PATH,
+/// then the version-manager folders.
+pub fn child_path(first: Option<&Path>) -> Option<OsString> {
+    let mut lists: Vec<OsString> = Vec::new();
+    if let Some(d) = first {
+        lists.push(d.as_os_str().to_owned());
     }
+    if let Some(p) = merge_paths(login_shell_path().as_ref(), std::env::var_os("PATH").as_ref()) {
+        lists.push(p);
+    }
+    let extra: Vec<PathBuf> = version_manager_dirs(home().as_deref());
+    if let Ok(j) = std::env::join_paths(extra) {
+        lists.push(j);
+    }
+    let mut acc: Option<OsString> = None;
+    for l in lists {
+        acc = merge_paths(acc.as_ref(), Some(&l));
+    }
+    acc
+}
+
+fn home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let h = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let h = std::env::var_os("HOME");
+    h.filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+// ---------- Node version managers ----------
+
+/// `<root>/<version>/<suffix>` dirs, newest version first (by semver of the
+/// version dir name, e.g. "v24.14.1").
+fn versioned_bins(root: &Path, suffix: &[&str]) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut v: Vec<(Vec<u64>, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let ver = parse_semver(&name).unwrap_or_default();
+            let mut p = e.path();
+            for s in suffix {
+                p = p.join(s);
+            }
+            p.is_dir().then_some((ver, p))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Where npm-installed CLIs land under the common Node version managers
+/// (a Finder-launched app never loads their shell hooks).
+pub fn version_manager_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    version_manager_dirs_in(
+        home,
+        std::env::var_os("NVM_DIR").map(PathBuf::from),
+        std::env::var_os("FNM_DIR").map(PathBuf::from),
+    )
+}
+
+/// Pure form (explicit $NVM_DIR / $FNM_DIR) for tests.
+pub fn version_manager_dirs_in(home: Option<&Path>, nvm_dir: Option<PathBuf>, fnm_dir: Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(h) = home else { return Vec::new() };
+    let mut dirs = Vec::new();
+    // nvm (honours $NVM_DIR)
+    let nvm = nvm_dir.unwrap_or_else(|| h.join(".nvm"));
+    dirs.extend(versioned_bins(&nvm.join("versions").join("node"), &["bin"]));
+    // fnm (XDG, macOS, legacy roots; honours $FNM_DIR)
+    let mut fnm_roots: Vec<PathBuf> = fnm_dir.into_iter().collect();
+    fnm_roots.push(h.join(".local").join("share").join("fnm"));
+    fnm_roots.push(h.join("Library").join("Application Support").join("fnm"));
+    fnm_roots.push(h.join(".fnm"));
+    for r in fnm_roots {
+        dirs.extend(versioned_bins(&r.join("node-versions"), &["installation", "bin"]));
+    }
+    // shims / global bins
+    dirs.push(h.join(".volta").join("bin"));
+    dirs.push(h.join(".asdf").join("shims"));
+    dirs.push(h.join(".local").join("share").join("mise").join("shims"));
+    dirs.push(h.join(".npm-global").join("bin"));
+    dirs.push(h.join(".npm-packages").join("bin"));
+    dirs.push(h.join("Library").join("pnpm"));
+    dirs.push(h.join(".yarn").join("bin"));
+    dirs
 }
 
 // ---------- candidates + newest ----------
@@ -204,7 +301,7 @@ pub fn version_of(bin: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(p) = merge_paths(login_shell_path().as_ref(), std::env::var_os("PATH").as_ref()) {
+    if let Some(p) = child_path(bin.parent()) {
         cmd.env("PATH", p);
     }
     #[cfg(windows)]
@@ -238,7 +335,9 @@ pub fn resolve(names: &[&str], override_bin: Option<&str>, extra_dirs: &[PathBuf
         let p = PathBuf::from(o);
         return is_executable(&p).then_some(Resolved { path: p, others: Vec::new() });
     }
-    let cands = candidates(names, &[login_shell_path(), std::env::var_os("PATH")], extra_dirs);
+    let mut dirs = extra_dirs.to_vec();
+    dirs.extend(version_manager_dirs(home().as_deref()));
+    let cands = candidates(names, &[login_shell_path(), std::env::var_os("PATH")], &dirs);
     let path = if cands.len() > 1 { pick_newest(&cands, version_of)? } else { cands.first()?.clone() };
     let others = cands.into_iter().filter(|c| *c != path).collect();
     Some(Resolved { path, others })
@@ -328,6 +427,35 @@ mod tests {
         assert_eq!(pick_newest(&reversed, version_of), Some(fresh));
         // unknown versions rank last; all unknown keeps the first
         assert_eq!(pick_newest(&[stale.clone()], |_| None), Some(stale));
+    }
+
+    /// The owner's Mac: opencode only under nvm (loaded from ~/.zshrc, so
+    /// invisible to a Finder launch), a stale one in a fallback folder.
+    #[cfg(unix)]
+    #[test]
+    fn nvm_install_found_newest_node_first_and_wins_over_stale_fallback() {
+        let home = tmp("nvm");
+        let nodes = home.join(".nvm").join("versions").join("node");
+        for v in ["v18.20.4", "v24.14.1", "v20.11.0"] {
+            std::fs::create_dir_all(nodes.join(v).join("bin")).unwrap();
+        }
+        let dirs = version_manager_dirs_in(Some(&home), None, None);
+        let nvm: Vec<_> = dirs.iter().filter(|d| d.starts_with(&nodes)).collect();
+        assert_eq!(nvm[0], &nodes.join("v24.14.1").join("bin"));
+        assert_eq!(nvm[2], &nodes.join("v18.20.4").join("bin"));
+        let fresh = fake(&nodes.join("v24.14.1").join("bin"), "opencode", "2.2.6");
+        let stale_dir = home.join(".opencode").join("bin");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        fake(&stale_dir, "opencode", "0.3.1");
+        let mut extra = vec![stale_dir];
+        extra.extend(dirs);
+        let c = candidates(&["opencode"], &[Some(OsString::from("/usr/bin:/bin"))], &extra);
+        assert_eq!(c.len(), 2);
+        assert_eq!(pick_newest(&c, version_of), Some(fresh));
+        // fnm layout too
+        let fnm = home.join(".local").join("share").join("fnm").join("node-versions").join("v22.1.0").join("installation").join("bin");
+        std::fs::create_dir_all(&fnm).unwrap();
+        assert!(version_manager_dirs_in(Some(&home), None, None).contains(&fnm));
     }
 
     #[cfg(unix)]

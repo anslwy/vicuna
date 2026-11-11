@@ -256,6 +256,11 @@ pub fn command(bin: &Path) -> Command {
     for (k, v) in process_env() {
         cmd.env(k, v);
     }
+    // the terminal's PATH (plus opencode's own dir: an nvm install needs its
+    // sibling `node`), so MCP servers opencode spawns resolve like in a shell
+    if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
+        cmd.env("PATH", p);
+    }
     if let Some(h) = home_dir() {
         cmd.current_dir(h);
     }
