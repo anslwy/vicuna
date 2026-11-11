@@ -1384,8 +1384,8 @@
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
   let workEngineInfo = $state<WorkEngineInfo | null>(null);
 
-  /** Work mode = the user's agent CLI over ACP: opencode or Claude Code
-   *  (through its ACP adapter), nothing else. Detection re-runs at startup,
+  /** Work mode = the user's own agent CLI: opencode (over ACP) or Claude
+   *  Code (its headless stream-json mode), nothing else. Detection re-runs at startup,
    *  on window focus, on Settings → Refresh and when the model menu opens,
    *  so installing an engine while Vicuna runs is picked up. */
   let workEngineChecked = $state(false);
@@ -8552,7 +8552,7 @@
       {/if}
       <span class="setting-note" data-testid="work-engine-status">
         {#if workEngineInfo?.installed}
-          {workEngineLabel} {workEngineInfo.version ?? ""} · {workEngineInfo.path}{#if workEngineInfo.adapterPath} · adapter {workEngineInfo.adapterPath}{/if}
+          {workEngineLabel} {workEngineInfo.version ?? ""} · {workEngineInfo.path}
           {#if workEngineInfo.warning}
             <br /><span data-testid="work-engine-warning">⚠ {workEngineInfo.warning}</span>
           {/if}
@@ -8568,7 +8568,7 @@
       {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
         <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
       {/each}
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or Claude Code through its ACP adapter (<code>npm install -g @agentclientprotocol/claude-agent-acp</code>, using your own <code>claude</code> login). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code>, <code>VICUNA_CLAUDE_ACP_BIN</code>.</span>
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or your <code>claude</code> CLI (headless <code>claude -p</code> stream-json, with your own login; nothing else to install). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code> and <code>VICUNA_CLAUDE_BIN</code>.</span>
       <label class="setting-note approval-row" data-testid="work-approval">
         <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
         Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.

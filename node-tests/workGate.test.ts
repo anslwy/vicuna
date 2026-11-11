@@ -71,17 +71,17 @@ import { engineId, engineLabel, workEngineChoices } from "../src/lib/workGate.ts
 const claudeMissing: WorkEngineInfo = {
   id: "claude", label: "Claude Code", installed: false, path: null, version: null,
   installUrl: "https://docs.claude.com/en/docs/claude-code/setup", model: null, configPath: null,
-  missing: "Claude ACP adapter not found, install it: npm install -g @agentclientprotocol/claude-agent-acp",
+  missing: "Claude Code CLI not found, install it: https://docs.claude.com/en/docs/claude-code/setup",
   engines: [
     { id: "opencode", label: "opencode", installed: true, version: "2.2.6", missing: null },
-    { id: "claude", label: "Claude Code", installed: false, version: "2.1.322", missing: "adapter" }
+    { id: "claude", label: "Claude Code", installed: false, version: null, missing: "Claude Code CLI not found" }
   ]
 };
 
 test("Claude missing: Send blocked with the engine's own install hint", () => {
   const g = workSendGate(claudeMissing);
   assert.equal(g.blocked, true);
-  assert.match(g.reason ?? "", /npm install -g @agentclientprotocol\/claude-agent-acp/);
+  assert.match(g.reason ?? "", /Claude Code CLI not found, install it: https:\/\/docs\.claude\.com/);
   assert.equal(engineLabel(claudeMissing), "Claude Code");
 });
 

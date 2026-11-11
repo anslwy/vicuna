@@ -1,18 +1,11 @@
 // Claude Code as a Work engine: discovery of the user's `claude` CLI and the
-// ACP adapter that drives it.
-//
-// Claude Code has no native ACP mode. The standard bridge is the ACP
-// project's adapter (npm `@agentclientprotocol/claude-agent-acp`, formerly
-// Zed's `@zed-industries/claude-code-acp`), which runs the Claude Agent SDK.
-// Vicuna points it at the user's own `claude` binary through
-// CLAUDE_CODE_EXECUTABLE, so the user's login, settings and plan apply.
-// Nothing is bundled: both pieces must be installed, otherwise Work mode on
-// this engine is disabled with an install hint (same contract as opencode).
+// saved model pick. The engine itself (claude_cli.rs) drives that CLI headless
+// with its stream-json protocol: no SDK, no adapter, nothing bundled. Without
+// `claude`, Work mode on this engine is disabled with an install hint (same
+// contract as opencode).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-
-use tokio::process::Command;
 
 use crate::opencode::{
     common_dirs, find_exe_in, home_dir, parse_version, read_model_from, write_model_to, EngineSummary,
@@ -20,28 +13,19 @@ use crate::opencode::{
 };
 
 pub const CLI_INSTALL_URL: &str = "https://docs.claude.com/en/docs/claude-code/setup";
-pub const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-pub const ADAPTER_URL: &str = "https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp";
-/// Exclusive overrides (absolute paths), like VICUNA_OPENCODE_BIN.
+/// Exclusive override (absolute path), like VICUNA_OPENCODE_BIN.
 pub const BIN_ENV: &str = "VICUNA_CLAUDE_BIN";
-pub const ADAPTER_ENV: &str = "VICUNA_CLAUDE_ACP_BIN";
 
 #[cfg(windows)]
 const CLI_NAMES: &[&str] = &["claude.exe", "claude.cmd", "claude"];
 #[cfg(not(windows))]
 const CLI_NAMES: &[&str] = &["claude"];
-// current name first, then the deprecated Zed package's binary
-#[cfg(windows)]
-const ADAPTER_NAMES: &[&str] = &["claude-agent-acp.cmd", "claude-agent-acp.exe", "claude-code-acp.cmd", "claude-code-acp.exe"];
-#[cfg(not(windows))]
-const ADAPTER_NAMES: &[&str] = &["claude-agent-acp", "claude-code-acp"];
 
 // ---------- detection ----------
 
 /// Install locations after PATH: Claude's own local install dir, then the
 /// shared list (~/.local/bin, Homebrew, /usr/local). Node version managers
-/// (nvm, fnm, volta, asdf, npm globals, where `npm -g` puts the adapter) are
-/// searched by exe_resolve for every engine.
+/// (nvm, fnm, volta, asdf, npm globals) are searched by exe_resolve.
 fn extra_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(h) = home {
@@ -55,10 +39,6 @@ pub fn find_claude_in(override_bin: Option<&str>, path_var: Option<OsString>, ho
     find_exe_in(CLI_NAMES, override_bin, path_var, &extra_dirs(home))
 }
 
-pub fn find_adapter_in(override_bin: Option<&str>, path_var: Option<OsString>, home: Option<&Path>) -> Option<PathBuf> {
-    find_exe_in(ADAPTER_NAMES, override_bin, path_var, &extra_dirs(home))
-}
-
 /// Like the user's terminal (login-shell PATH, process PATH, install
 /// folders; newest `--version` when several exist), same as opencode.
 pub fn resolve_claude() -> Option<crate::exe_resolve::Resolved> {
@@ -69,78 +49,8 @@ pub fn find_claude() -> Option<PathBuf> {
     resolve_claude().map(|r| r.path)
 }
 
-pub fn find_adapter() -> Option<PathBuf> {
-    crate::exe_resolve::resolve(ADAPTER_NAMES, std::env::var(ADAPTER_ENV).ok().as_deref(), &extra_dirs(home_dir().as_deref()))
-        .map(|r| r.path)
-}
-
-/// Both pieces, or the reason (with the install hint) why not.
-pub fn find_parts() -> Result<(PathBuf, PathBuf), String> {
-    let cli = find_claude();
-    let adapter = find_adapter();
-    match (cli, adapter) {
-        (Some(c), Some(a)) => Ok((c, a)),
-        (c, a) => Err(missing_reason(c.is_some(), a.is_some()).unwrap_or_default()),
-    }
-}
-
-pub fn missing_reason(has_cli: bool, has_adapter: bool) -> Option<String> {
-    match (has_cli, has_adapter) {
-        (true, true) => None,
-        (false, true) => Some(format!("Claude Code CLI not found, install it: {CLI_INSTALL_URL}")),
-        (true, false) => Some(format!(
-            "Claude ACP adapter not found, install it: npm install -g {ADAPTER_PACKAGE}"
-        )),
-        (false, false) => Some(format!(
-            "Claude Code CLI and its ACP adapter not found, install them: {CLI_INSTALL_URL} and npm install -g {ADAPTER_PACKAGE}"
-        )),
-    }
-}
-
-// ---------- process ----------
-
-/// PATH for the adapter: it is a `#!/usr/bin/env node` script, and a
-/// Finder-launched app's PATH lacks node. The adapter's own dir (and its
-/// symlink target's: npm/nvm keep `node` next to it) and claude's dir go
-/// first, then the terminal's PATH and the version-manager folders.
-fn child_path(adapter: &Path, cli: &Path) -> OsString {
-    let mut lists: Vec<OsString> = Vec::new();
-    for p in [adapter, cli] {
-        if let Some(d) = p.parent() {
-            lists.push(d.as_os_str().to_owned());
-        }
-        if let Some(d) = std::fs::canonicalize(p).ok().and_then(|r| r.parent().map(Path::to_path_buf)) {
-            lists.push(d.into_os_string());
-        }
-    }
-    if let Some(p) = crate::exe_resolve::child_path(None) {
-        lists.push(p);
-    }
-    let mut acc: Option<OsString> = None;
-    for l in lists {
-        acc = crate::exe_resolve::merge_paths(acc.as_ref(), Some(&l));
-    }
-    acc.unwrap_or_default()
-}
-
-pub fn command(adapter: &Path, cli: &Path) -> Command {
-    let mut cmd = Command::new(adapter);
-    cmd.env("CLAUDE_CODE_EXECUTABLE", cli)
-        .env("PATH", child_path(adapter, cli))
-        .env("NO_COLOR", "1");
-    if let Some(h) = home_dir() {
-        cmd.current_dir(h);
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd
+pub fn missing_message() -> String {
+    format!("Claude Code CLI not found, install it: {CLI_INSTALL_URL}")
 }
 
 fn describe(p: &Path) -> (Option<String>, String) {
@@ -155,27 +65,24 @@ fn describe(p: &Path) -> (Option<String>, String) {
 
 pub async fn engine_info() -> WorkEngineInfo {
     // resolution may run `--version` on several binaries: off the async pool
-    let (cli, adapter, version, other_labels) = tokio::task::spawn_blocking(|| {
+    let (cli, version, other_labels) = tokio::task::spawn_blocking(|| {
         let found = resolve_claude();
-        let adapter = find_adapter();
         let version = found.as_ref().and_then(|f| describe(&f.path).0);
         let others: Vec<String> = found.as_ref().map(|f| f.others.iter().map(|o| describe(o).1).collect()).unwrap_or_default();
-        (found.map(|f| f.path), adapter, version, others)
+        (found.map(|f| f.path), version, others)
     })
     .await
-    .unwrap_or((None, None, None, Vec::new()));
-    let installed = cli.is_some() && adapter.is_some();
-    let has_cli = cli.is_some();
+    .unwrap_or((None, None, Vec::new()));
+    let installed = cli.is_some();
     WorkEngineInfo {
         id: "claude".to_string(),
         label: "Claude Code".to_string(),
         installed,
-        missing: missing_reason(has_cli, adapter.is_some()),
-        adapter_path: adapter.map(|a| a.display().to_string()),
+        missing: (!installed).then(missing_message),
         engines: Vec::new(),
         path: cli.map(|c| c.display().to_string()),
         version,
-        install_url: if installed || !has_cli { CLI_INSTALL_URL } else { ADAPTER_URL }.to_string(),
+        install_url: CLI_INSTALL_URL.to_string(),
         model: saved_model(),
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: other_labels,
@@ -234,34 +141,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn finds_cli_and_adapter_on_path_and_in_install_dirs() {
+    fn finds_cli_on_path_and_in_install_dirs() {
         let path_dir = tmp("path");
         let home = tmp("home");
         let cli = fake(&path_dir, "claude");
         assert_eq!(find_claude_in(None, Some(path_dir.clone().into_os_string()), Some(&home)), Some(cli));
-        // adapter only in ~/.npm-global/bin (a GUI PATH misses it)
-        let npm = home.join(".npm-global").join("bin");
-        std::fs::create_dir_all(&npm).unwrap();
-        let adapter = fake(&npm, "claude-agent-acp");
-        assert_eq!(find_adapter_in(None, Some(OsString::from("/nonexistent")), Some(&home)), Some(adapter));
-        // the deprecated Zed binary name still counts
-        let legacy_home = tmp("legacy");
-        let lb = legacy_home.join(".local").join("bin");
-        std::fs::create_dir_all(&lb).unwrap();
-        let legacy = fake(&lb, "claude-code-acp");
-        assert_eq!(find_adapter_in(None, None, Some(&legacy_home)), Some(legacy));
+        // native installer location, which a GUI PATH misses
+        let local = home.join(".claude").join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let native = fake(&local, "claude");
+        assert_eq!(find_claude_in(None, Some(OsString::from("/nonexistent")), Some(&home)), Some(native));
         // an override that doesn't exist is exclusive: missing
         assert_eq!(find_claude_in(Some("/nonexistent/claude"), Some(path_dir.into_os_string()), Some(&home)), None);
-    }
-
-    #[test]
-    fn missing_reason_names_what_to_install() {
-        assert_eq!(missing_reason(true, true), None);
-        assert!(missing_reason(false, true).unwrap().contains(CLI_INSTALL_URL));
-        let a = missing_reason(true, false).unwrap();
-        assert!(a.contains("npm install -g @agentclientprotocol/claude-agent-acp"), "{a}");
-        let both = missing_reason(false, false).unwrap();
-        assert!(both.contains(CLI_INSTALL_URL) && both.contains(ADAPTER_PACKAGE));
+        assert!(missing_message().contains(CLI_INSTALL_URL));
     }
 
     #[test]

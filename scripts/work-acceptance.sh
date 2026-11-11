@@ -15,7 +15,7 @@
 # Build the bridge first:  (cd bridge && cargo build)
 # Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
 #      src-tauri/target/debug/vicuna-bridge), PORT (default 1427),
-#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CLAUDE_ACP_BIN
+#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN
 #      (default: found on PATH).
 # Billed turns (by the provider; opencode/beam-free is free): present = 2,
 # mcp = 1, approve = 1, toolcap = 1. Every mode runs the bridge with a temporary HOME so
@@ -52,7 +52,6 @@ for f in .claude .claude.json; do
 done
 oc_bin="${VICUNA_OPENCODE_BIN:-$(command -v opencode || true)}"
 cl_bin="${VICUNA_CLAUDE_BIN:-$(command -v claude || true)}"
-ad_bin="${VICUNA_CLAUDE_ACP_BIN:-$(command -v claude-agent-acp || command -v claude-code-acp || true)}"
 
 start_bridge() { # extra env assignments...
   env HOME="$work/home" \
@@ -62,7 +61,6 @@ start_bridge() { # extra env assignments...
     XDG_STATE_HOME="${XDG_STATE_HOME:-$real_home/.local/state}" \
     VICUNA_OPENCODE_BIN="${oc_bin:-/nonexistent/opencode}" \
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
-    VICUNA_CLAUDE_ACP_BIN="${ad_bin:-/nonexistent/claude-agent-acp}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 50); do
@@ -149,7 +147,7 @@ case "$mode" in
   missing)
     # exclusive overrides that do not exist: detection must report missing
     if [ "$engine" = "claude" ]; then
-      start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_ACP_BIN=/nonexistent/claude-agent-acp
+      start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude
       invoke work_engine_select '{"engine":"claude"}' >/dev/null
     else
       start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude
@@ -165,8 +163,8 @@ d = info["data"]
 assert info["ok"] and d["id"] == engine and d["installed"] is False, d
 assert all(not e["installed"] for e in d["engines"]), d["engines"]
 if engine == "claude":
-    assert "npm install -g @agentclientprotocol/claude-agent-acp" in d["missing"], d
-    assert "npm install -g @agentclientprotocol/claude-agent-acp" in start.get("error", ""), start
+    assert "Claude Code CLI not found, install it:" in d["missing"], d
+    assert "Claude Code CLI not found, install it:" in start.get("error", ""), start
 else:
     assert d["path"] is None and d["installUrl"].startswith("https://opencode.ai/"), d
     assert "opencode CLI not found, install it:" in start.get("error", ""), start
@@ -203,7 +201,7 @@ PY
     check_turn PONG yes
     s2="$(saved_session)"
     [ -n "$s1" ] && [ "$s1" = "$s2" ] || { echo "FAIL session not resumed: '$s1' -> '$s2'"; exit 1; }
-    echo "PASS two turns via $engine ACP; turn 2 resumed session $s1 and remembered turn 1"
+    echo "PASS two turns via $engine; turn 2 resumed session $s1 and remembered turn 1"
     ;;
   mcp)
     [ -n "$model" ] || { echo "usage: $0 mcp <model> [engine]"; exit 2; }

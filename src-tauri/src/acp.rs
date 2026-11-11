@@ -1,9 +1,10 @@
-// Vicuna Work mode = the user's agent CLI (opencode, or Claude Code through
-// its ACP adapter), driven over the Agent Client Protocol (ACP).
+// Vicuna Work mode on opencode, driven over the Agent Client Protocol (ACP).
+// (The Claude Code engine drives the `claude` CLI's stream-json protocol
+// instead: claude_cli.rs; run_turn dispatches by engine. Both share this
+// module's session store, MCP planning, prompts and turn helpers.)
 //
-// One long-lived ACP process per engine (`opencode acp`, or
-// `claude-agent-acp` pointed at the user's `claude`; spawned on demand,
-// respawned if it dies or the binary moves) serves every Work session: `initialize` once, then per session `session/new` (cwd +
+// One long-lived `opencode acp` process (spawned on demand, respawned if it
+// dies or the binary moves) serves every Work session: `initialize` once, then per session `session/new` (cwd +
 // Vicuna's MCP servers) or `session/resume`/`session/load` for a saved
 // session, `session/set_config_option` for the model picked in Vicuna, and
 // `session/prompt`. `session/update` notifications are routed by sessionId and
@@ -27,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
-use super::opencode::{find_opencode, OpencodeModel, INSTALL_URL};
+use super::opencode::{find_opencode, INSTALL_URL};
 use super::work_engine::Engine;
 use super::work_agent::{emit_ev, TurnState, WorkAgentEvent};
 use super::ChatMessage;
@@ -50,7 +51,7 @@ struct Proc {
     /// Approval mode the process was started under (opencode's config
     /// depends on it, so a toggle respawns).
     ask: bool,
-    /// The binary this process was started from (opencode, or the adapter).
+    /// The opencode binary this process was started from.
     bin: PathBuf,
     // held so kill_on_drop ends the process when this Proc is replaced
     _child: Child,
@@ -61,9 +62,6 @@ pub struct AcpState {
     sessions: Mutex<HashMap<String, String>>,
     loaded: AtomicBool,
     procs: tokio::sync::Mutex<HashMap<Engine, Proc>>,
-    /// Claude's model list, read from a session's `model` config option;
-    /// cleared when the Claude process is respawned.
-    claude_models: tokio::sync::Mutex<Option<Vec<OpencodeModel>>>,
 }
 
 impl AcpState {
@@ -83,12 +81,12 @@ impl AcpState {
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<String> {
+    pub(crate) fn get(&self, key: &str) -> Option<String> {
         self.load().ok()?;
         self.sessions.lock().ok()?.get(key).cloned()
     }
 
-    fn set(&self, key: String, acp_session: String) {
+    pub(crate) fn set(&self, key: String, acp_session: String) {
         let _ = self.load();
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.insert(key, acp_session);
@@ -105,19 +103,12 @@ impl AcpState {
     /// The warm, initialized ACP client for `engine`; (re)spawned when there
     /// is none, it died, or detection now resolves a different binary.
     async fn client(&self, engine: Engine) -> Result<Arc<AcpClient>, String> {
-        let (bin, cmd) = match engine {
-            Engine::Opencode => {
-                let bin = find_opencode().ok_or_else(not_found_message)?;
-                let mut cmd = super::opencode::command(&bin);
-                cmd.arg("acp");
-                (bin, cmd)
-            }
-            Engine::Claude => {
-                let (cli, adapter) = super::claude::find_parts()?;
-                let cmd = super::claude::command(&adapter, &cli);
-                (adapter, cmd)
-            }
-        };
+        if engine != Engine::Opencode {
+            return Err(format!("{} does not run over ACP", engine.label()));
+        }
+        let bin = find_opencode().ok_or_else(not_found_message)?;
+        let mut cmd = super::opencode::command(&bin);
+        cmd.arg("acp");
         let mut guard = self.procs.lock().await;
         if let Some(p) = guard.get(&engine) {
             let ask_now = engine == Engine::Opencode && super::work_engine::approval_ask();
@@ -126,9 +117,6 @@ impl AcpState {
             }
         }
         guard.remove(&engine);
-        if engine == Engine::Claude {
-            *self.claude_models.lock().await = None;
-        }
         let label = engine_process_label(engine);
         let (client, child) = spawn_acp(cmd, label, &bin)?;
         client
@@ -162,79 +150,18 @@ impl AcpState {
     /// (app startup). Silent when it is missing; the UI shows that state.
     pub async fn prewarm(&self) {
         let engine = super::work_engine::current_engine();
-        if engine.is_present() {
+        // only opencode keeps a warm process; claude starts per turn
+        if engine == Engine::Opencode && engine.is_present() {
             let _ = self.client(engine).await;
         }
-    }
-
-    /// Claude's selectable models, detected (not hardcoded): the adapter
-    /// lists them as the `model` config option of a session, so open a
-    /// throwaway session (no prompt, nothing billed) and read it.
-    pub async fn claude_models(&self) -> Result<Vec<OpencodeModel>, String> {
-        let client = self.client(Engine::Claude).await?;
-        if let Some(cached) = self.claude_models.lock().await.clone() {
-            return Ok(cached);
-        }
-        let cwd = super::opencode::home_dir()
-            .map(|h| h.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        let r = client
-            .call("session/new", session_params(&cwd, None, &[]), SESSION_TIMEOUT)
-            .await
-            .map_err(|e| format!("Claude Code could not list models: {e}"))?;
-        if let Some(sid) = r.get("sessionId").and_then(|s| s.as_str()) {
-            // best effort: the adapter supports session/close
-            let _ = client.call("session/close", json!({ "sessionId": sid }), CONFIG_TIMEOUT).await;
-        }
-        let models = config_models(&r);
-        if models.is_empty() {
-            return Err("Claude Code reported no models (is `claude` logged in? run `claude` once and /login)".into());
-        }
-        *self.claude_models.lock().await = Some(models.clone());
-        Ok(models)
     }
 }
 
 fn engine_process_label(engine: Engine) -> &'static str {
     match engine {
         Engine::Opencode => "opencode acp",
-        Engine::Claude => "claude-agent-acp",
+        Engine::Claude => "claude",
     }
-}
-
-/// Model rows from a session's `model` config option (Claude adapter), minus
-/// the "default" pseudo-entry (the picker has its own default row).
-fn config_models(result: &Value) -> Vec<OpencodeModel> {
-    let Some(opt) = result
-        .get("configOptions")
-        .and_then(|o| o.as_array())
-        .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model")))
-    else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut push = |v: &Value| {
-        let Some(id) = v.get("value").and_then(|x| x.as_str()).filter(|x| !x.is_empty() && *x != "default") else {
-            return;
-        };
-        if out.iter().any(|m: &OpencodeModel| m.id == id) {
-            return;
-        }
-        out.push(OpencodeModel {
-            id: id.to_string(),
-            provider: "claude".to_string(),
-            name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
-        });
-    };
-    for o in opt.get("options").and_then(|o| o.as_array()).into_iter().flatten() {
-        // grouped options carry their own `options` list
-        if let Some(group) = o.get("options").and_then(|g| g.as_array()) {
-            group.iter().for_each(&mut push);
-        } else {
-            push(o);
-        }
-    }
-    out
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -254,7 +181,7 @@ fn sessions_path() -> Result<PathBuf, String> {
 
 /// Keyed by chat + workspace only: the model is switched inside the session
 /// (set_config_option), so changing it keeps the conversation.
-fn session_key(engine: Engine, session_id: Option<&str>, workspace: &str) -> Option<String> {
+pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &str) -> Option<String> {
     // opencode keeps the original key shape so sessions saved before Claude
     // existed still resume
     session_id.map(|id| match engine {
@@ -376,7 +303,7 @@ fn skipped_note(skipped: &[PlannedServer]) -> Option<String> {
 /// Vicuna's MCP dialog, as opencode `mcpServers`: every enabled vicuna.json
 /// server plus the built-in browser row when it is connected, trimmed to
 /// the tool budget. Returns the entries and an optional note for the user.
-async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Option<String>) {
+pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Option<String>) {
     let files = crate::mcp::list_file_servers().unwrap_or_default();
     let mut planned = Vec::new();
     for s in files.iter().filter(|s| s.enabled) {
@@ -919,7 +846,7 @@ fn tool_output(update: &Value) -> String {
     out
 }
 
-fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (String, Value) {
+pub(crate) fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (String, Value) {
     let path = raw
         .get("path")
         .or_else(|| raw.get("file_path"))
@@ -1103,13 +1030,13 @@ fn prompt_blocks(text: &str, images: &Option<Vec<String>>) -> Vec<Value> {
     blocks
 }
 
-fn last_user_message(messages: &[ChatMessage]) -> Option<&ChatMessage> {
+pub(crate) fn last_user_message(messages: &[ChatMessage]) -> Option<&ChatMessage> {
     messages.iter().rev().find(|m| m.role == "user")
 }
 
 /// On a brand-new opencode session with existing Vicuna history (fork, app
 /// restart), hand opencode the visible transcript so the work continues in context.
-fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage) -> String {
+pub(crate) fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage) -> String {
     let mut lines: Vec<String> = Vec::new();
     for m in messages {
         if m.role == "system" || std::ptr::eq(m, last_user) {
@@ -1140,7 +1067,7 @@ fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage) -> String
     format!("Conversation so far (for context):\n{joined}\n\n---\n")
 }
 
-fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Option<&str>) -> String {
+pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Option<&str>) -> String {
     let uploads = session_id
         .map(|id| format!("Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."))
         .unwrap_or_default();
@@ -1162,7 +1089,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
     )
 }
 
-fn take_queue(turn: &TurnState) -> Vec<(String, ChatMessage)> {
+pub(crate) fn take_queue(turn: &TurnState) -> Vec<(String, ChatMessage)> {
     turn.queue
         .lock()
         .map(|mut q| std::mem::take(&mut *q))
@@ -1170,7 +1097,7 @@ fn take_queue(turn: &TurnState) -> Vec<(String, ChatMessage)> {
 }
 
 /// Concatenate queued messages for a follow-up prompt. Images travel with it.
-fn messages_text(messages: &[ChatMessage]) -> (String, Option<Vec<String>>) {
+pub(crate) fn messages_text(messages: &[ChatMessage]) -> (String, Option<Vec<String>>) {
     let mut text = String::new();
     let mut images: Option<Vec<String>> = None;
     for m in messages {
@@ -1204,7 +1131,22 @@ pub async fn run_turn(
     mcp_snapshot: McpSnapshot,
     engine: Engine,
 ) {
-    if let Err(message) = run_turn_inner(
+    let res = if engine == Engine::Claude {
+        super::claude_cli::run_turn_inner(
+            &turn,
+            model.as_deref(),
+            &workspace,
+            &messages,
+            session_id.as_deref(),
+            goal_text.as_deref(),
+            fresh_session,
+            &on_event,
+            state,
+            &mcp_snapshot,
+        )
+        .await
+    } else {
+        run_turn_inner(
         engine,
         &turn,
         model.as_deref(),
@@ -1218,7 +1160,8 @@ pub async fn run_turn(
         &mcp_snapshot,
     )
     .await
-    {
+    };
+    if let Err(message) = res {
         let _ = on_event.send(WorkAgentEvent::Error { message });
     }
 }
@@ -1259,7 +1202,7 @@ async fn open_session(
 
 /// Model to run: the turn's explicit pick, else the one saved in Vicuna's
 /// picker, else opencode's own default (None).
-fn effective_model(engine: Engine, requested: Option<&str>) -> Option<String> {
+pub(crate) fn effective_model(engine: Engine, requested: Option<&str>) -> Option<String> {
     requested
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -1267,7 +1210,7 @@ fn effective_model(engine: Engine, requested: Option<&str>) -> Option<String> {
         .or_else(|| engine.saved_model())
 }
 
-fn friendly_prompt_error(engine: Engine, e: String) -> String {
+pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
     let low = e.to_lowercase();
     if is_tool_limit_error(&e) {
         format!("{e}\n{TOOL_LIMIT_HINT}")
@@ -1536,29 +1479,6 @@ mod tests {
         assert_eq!(session_key(Engine::Opencode, None, "/w"), None);
         // engines never share a session id (switching engine starts fresh)
         assert_eq!(session_key(Engine::Claude, Some("chat1"), "/w"), Some("claude|chat1|/w".to_string()));
-    }
-
-    /// Claude's models come from the adapter's `model` config option (shape
-    /// captured from claude-agent-acp 0.99.1), never a hardcoded list.
-    #[test]
-    fn claude_models_detected_from_config_option() {
-        let r = json!({ "sessionId": "s", "configOptions": [
-            { "id": "mode", "currentValue": "default", "options": [{ "value": "default", "name": "Default" }] },
-            { "id": "model", "currentValue": "opus", "options": [
-                { "value": "default", "name": "Default (recommended)" },
-                { "value": "opus", "name": "Opus" },
-                { "value": "haiku", "name": "Haiku" },
-                { "group": "Pinned", "name": "Pinned", "options": [{ "value": "claude-haiku-4-5-20251001", "name": "Haiku 4.5" }] },
-                { "value": "haiku", "name": "dup" }
-            ]}
-        ]});
-        let ids: Vec<_> = config_models(&r).into_iter().map(|m| (m.id, m.name, m.provider)).collect();
-        assert_eq!(ids, vec![
-            ("opus".to_string(), Some("Opus".to_string()), "claude".to_string()),
-            ("haiku".to_string(), Some("Haiku".to_string()), "claude".to_string()),
-            ("claude-haiku-4-5-20251001".to_string(), Some("Haiku 4.5".to_string()), "claude".to_string()),
-        ]);
-        assert!(config_models(&json!({ "sessionId": "s" })).is_empty());
     }
 
     #[test]

@@ -19,8 +19,6 @@ export interface WorkEngineInfo {
   label?: string;
   /** why the engine can't run, with the install hint */
   missing?: string | null;
-  /** Claude only: the ACP adapter path */
-  adapterPath?: string | null;
   engines?: EngineSummary[];
   installed: boolean;
   path: string | null;

@@ -148,9 +148,6 @@ pub struct WorkEngineInfo {
     /// Why the engine can't run, with the install hint (None when installed).
     #[serde(default)]
     pub missing: Option<String>,
-    /// Claude only: the ACP adapter the engine runs through.
-    #[serde(default)]
-    pub adapter_path: Option<String>,
     /// Every engine Vicuna knows (filled by `work_engine_info`), so the UI can
     /// offer an engine picker when more than one is installed.
     #[serde(default)]
@@ -187,7 +184,6 @@ pub fn not_installed_info() -> WorkEngineInfo {
         id: "opencode".to_string(),
         label: "opencode".to_string(),
         missing: Some(format!("opencode CLI not found, install it: {INSTALL_URL}")),
-        adapter_path: None,
         engines: Vec::new(),
         installed: false,
         path: None,
@@ -380,8 +376,8 @@ pub(crate) async fn run_capture(bin: &Path, args: &[&str], timeout: Duration) ->
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct OpencodeModel {
-    /// `provider/model` exactly as opencode accepts it (Claude: the model
-    /// value the adapter's `model` config option accepts, e.g. "haiku").
+    /// `provider/model` exactly as opencode accepts it (Claude: the `--model`
+    /// value the CLI lists in its initialize response, e.g. "haiku").
     pub id: String,
     pub provider: String,
     /// Display name when the engine provides one (Claude).

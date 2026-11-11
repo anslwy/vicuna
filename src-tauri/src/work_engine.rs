@@ -47,16 +47,14 @@ impl Engine {
     pub fn is_present(self) -> bool {
         match self {
             Engine::Opencode => crate::opencode::find_opencode().is_some(),
-            Engine::Claude => crate::claude::find_parts().is_ok(),
+            Engine::Claude => crate::claude::find_claude().is_some(),
         }
     }
 
     pub fn missing_message(self) -> String {
         match self {
             Engine::Opencode => crate::acp::not_found_message(),
-            Engine::Claude => crate::claude::find_parts().err().unwrap_or_else(|| {
-                crate::claude::missing_reason(false, false).unwrap_or_default()
-            }),
+            Engine::Claude => crate::claude::missing_message(),
         }
     }
 
@@ -187,11 +185,11 @@ pub async fn engines_info() -> WorkEngineInfo {
 
 // ---------- models ----------
 
-pub async fn list_models(engine: Engine, acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
+pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
     match engine {
         Engine::Opencode => crate::opencode::list_models().await,
         Engine::Claude => Ok(OpencodeModels {
-            models: acp.claude_models().await?,
+            models: crate::claude_cli::list_models().await?,
             current: crate::claude::saved_model(),
         }),
     }

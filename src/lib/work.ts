@@ -470,8 +470,8 @@ export async function setOpencodeModel(model: string | null): Promise<void> {
   await invokeCmd<void>("opencode_set_model", { model });
 }
 
-/** Work models of `engine` (opencode: `opencode models`; Claude: read from
- *  the adapter's session config) plus that engine's saved pick. */
+/** Work models of `engine` (opencode: `opencode models`; Claude: the CLI's
+ *  own model list from its initialize response) plus that engine's pick. */
 export async function listWorkModels(engine: string): Promise<OpencodeModels> {
   return await invokeCmd<OpencodeModels>("work_models", { engine });
 }
