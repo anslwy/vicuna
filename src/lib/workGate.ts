@@ -13,6 +13,8 @@ export interface WorkEngineInfo {
   configPath: string | null;
   /** other installs detection found but did not pick ("path (version)") */
   others?: string[];
+  /** non-blocking warning, e.g. older than the tested minimum version */
+  warning?: string | null;
 }
 
 /** Send gate for Work mode: no opencode, no turn (there is no fallback).

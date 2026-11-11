@@ -7111,6 +7111,12 @@
           {/if}
         </div>
       {/if}
+      {#if composerMode === "work" && !workGate.blocked && workEngineInfo?.warning}
+        <div class="opencode-missing" data-testid="opencode-outdated" role="status">
+          <span>{workEngineInfo.warning}</span>
+          <button class="mini-btn" data-testid="opencode-recheck-outdated" onclick={() => void refreshWorkEngine()}>Check again</button>
+        </div>
+      {/if}
       {#if composerMode === "work" && workGate.blocked && workEngineChecked}
         <div class="opencode-missing" data-testid="opencode-missing" role="status">
           <span>{workGate.reason ?? "opencode CLI not found"}</span>
@@ -8487,6 +8493,9 @@
       <span class="setting-note" data-testid="work-engine-status">
         {#if workEngineInfo?.installed}
           opencode {workEngineInfo.version ?? ""} · {workEngineInfo.path}
+          {#if workEngineInfo.warning}
+            <br /><span data-testid="work-engine-warning">⚠ {workEngineInfo.warning}</span>
+          {/if}
           {#if (workEngineInfo.others ?? []).length > 0}
             <br /><span data-testid="work-engine-others">Also found (not used; the newest version wins): {(workEngineInfo.others ?? []).join(", ")}</span>
           {/if}

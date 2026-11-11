@@ -195,7 +195,7 @@ PY
     # Reproduces the release-.dmg bug without a Mac. The bridge starts with
     # launchd's minimal environment (env -i, PATH=/usr/bin:/bin), like a
     # Finder/Dock launch. Three installs, as on the owner's Mac and worse:
-    #   ~/.opencode/bin/opencode        0.3.1  stale fallback, prints the
+    #   ~/.opencode/bin/opencode       1.3.17  stale fallback (owner's Mac), prints the
     #                                          outdated-config error
     #   <login PATH dir>/opencode       1.0.0  on the shell PATH (~/.profile)
     #   ~/.nvm/versions/node/v24.14.1/bin/opencode  the real, newest one; nvm
@@ -210,7 +210,7 @@ PY
     cat >"$fh/.opencode/bin/opencode" <<'SH'
 #!/bin/sh
 case "$1" in
-  --version) echo "0.3.1" ;;
+  --version) echo "1.3.17" ;;
   *) printf '\033[91m\033[1mError: \033[0mConfiguration is invalid at https://opencode.ai/console/api/config\n  Invalid option: expected one of "alpha"|"beta"|"deprecated" provider.opencode.models.beam-free.status\n' >&2; exit 1 ;;
 esac
 SH
@@ -233,13 +233,32 @@ d = info["data"]
 print("work_engine_info:", json.dumps({k: d.get(k) for k in ("installed", "path", "version", "others")}, indent=1))
 assert d["installed"], d
 assert d["path"] == want, f"picked {d['path']}, want the nvm install {want}"
-assert d["version"] and d["version"] not in ("0.3.1", "1.0.0"), d
+assert d["version"] and d["version"] not in ("1.3.17", "1.0.0"), d
+assert not d.get("warning"), d.get("warning")
 others = " ".join(d.get("others", []))
-assert ".opencode/bin/opencode (0.3.1)" in others and "login-bin/opencode (1.0.0)" in others, others
+assert ".opencode/bin/opencode (1.3.17)" in others and "login-bin/opencode (1.0.0)" in others, others
 print("PASS Finder-style launch finds the nvm-only opencode (newest), others listed as 'also found'")
 if not models["ok"]:
     raise SystemExit(f"opencode_models failed: {models}")
 print(f"PASS model menu lists {len(models['data']['models'])} models (no 'Configuration is invalid')")
+PY
+    # forcing the stale build: warned below the tested minimum, clean error
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    env -i HOME="$fh" SHELL=/bin/sh PATH=/usr/bin:/bin VICUNA_OPENCODE_BIN="$fh/.opencode/bin/opencode" \
+      "$bridge" "$port" >"$work/bridge2.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 50); do curl -fsS "$base/health" >/dev/null 2>&1 && break; sleep 0.2; done
+    info="$(invoke work_engine_info '{}')"
+    models="$(invoke opencode_models '{}')"
+    python3 - "$info" "$models" <<'PY'
+import json, sys
+info, models = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+w = info["data"].get("warning") or ""
+assert "1.3.17" in w and "opencode upgrade" in w, info["data"]
+print("PASS stale 1.3.17 forced: warning:", w)
+err = models.get("error", "")
+assert not models["ok"] and "\x1b" not in err and err.startswith("This opencode") and "opencode upgrade" in err, models
+print("PASS its model-menu error is clean and starts with the upgrade hint:", err.splitlines()[0][:120])
 PY
     ;;
   *)

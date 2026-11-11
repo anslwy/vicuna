@@ -16,6 +16,10 @@ use tokio::process::Command;
 
 /// Where the "not installed" state points the user.
 pub const INSTALL_URL: &str = "https://opencode.ai/docs/#install";
+/// Oldest opencode Vicuna's Work mode is tested against (acceptance runs,
+/// QA). Older builds still run but get an "update opencode" warning: e.g.
+/// 1.3.17 (Apr 2026) rejects the config opencode.ai serves now.
+pub const MIN_VERSION: &str = "2.2.6";
 /// Explicit override for unusual installs (absolute path to the binary).
 pub const BIN_ENV: &str = "VICUNA_OPENCODE_BIN";
 const CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
@@ -133,6 +137,9 @@ pub struct WorkEngineInfo {
     /// Other installs detection found but did not pick ("path (version)").
     #[serde(default)]
     pub others: Vec<String>,
+    /// Non-blocking warning, e.g. the version is older than MIN_VERSION.
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 pub fn not_installed_info() -> WorkEngineInfo {
@@ -144,6 +151,7 @@ pub fn not_installed_info() -> WorkEngineInfo {
         model: saved_model(),
         config_path: prefs_path().map(|p| p.display().to_string()),
         others: Vec::new(),
+        warning: None,
     }
 }
 
@@ -175,13 +183,26 @@ pub async fn engine_info() -> WorkEngineInfo {
     })
     .await
     .unwrap_or((None, Vec::new()));
+    let warning = version.as_deref().and_then(outdated_warning);
     WorkEngineInfo {
         installed: true,
         path: Some(found.path.display().to_string()),
         version,
         others,
+        warning,
         ..not_installed_info()
     }
+}
+
+/// Warning for a version below MIN_VERSION (None when new enough/unknown).
+pub fn outdated_warning(version: &str) -> Option<String> {
+    let have = crate::exe_resolve::parse_semver(version)?;
+    let min = crate::exe_resolve::parse_semver(MIN_VERSION)?;
+    (have < min).then(|| {
+        format!(
+            "opencode {version} is older than {MIN_VERSION}, the oldest version Vicuna is tested with; it may reject the current opencode config. Update it: opencode upgrade"
+        )
+    })
 }
 
 /// Old opencode builds reject the config opencode.ai now serves
@@ -586,6 +607,17 @@ mod tests {
         assert!(msg.starts_with("This opencode"), "{msg}");
         assert!(msg.contains("opencode upgrade") && msg.contains("Configuration is invalid"), "{msg}");
         assert_eq!(clean_error("\u{1b}[31mmodel not found\u{1b}[0m"), "model not found");
+    }
+
+
+    /// The owner's Mac ran opencode 1.3.17: warn below the tested minimum.
+    #[test]
+    fn versions_below_the_tested_minimum_warn() {
+        let w = outdated_warning("1.3.17").unwrap();
+        assert!(w.contains("1.3.17") && w.contains(MIN_VERSION) && w.contains("opencode upgrade"), "{w}");
+        assert_eq!(outdated_warning(MIN_VERSION), None);
+        assert_eq!(outdated_warning("2.10.0"), None);
+        assert_eq!(outdated_warning("garbage"), None);
     }
 
 }
