@@ -25,7 +25,6 @@ https://github.com/anslwy/vicuna/releases
 
 ```sh
 npm install
-sh scripts/fetch-fx-sidecar.sh   # Work mode's fx ACP engine (macOS/Linux)
 sh scripts/fetch-lb-sidecar.sh   # Browser tab's lb sidecar
 ```
 
@@ -60,11 +59,13 @@ npm run build   # static build to ./build
   commands and renders streamed `Channel` events (`token` / `think` / `done`);
   in a plain browser (`npm run dev`) it falls back to direct `fetch` so
   web-only dev works without the shell.
-- Work mode runs through the bundled [fx](https://github.com/vercel-labs/fx)
-  agent over ACP: `src-tauri/src/acp.rs` spawns `fx acp`, registers an
-  additive `vicuna-local` Ollama connection in `~/.fx/settings.json`, and
-  streams its ACP updates into the same UI event channel. A missing sidecar
-  (or Windows) falls back to the built-in agent loop.
+- Work mode runs on the user's installed [opencode](https://opencode.ai) CLI
+  over ACP: `src-tauri/src/acp.rs` keeps one warm `opencode acp` process,
+  opens a session per chat (workspace cwd + the MCP dialog's enabled servers and the built-in browser, kept under the 128-tool limit), applies
+  the model picked in Vicuna (listed from `opencode models`) and streams ACP
+  updates into the same UI event channel. Nothing is bundled and there is no
+  fallback: without opencode, Work mode shows an install link and Send is
+  disabled. Install: https://opencode.ai/docs/#install
 - Chat streaming returns the full text; `done_reason: "load"` retries up to
   3x after a 2s wait (model was reloading). Stop-button abort raises
   `AbortError` on the frontend; the backend request runs detached (no cancel

@@ -19,6 +19,7 @@ use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
 pub mod acp;
 pub mod browser;
 pub mod mcp;
+pub mod opencode;
 pub mod work_agent;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
@@ -1968,8 +1969,10 @@ async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileCo
 
 /// ---------- In-app update wrappers (same _logic pattern) ----------
 #[tauri::command]
-async fn work_engine_info(app: AppHandle) -> Result<acp::WorkEngineInfo, String> {
-    Ok(acp::engine_info(app.path().resource_dir().ok().as_deref()))
+async fn work_engine_info() -> Result<opencode::WorkEngineInfo, String> {
+    // re-detects on every call: the UI's Refresh / window focus picks up an
+    // opencode installed while Vicuna is running
+    Ok(opencode::engine_info().await)
 }
 
 #[tauri::command]
@@ -5061,9 +5064,19 @@ pub fn run() {
             work_agent::work_agent_queue,
             work_agent::work_agent_remove,
             work_agent::work_agent_answer,
-            work_engine_info
+            work_engine_info,
+            opencode::opencode_models,
+            opencode::opencode_set_model
         ])
         .setup(|app| {
+            // Warm the long-lived `opencode acp` process so the first Work
+            // turn skips its cold start (no-op when opencode is missing).
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    handle.state::<acp::AcpState>().prewarm().await;
+                });
+            }
             // Debug builds say so in the window title (`npm run desktop:dev`
             // → `tauri dev`), so a dev window can't be mistaken for the
             // installed Vicuna.App on the Mac. Release builds keep "Vicuna".
