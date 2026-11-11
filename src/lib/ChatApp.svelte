@@ -50,7 +50,7 @@
     type ViewAnchor
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
-  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH } from "$lib/modelIcons";
+  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -6570,7 +6570,7 @@
   {#if id === "claude"}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
   {:else if id === "codex"}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7.5 9.5l3 2.5-3 2.5M12.5 15h4"/></svg>
+    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={CODEX_ICON_OUTLINE_PATH}/><path d={CODEX_ICON_PROMPT_PATH}/></svg>
   {:else}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
   {/if}
