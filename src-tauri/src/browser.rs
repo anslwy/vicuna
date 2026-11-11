@@ -344,14 +344,44 @@ pub fn user_chrome_override() -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
-/// Ordered attempt list for `--chrome`: CloakBrowser first, then each installed
-/// system Chromium. Pure so the ordering is testable without a daemon.
+/// Whether `os` (a `std::env::consts::OS` value) launches an installed system
+/// browser ahead of CloakBrowser. Windows only: CloakBrowser is unstable
+/// there, while Edge ships with every Windows 10/11 install. macOS/Linux keep
+/// CloakBrowser first.
+pub fn prefers_system_browser(os: &str) -> bool {
+    os == "windows"
+}
+
+/// Ordered attempt list for `--chrome` on this OS (see [`start_attempts_for`]).
 pub fn start_attempts(engine: Option<&Path>, system: &[PathBuf]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if let Some(e) = engine {
-        out.push(e.display().to_string());
+    start_attempts_for(std::env::consts::OS, None, engine, system)
+}
+
+/// Ordered attempt list for `--chrome`. `user_override`
+/// (`VICUNA_BROWSER_CHROME`) always comes first. Then, on macOS/Linux:
+/// CloakBrowser, then each installed system Chromium in the order given. On
+/// Windows: Edge, then the other system browsers (Chrome), then CloakBrowser
+/// last. Duplicates are dropped. Pure, with `os` injected, so every
+/// platform's ordering is testable on any CI host.
+pub fn start_attempts_for(
+    os: &str,
+    user_override: Option<&Path>,
+    engine: Option<&Path>,
+    system: &[PathBuf],
+) -> Vec<String> {
+    let mut ordered: Vec<&Path> = Vec::new();
+    ordered.extend(user_override);
+    if prefers_system_browser(os) {
+        let is_edge = |p: &&PathBuf| p.display().to_string().to_ascii_lowercase().contains("msedge");
+        ordered.extend(system.iter().filter(is_edge).map(|p| p.as_path()));
+        ordered.extend(system.iter().filter(|p| !is_edge(p)).map(|p| p.as_path()));
+        ordered.extend(engine);
+    } else {
+        ordered.extend(engine);
+        ordered.extend(system.iter().map(|p| p.as_path()));
     }
-    for p in system {
+    let mut out: Vec<String> = Vec::new();
+    for p in ordered {
         let s = p.display().to_string();
         if !out.contains(&s) {
             out.push(s);
@@ -920,10 +950,17 @@ pub async fn browser_start_logic(
     // instance, or touching a real profile (the original cloak-only reason).
     let mut engine_error: Option<String> = None;
     let override_chrome = user_chrome_override();
+    let system: Vec<PathBuf> = existing_binaries(system_chrome_candidates());
+    // Windows prefers an installed Edge/Chrome over CloakBrowser: when one
+    // exists, skip the CloakBrowser download and use only an
+    // already-cached copy, tried last.
+    let prefer_system = prefers_system_browser(std::env::consts::OS) && !system.is_empty();
     // An explicit override means "use this Chromium", not "download one
     // first": skip the engine fetch so a blocked download can't delay it.
     let engine = if override_chrome.is_some() {
         None
+    } else if prefer_system {
+        find_cloak_browser()
     } else {
         match browser_ensure_engine_logic(resource_dir.clone()).await {
             Ok(info) => Some(PathBuf::from(info.path)),
@@ -933,9 +970,12 @@ pub async fn browser_start_logic(
             }
         }
     };
-    let mut system: Vec<PathBuf> = override_chrome.clone().into_iter().collect();
-    system.extend(existing_binaries(system_chrome_candidates()));
-    let attempts = start_attempts(engine.as_deref(), &system);
+    let attempts = start_attempts_for(
+        std::env::consts::OS,
+        override_chrome.as_deref(),
+        engine.as_deref(),
+        &system,
+    );
     if attempts.is_empty() {
         return Err(format!(
             "no browser engine could be used: {} — install Google Chrome/Edge, or retry the built-in CloakBrowser download",
@@ -973,7 +1013,10 @@ pub async fn browser_start_logic(
                 }
                 if let Ok(mut g) = state.fallback.lock() {
                     let explicit = override_chrome.as_deref() == Some(Path::new(target.as_str()));
-                    *g = if is_cloak_engine(target) || explicit {
+                    // A system browser picked as Windows' preferred
+                    // engine is not a fallback: no "instead of CloakBrowser"
+                    // warning for it.
+                    *g = if is_cloak_engine(target) || explicit || prefer_system {
                         None
                     } else {
                         Some(fallback_warning(target, engine_error.as_deref()))
@@ -1650,6 +1693,42 @@ mod tests {
         assert_eq!(stale_engine_warning(None, None), None);
     }
 
+    #[test]
+    fn start_attempts_windows_prefers_edge_then_chrome_then_cloak() {
+        let cloak = PathBuf::from(r"C:\Users\u\.cloakbrowser\chromium-146\chrome.exe");
+        let chrome = PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        let edge = PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe");
+        let s = |p: &PathBuf| p.display().to_string();
+        // system_chrome_candidates() lists Chrome before Edge; Edge still wins
+        let a = start_attempts_for("windows", None, Some(&cloak), &[chrome.clone(), edge.clone()]);
+        assert_eq!(a, vec![s(&edge), s(&chrome), s(&cloak)]);
+        // no system browser: CloakBrowser alone
+        assert_eq!(start_attempts_for("windows", None, Some(&cloak), &[]), vec![s(&cloak)]);
+        // VICUNA_BROWSER_CHROME still overrides everything, deduped
+        let custom = PathBuf::from(r"D:\chromium\chrome.exe");
+        let b = start_attempts_for("windows", Some(&custom), None, &[chrome.clone(), edge.clone()]);
+        assert_eq!(b, vec![s(&custom), s(&edge), s(&chrome)]);
+        let c = start_attempts_for("windows", Some(&chrome), Some(&cloak), &[chrome.clone(), edge.clone()]);
+        assert_eq!(c, vec![s(&chrome), s(&edge), s(&cloak)]);
+        assert!(prefers_system_browser("windows"));
+    }
+
+    #[test]
+    fn start_attempts_mac_linux_keep_cloak_first() {
+        let cloak = PathBuf::from("/home/u/.cloakbrowser/chromium-146/chrome");
+        let chrome = PathBuf::from("/usr/bin/google-chrome");
+        let edge = PathBuf::from("/usr/bin/microsoft-edge");
+        let s = |p: &PathBuf| p.display().to_string();
+        for os in ["linux", "macos"] {
+            assert!(!prefers_system_browser(os));
+            let a = start_attempts_for(os, None, Some(&cloak), &[chrome.clone(), edge.clone()]);
+            assert_eq!(a, vec![s(&cloak), s(&chrome), s(&edge)], "{os}");
+            let b = start_attempts_for(os, Some(&edge), Some(&cloak), &[chrome.clone(), edge.clone()]);
+            assert_eq!(b, vec![s(&edge), s(&cloak), s(&chrome)], "{os}");
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn start_attempts_put_cloak_first_then_system() {
         let cloak = PathBuf::from("/home/u/.cloakbrowser/chromium-146/chrome");
