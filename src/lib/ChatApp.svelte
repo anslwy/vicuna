@@ -2,7 +2,8 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
-  import { notifyTurnEnd, getNotifyEnabled, setNotifyEnabled } from "$lib/notify";
+  import { notifyTurnEnd, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
+  import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
   import "katex/dist/katex.min.css";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
@@ -259,6 +260,8 @@
   const chatErrorIds = new Set<string>();
   const notifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let notifyTurns = $state(true);
+  let notifySound = $state(true);
+  let notifySoundChoice = $state<string>(DEFAULT_CHIME);
   function lastReply(id: string): string {
     const c = chats.find((x) => x.id === id);
     const m = c?.messages[c.messages.length - 1];
@@ -6429,6 +6432,13 @@
 
   onMount(() => {
     notifyTurns = getNotifyEnabled();
+    notifySound = getNotifySound();
+    notifySoundChoice = getNotifySoundChoice();
+    // audio contexts start suspended until a gesture; unlock on the first one
+    // so a chime can play later while the window is in the background
+    const unlock = () => { unlockChime(); window.removeEventListener("pointerdown", unlock); window.removeEventListener("keydown", unlock); };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
     window.addEventListener("beforeunload", handleUnload);
     window.addEventListener("message", onBrowserFrameMessage);
     window.addEventListener("pointerup", onMessagesPointerUp);
@@ -8683,6 +8693,25 @@
         <input type="checkbox" data-testid="notify-turns-toggle" checked={notifyTurns} onchange={(e) => { notifyTurns = (e.currentTarget as HTMLInputElement).checked; setNotifyEnabled(notifyTurns); }} />
         Notify when a Chat or Work turn finishes while Vicuna isn't in front (not when you press Stop).
       </label>
+      <label class="setting-note approval-row" data-testid="notify-sound">
+        <input type="checkbox" data-testid="notify-sound-toggle" checked={notifySound} disabled={!notifyTurns} onchange={(e) => { notifySound = (e.currentTarget as HTMLInputElement).checked; setNotifySound(notifySound); if (notifySound) void playChime(notifySoundChoice); }} />
+        Play a sound with the notification.
+      </label>
+      <div class="browse-actions notify-sound-pick">
+        <select
+          class="browse-variant"
+          data-testid="notify-sound-select"
+          aria-label="Notification sound"
+          value={notifySoundChoice}
+          disabled={!notifyTurns || !notifySound}
+          onchange={(e) => { notifySoundChoice = e.currentTarget.value; setNotifySoundChoice(notifySoundChoice); void playChime(notifySoundChoice); }}
+        >
+          {#each CHIME_OPTIONS as s}
+            <option value={s.id}>{s.label}</option>
+          {/each}
+        </select>
+        <button class="mini-btn" data-testid="notify-sound-preview" disabled={!notifyTurns || !notifySound} onclick={() => void playChime(notifySoundChoice)}>▶ Preview</button>
+      </div>
     </div>
     <div class="setting-stacked">
       <span class="setting-label">Continue method</span>
@@ -9509,6 +9538,8 @@
   .engine-opt:disabled { opacity: .5; cursor: default; }
   .approval-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
   .approval-row input { margin-top: 2px; }
+  .notify-sound-pick { max-width: 320px; padding-left: 21px; }
+  .notify-sound-pick :disabled { opacity: 0.5; cursor: default; }
   .engine-ico { flex: none; display: block; }
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }

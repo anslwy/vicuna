@@ -39,6 +39,10 @@ export function notifyBody(mode: TurnMode, end: TurnEnd, reply?: string): string
 }
 
 export const NOTIFY_PREF_KEY = "vicuna-notify-turns";
+/** Chime alongside the notification (on by default, same "0" = off rule). */
+export const NOTIFY_SOUND_PREF_KEY = "vicuna-notify-sound";
+/** Which chime preset (see CHIME_OPTIONS in ./chime); missing = default. */
+export const NOTIFY_SOUND_CHOICE_KEY = "vicuna-notify-sound-choice";
 
 /** Stored value → enabled (anything but "0" counts as on). */
 export function parseNotifyPref(raw: string | null): boolean {
