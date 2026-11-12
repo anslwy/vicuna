@@ -129,6 +129,12 @@ impl AcpState {
                 let cmd = super::agy::command(&bin, ask_now, Path::new(workspace));
                 (bin, cmd, workspace.to_string())
             }
+            Engine::Fx => {
+                let bin = super::fx::find_fx().ok_or_else(super::fx::missing_message)?;
+                let mut cmd = super::fx::command(&bin, ask_now);
+                cmd.arg("acp");
+                (bin, cmd, String::new())
+            }
             _ => return Err(format!("{} does not run over ACP", engine.label())),
         };
         let key = (engine, ws);
@@ -175,8 +181,8 @@ impl AcpState {
     /// (app startup). Silent when it is missing; the UI shows that state.
     pub async fn prewarm(&self) {
         let engine = super::work_engine::current_engine();
-        // only opencode keeps a warm process; claude starts per turn
-        if engine == Engine::Opencode && engine.is_present() {
+        // only the ACP engines keep a warm process; claude/codex start per turn
+        if matches!(engine, Engine::Opencode | Engine::Fx) && engine.is_present() {
             let _ = self.client(engine, "").await;
         }
     }
@@ -213,6 +219,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Claude => "claude",
         Engine::Codex => "codex app-server",
         Engine::Agy => "agy acp",
+        Engine::Fx => "fx acp",
     }
 }
 
@@ -241,6 +248,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Claude => format!("claude|{id}|{workspace}"),
         Engine::Codex => format!("codex|{id}|{workspace}"),
         Engine::Agy => format!("agy|{id}|{workspace}"),
+        Engine::Fx => format!("fx|{id}|{workspace}"),
     })
 }
 
@@ -408,6 +416,22 @@ fn resolve_executable(name: &str) -> Option<String> {
     None
 }
 
+/// Stdio entries need an absolute command for fx; HTTP entries pass.
+/// Returns (kept, names of the dropped servers).
+fn split_absolute_commands(mcp: Vec<Value>) -> (Vec<Value>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for e in mcp {
+        match e.get("command").and_then(Value::as_str) {
+            Some(c) if !Path::new(c).is_absolute() => {
+                dropped.push(e.get("name").and_then(Value::as_str).unwrap_or(c).to_string());
+            }
+            _ => kept.push(e),
+        }
+    }
+    (kept, dropped)
+}
+
 /// Params for session/new, resume and load.
 fn session_params(workspace: &str, session_id: Option<&str>, mcp: &[Value]) -> Value {
     let mut v = json!({ "cwd": workspace, "mcpServers": mcp });
@@ -431,20 +455,40 @@ fn current_model(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The model a session result reports: agy's `models.currentModelId` is the
-/// full id it lists (`gemini-3.8-flash-medium`; its `model` config option
-/// drops the thinking level), the others report `configOptions.model`.
+fn config_value(result: &Value, id: &str) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("id").and_then(|i| i.as_str()) == Some(id))?
+        .get("currentValue")?
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// The model a session result reports: fx combines its `provider` and
+/// `model` config options (`codex/gpt-6-luna`); agy's `models.currentModelId`
+/// is the full id it lists (`gemini-3.8-flash-medium`; its `model` config
+/// option drops the thinking level); the others report `configOptions.model`.
 fn acp_model(engine: Engine, result: &Value) -> Option<String> {
-    if engine == Engine::Agy {
-        if let Some(m) = result
+    let model = if engine == Engine::Agy {
+        result
             .pointer("/models/currentModelId")
             .and_then(Value::as_str)
             .filter(|m| !m.is_empty())
-        {
-            return Some(m.to_string());
-        }
+            .map(str::to_string)
+    } else {
+        current_model(result)
+    };
+    let model = model?;
+    if engine == Engine::Fx {
+        return Some(match config_value(result, "provider") {
+            Some(p) => format!("{p}/{model}"),
+            None => model,
+        });
     }
-    current_model(result)
+    Some(model)
 }
 
 /// agy sometimes fails its first session with "ACP session startup timed
@@ -452,6 +496,89 @@ fn acp_model(engine: Engine, result: &Value) -> Option<String> {
 fn is_startup_timeout(e: &str) -> bool {
     let low = e.to_lowercase();
     low.contains("timed out") || low.contains("timeout")
+}
+
+/// Every model fx offers, as `provider/model`, from a throwaway ACP session:
+/// the `provider` select lists fx's built-in and configured providers;
+/// switching to each one (session-only, fx does not persist it) yields that
+/// provider's `model` options. Providers that are not signed in are skipped.
+async fn fx_list_models(client: &AcpClient, cwd: &str) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
+    let r = client
+        .call("session/new", json!({ "cwd": cwd, "mcpServers": [] }), SESSION_TIMEOUT)
+        .await
+        .map_err(|e| format!("fx could not list models: {e}"))?;
+    let sid = r.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let providers: Vec<String> = r
+        .get("configOptions")
+        .and_then(|o| o.as_array())
+        .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("provider")))
+        .and_then(|o| o.get("options"))
+        .and_then(|o| o.as_array())
+        .map(|a| a.iter().filter_map(|o| o.get("value")?.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut add = |provider: &str, res: &Value| {
+        let opts = res
+            .get("configOptions")
+            .and_then(|o| o.as_array())
+            .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model")))
+            .and_then(|o| o.get("options"))
+            .and_then(|o| o.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for o in opts {
+            let Some(m) = o.get("value").and_then(|v| v.as_str()) else { continue };
+            let id = format!("{provider}/{m}");
+            if !out.iter().any(|x: &crate::opencode::OpencodeModel| x.id == id) {
+                out.push(crate::opencode::OpencodeModel { id, provider: provider.to_string(), name: None });
+            }
+        }
+    };
+    let start = config_value(&r, "provider");
+    if providers.is_empty() {
+        if let Some(p) = &start {
+            add(p, &r);
+        }
+    }
+    for p in &providers {
+        let res = if start.as_deref() == Some(p.as_str()) {
+            r.clone()
+        } else {
+            match client
+                .call(
+                    "session/set_config_option",
+                    json!({ "sessionId": sid, "configId": "provider", "value": p }),
+                    CONFIG_TIMEOUT,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(_) => continue,
+            }
+        };
+        add(p, &res);
+    }
+    if !sid.is_empty() {
+        let _ = client.call("session/close", json!({ "sessionId": sid }), CONFIG_TIMEOUT).await;
+    }
+    Ok(out)
+}
+
+impl AcpState {
+    /// fx's models (see fx_list_models), from a short-lived `fx acp` of its
+    /// own: fx 0.0.16 keeps the last switched-to provider's model catalog
+    /// process-wide, so after cycling providers a later session on the same
+    /// process rejects valid models ("Model is not available for the active
+    /// provider"). The warm turn process never cycles.
+    pub async fn fx_models(&self) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
+        let bin = super::fx::find_fx().ok_or_else(super::fx::missing_message)?;
+        let mut cmd = super::fx::command(&bin, false);
+        cmd.arg("acp");
+        let (client, _child) = start_initialized(cmd, "fx acp", &bin).await?;
+        let cwd = home_dir()?.display().to_string();
+        fx_list_models(&client, &cwd).await
+        // _child is killed on drop
+    }
 }
 
 /// Provider rejections caused by too many tools in the request (OpenAI-style
@@ -1311,9 +1438,10 @@ pub async fn run_turn(
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
     // each claude process and each codex app-server gets its own.
-    // agy: one warm process per workspace whose sessions keep their MCP
-    // connections, so the same stable per-workspace route as opencode.
-    let route = matches!(engine, Engine::Opencode | Engine::Agy).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    // fx/agy: a resumed session keeps the MCP connections of the warm
+    // process (agy: one per workspace), so the same stable per-workspace
+    // route as opencode.
+    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1470,6 +1598,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
             Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
+            Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
         }
     } else {
         e
@@ -1507,6 +1636,21 @@ async fn run_turn_inner(
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
     let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
+    // fx rejects the whole session when one stdio server's command is not an
+    // absolute path; leave out the ones that did not resolve and say so
+    let mcp = if engine == Engine::Fx {
+        let (kept, dropped) = split_absolute_commands(mcp);
+        if !dropped.is_empty() {
+            let note = format!(
+                "MCP servers not available to fx this turn (command not found on your PATH): {}",
+                dropped.join(", ")
+            );
+            emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
+        }
+        kept
+    } else {
+        mcp
+    };
     let (client, (acp_session, resumed, mut used_model)) =
         open_session_retrying(engine, state, client, saved, workspace, &mcp, on_event, stop).await?;
     if let Some(k) = key {
@@ -1524,6 +1668,22 @@ async fn run_turn_inner(
                 .map_err(|e| friendly_prompt_error(engine, format!("Antigravity could not switch to model {m}: {e}")))?;
         }
         used_model = Some(m);
+    } else if let (Engine::Fx, Some(m)) = (engine, effective_model(engine, model)) {
+        // `provider/model`: switch the provider first (its model list
+        // changes with it), then the model
+        let (provider, bare) = super::fx::split_model(&m)
+            .ok_or_else(|| format!("fx model ids are provider/model, got {m}"))?;
+        for (id, value) in [("provider", provider), ("model", bare)] {
+            let r = client
+                .call(
+                    "session/set_config_option",
+                    json!({ "sessionId": acp_session, "configId": id, "value": value }),
+                    CONFIG_TIMEOUT,
+                )
+                .await
+                .map_err(|e| friendly_prompt_error(engine, format!("fx could not switch to {id} {value}: {e}")))?;
+            used_model = acp_model(engine, &r).or(Some(m.clone()));
+        }
     } else if let Some(m) = effective_model(engine, model) {
         let r = client
             .call(
@@ -1845,6 +2005,63 @@ mod tests {
         assert_eq!(current_model(&r).as_deref(), Some("opencode/beam-free"));
         assert_eq!(current_model(&json!({ "sessionId": "s" })), None);
         assert_eq!(current_model(&json!({ "configOptions": [{ "id": "model", "currentValue": "" }] })), None);
+    }
+
+    /// fx reports provider and model as separate config options; Vicuna's
+    /// id (and the reply label) is `provider/model`.
+    #[test]
+    fn fx_model_id_joins_provider_and_model() {
+        let r = json!({ "configOptions": [
+            { "id": "provider", "currentValue": "ollama" },
+            { "id": "model", "currentValue": "deepseek-v4.1-flash:cloud" }
+        ]});
+        assert_eq!(acp_model(Engine::Fx, &r).as_deref(), Some("ollama/deepseek-v4.1-flash:cloud"));
+        assert_eq!(acp_model(Engine::Opencode, &r).as_deref(), Some("deepseek-v4.1-flash:cloud"));
+        assert_eq!(session_key(Engine::Fx, Some("c1"), "/ws").as_deref(), Some("fx|c1|/ws"));
+        assert_eq!(engine_process_label(Engine::Fx), "fx acp");
+    }
+
+    #[test]
+    fn fx_drops_stdio_servers_without_an_absolute_command() {
+        let mcp = vec![
+            json!({ "name": "a", "command": "/usr/bin/python3", "args": [], "env": [] }),
+            json!({ "name": "b", "command": "uvx", "args": [], "env": [] }),
+            json!({ "type": "http", "name": "vicuna-mcp", "url": "http://127.0.0.1:1/mcp/x", "headers": [] }),
+        ];
+        let (kept, dropped) = split_absolute_commands(mcp);
+        assert_eq!(kept.iter().map(|e| e["name"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "vicuna-mcp"]);
+        assert_eq!(dropped, ["b"]);
+    }
+
+    /// fx sends its own tool name (`name`) next to a generic title; MCP tools
+    /// (kind other) show that name, native kinds keep their mapping.
+    #[test]
+    fn fx_tool_names_and_plan_notes() {
+        let mut tools = HashMap::new();
+        let mcp = json!({ "sessionUpdate": "tool_call", "toolCallId": "m1", "name": "browser__navigate", "title": "Calling tool", "kind": "other", "status": "pending", "rawInput": { "url": "https://example.com" } });
+        match &tool_events(&mcp, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "browser__navigate");
+                assert_eq!(args["url"], "https://example.com");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let shell = json!({ "sessionUpdate": "tool_call", "toolCallId": "s1", "name": "shell", "title": "Running", "kind": "execute", "status": "pending", "rawInput": { "action": "run", "command": "ls" } });
+        match &tool_events(&shell, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "exec");
+                assert_eq!(args["command"], "ls");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let plan = json!({ "sessionUpdate": "plan", "entries": [
+            { "content": "Read code", "status": "completed", "priority": "high" },
+            { "content": "Fix bug", "status": "in_progress", "priority": "high" },
+            { "content": "Test", "status": "pending", "priority": "low" }
+        ]});
+        let note = plan_note(&plan).unwrap();
+        assert!(note.contains("- [x] Read code") && note.contains("- [~] Fix bug") && note.contains("- [ ] Test"), "{note}");
+        assert_eq!(plan_note(&json!({ "entries": [] })), None);
     }
 
     /// QA FAIL (PR #6): cards showed `{}` because ToolStart went out with

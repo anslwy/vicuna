@@ -12,9 +12,9 @@ export interface EngineSummary {
 }
 
 /** Work engine detection (re-run on every call: Refresh, window focus): the
- *  current engine (opencode, Claude Code, Codex or Antigravity) plus a summary of all engines. */
+ *  current engine (opencode, Claude Code, Codex, fx or Antigravity) plus a summary of all engines. */
 export interface WorkEngineInfo {
-  /** "opencode" | "claude" | "codex" | "agy" (older backends omit it: opencode) */
+  /** "opencode" | "claude" | "codex" | "fx" | "agy" (older backends omit it: opencode) */
   id?: string;
   label?: string;
   /** why the engine can't run, with the install hint */
@@ -51,7 +51,7 @@ export function engineId(info: WorkEngineInfo | null): string {
 
 export function engineLabel(info: WorkEngineInfo | null): string {
   const id = engineId(info);
-  return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : id === "agy" ? "Antigravity" : "OpenCode");
+  return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : id === "fx" ? "fx" : id === "agy" ? "Antigravity" : "OpenCode");
 }
 
 /** Engines the picker offers: the installed ones. The picker only shows
@@ -86,8 +86,8 @@ export function opencodeModelChoices(list: OpencodeModels | null, selected: stri
 
 
 /** Label for a Work-mode reply: the model the engine reported for the turn
- *  (backend sends opencode `provider/model`, `claude/<model>` or
- *  `codex/<model>`), else the
+ *  (backend sends opencode `provider/model`, `claude/<model>`, `codex/<model>`,
+ *  `fx/<provider/model>` or `agy/<model>`), else the
  *  Work picker's choice in the same shape, else the engine id. Never the
  *  Chat-mode model. */
 export function workReplyModel(
@@ -99,5 +99,7 @@ export function workReplyModel(
   if (r) return r;
   const p = picked?.trim();
   if (!p) return engine;
-  return engine === "claude" || engine === "codex" || engine === "agy" ? `${engine}/${p}` : p;
+  // fx/agy ids that are not already engine-prefixed get the engine prefix to
+  // keep them apart from the Codex engine's own `codex/<model>`
+  return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" ? `${engine}/${p}` : p;
 }

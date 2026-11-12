@@ -27,6 +27,7 @@ pub mod claude;
 pub mod claude_cli;
 pub mod codex;
 pub mod codex_cli;
+pub mod fx;
 pub mod work_engine;
 pub mod work_agent;
 pub mod vicuna_mcp;

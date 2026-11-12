@@ -24,6 +24,11 @@ export const CODEX_ICON_OUTLINE_PATH =
   "M19.69 9.79A4 4 0 0 1 17.75 17.56A4 4 0 0 1 10.06 19.76A4 4 0 0 1 4.31 14.21A4 4 0 0 1 6.25 6.44A4 4 0 0 1 13.94 4.24A4 4 0 0 1 19.69 9.79Z";
 export const CODEX_ICON_PROMPT_PATH = "M7.5 9.2l2.5 2.8-2.5 2.8M12.6 14.7h3.3";
 
+// fx mark: an italic script "f" with a crossbar next to an "x" (fx prints
+// "𝒇x"), drawn as strokes like the Codex mark so it follows the theme.
+export const FX_ICON_PATH =
+  "M4 20.5c1.6 0 2.4-.9 2.8-2.8L9.2 6.3C9.6 4.4 10.4 3.5 12 3.5M5.5 9.5h6M13.5 12l6 7.5M19.5 12l-6 7.5";
+
 // Antigravity (agy) mark: a rising arch drawn as one stroke (fill none,
 // stroke currentColor, width 2, round caps), Vicuna's own line drawing
 // in the spirit of the CLI's arch logo, so it follows the theme.
