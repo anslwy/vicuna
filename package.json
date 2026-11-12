@@ -1,6 +1,6 @@
 {
   "name": "vicuna",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Vicuna — minimal desktop chat client for Ollama",
   "type": "module",
   "scripts": {
