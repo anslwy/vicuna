@@ -319,7 +319,10 @@ pub fn mcp_servers(entries: &[Value], ask: bool) -> Option<Value> {
             continue;
         };
         let mut cfg = cfg;
-        cfg["default_tools_approval_mode"] = json!(if ask { "prompt" } else { "approve" });
+        // vicuna-mcp's ask_user is itself the question to the user: never
+        // gate it behind an Allow card
+        let approve = !ask || name == crate::vicuna_mcp::SERVER_NAME;
+        cfg["default_tools_approval_mode"] = json!(if approve { "approve" } else { "prompt" });
         servers.insert(name, cfg);
     }
     (!servers.is_empty()).then_some(Value::Object(servers))
@@ -340,8 +343,12 @@ pub fn thread_params(workspace: &str, ask: bool, user_sandbox: Option<&str>, mod
     if let Some(m) = model {
         p["model"] = json!(m);
     }
+    // Codex's own request_user_input question tool stays off outside Plan
+    // mode (pinned here; Vicuna never runs Plan mode): questions go through
+    // vicuna-mcp's ask_user, and a stray one is routed to the ask card.
+    p["config"] = json!({ "features": { "default_mode_request_user_input": false } });
     if let Some(servers) = mcp_servers(mcp, ask) {
-        p["config"] = json!({ "mcp_servers": servers });
+        p["config"]["mcp_servers"] = servers;
     }
     p
 }
@@ -574,7 +581,7 @@ fn handle_approval(server: &Server, id: &Value, method: &str, params: &Value, tu
     emit_ev(
         on_event,
         &turn.stop,
-        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: vec!["Allow".into(), "Deny".into()] },
+        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: vec!["Allow".into(), "Deny".into()], multi: false },
     );
     let (writer, on_event, turn, id, method, params) =
         (server.writer.clone(), on_event.clone(), turn.clone(), id.clone(), method.to_string(), params.clone());
@@ -585,6 +592,75 @@ fn handle_approval(server: &Server, id: &Value, method: &str, params: &Value, tu
         let verdict = if allow { "Approved" } else { "Denied" };
         emit_ev(&on_event, &turn.stop, WorkAgentEvent::DisplayNote { text: format!("\n> {verdict}: {title}\n") });
     });
+}
+
+/// Codex's native question (`item/tool/requestUserInput`, normally Plan mode
+/// only): each question becomes the chat's ask card in turn; the answers go
+/// back as `{answers: {<id>: {answers: [..]}}}`. Stop answers nothing.
+fn handle_user_input(server: &Server, id: &Value, params: &Value, turn: &Arc<TurnState>, on_event: &Channel<WorkAgentEvent>) {
+    let questions = params.get("questions").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (writer, on_event, turn, id) = (server.writer.clone(), on_event.clone(), turn.clone(), id.clone());
+    tokio::spawn(async move {
+        let mut answers = serde_json::Map::new();
+        for q in questions {
+            if turn.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let (qid, question, options) = user_input_question(&q);
+            let ask_id = format!("ask-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+            let (tx, rx) = oneshot::channel::<String>();
+            if let Ok(mut m) = turn.ask_pending.lock() {
+                m.insert(ask_id.clone(), tx);
+            }
+            emit_ev(&on_event, &turn.stop, WorkAgentEvent::AskRequest { ask_id: ask_id.clone(), question, options, multi: false });
+            let answer = rx.await.ok();
+            if let Ok(mut m) = turn.ask_pending.lock() {
+                m.remove(&ask_id);
+            }
+            match answer {
+                Some(a) if !turn.stop.load(Ordering::Relaxed) => {
+                    answers.insert(qid, json!({ "answers": [a.trim()] }));
+                }
+                _ => break,
+            }
+        }
+        let _ = writer.send(line(&json!({ "id": id, "result": { "answers": answers } })));
+    });
+}
+
+/// (id, question text, option labels) of one request_user_input question.
+fn user_input_question(q: &Value) -> (String, String, Vec<String>) {
+    let s = |k: &str| q.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let (header, text) = (s("header"), s("question"));
+    let question = if header.is_empty() || text.contains(&header) { text } else { format!("{header}: {text}") };
+    let options = q
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|o| o.iter().filter_map(|x| x.get("label").and_then(Value::as_str)).map(str::to_string).collect())
+        .unwrap_or_default();
+    (s("id"), question, options)
+}
+
+/// `turn/plan/updated` as a transcript checklist.
+fn plan_note(params: &Value) -> Option<String> {
+    let steps = params.get("plan").and_then(Value::as_array)?;
+    if steps.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n\n**Plan**\n");
+    if let Some(e) = params.get("explanation").and_then(Value::as_str).map(str::trim).filter(|e| !e.is_empty()) {
+        out.push_str(&format!("{e}\n"));
+    }
+    for st in steps {
+        let mark = match st.get("status").and_then(Value::as_str) {
+            Some("completed") => "[x]",
+            Some("inProgress") => "[~]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("- {mark} {}\n", st.get("step").and_then(Value::as_str).unwrap_or("").trim()));
+    }
+    out.push('\n');
+    Some(out)
 }
 
 // ---------- one Work turn ----------
@@ -608,6 +684,7 @@ pub async fn run_turn_inner(
     on_event: &Channel<WorkAgentEvent>,
     state: &AcpState,
     mcp_snapshot: &McpSnapshot,
+    ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
     let cli = crate::codex::find_codex().ok_or_else(|| Engine::Codex.missing_message())?;
@@ -619,6 +696,7 @@ pub async fn run_turn_inner(
     if let Some(note) = mcp_note {
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
+    let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
     let picked = acp::effective_model(Engine::Codex, model);
     if let Some(m) = &picked {
         emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Codex.reply_label(m) });
@@ -738,6 +816,8 @@ async fn run_turns(
                     // server -> client request
                     if is_approval(&method) {
                         handle_approval(server, id, &method, &params, turn, on_event);
+                    } else if method == "item/tool/requestUserInput" {
+                        handle_user_input(server, id, &params, turn, on_event);
                     } else {
                         server.respond_error(id, "not supported by Vicuna");
                     }
@@ -757,6 +837,11 @@ async fn run_turns(
                             if let Some(m) = params.pointer("/error/message").and_then(Value::as_str) {
                                 emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n> Codex: {m}\n") });
                             }
+                        }
+                    }
+                    "turn/plan/updated" => {
+                        if let Some(text) = plan_note(&params) {
+                            emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text });
                         }
                     }
                     "turn/completed" => {
@@ -881,6 +966,33 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_server_is_never_gated_and_native_question_is_pinned_off() {
+        let mcp = crate::vicuna_mcp::with_ask_server(vec![json!({ "name": "p", "command": "x" })], Some("http://127.0.0.1:9/mcp/t"));
+        let p = thread_params("/w", true, None, None, &mcp);
+        assert_eq!(p["config"]["mcp_servers"]["vicuna-mcp"], json!({ "url": "http://127.0.0.1:9/mcp/t", "default_tools_approval_mode": "approve" }));
+        assert_eq!(p["config"]["mcp_servers"]["p"]["default_tools_approval_mode"], "prompt");
+        assert_eq!(p["config"]["features"]["default_mode_request_user_input"], false);
+        assert_eq!(thread_params("/w", false, None, None, &[])["config"], json!({ "features": { "default_mode_request_user_input": false } }));
+    }
+
+    #[test]
+    fn native_question_maps_to_the_ask_card() {
+        let q = json!({ "id": "fruit", "header": "Fruit", "question": "Which fruit?", "isOther": true, "isSecret": false,
+            "options": [{ "label": "Mango", "description": "" }, { "label": "Kiwi", "description": "green" }] });
+        assert_eq!(user_input_question(&q), ("fruit".to_string(), "Fruit: Which fruit?".to_string(), vec!["Mango".to_string(), "Kiwi".to_string()]));
+        let bare = json!({ "id": "x", "header": "", "question": "Name?", "options": null });
+        assert_eq!(user_input_question(&bare).2, Vec::<String>::new());
+    }
+
+    #[test]
+    fn plan_updates_render_as_a_checklist() {
+        let n = plan_note(&json!({ "explanation": "two steps", "plan": [
+            { "step": "read", "status": "completed" }, { "step": "edit", "status": "inProgress" }, { "step": "test", "status": "pending" } ] })).unwrap();
+        assert!(n.contains("**Plan**\ntwo steps\n- [x] read\n- [~] edit\n- [ ] test\n"), "{n}");
+        assert_eq!(plan_note(&json!({ "plan": [] })), None);
+    }
+
+    #[test]
     fn mcp_servers_become_config_overrides() {
         let cfg = mcp_servers(&[
             json!({ "name": "probe", "command": "/usr/bin/python3", "args": ["s.py", "3"], "env": [{ "name": "K", "value": "v" }] }),
@@ -903,7 +1015,7 @@ mod tests {
         assert_eq!(auto["approvalPolicy"], "never");
         assert_eq!(auto["sandbox"], "workspace-write");
         assert!(auto.get("model").is_none(), "no pick: the user's config.toml model runs");
-        assert!(auto.get("config").is_none());
+        assert!(auto["config"].get("mcp_servers").is_none());
         let ask = thread_params("/w", true, Some("read-only"), Some("gpt-6-luna"), &[json!({ "name": "p", "command": "x" })]);
         assert_eq!(ask["approvalPolicy"], "untrusted");
         assert_eq!(ask["sandbox"], "read-only", "the user's sandbox_mode is kept");

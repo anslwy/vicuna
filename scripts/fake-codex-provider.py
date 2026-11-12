@@ -9,6 +9,9 @@ scripted:
   "exactly the word W"          -> W
   prompt mentions noop_001      -> call the MCP tool (note=vicuna-args-check)
   prompt says "run exactly: X"  -> call the shell tool with X
+  prompt says "ask me which fruit" -> call vicuna-mcp ask_user (Mango/Kiwi/Papaya),
+                                   then reply FRUIT=<the answer>
+  prompt says "make a plan"     -> call update_plan (3 steps), then PLANNED
   "previous message" question   -> answer with the word the model said
                                    earlier in the SAME thread history (proves
                                    resume: a fresh thread has no PONG)
@@ -56,6 +59,12 @@ def decide(body):
         out = out if isinstance(out, str) else json.dumps(out)
         # after the MCP call, go on to the shell step if the prompt has one
         user = [texts(i) for i in items if i.get("role") == "user"][-1]
+        calls = [i for i in items if i.get("type") == "function_call"]
+        if calls and (calls[-1].get("name") or "").endswith("ask_user"):
+            a = re.search(r"The user answered: ([^\"\n]+)", out)
+            return [("text", f"FRUIT={a.group(1).strip()}" if a else f"NO ANSWER: {out[:120]}")]
+        if calls and calls[-1].get("name") == "update_plan":
+            return [("text", "PLANNED")]
         done_calls = [i.get("name") for i in items if i.get("type") == "function_call"]
         m = CMD.search(user)
         if m and not any(n and ("shell" in n or "exec" in n) for n in done_calls):
@@ -69,6 +78,16 @@ def decide(body):
         if mcp:
             return [("call", mcp, {"note": "vicuna-args-check"})]
         return [("text", f"no noop_001 tool offered (tools: {names})")]
+    if "ask me which fruit" in user:
+        ask = next((n for n in names if n.endswith("ask_user")), None)
+        if ask:
+            return [("call", ask, {"question": "Which fruit should I use?", "choices": ["Mango", "Kiwi", "Papaya"]})]
+        return [("text", f"no ask_user tool offered (tools: {names})")]
+    if "make a plan" in user and "update_plan" in names:
+        return [("call", "update_plan", {"explanation": "fake plan", "plan": [
+            {"step": "read the code", "status": "completed"},
+            {"step": "make the change", "status": "in_progress"},
+            {"step": "run the tests", "status": "pending"}]})]
     m = CMD.search(user)
     if m:
         return shell_call(names, m.group(1))

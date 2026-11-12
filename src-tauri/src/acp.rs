@@ -1137,8 +1137,8 @@ pub async fn run_turn(
 ) {
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
-    // each claude process gets its own.
-    let route = (engine != Engine::Claude).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    // each claude process and each codex app-server gets its own.
+    let route = (engine == Engine::Opencode).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1174,6 +1174,7 @@ pub async fn run_turn(
             &on_event,
             state,
             &mcp_snapshot,
+            ask_url.as_deref(),
         )
         .await
     } else {
