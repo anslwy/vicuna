@@ -448,7 +448,7 @@ export type WorkAgentEvent =
   | { type: "queuedrained"; ids: string[]; messages: ChatMsg[] }
   | { type: "toolstart"; name: string; args: Record<string, any> }
   | { type: "toolend"; name: string; output: string }
-  | { type: "askrequest"; ask_id: string; question: string; options: string[] }
+  | { type: "askrequest"; ask_id: string; question: string; options: string[]; multi?: boolean }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "contextcompacted"; note: string }
   | { type: "done"; stopped: boolean }

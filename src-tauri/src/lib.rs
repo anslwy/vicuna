@@ -16,6 +16,7 @@ use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+use tauri_plugin_sql::{DbInstances, DbPool};
 pub mod acp;
 pub mod browser;
 pub mod mcp;
@@ -27,6 +28,7 @@ pub mod codex;
 pub mod codex_cli;
 pub mod work_engine;
 pub mod work_agent;
+pub mod vicuna_mcp;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -42,6 +44,115 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+// ---- chat storage: atomic full rewrite (see store.ts saveChats) ----
+// The JS rewrite used to run DELETE + per-message INSERTs as separate plugin
+// statements. A page unload (right-click → Refresh on Windows) kills the
+// awaiting JS loop right after the DELETEs land, leaving the tables empty —
+// history was lost exactly this way (live, 2026-11-11). The plugin pool runs
+// each statement on a possibly different connection, so BEGIN/COMMIT from JS
+// is unsafe; one sqlx transaction on that pool makes the rewrite
+// all-or-nothing: a save killed mid-flight rolls back instead of truncating.
+
+const CHATS_DB_KEY: &str = "sqlite:vicuna.db";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct MsgSaveRow {
+    role: String,
+    content: String,
+    thinking: String,
+    model: Option<String>,
+    images: Option<Vec<String>>,
+    gen_ms: Option<f64>,
+    gen_tps: Option<f64>,
+    gen_cost: Option<f64>,
+    summary: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ChatSaveRow {
+    id: String,
+    title: String,
+    created_at: i64,
+    updated_at: Option<i64>,
+    forked_from: Option<String>,
+    fork_from_index: Option<i64>,
+    mode: Option<String>,
+    workspace: Option<String>,
+    goal: Option<String>,
+    messages: Vec<MsgSaveRow>,
+}
+
+#[tauri::command]
+async fn chats_save(
+    instances: State<'_, DbInstances>,
+    chats: Vec<ChatSaveRow>,
+) -> Result<(), String> {
+    let instances = instances.0.read().await;
+    let pool = match instances.get(CHATS_DB_KEY) {
+        Some(DbPool::Sqlite(pool)) => pool,
+        Some(_) => return Err("chats_save: vicuna.db pool is not sqlite".into()),
+        None => return Err("chats_save: vicuna.db is not loaded".into()),
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("chats_save begin failed: {e}"))?;
+    sqlx::query("DELETE FROM messages")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("chats_save: {e}"))?;
+    sqlx::query("DELETE FROM chats")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("chats_save: {e}"))?;
+    for chat in chats {
+        sqlx::query(
+            "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(chat.id.clone())
+        .bind(chat.title.clone())
+        .bind(chat.created_at)
+        .bind(chat.forked_from)
+        .bind(chat.fork_from_index)
+        .bind(chat.mode.unwrap_or_else(|| "chat".into()))
+        .bind(chat.workspace)
+        .bind(chat.goal)
+        .bind(chat.updated_at.unwrap_or(chat.created_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("chats_save: {e}"))?;
+        for (i, m) in chat.messages.iter().enumerate() {
+            let images = m
+                .images
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            sqlx::query(
+                "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(chat.id.clone())
+            .bind(m.role.clone())
+            .bind(m.content.clone())
+            .bind(m.thinking.clone())
+            .bind(m.model.clone())
+            .bind(i as i64)
+            .bind(images)
+            .bind(m.gen_ms)
+            .bind(m.gen_tps)
+            .bind(m.summary.map(|b| if b { 1 } else { 0 }))
+            .bind(m.gen_cost)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("chats_save: {e}"))?;
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("chats_save commit failed: {e}"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5001,6 +5112,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            chats_save,
             ollama_list_models,
             ollama_list_running,
             ollama_warm_model,

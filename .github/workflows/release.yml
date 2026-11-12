@@ -7,6 +7,7 @@ name: Build + release (macOS, Windows, Linux)
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -100,21 +101,13 @@ jobs:
       # would also build an .msi, which needs a WiX toolchain on the runner)
       - run: npx tauri build --bundles nsis
 
-      - name: Upload setup.exe to rolling release (only when absent)
+      - name: Upload setup.exe to rolling release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --title "Latest dev build" || true
-          # Keep the existing setup.exe
-          # asset instead of replacing a known-good Windows build on every
-          # main push; publish a new exe only when the release has none yet.
-          # To force a new Windows build, delete the setup.exe asset from `latest`.
-          if gh release view latest --json assets --jq '.assets[].name' | grep -qi '\.exe$'; then
-            echo "latest already has a Windows setup.exe; keeping it."
-            exit 0
-          fi
-          gh release upload latest src-tauri/target/release/bundle/nsis/*.exe
+          gh release upload latest --clobber src-tauri/target/release/bundle/nsis/*.exe
 
   build-linux:
     # 22.04 for the older glibc: the AppImage runs on more distros

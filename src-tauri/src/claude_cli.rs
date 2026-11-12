@@ -202,6 +202,19 @@ pub fn mcp_config(entries: &[Value]) -> Option<String> {
     (!servers.is_empty()).then(|| json!({ "mcpServers": servers }).to_string())
 }
 
+/// AskUserQuestion can't be answered through `-p` (its can_use_tool request
+/// carries no answers, so the model reads "The user did not answer"); it is
+/// switched off and vicuna-mcp's ask_user, pre-approved so "ask before
+/// running tools" doesn't gate the question itself, takes its place.
+pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
+    let mut args = vec!["--disallowedTools".to_string(), "AskUserQuestion".to_string()];
+    if mcp.iter().any(|e| e.get("name").and_then(|n| n.as_str()) == Some(crate::vicuna_mcp::SERVER_NAME)) {
+        args.push("--allowedTools".to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_TOOL_ID.to_string());
+    }
+    args
+}
+
 // ---------- tool cards ----------
 
 /// Claude tool names -> Vicuna's card names/args (unknown/MCP: as-is).
@@ -361,7 +374,7 @@ fn handle_permission(
     emit_ev(
         on_event,
         &turn.stop,
-        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: vec!["Allow".into(), "Deny".into()] },
+        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: vec!["Allow".into(), "Deny".into()], multi: false },
     );
     let (writer, on_event, turn) = (writer.clone(), on_event.clone(), turn.clone());
     tokio::spawn(async move {
@@ -402,6 +415,7 @@ pub async fn run_turn_inner(
     on_event: &Channel<WorkAgentEvent>,
     state: &AcpState,
     mcp_snapshot: &McpSnapshot,
+    ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
     let cli = crate::claude::find_claude().ok_or_else(|| Engine::Claude.missing_message())?;
@@ -413,6 +427,7 @@ pub async fn run_turn_inner(
     if let Some(note) = mcp_note {
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
+    let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
     let picked = acp::effective_model(Engine::Claude, model);
     if let Some(m) = &picked {
         emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Claude.reply_label(m) });
@@ -480,6 +495,7 @@ async fn run_process(
     if let Some(cfg) = mcp_config(mcp) {
         cmd.args(["--mcp-config", &cfg]);
     }
+    cmd.args(question_tool_args(mcp));
     let mut child = cmd
         .spawn()
         .map_err(|e| RunError::Fatal(crate::work_engine::spawn_error("claude", cli, Path::new(workspace), &e)))?;
@@ -690,6 +706,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn ask_user_replaces_ask_user_question() {
+        let none = question_tool_args(&[]);
+        assert_eq!(none, vec!["--disallowedTools", "AskUserQuestion"]);
+        let mcp = crate::vicuna_mcp::with_ask_server(vec![], Some("http://127.0.0.1:9/mcp/t"));
+        assert_eq!(
+            question_tool_args(&mcp),
+            vec!["--disallowedTools", "AskUserQuestion", "--allowedTools", "mcp__vicuna-mcp__ask_user"]
+        );
+        let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();
+        assert_eq!(cfg["mcpServers"]["vicuna-mcp"], json!({ "type": "http", "url": "http://127.0.0.1:9/mcp/t", "headers": {} }));
     }
 
     #[test]
