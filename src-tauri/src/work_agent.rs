@@ -29,7 +29,16 @@ pub enum WorkAgentEvent {
     QueueDrained { ids: Vec<String>, messages: Vec<ChatMessage> },
     ToolStart { name: String, args: serde_json::Value },
     ToolEnd { name: String, output: String },
-    AskRequest { ask_id: String, question: String, options: Vec<String> },
+    /// The chat's ask card: a permission request (`perm-*`, Allow/Deny) or
+    /// an agent question from vicuna-mcp's ask_user (`ask-*`; `multi` lets
+    /// the user pick several options, answered as a JSON array).
+    AskRequest {
+        ask_id: String,
+        question: String,
+        options: Vec<String>,
+        #[serde(default)]
+        multi: bool,
+    },
     BgCompleted { job_id: String, command: String, output: String },
     ContextCompacted { note: String },
     Done { stopped: bool },

@@ -332,7 +332,8 @@ pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Opt
             }
         }
     }
-    let (kept, skipped) = fit_tool_budget(planned, PROVIDER_TOOL_LIMIT - OPENCODE_TOOL_RESERVE);
+    let budget = PROVIDER_TOOL_LIMIT - OPENCODE_TOOL_RESERVE - crate::vicuna_mcp::TOOL_COUNT;
+    let (kept, skipped) = fit_tool_budget(planned, budget);
     (kept.into_iter().map(|s| s.entry).collect(), skipped_note(&skipped))
 }
 
@@ -708,7 +709,7 @@ fn spawn_permission_ask(
     emit_ev(
         &on_event,
         &turn.stop,
-        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: labels },
+        WorkAgentEvent::AskRequest { ask_id, question: format!("Allow {title}?"), options: labels, multi: false },
     );
     tokio::spawn(async move {
         let answer = rx.await.unwrap_or_else(|_| "cancelled".to_string());
@@ -1079,6 +1080,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Never crawl from / or the home folder (`find /`, `find ~`, `grep -r /`): on macOS that triggers a consent dialog for every protected folder. Use targeted paths.\n\
 - Keep the user oriented: write one short line before a batch of tool calls saying what you are doing and why, then after the work summarize what changed with paths and commands that matter.\n\
 - Read before overwriting a file. Prefer targeted reads/searches over dumping large files.\n\
+- When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 {uploads}\n{goal}",
         goal = goal
             .filter(|g| !g.trim().is_empty())
@@ -1131,6 +1133,18 @@ pub async fn run_turn(
     mcp_snapshot: McpSnapshot,
     engine: Engine,
 ) {
+    // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
+    // keeps MCP servers per workspace folder, so its route is the workspace;
+    // each claude process gets its own.
+    let route = (engine != Engine::Claude).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    };
+    let ask_url = _ask.as_ref().map(|r| r.url.clone());
     let res = if engine == Engine::Claude {
         super::claude_cli::run_turn_inner(
             &turn,
@@ -1143,6 +1157,7 @@ pub async fn run_turn(
             &on_event,
             state,
             &mcp_snapshot,
+            ask_url.as_deref(),
         )
         .await
     } else {
@@ -1158,6 +1173,7 @@ pub async fn run_turn(
         &on_event,
         state,
         &mcp_snapshot,
+        ask_url.as_deref(),
     )
     .await
     };
@@ -1237,6 +1253,7 @@ async fn run_turn_inner(
     on_event: &Channel<WorkAgentEvent>,
     state: &AcpState,
     mcp_snapshot: &McpSnapshot,
+    ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
@@ -1253,6 +1270,7 @@ async fn run_turn_inner(
     if let Some(note) = mcp_note {
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
+    let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
     let (acp_session, resumed, mut used_model) = open_session(engine, &client, saved, workspace, &mcp).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
