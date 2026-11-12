@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Headless acceptance for Work mode (opencode over ACP, Claude Code via
-# `claude -p` stream-json, Codex via `codex app-server`),
+# Headless acceptance for Work mode (opencode and fx over ACP, Claude Code
+# via `claude -p` stream-json, Codex via `codex app-server`),
 # through the real backend: the loopback bridge, no Tauri window needed.
 #
 #   scripts/work-acceptance.sh missing [engine]          # engine forced missing
@@ -15,14 +15,18 @@
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
 #
-#   engine = opencode (default) | claude | codex
+#   engine = opencode (default) | claude | codex | fx
 #   e.g.  present opencode/beam-free          present haiku claude
 #         present gpt-6-luna codex            combo gpt-6-luna codex
+#         present codex/gpt-6-luna fx         combo ollama/deepseek-v4.1-flash:cloud fx
+#   fx models are <fx provider>/<model>; the ollama route needs an "ollama"
+#   provider in ~/.fx/settings.json (see src-tauri/src/fx.rs). fx runs with
+#   the user's real ~/.fx (login, providers, its sessions) linked in.
 #
 # Build the bridge first:  (cd bridge && cargo build)
 # Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
 #      src-tauri/target/debug/vicuna-bridge), PORT (default 1427),
-#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN,
+#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN / VICUNA_FX_BIN,
 #      VICUNA_CODEX_EFFORT (codex reasoning effort; default here: low),
 #      VICUNA_CODEX_FAKE=1: run the real `codex app-server` against
 #      scripts/fake-codex-provider.py (a scripted Responses API in a temp
@@ -40,7 +44,7 @@ mode="${1:-}"
 model="${2:-}"
 engine="${3:-opencode}"
 [ "$mode" = "missing" ] && engine="${2:-opencode}"
-case "$engine" in opencode|claude|codex) ;; *) echo "engine must be opencode, claude or codex"; exit 2 ;; esac
+case "$engine" in opencode|claude|codex|fx) ;; *) echo "engine must be opencode, claude, codex or fx"; exit 2 ;; esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${PORT:-1427}"
 bridge="${BRIDGE:-}"
@@ -61,12 +65,13 @@ trap cleanup EXIT
 
 # temp HOME with the engines' real logins linked in
 mkdir -p "$work/home/vicuna/config" "$work/ws"
-for f in .claude .claude.json; do
+for f in .claude .claude.json .fx; do
   [ -e "$real_home/$f" ] && ln -s "$real_home/$f" "$work/home/$f"
 done
 oc_bin="${VICUNA_OPENCODE_BIN:-$(command -v opencode || true)}"
 cl_bin="${VICUNA_CLAUDE_BIN:-$(command -v claude || true)}"
 cx_bin="${VICUNA_CODEX_BIN:-$(command -v codex || true)}"
+fx_bin="${VICUNA_FX_BIN:-$(command -v fx || true)}"
 codex_home="${CODEX_HOME:-$real_home/.codex}"
 if [ "$engine" = "codex" ] && [ -n "${VICUNA_CODEX_FAKE:-}" ]; then
   fake_port=$((port + 1000))
@@ -87,6 +92,7 @@ start_bridge() { # extra env assignments...
     VICUNA_OPENCODE_BIN="${oc_bin:-/nonexistent/opencode}" \
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
     VICUNA_CODEX_BIN="${cx_bin:-/nonexistent/codex}" \
+    VICUNA_FX_BIN="${fx_bin:-/nonexistent/fx}" \
     CODEX_HOME="$codex_home" VICUNA_CODEX_EFFORT="${VICUNA_CODEX_EFFORT:-low}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
   pid=$!
@@ -137,7 +143,7 @@ saved_session() { # the engine session id Vicuna saved for this chat
   python3 - "$work/home/vicuna/config/opencode-sessions.json" "$engine" "accept-$$|$work/ws" <<'PY'
 import json, sys
 path, engine, key = sys.argv[1:]
-if engine in ("claude", "codex"):
+if engine in ("claude", "codex", "fx"):
     key = engine + "|" + key
 try:
     print(json.load(open(path)).get(key, ""))
@@ -146,7 +152,7 @@ except FileNotFoundError:
 PY
 }
 
-want_label() { case "$engine" in claude|codex) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
+want_label() { case "$engine" in claude|codex|fx) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
 
 check_turn() { # expect-substring label-check(yes|no)
   python3 - "$work/events.jsonl" "$1" "$2" "$(want_label)" <<'PY'
@@ -173,7 +179,7 @@ PY
 case "$mode" in
   missing)
     # exclusive overrides that do not exist: detection must report missing
-    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex
+    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex VICUNA_FX_BIN=/nonexistent/fx
     [ "$engine" = "opencode" ] || invoke work_engine_select "{\"engine\":\"$engine\"}" >/dev/null
     info="$(invoke work_engine_info '{}')"
     echo "work_engine_info: $info"
@@ -192,6 +198,10 @@ elif engine == "codex":
     assert d["label"] == "Codex" and d["installUrl"].startswith("https://developers.openai.com/codex"), d
     assert "Codex CLI not found, install it:" in d["missing"], d
     assert "Codex CLI not found, install it:" in start.get("error", ""), start
+elif engine == "fx":
+    assert d["label"] == "fx" and d["installUrl"].startswith("https://fx.sh"), d
+    assert "fx CLI not found, install it:" in d["missing"], d
+    assert "fx CLI not found, install it:" in start.get("error", ""), start
 else:
     assert d["path"] is None and d["installUrl"].startswith("https://opencode.ai/"), d
     assert "OpenCode CLI not found, install it:" in start.get("error", ""), start
@@ -708,5 +718,5 @@ print("PASS its model-menu error is clean and starts with the upgrade hint:", er
 PY
     ;;
   *)
-    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | combo <model> [engine] | stopq <model> [engine] | finder | finder-codex"; exit 2 ;;
+    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | combo <model> [engine] | stopq <model> [engine] | ask <model> [engine] | finder | finder-codex   (engine: opencode|claude|codex|fx)"; exit 2 ;;
 esac

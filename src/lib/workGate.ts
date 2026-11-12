@@ -14,7 +14,7 @@ export interface EngineSummary {
 /** Work engine detection (re-run on every call: Refresh, window focus): the
  *  current engine (opencode, Claude Code or Codex) plus a summary of all engines. */
 export interface WorkEngineInfo {
-  /** "opencode" | "claude" | "codex" (older backends omit it: opencode) */
+  /** "opencode" | "claude" | "codex" | "fx" (older backends omit it: opencode) */
   id?: string;
   label?: string;
   /** why the engine can't run, with the install hint */
@@ -51,7 +51,7 @@ export function engineId(info: WorkEngineInfo | null): string {
 
 export function engineLabel(info: WorkEngineInfo | null): string {
   const id = engineId(info);
-  return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : "OpenCode");
+  return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : id === "fx" ? "fx" : "OpenCode");
 }
 
 /** Engines the picker offers: the installed ones. The picker only shows
@@ -99,5 +99,7 @@ export function workReplyModel(
   if (r) return r;
   const p = picked?.trim();
   if (!p) return engine;
-  return engine === "claude" || engine === "codex" ? `${engine}/${p}` : p;
+  // fx ids are `provider/model` already; the engine prefix keeps them apart
+  // from the Codex engine's own `codex/<model>`
+  return engine === "claude" || engine === "codex" || engine === "fx" ? `${engine}/${p}` : p;
 }

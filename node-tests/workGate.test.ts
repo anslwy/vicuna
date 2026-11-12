@@ -124,3 +124,30 @@ test("Codex engine: label, reply label, gate and picker", () => {
   const missing = { ...codex, installed: false, missing: "Codex CLI not found, install it: https://developers.openai.com/codex/cli" } as WorkEngineInfo;
   assert.equal(workSendGate(missing).reason, missing.missing);
 });
+
+// ---------- fx as a fourth engine ----------
+test("fx engine: label, provider/model reply label, gate and picker", () => {
+  const fx: WorkEngineInfo = {
+    id: "fx", label: "fx", installed: true, path: "/home/u/.local/bin/fx", version: "0.0.16",
+    installUrl: "https://fx.sh/docs", model: null, configPath: null,
+    engines: [
+      { id: "opencode", label: "OpenCode", installed: true, version: "2.2.6", missing: null },
+      { id: "claude", label: "Claude Code", installed: true, version: "2.1.0", missing: null },
+      { id: "codex", label: "Codex", installed: true, version: "0.166.0", missing: null },
+      { id: "fx", label: "fx", installed: true, version: "0.0.16", missing: null },
+    ],
+  } as WorkEngineInfo;
+  assert.equal(engineId(fx), "fx");
+  assert.equal(engineLabel(fx), "fx");
+  assert.equal(engineLabel({ ...fx, label: "" } as WorkEngineInfo), "fx");
+  assert.deepEqual(workEngineChoices(fx).map((e) => e.id), ["opencode", "claude", "codex", "fx"]);
+  assert.equal(workSendGate(fx).blocked, false);
+  // both routes: fx's codex provider and a configured ollama provider
+  assert.equal(workReplyModel(null, "codex/gpt-6-luna", "fx"), "fx/codex/gpt-6-luna");
+  assert.equal(workReplyModel(null, "ollama/deepseek-v4.1-flash:cloud", "fx"), "fx/ollama/deepseek-v4.1-flash:cloud");
+  assert.equal(workReplyModel("fx/ollama/deepseek-v4.1-flash:cloud", "codex/gpt-6-luna", "fx"), "fx/ollama/deepseek-v4.1-flash:cloud");
+  assert.equal(workReplyModel(null, null, "fx"), "fx");
+  const missing = { ...fx, installed: false, missing: "fx CLI not found, install it: https://fx.sh/docs" } as WorkEngineInfo;
+  assert.equal(workSendGate(missing).blocked, true);
+  assert.equal(workSendGate(missing).reason, missing.missing);
+});
