@@ -1,7 +1,7 @@
 // Turn-finished notification gate (run: `npm test`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldNotify, notifyTitle, notifyBody, parseNotifyPref } from "../src/lib/notifyGate.ts";
+import { shouldNotify, notifyTitle, notifyBody, parseNotifyPref, askBody } from "../src/lib/notifyGate.ts";
 
 const base = { enabled: true, focused: false, visible: true, userStopped: false };
 
@@ -39,4 +39,13 @@ test("pref defaults to on", () => {
   assert.equal(parseNotifyPref(null), true);
   assert.equal(parseNotifyPref("0"), false);
   assert.equal(parseNotifyPref("1"), true);
+});
+test("ask body: question clipped, empty falls back", () => {
+  assert.equal(askBody("Which color?"), "Which color?");
+  assert.equal(askBody("  \n multi\nline \t question  "), "multi line question");
+  assert.equal(askBody(""), "The agent is waiting for your answer.");
+  assert.equal(askBody("   "), "The agent is waiting for your answer.");
+  const b = askBody("x".repeat(200));
+  assert.ok(b.length <= 80);
+  assert.ok(b.endsWith("…"));
 });

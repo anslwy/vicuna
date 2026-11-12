@@ -11,6 +11,8 @@
     "opener:allow-open-path",
     "sql:default",
     "sql:allow-execute",
-    "notification:default"
+    "notification:default",
+    "updater:default",
+    "process:default"
   ]
 }

@@ -28,3 +28,8 @@ export const CODEX_ICON_PROMPT_PATH = "M7.5 9.2l2.5 2.8-2.5 2.8M12.6 14.7h3.3";
 // "𝒇x"), drawn as strokes like the Codex mark so it follows the theme.
 export const FX_ICON_PATH =
   "M4 20.5c1.6 0 2.4-.9 2.8-2.8L9.2 6.3C9.6 4.4 10.4 3.5 12 3.5M5.5 9.5h6M13.5 12l6 7.5M19.5 12l-6 7.5";
+
+// Antigravity (agy) mark: a rising arch drawn as one stroke (fill none,
+// stroke currentColor, width 2, round caps), Vicuna's own line drawing
+// in the spirit of the CLI's arch logo, so it follows the theme.
+export const AGY_ICON_PATH = "M4 19.5c2 0 2.9-1.3 3.8-3.6L12 4.5l4.2 11.4c.9 2.3 1.8 3.6 3.8 3.6";

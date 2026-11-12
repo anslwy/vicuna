@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Headless acceptance for Work mode (opencode and fx over ACP, Claude Code
-# via `claude -p` stream-json, Codex via `codex app-server`),
+# Headless acceptance for Work mode (opencode over ACP, Claude Code via
+# `claude -p` stream-json, Codex via `codex app-server`, Antigravity via
+# `agy acp`, fx via `fx acp`),
 # through the real backend: the loopback bridge, no Tauri window needed.
 #
 #   scripts/work-acceptance.sh missing [engine]          # engine forced missing
@@ -11,13 +12,16 @@
 #   scripts/work-acceptance.sh combo <model> [engine]    # ONE turn: MCP tool with real args + 'ask' approval of a shell command
 #   scripts/work-acceptance.sh stopq <model> [engine]    # a message queued mid-turn runs next; Stop interrupts a long reply
 #   scripts/work-acceptance.sh ask <model> [engine]      # agent question (vicuna-mcp ask_user): card, answer continues, Stop cancels
+#   scripts/work-acceptance.sh always <model> [engine]   # 'ask' mode: "Always allow" on the first shell command approves the second
+#   scripts/work-acceptance.sh stoptool <model> [engine] # Stop during a long shell command ends the turn AND the command; missing workspace errors
 #   scripts/work-acceptance.sh plan <model> codex       # Codex goal/plan updates show as a transcript note (1 turn)
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
 #
-#   engine = opencode (default) | claude | codex | fx
+#   engine = opencode (default) | claude | codex | agy | fx
 #   e.g.  present opencode/beam-free          present haiku claude
 #         present gpt-6-luna codex            combo gpt-6-luna codex
+#         present gemini-3.8-flash-medium agy
 #         present codex/gpt-6-luna fx         combo ollama/deepseek-v4.1-flash:cloud fx
 #   fx models are <fx provider>/<model>; the ollama route needs an "ollama"
 #   provider in ~/.fx/settings.json (see src-tauri/src/fx.rs). fx refuses a
@@ -27,7 +31,8 @@
 # Build the bridge first:  (cd bridge && cargo build)
 # Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
 #      src-tauri/target/debug/vicuna-bridge), PORT (default 1427),
-#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN / VICUNA_FX_BIN,
+#      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN /
+#      VICUNA_AGY_BIN / VICUNA_FX_BIN,
 #      VICUNA_CODEX_EFFORT (codex reasoning effort; default here: low),
 #      VICUNA_CODEX_FAKE=1: run the real `codex app-server` against
 #      scripts/fake-codex-provider.py (a scripted Responses API in a temp
@@ -38,14 +43,15 @@
 # mcp = 1, approve = 1, toolcap = 1, combo = 1, ask = 2 (Codex: present + combo = 3). Every mode runs the bridge with a temporary HOME so
 # the user's real ~/vicuna/config is never touched; opencode keeps its real
 # XDG config/auth, Claude its real ~/.claude login (symlinked in) and Codex
-# its real ~/.codex (CODEX_HOME).
+# its real ~/.codex (CODEX_HOME) and agy its real ~/.gemini (symlinked in,
+# never copied).
 set -euo pipefail
 
 mode="${1:-}"
 model="${2:-}"
 engine="${3:-opencode}"
 [ "$mode" = "missing" ] && engine="${2:-opencode}"
-case "$engine" in opencode|claude|codex|fx) ;; *) echo "engine must be opencode, claude, codex or fx"; exit 2 ;; esac
+case "$engine" in opencode|claude|codex|agy|fx) ;; *) echo "engine must be opencode, claude, codex, agy or fx"; exit 2 ;; esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${PORT:-1427}"
 bridge="${BRIDGE:-}"
@@ -66,12 +72,14 @@ trap cleanup EXIT
 
 # temp HOME with the engines' real logins linked in
 mkdir -p "$work/home/vicuna/config" "$work/ws"
-for f in .claude .claude.json; do
+for f in .claude .claude.json .gemini; do
   [ -e "$real_home/$f" ] && ln -s "$real_home/$f" "$work/home/$f"
 done
 oc_bin="${VICUNA_OPENCODE_BIN:-$(command -v opencode || true)}"
 cl_bin="${VICUNA_CLAUDE_BIN:-$(command -v claude || true)}"
 cx_bin="${VICUNA_CODEX_BIN:-$(command -v codex || true)}"
+agy_bin="${VICUNA_AGY_BIN:-$(command -v agy || true)}"
+[ -z "$agy_bin" ] && [ -x "$real_home/.local/bin/agy" ] && agy_bin="$real_home/.local/bin/agy"
 fx_bin="${VICUNA_FX_BIN:-$(command -v fx || true)}"
 codex_home="${CODEX_HOME:-$real_home/.codex}"
 if [ "$engine" = "codex" ] && [ -n "${VICUNA_CODEX_FAKE:-}" ]; then
@@ -93,6 +101,7 @@ start_bridge() { # extra env assignments...
     VICUNA_OPENCODE_BIN="${oc_bin:-/nonexistent/opencode}" \
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
     VICUNA_CODEX_BIN="${cx_bin:-/nonexistent/codex}" \
+    VICUNA_AGY_BIN="${agy_bin:-/nonexistent/agy}" \
     VICUNA_FX_BIN="${fx_bin:-/nonexistent/fx}" VICUNA_FX_HOME="${VICUNA_FX_HOME:-$real_home}" \
     CODEX_HOME="$codex_home" VICUNA_CODEX_EFFORT="${VICUNA_CODEX_EFFORT:-low}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
@@ -144,7 +153,7 @@ saved_session() { # the engine session id Vicuna saved for this chat
   python3 - "$work/home/vicuna/config/opencode-sessions.json" "$engine" "accept-$$|$work/ws" <<'PY'
 import json, sys
 path, engine, key = sys.argv[1:]
-if engine in ("claude", "codex", "fx"):
+if engine in ("claude", "codex", "agy", "fx"):
     key = engine + "|" + key
 try:
     print(json.load(open(path)).get(key, ""))
@@ -153,7 +162,7 @@ except FileNotFoundError:
 PY
 }
 
-want_label() { case "$engine" in claude|codex|fx) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
+want_label() { case "$engine" in claude|codex|agy|fx) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
 
 check_turn() { # expect-substring label-check(yes|no)
   python3 - "$work/events.jsonl" "$1" "$2" "$(want_label)" <<'PY'
@@ -180,7 +189,7 @@ PY
 case "$mode" in
   missing)
     # exclusive overrides that do not exist: detection must report missing
-    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex VICUNA_FX_BIN=/nonexistent/fx
+    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex VICUNA_AGY_BIN=/nonexistent/agy VICUNA_FX_BIN=/nonexistent/fx
     [ "$engine" = "opencode" ] || invoke work_engine_select "{\"engine\":\"$engine\"}" >/dev/null
     info="$(invoke work_engine_info '{}')"
     echo "work_engine_info: $info"
@@ -199,6 +208,10 @@ elif engine == "codex":
     assert d["label"] == "Codex" and d["installUrl"].startswith("https://developers.openai.com/codex"), d
     assert "Codex CLI not found, install it:" in d["missing"], d
     assert "Codex CLI not found, install it:" in start.get("error", ""), start
+elif engine == "agy":
+    assert d["label"] == "Antigravity" and d["installUrl"].startswith("https://antigravity.google"), d
+    assert "Antigravity CLI (agy) not found, install it:" in d["missing"], d
+    assert "Antigravity CLI (agy) not found, install it:" in start.get("error", ""), start
 elif engine == "fx":
     assert d["label"] == "fx" and d["installUrl"].startswith("https://fx.sh"), d
     assert "fx CLI not found, install it:" in d["missing"], d
@@ -333,6 +346,113 @@ text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
 assert "vicuna-approve-ok" in outs + text, (outs[:300], text[:300])
 import os
 print("PASS ask mode: the command waited for the ask card, ran after Allow, transcript says Approved")
+PY
+    ;;
+  stoptool)
+    [ -n "$model" ] || { echo "usage: $0 stoptool <model> [engine]"; exit 2; }
+    # Stop while a shell command runs: the turn ends (done stopped=true) and
+    # the command's process is gone too (agy leaves it running on cancel).
+    # Then a turn in a folder that does not exist fails with a readable error.
+    start_bridge
+    marker="vicuna-stoptool-$$"
+    start="$(invoke work_agent_start "$(turn_args "st-$$" true "Use your shell tool to run exactly this one command and wait for it to finish: sleep 45 && echo $marker. Do not run it in the background.")")"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    stopped_at=""
+    for _ in $(seq 1 240); do
+      curl -sS "$base/poll/st-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      if [ -z "$stopped_at" ] && grep -q '"type": "toolstart"' "$work/events.jsonl" && pgrep -f "sleep 45" >/dev/null; then
+        sleep 2
+        echo "sleep is running; pressing Stop"
+        invoke work_agent_stop "{\"turnId\":\"$turn_id\"}" >/dev/null
+        stopped_at=1
+      fi
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    sleep 2
+    left="$(pgrep -fa "sleep 45" || true)"
+    python3 - "$work/events.jsonl" "$stopped_at" "$left" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert sys.argv[2] == "1", "the shell command never started"
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+done = [e for e in evs if e.get("type") == "done"]
+assert done and done[-1].get("stopped") is True, done
+assert not sys.argv[3].strip(), f"the command outlived Stop: {sys.argv[3]}"
+print("PASS Stop mid-tool: turn stopped and the running command was ended")
+PY
+    start="$(invoke work_agent_start "$(python3 - "$model" "$engine" <<'PY'
+import json, sys
+print(json.dumps({"engine": sys.argv[2], "model": sys.argv[1], "workspace": "/nonexistent/vicuna-ws", "sessionId": "gone-1",
+                  "freshSession": True, "messages": [{"role": "user", "content": "hi"}], "onEvent": {"__bridge_channel": "gone-1"}}))
+PY
+)")"
+    poll_turn "gone-1"
+    python3 - "$work/events.jsonl" "$start" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+start = json.loads(sys.argv[2])
+msgs = [e.get("message", "") for e in evs if e.get("type") == "error"] + [start.get("error") or ""]
+assert any("workspace folder not found: /nonexistent/vicuna-ws" in m for m in msgs), (start, evs[-3:])
+print("PASS missing workspace: readable error:", [m for m in msgs if m][0])
+PY
+    ;;
+  always)
+    [ -n "$model" ] || { echo "usage: $0 always <model> [engine]"; exit 2; }
+    # "Ask before running tools" + "Always allow": the first shell command's
+    # card is answered Always allow; the second shell command in the same
+    # session runs without a card (transcript: "Always allowed", then
+    # "Auto-approved").
+    start_bridge
+    invoke work_set_approval '{"ask":true}' >/dev/null
+    start="$(invoke work_agent_start "$(turn_args "al-$$" true "Use your shell tool twice, as two separate tool calls, one after the other: first run exactly: echo vicuna-first-ok > first.txt ; then run exactly: echo vicuna-second-ok > second.txt && cat first.txt second.txt . Then reply with the final output.")")"
+    echo "work_agent_start: $start"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    seen=""
+    for _ in $(seq 1 600); do
+      curl -sS "$base/poll/al-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      for aid in $(python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e.get("type") == "askrequest":
+        print(e["ask_id"])
+PY
+); do
+        case " $seen " in *" $aid "*) continue ;; esac
+        seen="$seen $aid"
+        echo "ask card $aid -> Always allow"
+        invoke work_agent_answer "{\"turnId\":\"$turn_id\",\"askId\":\"$aid\",\"answer\":\"Always allow\"}" >/dev/null
+      done
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    invoke work_set_approval '{"ask":false}' >/dev/null
+    python3 - "$work/events.jsonl" "$work/ws" <<'PY'
+import json, os, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+errs = [e for e in evs if e.get("type") == "error"]
+assert not errs, errs
+asks = [e for e in evs if e.get("type") == "askrequest"]
+assert asks, "no ask card appeared"
+print("  card options:", asks[0]["options"])
+assert any(o.lower() == "always allow" for o in asks[0]["options"]), asks[0]["options"]
+execs = [e for e in evs if e.get("type") == "toolstart" and e.get("name") == "exec"]
+assert len(execs) >= 2, f"expected two shell calls, got {len(execs)}"
+assert len(asks) < len(execs), f"{len(asks)} cards for {len(execs)} shell calls: Always allow was not remembered"
+notes = "".join(e.get("text", "") for e in evs if e.get("type") == "displaynote")
+assert "Always allowed:" in notes and "Auto-approved:" in notes, notes
+ws = sys.argv[2]
+assert open(os.path.join(ws, "second.txt")).read().strip() == "vicuna-second-ok", "second command did not run in the workspace"
+print(f"PASS always: {len(asks)} card(s) for {len(execs)} shell calls; transcript says Always allowed, then Auto-approved")
 PY
     ;;
   ask)
