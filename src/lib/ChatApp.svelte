@@ -2,6 +2,7 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { shouldWarnOllamaUnavailable } from "$lib/ollamaWarning";
   import { notifyTurnEnd, notifyAgentAsk, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
@@ -1514,6 +1515,8 @@
   async function pickWorkModel(id: string | null) {
     workModel = id;
     modelOpen = false;
+    error = null;
+    await warnIfOllamaUnavailable(id?.startsWith("ollama/") ?? false);
     try {
       await setWorkModel(engineId(workEngineInfo), id);
     } catch (e: any) {
@@ -2964,14 +2967,34 @@
     persistPrefs();
   }
 
+  const ollamaUnavailableMessage = () => `Ollama isn't reachable at ${activeOllamaBase()}. Start Ollama to use this model.`;
+
+  async function warnIfOllamaUnavailable(isOllamaModel: boolean): Promise<boolean> {
+    if (!isOllamaModel) return false;
+    try {
+      await serverVersion();
+      return false;
+    } catch {
+      if (shouldWarnOllamaUnavailable(isOllamaModel, false)) error = ollamaUnavailableMessage();
+      return true;
+    }
+  }
+
+  async function pickChatModel(id: string) {
+    selectedModel = id;
+    modelOpen = false;
+    error = null;
+    save();
+    await warnIfOllamaUnavailable(!isOpenRouterSelection(id));
+  }
+
   async function refreshModels() {
     try {
       const tags = await listModels();
       models = tags.map((t) => t.name);
       if (models.length > 0 && !models.includes(selectedModel) && !isOpenRouterSelection(selectedModel)) selectedModel = models[0];
-      error = null;
-    } catch (err: any) {
-      error = `Cannot reach Ollama at ${activeOllamaBase()}. Is \`ollama serve\` running?`;
+    } catch {
+      // Ollama is optional; the picker can still show catalog models as unavailable.
     }
   }
 
@@ -3623,7 +3646,9 @@
       if (err?.name === "AbortError") {
         // keep partial
       } else {
-        error = err?.message ?? String(err);
+        if (!await warnIfOllamaUnavailable(!isOpenRouterSelection(selectedModel))) {
+          error = err?.message ?? String(err);
+        }
         chatErrorIds.add(chat.id);
         const c = chats.find((x) => x.id === chat.id);
         if (c && removeIfEmpty && !produced) {
@@ -6410,7 +6435,9 @@
           void settle(ev.stopped);
           break;
         case "error":
-          error = ev.message;
+          void warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false).then((warned) => {
+            if (!warned) error = ev.message;
+          });
           setToolStatus(chat.id, null);
           void settle(false);
           break;
@@ -6430,7 +6457,9 @@
         onEvent: (ev) => handleEvent(ev)
       });
     } catch (e: any) {
-      error = typeof e === "string" ? e : (e?.message ?? String(e));
+      if (!await warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false)) {
+        error = typeof e === "string" ? e : (e?.message ?? String(e));
+      }
       await settle(true);
       return;
     }
@@ -7836,7 +7865,7 @@
                         data-provider={choice.provider}
                         data-model={choice.id}
                         title={choice.sub || choice.name}
-                        onclick={() => { selectedModel = choice.id; modelOpen = false; save(); }}
+                        onclick={() => void pickChatModel(choice.id)}
                       >
                         <span class="model-opt-top">
                           <span class="prov-ico" aria-hidden="true">
