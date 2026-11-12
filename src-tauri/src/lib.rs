@@ -18,6 +18,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
 use tauri_plugin_sql::{DbInstances, DbPool};
 pub mod acp;
+pub mod agy;
 pub mod browser;
 pub mod mcp;
 pub mod opencode;

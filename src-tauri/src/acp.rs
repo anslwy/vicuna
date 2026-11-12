@@ -1,4 +1,7 @@
-// Vicuna Work mode on opencode, driven over the Agent Client Protocol (ACP).
+// Vicuna Work mode on opencode and Antigravity (agy), driven over the Agent
+// Client Protocol (ACP). agy differs in three ways: one process per workspace
+// (it runs tools in its own cwd), full model ids via session/set_model, and
+// Allow/Deny-only permission requests (Vicuna adds "Always allow").
 // (The Claude Code engine drives the `claude` CLI's stream-json protocol
 // instead: claude_cli.rs; run_turn dispatches by engine. Both share this
 // module's session store, MCP planning, prompts and turn helpers.)
@@ -16,7 +19,7 @@
 // (allow_once -> allow_always -> first allow) and shown as a note.
 // There is no fallback engine: without opencode, Work mode is disabled.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +42,8 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const OUTPUT_CAP: usize = 32 * 1024;
+/// session/new tries for agy (see open_session_retrying).
+const AGY_SESSION_ATTEMPTS: u32 = 3;
 
 pub fn not_found_message() -> String {
     format!("OpenCode CLI not found, install it: {INSTALL_URL}")
@@ -61,7 +66,10 @@ struct Proc {
 pub struct AcpState {
     sessions: Mutex<HashMap<String, String>>,
     loaded: AtomicBool,
-    procs: tokio::sync::Mutex<HashMap<Engine, Proc>>,
+    /// (engine, workspace) -> warm process. The workspace is empty for
+    /// engines with one shared process (opencode); agy runs its tools in its
+    /// own working directory, so it gets one process per workspace.
+    procs: tokio::sync::Mutex<HashMap<(Engine, String), Proc>>,
 }
 
 impl AcpState {
@@ -102,48 +110,48 @@ impl AcpState {
 
     /// The warm, initialized ACP client for `engine`; (re)spawned when there
     /// is none, it died, or detection now resolves a different binary.
-    async fn client(&self, engine: Engine) -> Result<Arc<AcpClient>, String> {
-        if engine != Engine::Opencode {
-            return Err(format!("{} does not run over ACP", engine.label()));
-        }
-        let bin = find_opencode().ok_or_else(not_found_message)?;
-        let mut cmd = super::opencode::command(&bin);
-        cmd.arg("acp");
+    async fn client(&self, engine: Engine, workspace: &str) -> Result<Arc<AcpClient>, String> {
+        let ask_now = super::work_engine::approval_ask();
+        let (bin, cmd, ws) = match engine {
+            Engine::Opencode => {
+                let bin = find_opencode().ok_or_else(not_found_message)?;
+                let mut cmd = super::opencode::command(&bin);
+                cmd.arg("acp");
+                (bin, cmd, String::new())
+            }
+            Engine::Agy => {
+                let bin = super::agy::find_agy().ok_or_else(super::agy::missing_message)?;
+                let cmd = super::agy::command(&bin, ask_now, Path::new(workspace));
+                (bin, cmd, workspace.to_string())
+            }
+            _ => return Err(format!("{} does not run over ACP", engine.label())),
+        };
+        let key = (engine, ws);
         let mut guard = self.procs.lock().await;
-        if let Some(p) = guard.get(&engine) {
-            let ask_now = engine == Engine::Opencode && super::work_engine::approval_ask();
+        if let Some(p) = guard.get(&key) {
             if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin && p.ask == ask_now {
                 return Ok(p.client.clone());
             }
         }
-        guard.remove(&engine);
-        let label = engine_process_label(engine);
-        let (client, child) = spawn_acp(cmd, label, &bin)?;
-        client
-            .call(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false
-                    },
-                    "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": env!("CARGO_PKG_VERSION") }
-                }),
-                INIT_TIMEOUT,
-            )
-            .await
-            .map_err(|e| format!("{label} initialize failed: {e}"))?;
+        guard.remove(&key);
+        let (client, child) = start_initialized(cmd, engine_process_label(engine), &bin).await?;
         guard.insert(
-            engine,
+            key,
             Proc {
                 client: client.clone(),
-                ask: engine == Engine::Opencode && super::work_engine::approval_ask(),
+                ask: ask_now,
                 bin,
                 _child: child,
             },
         );
         Ok(client)
+    }
+
+    /// Drop a warm process (e.g. it failed to start a session) so the next
+    /// call respawns it.
+    async fn discard(&self, engine: Engine, workspace: &str) {
+        let ws = if engine == Engine::Agy { workspace.to_string() } else { String::new() };
+        self.procs.lock().await.remove(&(engine, ws));
     }
 
     /// Start the current engine's warm process ahead of the first Work turn
@@ -152,9 +160,34 @@ impl AcpState {
         let engine = super::work_engine::current_engine();
         // only opencode keeps a warm process; claude starts per turn
         if engine == Engine::Opencode && engine.is_present() {
-            let _ = self.client(engine).await;
+            let _ = self.client(engine, "").await;
         }
     }
+}
+
+/// Spawn an ACP agent and run `initialize`.
+async fn start_initialized(
+    cmd: tokio::process::Command,
+    label: &'static str,
+    bin: &Path,
+) -> Result<(Arc<AcpClient>, Child), String> {
+    let (client, child) = spawn_acp(cmd, label, bin)?;
+    client
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false
+                },
+                "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": env!("CARGO_PKG_VERSION") }
+            }),
+            INIT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("{label} initialize failed: {e}"))?;
+    Ok((client, child))
 }
 
 fn engine_process_label(engine: Engine) -> &'static str {
@@ -162,6 +195,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Opencode => "opencode acp",
         Engine::Claude => "claude",
         Engine::Codex => "codex app-server",
+        Engine::Agy => "agy acp",
     }
 }
 
@@ -189,6 +223,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Opencode => format!("{id}|{workspace}"),
         Engine::Claude => format!("claude|{id}|{workspace}"),
         Engine::Codex => format!("codex|{id}|{workspace}"),
+        Engine::Agy => format!("agy|{id}|{workspace}"),
     })
 }
 
@@ -344,7 +379,9 @@ fn resolve_executable(name: &str) -> Option<String> {
     if p.is_absolute() && p.is_file() {
         return Some(name.to_string());
     }
-    let path = std::env::var_os("PATH")?;
+    // the terminal's PATH (login shell + process PATH): a GUI app's own PATH
+    // misses nvm/uv/homebrew tools, and fx only accepts absolute commands
+    let path = crate::exe_resolve::child_path(None).or_else(|| std::env::var_os("PATH"))?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
         if candidate.is_file() {
@@ -377,6 +414,29 @@ fn current_model(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The model a session result reports: agy's `models.currentModelId` is the
+/// full id it lists (`gemini-3.8-flash-medium`; its `model` config option
+/// drops the thinking level), the others report `configOptions.model`.
+fn acp_model(engine: Engine, result: &Value) -> Option<String> {
+    if engine == Engine::Agy {
+        if let Some(m) = result
+            .pointer("/models/currentModelId")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+        {
+            return Some(m.to_string());
+        }
+    }
+    current_model(result)
+}
+
+/// agy sometimes fails its first session with "ACP session startup timed
+/// out" (its backend warming up); a retry on the same process succeeds.
+fn is_startup_timeout(e: &str) -> bool {
+    let low = e.to_lowercase();
+    low.contains("timed out") || low.contains("timeout")
+}
+
 /// Provider rejections caused by too many tools in the request (OpenAI-style
 /// "maximum number of items is 128" on `tools`, and similar wordings).
 fn is_tool_limit_error(e: &str) -> bool {
@@ -407,6 +467,10 @@ struct AcpClient {
     stderr_tail: Arc<Mutex<String>>,
     closed: Arc<AtomicBool>,
     label: &'static str,
+    /// `sessionId|tool` pairs the user answered "Always allow" for, when the
+    /// agent offers no allow_always option of its own (agy): later requests
+    /// for that tool in that session are approved without a card.
+    always: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Unregisters a session's update route when the turn ends.
@@ -532,9 +596,10 @@ fn spawn_acp(
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let stderr_tail = Arc::new(Mutex::new(String::new()));
     let closed = Arc::new(AtomicBool::new(false));
+    let always: Arc<Mutex<HashSet<String>>> = Arc::default();
 
-    let (pending_r, routes_r, write_r, closed_r) =
-        (pending.clone(), routes.clone(), write_tx.clone(), closed.clone());
+    let (pending_r, routes_r, write_r, closed_r, always_r) =
+        (pending.clone(), routes.clone(), write_tx.clone(), closed.clone(), always.clone());
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -549,9 +614,12 @@ fn spawn_acp(
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
                     // "ask" mode: hand the permission request to the turn
                     // that owns the session; it asks the user and responds.
+                    let remembered = always_key(&params)
+                        .is_some_and(|k| always_r.lock().map(|a| a.contains(&k)).unwrap_or(false));
                     if method == "session/request_permission"
                         && super::work_engine::approval_ask()
                         && has_route(&routes_r, &params)
+                        && !remembered
                     {
                         let fwd = json!({ "vicuna_permission_request": { "id": id, "params": params.clone() } });
                         forward(&routes_r, &params, fwd);
@@ -632,6 +700,7 @@ fn spawn_acp(
         stderr_tail,
         closed,
         label,
+        always,
     });
     Ok((client, child))
 }
@@ -663,9 +732,49 @@ fn permission_options(params: &Value) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+/// The label Vicuna adds when the agent has no allow_always option.
+pub(crate) const ALWAYS_LABEL: &str = "Always allow";
+
+/// Whether the ask card gets a synthesized "Always allow" (an allow option
+/// exists but no allow_always one).
+fn synth_always(params: &Value) -> bool {
+    let opts = permission_options(params);
+    opts.iter().any(|(_, k, _)| k.starts_with("allow")) && !opts.iter().any(|(_, k, _)| k == "allow_always")
+}
+
+/// Card labels: the agent's options, plus "Always allow" right after its
+/// first allow option when the agent offers none.
+fn permission_labels(params: &Value) -> Vec<String> {
+    let opts = permission_options(params);
+    let mut labels: Vec<String> = opts.iter().map(|(_, _, n)| n.clone()).collect();
+    if synth_always(params) {
+        let at = opts.iter().position(|(_, k, _)| k.starts_with("allow")).map_or(labels.len(), |i| i + 1);
+        labels.insert(at, ALWAYS_LABEL.to_string());
+    }
+    labels
+}
+
+/// The remembered-approval key of a permission request: session + the
+/// agent's tool name (agy `run_command`), else its kind.
+fn always_key(params: &Value) -> Option<String> {
+    let sid = params.get("sessionId")?.as_str()?;
+    let tc = params.get("toolCall")?;
+    let tool = tc
+        .get("name")
+        .or_else(|| tc.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())?;
+    Some(format!("{sid}|{tool}"))
+}
+
+/// True when `answer` is the synthesized "Always allow" for this request.
+fn is_synth_always(params: &Value, answer: &str) -> bool {
+    synth_always(params) && answer.trim().eq_ignore_ascii_case(ALWAYS_LABEL)
+}
+
 fn permission_answer(params: &Value, answer: &str) -> (Value, bool) {
     let opts = permission_options(params);
-    let a = answer.trim().to_lowercase();
+    let a = if is_synth_always(params, answer) { "allow".to_string() } else { answer.trim().to_lowercase() };
     let by_kind = |pref: &str| opts.iter().find(|(_, k, _)| k.starts_with(pref));
     let chosen = opts
         .iter()
@@ -702,7 +811,7 @@ fn spawn_permission_ask(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or("a tool call")
         .to_string();
-    let labels: Vec<String> = permission_options(&params).into_iter().map(|(_, _, n)| n).collect();
+    let labels = permission_labels(&params);
     let ask_id = format!("perm-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = oneshot::channel::<String>();
     if let Ok(mut m) = turn.ask_pending.lock() {
@@ -716,8 +825,14 @@ fn spawn_permission_ask(
     tokio::spawn(async move {
         let answer = rx.await.unwrap_or_else(|_| "cancelled".to_string());
         let (result, allowed) = permission_answer(&params, &answer);
+        let remember = allowed && is_synth_always(&params, &answer);
+        if remember {
+            if let (Some(k), Ok(mut a)) = (always_key(&params), client.always.lock()) {
+                a.insert(k);
+            }
+        }
         let _ = client.respond(id, result);
-        let verdict = if allowed { "Approved" } else { "Denied" };
+        let verdict = if remember { "Always allowed" } else if allowed { "Approved" } else { "Denied" };
         emit_ev(&on_event, &turn.stop, WorkAgentEvent::DisplayNote { text: format!("\n> {verdict}: {title}\n") });
     });
 }
@@ -850,23 +965,21 @@ fn tool_output(update: &Value) -> String {
 }
 
 pub(crate) fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (String, Value) {
-    let path = raw
-        .get("path")
-        .or_else(|| raw.get("file_path"))
-        .or_else(|| raw.get("filePath"))
-        .and_then(|p| p.as_str())
+    // agy spells its arguments in CamelCase (AbsolutePath, CommandLine, ...)
+    let path = ["path", "file_path", "filePath", "AbsolutePath", "TargetFile", "DirectoryPath", "SearchPath", "SearchDirectory"]
+        .iter()
+        .find_map(|k| raw.get(*k).and_then(|p| p.as_str()))
         .unwrap_or(title);
     let command = raw
         .get("command")
         .or_else(|| raw.get("cmd"))
+        .or_else(|| raw.get("CommandLine"))
         .and_then(|c| c.as_str());
     // opencode glob/search tools can arrive as kind "read" with a pattern in
     // rawInput; show them as a search instead of "read — <title>".
-    let pattern = raw
-        .get("pattern")
-        .or_else(|| raw.get("glob"))
-        .or_else(|| raw.get("query"))
-        .and_then(|v| v.as_str());
+    let pattern = ["pattern", "glob", "query", "Pattern", "Query"]
+        .iter()
+        .find_map(|k| raw.get(*k).and_then(|v| v.as_str()));
     if let Some(pattern) = pattern {
         if kind_hint != "edit" {
             return (
@@ -881,7 +994,13 @@ pub(crate) fn tool_name_and_args(kind_hint: &str, title: &str, raw: &Value) -> (
         "edit" => json!({ "path": path }),
         "search" => json!({ "pattern": title }),
         "fetch" => json!({ "url": raw.get("url").and_then(|v| v.as_str()).unwrap_or(title) }),
-        _ => raw.clone(),
+        _ => {
+            let mut r = raw.clone();
+            if let Some(m) = r.as_object_mut() {
+                m.remove("toolSummary");
+            }
+            r
+        }
     };
     let name = match kind_hint {
         "execute" | "shell" => "exec",
@@ -901,6 +1020,8 @@ struct ToolState {
     ended: bool,
     kind: String,
     title: String,
+    /// The agent's own tool name, when it sends one (fx).
+    tool: Option<String>,
     raw: Value,
 }
 
@@ -930,6 +1051,7 @@ fn tool_events(update: &Value, tools: &mut HashMap<String, ToolState>) -> Vec<Wo
         ended: false,
         kind: "other".to_string(),
         title: "tool".to_string(),
+        tool: None,
         raw: json!({}),
     });
     if let Some(k) = update.get("kind").and_then(|k| k.as_str()) {
@@ -938,12 +1060,22 @@ fn tool_events(update: &Value, tools: &mut HashMap<String, ToolState>) -> Vec<Wo
     if let Some(t) = update.get("title").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
         entry.title = t.to_string();
     }
+    // fx names each call (`name`: write_file, shell, an MCP tool); for kinds
+    // without a native mapping that name reads better than a generic title
+    if let Some(n) = update.get("name").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
+        entry.tool = Some(n.to_string());
+    }
     if let Some(r) = update.get("rawInput").filter(|r| has_input(r)) {
         entry.raw = r.clone();
     }
     let finished = matches!(status, "completed" | "failed" | "cancelled");
     if !entry.started && (has_input(&entry.raw) || status == "in_progress" || finished) {
-        let (name, args) = tool_name_and_args(&entry.kind, &entry.title, &entry.raw);
+        let native = matches!(entry.kind.as_str(), "execute" | "shell" | "read" | "edit" | "search" | "fetch");
+        let title = match (&entry.tool, native) {
+            (Some(t), false) => t.clone(),
+            _ => entry.title.clone(),
+        };
+        let (name, args) = tool_name_and_args(&entry.kind, &title, &entry.raw);
         entry.name = name.clone();
         entry.started = true;
         out.push(WorkAgentEvent::ToolStart { name, args });
@@ -993,6 +1125,11 @@ fn handle_session_update(
                 emit_ev(on_event, stop, ev);
             }
         }
+        "plan" => {
+            if let Some(note) = plan_note(update) {
+                emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: note });
+            }
+        }
         "vicuna_permission" => {
             if let Some(title) = update.get("title").and_then(|t| t.as_str()) {
                 emit_ev(
@@ -1006,6 +1143,25 @@ fn handle_session_update(
         }
         _ => {}
     }
+}
+
+/// ACP `plan` update (entries with content + status) as a transcript checklist.
+fn plan_note(update: &Value) -> Option<String> {
+    let entries = update.get("entries").and_then(Value::as_array)?;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n\n**Plan**\n");
+    for e in entries {
+        let mark = match e.get("status").and_then(Value::as_str) {
+            Some("completed") => "[x]",
+            Some("in_progress") => "[~]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("- {mark} {}\n", e.get("content").and_then(Value::as_str).unwrap_or("").trim()));
+    }
+    out.push('\n');
+    Some(out)
 }
 
 fn image_blocks(images: &Option<Vec<String>>) -> Vec<Value> {
@@ -1138,7 +1294,9 @@ pub async fn run_turn(
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
     // each claude process and each codex app-server gets its own.
-    let route = (engine == Engine::Opencode).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    // agy: one warm process per workspace whose sessions keep their MCP
+    // connections, so the same stable per-workspace route as opencode.
+    let route = matches!(engine, Engine::Opencode | Engine::Agy).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1214,7 +1372,7 @@ async fn open_session(
                 .call(method, session_params(workspace, Some(&prev), mcp), SESSION_TIMEOUT)
                 .await
             {
-                let model = current_model(&r);
+                let model = acp_model(engine, &r);
                 return Ok((prev, true, model));
             }
         }
@@ -1225,12 +1383,54 @@ async fn open_session(
         .call("session/new", session_params(workspace, None, mcp), SESSION_TIMEOUT)
         .await
         .map_err(|e| format!("{} could not start a session: {e}", engine.label()))?;
+    Ok((session_id_of(engine, &result)?, false, acp_model(engine, &result)))
+}
+
+fn session_id_of(engine: Engine, result: &Value) -> Result<String, String> {
     let sid = result
         .get("sessionId")
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .ok_or_else(|| format!("{}: session/new returned no sessionId", engine_process_label(engine)))?;
-    Ok((sid, false, current_model(&result)))
+    Ok(sid)
+}
+
+/// open_session, retried for agy: its first session on a fresh process
+/// sometimes fails with "ACP session startup timed out". Retry on the same
+/// process once, then on a respawned one.
+#[allow(clippy::too_many_arguments)]
+async fn open_session_retrying(
+    engine: Engine,
+    state: &AcpState,
+    client: Arc<AcpClient>,
+    saved: Option<String>,
+    workspace: &str,
+    mcp: &[Value],
+    on_event: &Channel<WorkAgentEvent>,
+    stop: &AtomicBool,
+) -> Result<(Arc<AcpClient>, (String, bool, Option<String>)), String> {
+    let attempts = if engine == Engine::Agy { AGY_SESSION_ATTEMPTS } else { 1 };
+    let mut client = client;
+    let mut attempt = 1;
+    loop {
+        match open_session(engine, &client, saved.clone(), workspace, mcp).await {
+            Ok(r) => return Ok((client, r)),
+            Err(e) if attempt < attempts && !stop.load(Ordering::Relaxed) && (is_startup_timeout(&e) || client.closed.load(Ordering::Relaxed)) => {
+                emit_ev(
+                    on_event,
+                    stop,
+                    WorkAgentEvent::Status { label: Some(format!("{} session start failed, retrying ({}/{})", engine.label(), attempt + 1, attempts)) },
+                );
+                eprintln!("{}: {e}; retrying", engine_process_label(engine));
+                if attempt + 1 == attempts || client.closed.load(Ordering::Relaxed) {
+                    state.discard(engine, workspace).await;
+                    client = state.client(engine, workspace).await?;
+                }
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Model to run: the turn's explicit pick, else the one saved in Vicuna's
@@ -1252,6 +1452,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Opencode => format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model."),
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
+            Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
         }
     } else {
         e
@@ -1276,7 +1477,7 @@ async fn run_turn_inner(
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
         .ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let client = state.client(engine).await?;
+    let client = state.client(engine, workspace).await?;
 
     let key = session_key(engine, session_id, workspace);
     let saved = if fresh_session {
@@ -1289,13 +1490,24 @@ async fn run_turn_inner(
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
     let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
-    let (acp_session, resumed, mut used_model) = open_session(engine, &client, saved, workspace, &mcp).await?;
+    let (client, (acp_session, resumed, mut used_model)) =
+        open_session_retrying(engine, state, client, saved, workspace, &mcp, on_event, stop).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
     }
     let (mut updates, _route) = client.route(&acp_session);
 
-    if let Some(m) = effective_model(engine, model) {
+    if let (Engine::Agy, Some(m)) = (engine, effective_model(engine, model)) {
+        // agy lists full ids (`gemini-3.8-flash-medium`) for session/set_model;
+        // its `model` config option only knows the family
+        if used_model.as_deref() != Some(m.as_str()) {
+            client
+                .call("session/set_model", json!({ "sessionId": acp_session, "modelId": m }), CONFIG_TIMEOUT)
+                .await
+                .map_err(|e| friendly_prompt_error(engine, format!("Antigravity could not switch to model {m}: {e}")))?;
+        }
+        used_model = Some(m);
+    } else if let Some(m) = effective_model(engine, model) {
         let r = client
             .call(
                 "session/set_config_option",
@@ -1666,6 +1878,78 @@ mod tests {
         assert!(!pick("please no").1);
         let no_reject = json!({ "options": [{ "optionId": "a0", "kind": "allow_once", "name": "Allow" }] });
         assert_eq!(permission_answer(&no_reject, "cancelled"), (json!({ "outcome": { "outcome": "cancelled" } }), false));
+    }
+
+    /// agy offers only Allow / Deny: the card adds "Always allow", which
+    /// answers allow_once and is remembered per session + tool name.
+    #[test]
+    fn agy_permission_gets_a_synthesized_always() {
+        let params = json!({ "sessionId": "s9", "toolCall": { "name": "run_command", "kind": "execute", "title": "ls" }, "options": [
+            { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+            { "optionId": "deny", "name": "Deny", "kind": "reject_once" }
+        ]});
+        assert_eq!(permission_labels(&params), ["Allow", ALWAYS_LABEL, "Deny"]);
+        assert!(is_synth_always(&params, "always allow"));
+        assert_eq!(permission_answer(&params, ALWAYS_LABEL), (json!({ "outcome": { "outcome": "selected", "optionId": "allow" } }), true));
+        assert_eq!(permission_answer(&params, "Deny").0["outcome"]["optionId"], "deny");
+        assert_eq!(always_key(&params).as_deref(), Some("s9|run_command"));
+        // an agent with its own allow_always keeps its labels untouched
+        let oc = json!({ "options": [
+            { "optionId": "a1", "kind": "allow_always", "name": "Always allow" },
+            { "optionId": "a0", "kind": "allow_once", "name": "Allow" }
+        ]});
+        assert_eq!(permission_labels(&oc), ["Always allow", "Allow"]);
+        assert!(!is_synth_always(&oc, "Always allow"));
+    }
+
+    /// agy: full model id from `models.currentModelId`, CamelCase tool args,
+    /// MCP tools named by the agent, plan entries as a checklist.
+    #[test]
+    fn agy_models_tools_and_plans() {
+        let r = json!({ "models": { "currentModelId": "gemini-3.8-flash-medium" },
+            "configOptions": [{ "id": "model", "currentValue": "gemini-3.8-flash" }] });
+        assert_eq!(acp_model(Engine::Agy, &r).as_deref(), Some("gemini-3.8-flash-medium"));
+        assert_eq!(acp_model(Engine::Opencode, &r).as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(session_key(Engine::Agy, Some("c1"), "/ws").as_deref(), Some("agy|c1|/ws"));
+        assert!(is_startup_timeout("ACP session startup timed out"));
+        assert!(!is_startup_timeout("permission denied"));
+
+        let mut tools = HashMap::new();
+        let shell = json!({ "sessionUpdate": "tool_call", "toolCallId": "a1", "name": "run_command", "kind": "execute", "title": "ls -la", "status": "in_progress",
+            "rawInput": { "CommandLine": "ls -la", "WaitMsBeforeAsync": 5000, "toolSummary": "List" } });
+        match &tool_events(&shell, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "exec");
+                assert_eq!(args["command"], "ls -la");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let view = json!({ "sessionUpdate": "tool_call", "toolCallId": "a2", "name": "view_file", "kind": "read", "title": "Read main.rs", "status": "in_progress",
+            "rawInput": { "AbsolutePath": "/ws/main.rs" } });
+        match &tool_events(&view, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "read");
+                assert_eq!(args["path"], "/ws/main.rs");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let mcp = json!({ "sessionUpdate": "tool_call", "toolCallId": "a3", "name": "mcp_browser_navigate", "kind": "other", "title": "Run mcp_browser_navigate", "status": "in_progress",
+            "rawInput": { "toolSummary": "Open page", "url": "https://example.com" } });
+        match &tool_events(&mcp, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "mcp_browser_navigate");
+                assert_eq!(args, &json!({ "url": "https://example.com" }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let plan = json!({ "sessionUpdate": "plan", "entries": [
+            { "content": "Read code", "status": "completed" },
+            { "content": "Fix bug", "status": "in_progress" },
+            { "content": "Test", "status": "pending" }
+        ]});
+        let note = plan_note(&plan).unwrap();
+        assert!(note.contains("- [x] Read code") && note.contains("- [~] Fix bug") && note.contains("- [ ] Test"), "{note}");
+        assert_eq!(plan_note(&json!({ "entries": [] })), None);
     }
 
 }

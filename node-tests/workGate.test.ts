@@ -124,3 +124,27 @@ test("Codex engine: label, reply label, gate and picker", () => {
   const missing = { ...codex, installed: false, missing: "Codex CLI not found, install it: https://developers.openai.com/codex/cli" } as WorkEngineInfo;
   assert.equal(workSendGate(missing).reason, missing.missing);
 });
+
+// ---------- Antigravity (agy) as an engine ----------
+test("Antigravity engine: label, reply label, gate and picker", () => {
+  const agy: WorkEngineInfo = {
+    id: "agy", label: "Antigravity", installed: true, path: "/home/u/.local/bin/agy", version: "1.5.6",
+    installUrl: "https://antigravity.google/", model: null, configPath: null,
+    engines: [
+      { id: "opencode", label: "OpenCode", installed: true, version: "2.2.6", missing: null },
+      { id: "claude", label: "Claude Code", installed: false, version: null, missing: "Claude Code CLI not found" },
+      { id: "codex", label: "Codex", installed: false, version: null, missing: "Codex CLI not found" },
+      { id: "agy", label: "Antigravity", installed: true, version: "1.5.6", missing: null },
+    ],
+  } as WorkEngineInfo;
+  assert.equal(engineId(agy), "agy");
+  assert.equal(engineLabel(agy), "Antigravity");
+  assert.equal(engineLabel({ ...agy, label: "" } as WorkEngineInfo), "Antigravity");
+  assert.deepEqual(workEngineChoices(agy).map((e) => e.id), ["opencode", "agy"]);
+  assert.equal(workSendGate(agy).blocked, false);
+  assert.equal(workReplyModel(null, "gemini-3.8-flash-medium", "agy"), "agy/gemini-3.8-flash-medium");
+  assert.equal(workReplyModel("agy/gemini-4-argon-high", null, "agy"), "agy/gemini-4-argon-high");
+  assert.equal(workReplyModel(null, null, "agy"), "agy");
+  const missing = { ...agy, installed: false, missing: "Antigravity CLI (agy) not found, install it: https://antigravity.google/" } as WorkEngineInfo;
+  assert.deepEqual(workSendGate(missing), { blocked: true, reason: missing.missing });
+});
