@@ -641,7 +641,28 @@ fn user_input_question(q: &Value) -> (String, String, Vec<String>) {
     (s("id"), question, options)
 }
 
-/// `turn/plan/updated` as a transcript checklist.
+/// `thread/goal/updated` (Codex 0.16x's goal tools, which replaced
+/// update_plan) as a transcript note, or None when objective + status are
+/// unchanged (the notification also fires for token/time counters).
+fn goal_note(params: &Value, last: &mut Option<(String, String)>) -> Option<String> {
+    let g = params.get("goal")?;
+    let objective = g.get("objective").and_then(Value::as_str)?.trim().to_string();
+    let status = g.get("status").and_then(Value::as_str).unwrap_or("active").to_string();
+    if objective.is_empty() || last.as_ref() == Some(&(objective.clone(), status.clone())) {
+        return None;
+    }
+    *last = Some((objective.clone(), status.clone()));
+    let label = match status.as_str() {
+        "complete" => "Goal complete",
+        "paused" => "Goal paused",
+        "blocked" => "Goal blocked",
+        "usageLimited" | "budgetLimited" => "Goal stopped (limit reached)",
+        _ => "Goal",
+    };
+    Some(format!("\n> **{label}:** {objective}\n"))
+}
+
+/// `turn/plan/updated` as a transcript checklist (older Codex update_plan).
 fn plan_note(params: &Value) -> Option<String> {
     let steps = params.get("plan").and_then(Value::as_array)?;
     if steps.is_empty() {
@@ -786,6 +807,7 @@ async fn run_turns(
     let mut tools: HashMap<String, String> = HashMap::new();
     let mut output_chars = 0usize;
     let mut out_tokens: Option<f64> = None;
+    let mut last_goal: Option<(String, String)> = None;
     let mut started = Instant::now();
     let mut interrupted_at: Option<Instant> = None;
     loop {
@@ -837,6 +859,11 @@ async fn run_turns(
                             if let Some(m) = params.pointer("/error/message").and_then(Value::as_str) {
                                 emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n> Codex: {m}\n") });
                             }
+                        }
+                    }
+                    "thread/goal/updated" => {
+                        if let Some(text) = goal_note(&params, &mut last_goal) {
+                            emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text });
                         }
                     }
                     "turn/plan/updated" => {
@@ -982,6 +1009,17 @@ mod tests {
         assert_eq!(user_input_question(&q), ("fruit".to_string(), "Fruit: Which fruit?".to_string(), vec!["Mango".to_string(), "Kiwi".to_string()]));
         let bare = json!({ "id": "x", "header": "", "question": "Name?", "options": null });
         assert_eq!(user_input_question(&bare).2, Vec::<String>::new());
+    }
+
+    #[test]
+    fn goal_updates_render_once_per_change() {
+        let mut last = None;
+        let ev = |status: &str, used: u64| json!({ "threadId": "t", "turnId": null, "goal": {
+            "threadId": "t", "objective": "ship the fix", "status": status, "tokenBudget": null, "tokensUsed": used,
+            "timeUsedSeconds": 1, "createdAt": 0, "updatedAt": 0 } });
+        assert_eq!(goal_note(&ev("active", 1), &mut last).as_deref(), Some("\n> **Goal:** ship the fix\n"));
+        assert_eq!(goal_note(&ev("active", 50), &mut last), None, "counter-only updates stay quiet");
+        assert_eq!(goal_note(&ev("complete", 90), &mut last).as_deref(), Some("\n> **Goal complete:** ship the fix\n"));
     }
 
     #[test]

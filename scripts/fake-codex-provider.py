@@ -11,7 +11,8 @@ scripted:
   prompt says "run exactly: X"  -> call the shell tool with X
   prompt says "ask me which fruit" -> call vicuna-mcp ask_user (Mango/Kiwi/Papaya),
                                    then reply FRUIT=<the answer>
-  prompt says "make a plan"     -> call update_plan (3 steps), then PLANNED
+  prompt says "make a plan"     -> call update_plan (3 steps) if offered, else
+                                   create_goal (codex 0.16x), then PLANNED
   "previous message" question   -> answer with the word the model said
                                    earlier in the SAME thread history (proves
                                    resume: a fresh thread has no PONG)
@@ -63,7 +64,7 @@ def decide(body):
         if calls and (calls[-1].get("name") or "").endswith("ask_user"):
             a = re.search(r"The user answered: ([^\"\n]+)", out)
             return [("text", f"FRUIT={a.group(1).strip()}" if a else f"NO ANSWER: {out[:120]}")]
-        if calls and calls[-1].get("name") == "update_plan":
+        if calls and calls[-1].get("name") in ("update_plan", "create_goal"):
             return [("text", "PLANNED")]
         done_calls = [i.get("name") for i in items if i.get("type") == "function_call"]
         m = CMD.search(user)
@@ -83,6 +84,8 @@ def decide(body):
         if ask:
             return [("call", ask, {"question": "Which fruit should I use?", "choices": ["Mango", "Kiwi", "Papaya"]})]
         return [("text", f"no ask_user tool offered (tools: {names})")]
+    if "make a plan" in user and "update_plan" not in names and "create_goal" in names:
+        return [("call", "create_goal", {"objective": "fake goal: make the change and run the tests"})]
     if "make a plan" in user and "update_plan" in names:
         return [("call", "update_plan", {"explanation": "fake plan", "plan": [
             {"step": "read the code", "status": "completed"},

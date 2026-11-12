@@ -11,6 +11,7 @@
 #   scripts/work-acceptance.sh combo <model> [engine]    # ONE turn: MCP tool with real args + 'ask' approval of a shell command
 #   scripts/work-acceptance.sh stopq <model> [engine]    # a message queued mid-turn runs next; Stop interrupts a long reply
 #   scripts/work-acceptance.sh ask <model> [engine]      # agent question (vicuna-mcp ask_user): card, answer continues, Stop cancels
+#   scripts/work-acceptance.sh plan <model> codex       # Codex goal/plan updates show as a transcript note (1 turn)
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
 #
@@ -397,6 +398,23 @@ assert not errs, errs
 done = [e for e in evs if e.get("type") == "done"]
 assert done and done[-1]["stopped"] is True, done
 print("PASS Stop while a question was pending ended the turn cleanly (done stopped=true, no error)")
+PY
+    ;;
+  plan)
+    [ -n "$model" ] || { echo "usage: $0 plan <model> codex"; exit 2; }
+    # Codex 0.16x offers goal tools (create_goal/update_goal) instead of
+    # update_plan; either must reach the transcript as a note.
+    start_bridge
+    run_turn "plan-$$" true "First make a plan: set a goal with your goal tool (create_goal) or, if you have update_plan, a 3-step plan. Objective: add a README line. Then reply PLANNED. Do not run commands."
+    python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+notes = [e.get("text", "") for e in evs if e.get("type") == "displaynote"]
+hit = [n for n in notes if "**Goal" in n or "**Plan**" in n]
+print("  notes:", [n.strip()[:120] for n in hit] or notes[-3:])
+assert hit, "no Goal/Plan note"
+print("PASS the agent's goal/plan reached the transcript")
 PY
     ;;
   toolcap)
