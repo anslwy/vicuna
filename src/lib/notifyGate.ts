@@ -44,6 +44,13 @@ export const NOTIFY_SOUND_PREF_KEY = "vicuna-notify-sound";
 /** Which chime preset (see CHIME_OPTIONS in ./chime); missing = default. */
 export const NOTIFY_SOUND_CHOICE_KEY = "vicuna-notify-sound-choice";
 
+/** Notification body for an agent question (ask card): the question, clipped. */
+export function askBody(question: string): string {
+  const q = (question ?? "").replace(/\s+/g, " ").trim();
+  if (!q) return "The agent is waiting for your answer.";
+  return q.length > 80 ? q.slice(0, 79).trimEnd() + "…" : q;
+}
+
 /** Stored value → enabled (anything but "0" counts as on). */
 export function parseNotifyPref(raw: string | null): boolean {
   return raw !== "0";

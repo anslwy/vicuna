@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
-  import { notifyTurnEnd, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
+  import { notifyTurnEnd, notifyAgentAsk, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
   import "katex/dist/katex.min.css";
@@ -6363,6 +6363,9 @@
           saveSoon();
           break;
         case "askrequest":
+          // the agent is now blocked on the user: if the window is hidden or
+          // in the background, chime + OS notification so they come back
+          void notifyAgentAsk(ev.question);
           askOutcome = null;
           askText = "";
           pendingAsks = {
