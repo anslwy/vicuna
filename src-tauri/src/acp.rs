@@ -161,6 +161,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
     match engine {
         Engine::Opencode => "opencode acp",
         Engine::Claude => "claude",
+        Engine::Codex => "codex app-server",
     }
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
     session_id.map(|id| match engine {
         Engine::Opencode => format!("{id}|{workspace}"),
         Engine::Claude => format!("claude|{id}|{workspace}"),
+        Engine::Codex => format!("codex|{id}|{workspace}"),
     })
 }
 
@@ -1135,8 +1137,8 @@ pub async fn run_turn(
 ) {
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
-    // each claude process gets its own.
-    let route = (engine != Engine::Claude).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    // each claude process and each codex app-server gets its own.
+    let route = (engine == Engine::Opencode).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1147,6 +1149,21 @@ pub async fn run_turn(
     let ask_url = _ask.as_ref().map(|r| r.url.clone());
     let res = if engine == Engine::Claude {
         super::claude_cli::run_turn_inner(
+            &turn,
+            model.as_deref(),
+            &workspace,
+            &messages,
+            session_id.as_deref(),
+            goal_text.as_deref(),
+            fresh_session,
+            &on_event,
+            state,
+            &mcp_snapshot,
+            ask_url.as_deref(),
+        )
+        .await
+    } else if engine == Engine::Codex {
+        super::codex_cli::run_turn_inner(
             &turn,
             model.as_deref(),
             &workspace,
@@ -1234,6 +1251,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
         match engine {
             Engine::Opencode => format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model."),
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
+            Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
         }
     } else {
         e
@@ -1497,6 +1515,7 @@ mod tests {
         assert_eq!(session_key(Engine::Opencode, None, "/w"), None);
         // engines never share a session id (switching engine starts fresh)
         assert_eq!(session_key(Engine::Claude, Some("chat1"), "/w"), Some("claude|chat1|/w".to_string()));
+        assert_eq!(session_key(Engine::Codex, Some("chat1"), "/w"), Some("codex|chat1|/w".to_string()));
     }
 
     #[test]

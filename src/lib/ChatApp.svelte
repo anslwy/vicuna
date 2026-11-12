@@ -51,7 +51,7 @@
     type ViewAnchor
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
-  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH } from "$lib/modelIcons";
+  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -223,6 +223,10 @@
   let models = $state<string[]>(["gemma4:31b-cloud"]);
   let selectedModel = $state("gemma4:31b-cloud");
   let modelOpen = $state(false);
+  let engineMenuOpen = $state(false);
+  $effect(() => {
+    if (!modelOpen) engineMenuOpen = false;
+  });
   let modelQuery = $state("");
   /** sessions with a live chat-completion stream. Per session (not one global
    *  flag) so one thread working never blocks starting or using another:
@@ -1389,8 +1393,9 @@
   let buildInfo = $state<{ version: string; builtAtUnix: number } | null>(null);
   let workEngineInfo = $state<WorkEngineInfo | null>(null);
 
-  /** Work mode = the user's own agent CLI: opencode (over ACP) or Claude
-   *  Code (its headless stream-json mode), nothing else. Detection re-runs at startup,
+  /** Work mode = the user's own agent CLI: opencode (over ACP), Claude
+   *  Code (its headless stream-json mode) or Codex (codex app-server),
+   *  nothing else. Detection re-runs at startup,
    *  on window focus, on Settings → Refresh and when the model menu opens,
    *  so installing an engine while Vicuna runs is picked up. */
   let workEngineChecked = $state(false);
@@ -6590,6 +6595,8 @@
 {#snippet engineIcon(id: string)}
   {#if id === "claude"}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
+  {:else if id === "codex"}
+    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={CODEX_ICON_OUTLINE_PATH}/><path d={CODEX_ICON_PROMPT_PATH}/></svg>
   {:else}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
   {/if}
@@ -6855,7 +6862,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? (engineId(workEngineInfo) === "claude" ? "claude" : "opencode") : `no ${engineId(workEngineInfo)}`) : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -7460,10 +7467,18 @@
               <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
               <div class="model-drop" data-testid="model-dropdown" data-engine={engineId(workEngineInfo)}>
                 {#if workEngines.length > 1}
-                  <div class="engine-switch" data-testid="work-engine-picker" role="radiogroup" aria-label="Work engine">
-                    {#each workEngines as eng (eng.id)}
-                      <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => void pickWorkEngine(eng.id)}>{@render engineIcon(eng.id)}<span>{eng.label}</span></button>
-                    {/each}
+                  <div class="engine-select" data-testid="work-engine-picker">
+                    <button class="engine-select-btn" data-testid="work-engine-toggle" aria-haspopup="listbox" aria-expanded={engineMenuOpen} aria-label="Work engine" onclick={() => (engineMenuOpen = !engineMenuOpen)}>
+                      {@render engineIcon(engineId(workEngineInfo))}<span>{workEngineLabel}</span>
+                      <svg class="engine-select-chev {engineMenuOpen ? 'open' : ''}" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
+                    </button>
+                    {#if engineMenuOpen}
+                      <div class="engine-select-list" role="listbox" aria-label="Work engine">
+                        {#each workEngines as eng (eng.id)}
+                          <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => { engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{eng.label}</span>{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
+                        {/each}
+                      </div>
+                    {/if}
                   </div>
                 {/if}
                 <input
@@ -8626,7 +8641,7 @@
       {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
         <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
       {/each}
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>) or your <code>claude</code> CLI (headless <code>claude -p</code> stream-json, with your own login; nothing else to install). Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code> and <code>VICUNA_CLAUDE_BIN</code>.</span>
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>), your <code>claude</code> CLI (headless <code>claude -p</code> stream-json) or your <code>codex</code> CLI (<code>codex app-server</code>), each with your own login and config; nothing else to install. Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code> and <code>VICUNA_CODEX_BIN</code>.</span>
       <label class="setting-note approval-row" data-testid="work-approval">
         <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
         Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.
@@ -9445,6 +9460,16 @@
   .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
   .engine-switch { display: flex; gap: 4px; padding: 8px 8px 0; }
   .engine-switch.settings-engines { padding: 4px 0; }
+  .engine-select { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 2px; }
+  .engine-select-btn, .engine-select-opt { display: flex; align-items: center; gap: 8px; width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 10px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; text-align: left; }
+  .engine-select-btn span, .engine-select-opt span { flex: 1; min-width: 0; }
+  .engine-select-btn:hover, .engine-select-opt:hover { background: var(--hover); }
+  .engine-select-chev { color: var(--muted); transition: transform .15s; }
+  .engine-select-chev.open { transform: rotate(180deg); }
+  .engine-select-list { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
+  .engine-select-opt { border-color: transparent; color: var(--muted); }
+  .engine-select-opt.sel { color: var(--text); background: var(--hover); }
+  .engine-select-check { color: var(--accent); }
   .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
   .engine-opt:disabled { opacity: .5; cursor: default; }
@@ -9452,7 +9477,6 @@
   .approval-row input { margin-top: 2px; }
   .engine-ico { flex: none; display: block; }
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
-  .engine-opt .engine-ico { transform: translateY(.5px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }

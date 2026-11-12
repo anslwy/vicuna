@@ -471,7 +471,8 @@ export async function setOpencodeModel(model: string | null): Promise<void> {
 }
 
 /** Work models of `engine` (opencode: `opencode models`; Claude: the CLI's
- *  own model list from its initialize response) plus that engine's pick. */
+ *  own model list from its initialize response; Codex: app-server
+ *  `model/list`) plus that engine's pick. */
 export async function listWorkModels(engine: string): Promise<OpencodeModels> {
   return await invokeCmd<OpencodeModels>("work_models", { engine });
 }
@@ -493,7 +494,7 @@ export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> 
 }
 
 export interface WorkTurnParams {
-  /** "opencode" | "claude" (absent = the backend's saved choice) */
+  /** "opencode" | "claude" | "codex" (absent = the backend's saved choice) */
   engine?: string;
   /** engine model id; empty = saved pick / engine default */
   model: string;

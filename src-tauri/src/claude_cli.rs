@@ -498,7 +498,7 @@ async fn run_process(
     cmd.args(question_tool_args(mcp));
     let mut child = cmd
         .spawn()
-        .map_err(|e| RunError::Fatal(format!("cannot start claude ({}): {e}", cli.display())))?;
+        .map_err(|e| RunError::Fatal(crate::work_engine::spawn_error("claude", cli, Path::new(workspace), &e)))?;
     let mut stdin = child.stdin.take().ok_or(RunError::Fatal("claude: no stdin".into()))?;
     let stdout = child.stdout.take().ok_or(RunError::Fatal("claude: no stdout".into()))?;
     let stderr = child.stderr.take().ok_or(RunError::Fatal("claude: no stderr".into()))?;

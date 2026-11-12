@@ -73,6 +73,13 @@ npm run build   # static build to ./build
   installed, the Work model menu and Settings → Work engine let you switch;
   models come from the engine itself, and replies are labelled
   `claude/<model>` or opencode's `provider/model`.
+- Codex is the third Work engine: Vicuna drives your installed `codex` CLI
+  through `codex app-server` (its official JSON-RPC over stdio) with your own
+  login and `~/.codex/config.toml` (https://developers.openai.com/codex/cli).
+  Models come from `model/list`; with no pick in Vicuna your config's model
+  runs. Replies are labelled `codex/<model>`. Test without Codex quota:
+  `VICUNA_CODEX_FAKE=1 scripts/work-acceptance.sh present fake-codex codex`
+  (the real app-server against a scripted Responses API).
 - Chat streaming returns the full text; `done_reason: "load"` retries up to
   3x after a 2s wait (model was reloading). Stop-button abort raises
   `AbortError` on the frontend; the backend request runs detached (no cancel
