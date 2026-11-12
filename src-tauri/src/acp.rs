@@ -125,23 +125,7 @@ impl AcpState {
             }
         }
         guard.remove(&engine);
-        let label = engine_process_label(engine);
-        let (client, child) = spawn_acp(cmd, label, &bin)?;
-        client
-            .call(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false
-                    },
-                    "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": env!("CARGO_PKG_VERSION") }
-                }),
-                INIT_TIMEOUT,
-            )
-            .await
-            .map_err(|e| format!("{label} initialize failed: {e}"))?;
+        let (client, child) = start_initialized(cmd, engine_process_label(engine), &bin).await?;
         guard.insert(
             engine,
             Proc {
@@ -163,6 +147,31 @@ impl AcpState {
             let _ = self.client(engine).await;
         }
     }
+}
+
+/// Spawn an ACP agent and run `initialize`.
+async fn start_initialized(
+    cmd: tokio::process::Command,
+    label: &'static str,
+    bin: &Path,
+) -> Result<(Arc<AcpClient>, Child), String> {
+    let (client, child) = spawn_acp(cmd, label, bin)?;
+    client
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false
+                },
+                "clientInfo": { "name": "vicuna", "title": "Vicuna", "version": env!("CARGO_PKG_VERSION") }
+            }),
+            INIT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("{label} initialize failed: {e}"))?;
+    Ok((client, child))
 }
 
 fn engine_process_label(engine: Engine) -> &'static str {
@@ -497,11 +506,19 @@ async fn fx_list_models(client: &AcpClient, cwd: &str) -> Result<Vec<crate::open
 }
 
 impl AcpState {
-    /// fx's models (see fx_list_models), through the warm `fx acp` process.
+    /// fx's models (see fx_list_models), from a short-lived `fx acp` of its
+    /// own: fx 0.0.16 keeps the last switched-to provider's model catalog
+    /// process-wide, so after cycling providers a later session on the same
+    /// process rejects valid models ("Model is not available for the active
+    /// provider"). The warm turn process never cycles.
     pub async fn fx_models(&self) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
-        let client = self.client(Engine::Fx).await?;
+        let bin = super::fx::find_fx().ok_or_else(super::fx::missing_message)?;
+        let mut cmd = super::fx::command(&bin, false);
+        cmd.arg("acp");
+        let (client, _child) = start_initialized(cmd, "fx acp", &bin).await?;
         let cwd = home_dir()?.display().to_string();
         fx_list_models(&client, &cwd).await
+        // _child is killed on drop
     }
 }
 

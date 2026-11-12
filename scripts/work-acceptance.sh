@@ -20,8 +20,9 @@
 #         present gpt-6-luna codex            combo gpt-6-luna codex
 #         present codex/gpt-6-luna fx         combo ollama/deepseek-v4.1-flash:cloud fx
 #   fx models are <fx provider>/<model>; the ollama route needs an "ollama"
-#   provider in ~/.fx/settings.json (see src-tauri/src/fx.rs). fx runs with
-#   the user's real ~/.fx (login, providers, its sessions) linked in.
+#   provider in ~/.fx/settings.json (see src-tauri/src/fx.rs). fx refuses a
+#   symlinked ~/.fx, so it runs with HOME=VICUNA_FX_HOME (default: the real
+#   home: its login, providers and sessions); Vicuna's own config stays temp.
 #
 # Build the bridge first:  (cd bridge && cargo build)
 # Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
@@ -65,7 +66,7 @@ trap cleanup EXIT
 
 # temp HOME with the engines' real logins linked in
 mkdir -p "$work/home/vicuna/config" "$work/ws"
-for f in .claude .claude.json .fx; do
+for f in .claude .claude.json; do
   [ -e "$real_home/$f" ] && ln -s "$real_home/$f" "$work/home/$f"
 done
 oc_bin="${VICUNA_OPENCODE_BIN:-$(command -v opencode || true)}"
@@ -92,7 +93,7 @@ start_bridge() { # extra env assignments...
     VICUNA_OPENCODE_BIN="${oc_bin:-/nonexistent/opencode}" \
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
     VICUNA_CODEX_BIN="${cx_bin:-/nonexistent/codex}" \
-    VICUNA_FX_BIN="${fx_bin:-/nonexistent/fx}" \
+    VICUNA_FX_BIN="${fx_bin:-/nonexistent/fx}" VICUNA_FX_HOME="${VICUNA_FX_HOME:-$real_home}" \
     CODEX_HOME="$codex_home" VICUNA_CODEX_EFFORT="${VICUNA_CODEX_EFFORT:-low}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
   pid=$!

@@ -27,6 +27,9 @@ use crate::opencode::{
 pub const CLI_INSTALL_URL: &str = "https://fx.sh/docs";
 /// Exclusive override (absolute path), like VICUNA_OPENCODE_BIN.
 pub const BIN_ENV: &str = "VICUNA_FX_BIN";
+/// HOME for the fx processes Vicuna starts (dev/test only: the acceptance
+/// script runs Vicuna in a temp HOME, and fx refuses a symlinked ~/.fx).
+pub const HOME_ENV: &str = "VICUNA_FX_HOME";
 /// fx's own permission-mode override: per process, never written to the
 /// user's settings (unlike the ACP `mode` config option, which fx persists).
 const PERMISSION_ENV: &str = "FX_PERMISSION_MODE";
@@ -139,8 +142,13 @@ pub fn loopback_auth_env(settings: &Value, is_set: impl Fn(&str) -> bool) -> Vec
     out
 }
 
+/// The home fx runs in: VICUNA_FX_HOME when set, else the user's home.
+fn fx_home() -> Option<PathBuf> {
+    std::env::var_os(HOME_ENV).filter(|h| !h.is_empty()).map(PathBuf::from).or_else(home_dir)
+}
+
 fn fx_settings() -> Option<Value> {
-    let p = home_dir()?.join(".fx").join("settings.json");
+    let p = fx_home()?.join(".fx").join("settings.json");
     serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
 }
 
@@ -178,7 +186,10 @@ pub fn command(bin: &Path, ask: bool) -> Command {
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
     }
-    if let Some(h) = home_dir() {
+    if let Some(h) = std::env::var_os(HOME_ENV).filter(|h| !h.is_empty()) {
+        cmd.env("HOME", h);
+    }
+    if let Some(h) = fx_home() {
         cmd.current_dir(h);
     }
     cmd.stdin(std::process::Stdio::null())
