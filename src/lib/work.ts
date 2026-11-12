@@ -41,6 +41,30 @@ export async function renameWorkFile(root: string, path: string, newName: string
   return await invokeCmd<string>("work_rename", { root, path, newName });
 }
 
+export interface WorkFileContent {
+  path: string;
+  content: string;
+  truncated: boolean;
+  size: number;
+}
+
+/** Read a workspace file for the in-app editor (desktop or bridge). */
+export async function readWorkFile(root: string, path: string, maxBytes = 524288): Promise<WorkFileContent> {
+  return await invokeCmd<WorkFileContent>("work_read_file", { root, path, maxBytes });
+}
+
+/** Save a workspace file from the in-app editor (desktop or bridge). */
+export async function writeWorkFile(root: string, path: string, content: string): Promise<void> {
+  await invokeCmd<string>("work_write_file", { root, path, content });
+}
+
+/** Open a workspace path with the OS default app (desktop only; sandboxed
+ *  backend-side via work_join). */
+export async function openWorkPathExternal(root: string, path: string): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("work_open_path", { root, path });
+}
+
 /** Delete a workspace file or folder (recursive, desktop or bridge). */
 export async function deleteWorkFile(root: string, path: string): Promise<void> {
   await invokeCmd<void>("work_delete", { root, path });

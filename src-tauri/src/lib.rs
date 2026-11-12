@@ -1559,7 +1559,9 @@ pub async fn work_read_file_logic(
         return Err("not a file".to_string());
     }
     let size = meta.len();
-    let cap = max_bytes.unwrap_or(65536).clamp(1024, 262144) as usize;
+    // upper bound matches the write cap so the in-app editor can round-trip
+    // anything it may save; agent reads keep the 64KB default
+    let cap = max_bytes.unwrap_or(65536).clamp(1024, 524288) as usize;
     let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
     // reject obvious binaries (NUL byte in the head sample)
     if bytes.iter().take(4096).any(|&b| b == 0) {
@@ -2074,6 +2076,22 @@ async fn work_grep(root: String, pattern: String, include: Option<String>) -> Re
 #[tauri::command]
 async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
     work_write_file_logic(root, path, content).await
+}
+
+/// Open a workspace file/folder with the OS default app. Sandboxed through
+/// `work_join` (the opener capability itself carries no path scope, so the
+/// frontend's `openPath` was refused for every path).
+#[tauri::command]
+async fn work_open_path(app: AppHandle, root: String, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if !full.exists() {
+        return Err("file not found".to_string());
+    }
+    app.opener()
+        .open_path(full.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("cannot open: {e}"))
 }
 
 #[tauri::command]
@@ -5148,6 +5166,7 @@ pub fn run() {
             work_read_image,
             work_grep,
             work_write_file,
+            work_open_path,
             work_exec,
             work_fetch_url,
             work_exec_start,

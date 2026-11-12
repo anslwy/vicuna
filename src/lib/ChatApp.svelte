@@ -34,7 +34,7 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, multiAnswer } from "$lib/askCard";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -4785,13 +4785,50 @@
     expCtx = null;
   }
 
+  // in-app code editor (CodeMirror, lazy-loaded on first open so the initial
+  // bundle stays lean, like xterm). Click, double-click and menu → Open all
+  // land here for files; folders keep opening in the OS.
+  let codeEditorPath = $state<string | null>(null);
+  let codeEditorRoot = $state("");
+  let CodeEditorComp = $state<any>(null);
+
+  async function openInEditor(path: string) {
+    if (codeEditorPath === path) return; // dblclick's second click
+    try {
+      if (!CodeEditorComp) CodeEditorComp = (await import("$lib/CodeEditorModal.svelte")).default;
+      codeEditorRoot = explorerRoot.trim();
+      codeEditorPath = path;
+    } catch (e: any) {
+      flashExpNotice(`Couldn't load the editor: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  function closeCodeEditor() {
+    codeEditorPath = null;
+  }
+
   async function expOpenFile() {
     const p = expCtx;
     closeExpCtx();
-    if (!p || !isTauriRuntime()) return;
+    if (!p) return;
+    if (p.isDir) await openPathExternal(p.path);
+    else await openInEditor(p.path);
+  }
+
+  async function expOpenExternal() {
+    const p = expCtx;
+    closeExpCtx();
+    if (p) await openPathExternal(p.path);
+  }
+
+  /** OS default app, sandboxed backend-side (work_open_path) */
+  async function openPathExternal(path: string) {
+    if (!isTauriRuntime()) {
+      flashExpNotice("Opening in the default app needs the desktop app.");
+      return;
+    }
     try {
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(absExpPath(p.path));
+      await openWorkPathExternal(explorerRoot.trim(), path);
     } catch (e: any) {
       flashExpNotice(`Couldn't open: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
@@ -6689,7 +6726,7 @@
         e.preventDefault();
         return;
       }
-      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
+      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
       if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
@@ -8583,7 +8620,7 @@
                 style="padding-left: {10 + e.depth * 14}px"
                 data-testid="explorer-file"
                 title={e.path}
-                onclick={() => insertExplorerPath(e.path)}
+                onclick={() => void openInEditor(e.path)}
                 oncontextmenu={(ev) => openExpCtx(ev, e.path, false)}
               >
                 <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
@@ -8696,6 +8733,9 @@
     style="left: {expCtx.x}px; top: {expCtx.y}px;"
   >
     <button class="ctx-item" data-testid="explorer-open" onclick={() => void expOpenFile()}>Open</button>
+    {#if !expCtx.isDir}
+      <button class="ctx-item" data-testid="explorer-open-external" onclick={() => void expOpenExternal()}>Open in default app</button>
+    {/if}
     <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
     <button class="ctx-item" data-testid="explorer-rename" onclick={renameFromMenu}>Rename</button>
     <button
@@ -9394,6 +9434,18 @@
     {/if}
   </div>
 {/if}
+{/if}
+
+{#if codeEditorPath && CodeEditorComp}
+  {#key codeEditorPath}
+    <CodeEditorComp
+      root={codeEditorRoot}
+      path={codeEditorPath}
+      onclose={closeCodeEditor}
+      onsaved={() => { if (explorerOpen && !explorerLoading) void loadExplorer(); }}
+      onopenexternal={isTauriRuntime() ? (p: string) => void openPathExternal(p) : undefined}
+    />
+  {/key}
 {/if}
 
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
