@@ -194,6 +194,15 @@ pub async fn engines_info() -> WorkEngineInfo {
     info
 }
 
+/// A failed CLI spawn. With a missing working folder the OS reports ENOENT,
+/// which reads like the binary is missing, so name the folder instead.
+pub fn spawn_error(name: &str, bin: &Path, cwd: &Path, e: &std::io::Error) -> String {
+    if !cwd.is_dir() {
+        return format!("workspace folder not found: {} (pick an existing folder for this Work chat)", cwd.display());
+    }
+    format!("cannot start {name} ({}): {e}", bin.display())
+}
+
 // ---------- models ----------
 
 pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
@@ -284,6 +293,16 @@ mod tests {
         let only_codex = |e: Engine| e == Engine::Codex;
         assert_eq!(choose(Some(Engine::Claude), only_codex), Engine::Codex);
         assert_eq!(choose(Some(Engine::Codex), both), Engine::Codex);
+    }
+
+    #[test]
+    fn spawn_error_blames_a_missing_workspace() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let gone = Path::new("/nonexistent/vicuna-ws");
+        let msg = spawn_error("codex", Path::new("/usr/bin/codex"), gone, &e);
+        assert!(msg.starts_with("workspace folder not found: /nonexistent/vicuna-ws"), "{msg}");
+        let here = std::env::temp_dir();
+        assert!(spawn_error("codex", Path::new("/x/codex"), &here, &e).starts_with("cannot start codex (/x/codex):"));
     }
 
     #[test]

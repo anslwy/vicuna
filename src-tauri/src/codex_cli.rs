@@ -96,7 +96,7 @@ impl Server {
     async fn start(cli: &Path, cwd: &Path) -> Result<Server, String> {
         let mut child = base_command(cli, cwd)
             .spawn()
-            .map_err(|e| format!("cannot start codex ({}): {e}", cli.display()))?;
+            .map_err(|e| crate::work_engine::spawn_error("codex", cli, cwd, &e))?;
         let mut stdin = child.stdin.take().ok_or("codex: no stdin")?;
         let stdout = child.stdout.take().ok_or("codex: no stdout")?;
         let stderr = child.stderr.take().ok_or("codex: no stderr")?;
