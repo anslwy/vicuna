@@ -2,6 +2,7 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { notifyTurnEnd, getNotifyEnabled, setNotifyEnabled } from "$lib/notify";
   import { renderMarkdown } from "$lib/markdown";
   import "katex/dist/katex.min.css";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
@@ -251,6 +252,18 @@
   /** sessions the user asked to stop (Stop / double-Esc / chat deleted):
    *  per session so stopping one turn never aborts another */
   const workStopIds = new Set<string>();
+  // turn-finished OS notifications: chat turns the user stopped / that
+  // errored, and a short debounce so a tool loop's back-to-back streams
+  // notify once
+  const chatStopIds = new Set<string>();
+  const chatErrorIds = new Set<string>();
+  const notifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let notifyTurns = $state(true);
+  function lastReply(id: string): string {
+    const c = chats.find((x) => x.id === id);
+    const m = c?.messages[c.messages.length - 1];
+    return m?.role === "assistant" ? m.content : "";
+  }
   let workTurnSeq = 0;
   /** current frontend turn number per session: a stale turn's late events are
    *  dropped by comparing against this (a single global slot would invalidate
@@ -1058,12 +1071,22 @@
     return isChatStreaming(id) || isWorkRunning(id) || isCompacting(id);
   }
   function markStreaming(id: string) {
+    clearTimeout(notifyTimers.get(id));
+    notifyTimers.delete(id);
     if (!streamingIds.includes(id)) streamingIds = [...streamingIds, id];
     streamingStartedAt = { ...streamingStartedAt, [id]: Date.now() };
   }
   function unmarkStreaming(id: string) {
     if (!streamingIds.includes(id)) return;
     streamingIds = streamingIds.filter((x) => x !== id);
+    clearTimeout(notifyTimers.get(id));
+    notifyTimers.set(id, setTimeout(() => {
+      notifyTimers.delete(id);
+      if (isSessionBusy(id)) { chatStopIds.delete(id); chatErrorIds.delete(id); return; }
+      const userStopped = chatStopIds.delete(id);
+      const end = chatErrorIds.delete(id) ? "error" : "done";
+      void notifyTurnEnd({ title: chats.find((x) => x.id === id)?.title, mode: "chat", end, reply: lastReply(id), userStopped });
+    }, 1500));
     const { [id]: _, ...rest } = streamingStartedAt;
     streamingStartedAt = rest;
   }
@@ -3358,6 +3381,7 @@
         // keep partial
       } else {
         error = err?.message ?? String(err);
+        chatErrorIds.add(chat.id);
         const c = chats.find((x) => x.id === chat.id);
         if (c && removeIfEmpty && !produced) {
           c.messages = c.messages.filter((_, j) => j !== index);
@@ -5314,6 +5338,7 @@
     const turnId = workTurnIds.get(id);
     if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
     cancelPendingAsk(id, "(the user interrupted before answering)");
+    if (aborters.has(id)) chatStopIds.add(id);
     aborters.get(id)?.abort();
   }
 
@@ -5927,6 +5952,7 @@
       // Only the current turn clears its session (a superseded turn's late
       // settle must never wipe the newer turn's state).
       if (isCurrentTurn()) {
+        void notifyTurnEnd({ title: live()?.title, mode: "work", end: "done", reply: lastReply(chat.id), userStopped: workStopIds.has(chat.id) });
         unmarkWorkRunning(chat.id);
         workStopIds.delete(chat.id);
         workTurnSeqByChat.delete(chat.id);
@@ -6402,6 +6428,7 @@
   }
 
   onMount(() => {
+    notifyTurns = getNotifyEnabled();
     window.addEventListener("beforeunload", handleUnload);
     window.addEventListener("message", onBrowserFrameMessage);
     window.addEventListener("pointerup", onMessagesPointerUp);
@@ -8649,6 +8676,13 @@
       <div class="browse-actions">
         <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
       </div>
+    </div>
+    <div class="setting-stacked">
+      <span class="setting-label">Notifications</span>
+      <label class="setting-note approval-row" data-testid="notify-turns">
+        <input type="checkbox" data-testid="notify-turns-toggle" checked={notifyTurns} onchange={(e) => { notifyTurns = (e.currentTarget as HTMLInputElement).checked; setNotifyEnabled(notifyTurns); }} />
+        Notify when a Chat or Work turn finishes while Vicuna isn't in front (not when you press Stop).
+      </label>
     </div>
     <div class="setting-stacked">
       <span class="setting-label">Continue method</span>
