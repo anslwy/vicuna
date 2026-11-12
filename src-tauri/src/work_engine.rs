@@ -1,7 +1,7 @@
 // Work engines: which external agent CLI a Work turn runs on.
 //
-// opencode speaks ACP (acp.rs), Claude Code stream-json (claude_cli.rs) and
-// Codex its app-server JSON-RPC (codex_cli.rs); this module owns the choice
+// opencode and fx speak ACP (acp.rs), Claude Code stream-json (claude_cli.rs)
+// and Codex its app-server JSON-RPC (codex_cli.rs); this module owns the choice
 // between them (persisted in ~/vicuna/config/work-engine.json), the combined
 // detection the UI renders (engine picker when more than one is installed),
 // and per-engine model lists + saved model picks.
@@ -18,16 +18,18 @@ pub enum Engine {
     Opencode,
     Claude,
     Codex,
+    Fx,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 3] = [Engine::Opencode, Engine::Claude, Engine::Codex];
+    pub const ALL: [Engine; 4] = [Engine::Opencode, Engine::Claude, Engine::Codex, Engine::Fx];
 
     pub fn id(self) -> &'static str {
         match self {
             Engine::Opencode => "opencode",
             Engine::Claude => "claude",
             Engine::Codex => "codex",
+            Engine::Fx => "fx",
         }
     }
 
@@ -36,6 +38,7 @@ impl Engine {
             Engine::Opencode => "OpenCode",
             Engine::Claude => "Claude Code",
             Engine::Codex => "Codex",
+            Engine::Fx => "fx",
         }
     }
 
@@ -44,6 +47,7 @@ impl Engine {
             "opencode" => Some(Engine::Opencode),
             "claude" | "claude-code" | "claude_code" => Some(Engine::Claude),
             "codex" | "codex-cli" => Some(Engine::Codex),
+            "fx" => Some(Engine::Fx),
             _ => None,
         }
     }
@@ -54,6 +58,7 @@ impl Engine {
             Engine::Opencode => crate::opencode::find_opencode().is_some(),
             Engine::Claude => crate::claude::find_claude().is_some(),
             Engine::Codex => crate::codex::find_codex().is_some(),
+            Engine::Fx => crate::fx::find_fx().is_some(),
         }
     }
 
@@ -62,16 +67,19 @@ impl Engine {
             Engine::Opencode => crate::acp::not_found_message(),
             Engine::Claude => crate::claude::missing_message(),
             Engine::Codex => crate::codex::missing_message(),
+            Engine::Fx => crate::fx::missing_message(),
         }
     }
 
     /// The label prefix for a model id in reply footers: opencode ids are
-    /// already `provider/model`; Claude's are bare ("haiku" -> "claude/haiku").
+    /// already `provider/model`; Claude's are bare ("haiku" -> "claude/haiku");
+    /// fx's are `<fx provider>/<model>` ("fx/codex/gpt-6-luna").
     pub fn reply_label(self, model: &str) -> String {
         match self {
             Engine::Opencode => model.to_string(),
             Engine::Claude => format!("claude/{model}"),
             Engine::Codex => format!("codex/{model}"),
+            Engine::Fx => format!("fx/{model}"),
         }
     }
 
@@ -80,6 +88,7 @@ impl Engine {
             Engine::Opencode => crate::opencode::saved_model(),
             Engine::Claude => crate::claude::saved_model(),
             Engine::Codex => crate::codex::saved_model(),
+            Engine::Fx => crate::fx::saved_model(),
         }
     }
 
@@ -88,6 +97,7 @@ impl Engine {
             Engine::Opencode => crate::opencode::save_model(model),
             Engine::Claude => crate::claude::save_model(model),
             Engine::Codex => crate::codex::save_model(model),
+            Engine::Fx => crate::fx::save_model(model),
         }
     }
 
@@ -96,6 +106,7 @@ impl Engine {
             Engine::Opencode => crate::opencode::engine_info().await,
             Engine::Claude => crate::claude::engine_info().await,
             Engine::Codex => crate::codex::engine_info().await,
+            Engine::Fx => crate::fx::engine_info().await,
         }
     }
 }
@@ -205,7 +216,7 @@ pub fn spawn_error(name: &str, bin: &Path, cwd: &Path, e: &std::io::Error) -> St
 
 // ---------- models ----------
 
-pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
+pub async fn list_models(engine: Engine, acp: &crate::acp::AcpState) -> Result<OpencodeModels, String> {
     match engine {
         Engine::Opencode => crate::opencode::list_models().await,
         Engine::Claude => Ok(OpencodeModels {
@@ -215,6 +226,10 @@ pub async fn list_models(engine: Engine, _acp: &crate::acp::AcpState) -> Result<
         Engine::Codex => Ok(OpencodeModels {
             models: crate::codex_cli::list_models().await?,
             current: crate::codex::saved_model(),
+        }),
+        Engine::Fx => Ok(OpencodeModels {
+            models: acp.fx_models().await?,
+            current: crate::fx::saved_model(),
         }),
     }
 }
@@ -275,6 +290,9 @@ mod tests {
         assert_eq!(Engine::parse("Codex"), Some(Engine::Codex));
         assert_eq!(Engine::Codex.reply_label("gpt-6-luna"), "codex/gpt-6-luna");
         assert_eq!(Engine::Opencode.reply_label("opencode/beam-free"), "opencode/beam-free");
+        assert_eq!(Engine::parse("FX"), Some(Engine::Fx));
+        assert_eq!(Engine::Fx.reply_label("codex/gpt-6-luna"), "fx/codex/gpt-6-luna");
+        assert_eq!(Engine::Fx.label(), "fx");
     }
 
     #[test]
@@ -293,6 +311,9 @@ mod tests {
         let only_codex = |e: Engine| e == Engine::Codex;
         assert_eq!(choose(Some(Engine::Claude), only_codex), Engine::Codex);
         assert_eq!(choose(Some(Engine::Codex), both), Engine::Codex);
+        let only_fx = |e: Engine| e == Engine::Fx;
+        assert_eq!(choose(None, only_fx), Engine::Fx);
+        assert_eq!(choose(Some(Engine::Fx), both), Engine::Fx);
     }
 
     #[test]

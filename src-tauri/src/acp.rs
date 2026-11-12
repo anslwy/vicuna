@@ -103,15 +103,23 @@ impl AcpState {
     /// The warm, initialized ACP client for `engine`; (re)spawned when there
     /// is none, it died, or detection now resolves a different binary.
     async fn client(&self, engine: Engine) -> Result<Arc<AcpClient>, String> {
-        if engine != Engine::Opencode {
-            return Err(format!("{} does not run over ACP", engine.label()));
-        }
-        let bin = find_opencode().ok_or_else(not_found_message)?;
-        let mut cmd = super::opencode::command(&bin);
+        let ask_now = super::work_engine::approval_ask();
+        let (bin, mut cmd) = match engine {
+            Engine::Opencode => {
+                let bin = find_opencode().ok_or_else(not_found_message)?;
+                let cmd = super::opencode::command(&bin);
+                (bin, cmd)
+            }
+            Engine::Fx => {
+                let bin = super::fx::find_fx().ok_or_else(super::fx::missing_message)?;
+                let cmd = super::fx::command(&bin, ask_now);
+                (bin, cmd)
+            }
+            _ => return Err(format!("{} does not run over ACP", engine.label())),
+        };
         cmd.arg("acp");
         let mut guard = self.procs.lock().await;
         if let Some(p) = guard.get(&engine) {
-            let ask_now = engine == Engine::Opencode && super::work_engine::approval_ask();
             if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin && p.ask == ask_now {
                 return Ok(p.client.clone());
             }
@@ -138,7 +146,7 @@ impl AcpState {
             engine,
             Proc {
                 client: client.clone(),
-                ask: engine == Engine::Opencode && super::work_engine::approval_ask(),
+                ask: ask_now,
                 bin,
                 _child: child,
             },
@@ -150,8 +158,8 @@ impl AcpState {
     /// (app startup). Silent when it is missing; the UI shows that state.
     pub async fn prewarm(&self) {
         let engine = super::work_engine::current_engine();
-        // only opencode keeps a warm process; claude starts per turn
-        if engine == Engine::Opencode && engine.is_present() {
+        // only the ACP engines keep a warm process; claude/codex start per turn
+        if matches!(engine, Engine::Opencode | Engine::Fx) && engine.is_present() {
             let _ = self.client(engine).await;
         }
     }
@@ -162,6 +170,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Opencode => "opencode acp",
         Engine::Claude => "claude",
         Engine::Codex => "codex app-server",
+        Engine::Fx => "fx acp",
     }
 }
 
@@ -189,6 +198,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Opencode => format!("{id}|{workspace}"),
         Engine::Claude => format!("claude|{id}|{workspace}"),
         Engine::Codex => format!("codex|{id}|{workspace}"),
+        Engine::Fx => format!("fx|{id}|{workspace}"),
     })
 }
 
@@ -375,6 +385,106 @@ fn current_model(result: &Value) -> Option<String> {
         .as_str()
         .filter(|m| !m.is_empty())
         .map(str::to_string)
+}
+
+fn config_value(result: &Value, id: &str) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("id").and_then(|i| i.as_str()) == Some(id))?
+        .get("currentValue")?
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// The engine's model id from a configOptions-bearing result: opencode's
+/// `model` is already `provider/model`; fx keeps provider and model apart.
+fn engine_model(engine: Engine, result: &Value) -> Option<String> {
+    let model = current_model(result)?;
+    match engine {
+        Engine::Fx => Some(match config_value(result, "provider") {
+            Some(p) => format!("{p}/{model}"),
+            None => model,
+        }),
+        _ => Some(model),
+    }
+}
+
+/// Every model fx offers, as `provider/model`, from a throwaway ACP session:
+/// the `provider` select lists fx's built-in and configured providers;
+/// switching to each one (session-only, fx does not persist it) yields that
+/// provider's `model` options. Providers that are not signed in are skipped.
+async fn fx_list_models(client: &AcpClient, cwd: &str) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
+    let r = client
+        .call("session/new", json!({ "cwd": cwd, "mcpServers": [] }), SESSION_TIMEOUT)
+        .await
+        .map_err(|e| format!("fx could not list models: {e}"))?;
+    let sid = r.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let providers: Vec<String> = r
+        .get("configOptions")
+        .and_then(|o| o.as_array())
+        .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("provider")))
+        .and_then(|o| o.get("options"))
+        .and_then(|o| o.as_array())
+        .map(|a| a.iter().filter_map(|o| o.get("value")?.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut add = |provider: &str, res: &Value| {
+        let opts = res
+            .get("configOptions")
+            .and_then(|o| o.as_array())
+            .and_then(|a| a.iter().find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model")))
+            .and_then(|o| o.get("options"))
+            .and_then(|o| o.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for o in opts {
+            let Some(m) = o.get("value").and_then(|v| v.as_str()) else { continue };
+            let id = format!("{provider}/{m}");
+            if !out.iter().any(|x: &crate::opencode::OpencodeModel| x.id == id) {
+                out.push(crate::opencode::OpencodeModel { id, provider: provider.to_string(), name: None });
+            }
+        }
+    };
+    let start = config_value(&r, "provider");
+    if providers.is_empty() {
+        if let Some(p) = &start {
+            add(p, &r);
+        }
+    }
+    for p in &providers {
+        let res = if start.as_deref() == Some(p.as_str()) {
+            r.clone()
+        } else {
+            match client
+                .call(
+                    "session/set_config_option",
+                    json!({ "sessionId": sid, "configId": "provider", "value": p }),
+                    CONFIG_TIMEOUT,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(_) => continue,
+            }
+        };
+        add(p, &res);
+    }
+    if !sid.is_empty() {
+        let _ = client.call("session/close", json!({ "sessionId": sid }), CONFIG_TIMEOUT).await;
+    }
+    Ok(out)
+}
+
+impl AcpState {
+    /// fx's models (see fx_list_models), through the warm `fx acp` process.
+    pub async fn fx_models(&self) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
+        let client = self.client(Engine::Fx).await?;
+        let cwd = home_dir()?.display().to_string();
+        fx_list_models(&client, &cwd).await
+    }
 }
 
 /// Provider rejections caused by too many tools in the request (OpenAI-style
@@ -901,6 +1011,8 @@ struct ToolState {
     ended: bool,
     kind: String,
     title: String,
+    /// The agent's own tool name, when it sends one (fx).
+    tool: Option<String>,
     raw: Value,
 }
 
@@ -930,6 +1042,7 @@ fn tool_events(update: &Value, tools: &mut HashMap<String, ToolState>) -> Vec<Wo
         ended: false,
         kind: "other".to_string(),
         title: "tool".to_string(),
+        tool: None,
         raw: json!({}),
     });
     if let Some(k) = update.get("kind").and_then(|k| k.as_str()) {
@@ -938,12 +1051,22 @@ fn tool_events(update: &Value, tools: &mut HashMap<String, ToolState>) -> Vec<Wo
     if let Some(t) = update.get("title").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
         entry.title = t.to_string();
     }
+    // fx names each call (`name`: write_file, shell, an MCP tool); for kinds
+    // without a native mapping that name reads better than a generic title
+    if let Some(n) = update.get("name").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
+        entry.tool = Some(n.to_string());
+    }
     if let Some(r) = update.get("rawInput").filter(|r| has_input(r)) {
         entry.raw = r.clone();
     }
     let finished = matches!(status, "completed" | "failed" | "cancelled");
     if !entry.started && (has_input(&entry.raw) || status == "in_progress" || finished) {
-        let (name, args) = tool_name_and_args(&entry.kind, &entry.title, &entry.raw);
+        let native = matches!(entry.kind.as_str(), "execute" | "shell" | "read" | "edit" | "search" | "fetch");
+        let title = match (&entry.tool, native) {
+            (Some(t), false) => t.clone(),
+            _ => entry.title.clone(),
+        };
+        let (name, args) = tool_name_and_args(&entry.kind, &title, &entry.raw);
         entry.name = name.clone();
         entry.started = true;
         out.push(WorkAgentEvent::ToolStart { name, args });
@@ -993,6 +1116,11 @@ fn handle_session_update(
                 emit_ev(on_event, stop, ev);
             }
         }
+        "plan" => {
+            if let Some(note) = plan_note(update) {
+                emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: note });
+            }
+        }
         "vicuna_permission" => {
             if let Some(title) = update.get("title").and_then(|t| t.as_str()) {
                 emit_ev(
@@ -1006,6 +1134,25 @@ fn handle_session_update(
         }
         _ => {}
     }
+}
+
+/// ACP `plan` update (entries with content + status) as a transcript checklist.
+fn plan_note(update: &Value) -> Option<String> {
+    let entries = update.get("entries").and_then(Value::as_array)?;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n\n**Plan**\n");
+    for e in entries {
+        let mark = match e.get("status").and_then(Value::as_str) {
+            Some("completed") => "[x]",
+            Some("in_progress") => "[~]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("- {mark} {}\n", e.get("content").and_then(Value::as_str).unwrap_or("").trim()));
+    }
+    out.push('\n');
+    Some(out)
 }
 
 fn image_blocks(images: &Option<Vec<String>>) -> Vec<Value> {
@@ -1138,7 +1285,9 @@ pub async fn run_turn(
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
     // each claude process and each codex app-server gets its own.
-    let route = (engine == Engine::Opencode).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    // fx: a resumed session keeps the MCP connections of the warm process, so
+    // it gets the same stable per-workspace route as opencode.
+    let route = matches!(engine, Engine::Opencode | Engine::Fx).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1214,7 +1363,7 @@ async fn open_session(
                 .call(method, session_params(workspace, Some(&prev), mcp), SESSION_TIMEOUT)
                 .await
             {
-                let model = current_model(&r);
+                let model = engine_model(engine, &r);
                 return Ok((prev, true, model));
             }
         }
@@ -1230,7 +1379,7 @@ async fn open_session(
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .ok_or_else(|| format!("{}: session/new returned no sessionId", engine_process_label(engine)))?;
-    Ok((sid, false, current_model(&result)))
+    Ok((sid, false, engine_model(engine, &result)))
 }
 
 /// Model to run: the turn's explicit pick, else the one saved in Vicuna's
@@ -1252,6 +1401,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Opencode => format!("{e}\nThe selected provider needs credentials: run `opencode auth login` once, or pick another model."),
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
+            Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
         }
     } else {
         e
@@ -1295,7 +1445,23 @@ async fn run_turn_inner(
     }
     let (mut updates, _route) = client.route(&acp_session);
 
-    if let Some(m) = effective_model(engine, model) {
+    if let (Engine::Fx, Some(m)) = (engine, effective_model(engine, model)) {
+        // `provider/model`: switch the provider first (its model list
+        // changes with it), then the model
+        let (provider, bare) = super::fx::split_model(&m)
+            .ok_or_else(|| format!("fx model ids are provider/model, got {m}"))?;
+        for (id, value) in [("provider", provider), ("model", bare)] {
+            let r = client
+                .call(
+                    "session/set_config_option",
+                    json!({ "sessionId": acp_session, "configId": id, "value": value }),
+                    CONFIG_TIMEOUT,
+                )
+                .await
+                .map_err(|e| friendly_prompt_error(engine, format!("fx could not switch to {id} {value}: {e}")))?;
+            used_model = engine_model(engine, &r).or(Some(m.clone()));
+        }
+    } else if let Some(m) = effective_model(engine, model) {
         let r = client
             .call(
                 "session/set_config_option",
@@ -1609,6 +1775,51 @@ mod tests {
         assert_eq!(current_model(&r).as_deref(), Some("opencode/beam-free"));
         assert_eq!(current_model(&json!({ "sessionId": "s" })), None);
         assert_eq!(current_model(&json!({ "configOptions": [{ "id": "model", "currentValue": "" }] })), None);
+    }
+
+    /// fx reports provider and model as separate config options; Vicuna's
+    /// id (and the reply label) is `provider/model`.
+    #[test]
+    fn fx_model_id_joins_provider_and_model() {
+        let r = json!({ "configOptions": [
+            { "id": "provider", "currentValue": "ollama" },
+            { "id": "model", "currentValue": "deepseek-v4.1-flash:cloud" }
+        ]});
+        assert_eq!(engine_model(Engine::Fx, &r).as_deref(), Some("ollama/deepseek-v4.1-flash:cloud"));
+        assert_eq!(engine_model(Engine::Opencode, &r).as_deref(), Some("deepseek-v4.1-flash:cloud"));
+        assert_eq!(session_key(Engine::Fx, Some("c1"), "/ws").as_deref(), Some("fx|c1|/ws"));
+        assert_eq!(engine_process_label(Engine::Fx), "fx acp");
+    }
+
+    /// fx sends its own tool name (`name`) next to a generic title; MCP tools
+    /// (kind other) show that name, native kinds keep their mapping.
+    #[test]
+    fn fx_tool_names_and_plan_notes() {
+        let mut tools = HashMap::new();
+        let mcp = json!({ "sessionUpdate": "tool_call", "toolCallId": "m1", "name": "browser__navigate", "title": "Calling tool", "kind": "other", "status": "pending", "rawInput": { "url": "https://example.com" } });
+        match &tool_events(&mcp, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "browser__navigate");
+                assert_eq!(args["url"], "https://example.com");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let shell = json!({ "sessionUpdate": "tool_call", "toolCallId": "s1", "name": "shell", "title": "Running", "kind": "execute", "status": "pending", "rawInput": { "action": "run", "command": "ls" } });
+        match &tool_events(&shell, &mut tools)[..] {
+            [WorkAgentEvent::ToolStart { name, args }] => {
+                assert_eq!(name, "exec");
+                assert_eq!(args["command"], "ls");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let plan = json!({ "sessionUpdate": "plan", "entries": [
+            { "content": "Read code", "status": "completed", "priority": "high" },
+            { "content": "Fix bug", "status": "in_progress", "priority": "high" },
+            { "content": "Test", "status": "pending", "priority": "low" }
+        ]});
+        let note = plan_note(&plan).unwrap();
+        assert!(note.contains("- [x] Read code") && note.contains("- [~] Fix bug") && note.contains("- [ ] Test"), "{note}");
+        assert_eq!(plan_note(&json!({ "entries": [] })), None);
     }
 
     /// QA FAIL (PR #6): cards showed `{}` because ToolStart went out with
