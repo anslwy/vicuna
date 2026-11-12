@@ -13,6 +13,7 @@
 #   scripts/work-acceptance.sh stopq <model> [engine]    # a message queued mid-turn runs next; Stop interrupts a long reply
 #   scripts/work-acceptance.sh ask <model> [engine]      # agent question (vicuna-mcp ask_user): card, answer continues, Stop cancels
 #   scripts/work-acceptance.sh always <model> [engine]   # 'ask' mode: "Always allow" on the first shell command approves the second
+#   scripts/work-acceptance.sh stoptool <model> [engine] # Stop during a long shell command ends the turn AND the command; missing workspace errors
 #   scripts/work-acceptance.sh plan <model> codex       # Codex goal/plan updates show as a transcript note (1 turn)
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
@@ -333,6 +334,59 @@ text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
 assert "vicuna-approve-ok" in outs + text, (outs[:300], text[:300])
 import os
 print("PASS ask mode: the command waited for the ask card, ran after Allow, transcript says Approved")
+PY
+    ;;
+  stoptool)
+    [ -n "$model" ] || { echo "usage: $0 stoptool <model> [engine]"; exit 2; }
+    # Stop while a shell command runs: the turn ends (done stopped=true) and
+    # the command's process is gone too (agy leaves it running on cancel).
+    # Then a turn in a folder that does not exist fails with a readable error.
+    start_bridge
+    marker="vicuna-stoptool-$$"
+    start="$(invoke work_agent_start "$(turn_args "st-$$" true "Use your shell tool to run exactly this one command and wait for it to finish: sleep 45 && echo $marker. Do not run it in the background.")")"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    stopped_at=""
+    for _ in $(seq 1 240); do
+      curl -sS "$base/poll/st-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      if [ -z "$stopped_at" ] && grep -q '"type": "toolstart"' "$work/events.jsonl" && pgrep -f "sleep 45" >/dev/null; then
+        sleep 2
+        echo "sleep is running; pressing Stop"
+        invoke work_agent_stop "{\"turnId\":\"$turn_id\"}" >/dev/null
+        stopped_at=1
+      fi
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    sleep 2
+    left="$(pgrep -fa "sleep 45" || true)"
+    python3 - "$work/events.jsonl" "$stopped_at" "$left" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert sys.argv[2] == "1", "the shell command never started"
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+done = [e for e in evs if e.get("type") == "done"]
+assert done and done[-1].get("stopped") is True, done
+assert not sys.argv[3].strip(), f"the command outlived Stop: {sys.argv[3]}"
+print("PASS Stop mid-tool: turn stopped and the running command was ended")
+PY
+    start="$(invoke work_agent_start "$(python3 - "$model" "$engine" <<'PY'
+import json, sys
+print(json.dumps({"engine": sys.argv[2], "model": sys.argv[1], "workspace": "/nonexistent/vicuna-ws", "sessionId": "gone-1",
+                  "freshSession": True, "messages": [{"role": "user", "content": "hi"}], "onEvent": {"__bridge_channel": "gone-1"}}))
+PY
+)")"
+    poll_turn "gone-1"
+    python3 - "$work/events.jsonl" "$start" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+start = json.loads(sys.argv[2])
+msgs = [e.get("message", "") for e in evs if e.get("type") == "error"] + [start.get("error") or ""]
+assert any("workspace folder not found: /nonexistent/vicuna-ws" in m for m in msgs), (start, evs[-3:])
+print("PASS missing workspace: readable error:", [m for m in msgs if m][0])
 PY
     ;;
   always)

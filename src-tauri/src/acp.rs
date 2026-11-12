@@ -58,6 +58,8 @@ struct Proc {
     ask: bool,
     /// The opencode binary this process was started from.
     bin: PathBuf,
+    /// OS pid (agy: also its process group id).
+    pid: Option<u32>,
     // held so kill_on_drop ends the process when this Proc is replaced
     _child: Child,
 }
@@ -120,6 +122,9 @@ impl AcpState {
                 (bin, cmd, String::new())
             }
             Engine::Agy => {
+                if let Some(e) = super::agy::workspace_error(Path::new(workspace)) {
+                    return Err(e);
+                }
                 let bin = super::agy::find_agy().ok_or_else(super::agy::missing_message)?;
                 let cmd = super::agy::command(&bin, ask_now, Path::new(workspace));
                 (bin, cmd, workspace.to_string())
@@ -140,6 +145,7 @@ impl AcpState {
             Proc {
                 client: client.clone(),
                 ask: ask_now,
+                pid: child.id(),
                 bin,
                 _child: child,
             },
@@ -152,6 +158,17 @@ impl AcpState {
     async fn discard(&self, engine: Engine, workspace: &str) {
         let ws = if engine == Engine::Agy { workspace.to_string() } else { String::new() };
         self.procs.lock().await.remove(&(engine, ws));
+    }
+
+    /// Stop for agy: end its whole process group (agy leaves the command a
+    /// cancelled call started running), so nothing outlives the turn. The
+    /// next turn respawns agy and resumes the saved session.
+    async fn kill_tree(&self, engine: Engine, workspace: &str) {
+        let ws = if engine == Engine::Agy { workspace.to_string() } else { String::new() };
+        if let Some(p) = self.procs.lock().await.remove(&(engine, ws)) {
+            super::agy::kill_group(p.pid);
+            // dropping `p` kills agy itself (kill_on_drop)
+        }
     }
 
     /// Start the current engine's warm process ahead of the first Work turn
@@ -1565,6 +1582,8 @@ async fn run_turn_inner(
         let mut output_chars = 0usize;
         let mut tools: HashMap<String, ToolState> = HashMap::new();
         let mut cancelled = false;
+        // a tool call was still running when Stop was pressed
+        let mut tool_running_at_stop = false;
         let mut cancel_at: Option<Instant> = None;
         let outcome: Result<Value, String> = loop {
             tokio::select! {
@@ -1584,6 +1603,7 @@ async fn run_turn_inner(
                 _ = tokio::time::sleep(Duration::from_millis(120)) => {
                     if stop.load(Ordering::Relaxed) && !cancelled {
                         cancelled = true;
+                        tool_running_at_stop = tools.values().any(|t| t.started && !t.ended);
                         cancel_at = Some(Instant::now());
                         let _ = client.notify("session/cancel", json!({ "sessionId": acp_session }));
                     }
@@ -1596,6 +1616,10 @@ async fn run_turn_inner(
         // Drain trailing updates that arrived before the prompt response.
         while let Ok(msg) = updates.try_recv() {
             handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
+        }
+        if engine == Engine::Agy && cancelled && tool_running_at_stop {
+            state.kill_tree(engine, workspace).await;
+            emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
         }
         let gen_ms = started.elapsed().as_millis() as u64;
         let secs = (gen_ms as f64 / 1000.0).max(0.001);

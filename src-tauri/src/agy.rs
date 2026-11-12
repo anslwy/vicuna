@@ -59,13 +59,39 @@ pub fn missing_message() -> String {
 /// before running tools" off, agy approves everything itself
 /// (`--dangerously-skip-permissions`); with it on, agy sends
 /// `session/request_permission` and the user answers on the ask card.
+///
+/// The process leads its own process group so Stop can end the commands
+/// agy started: on session/cancel agy reports the call cancelled but leaves
+/// its child (e.g. `sleep 60`) running.
 pub fn command(bin: &Path, ask: bool, workspace: &Path) -> Command {
     let mut cmd = crate::opencode::command(bin);
     cmd.args(acp_args(ask));
-    if workspace.is_dir() {
-        cmd.current_dir(workspace);
-    }
+    cmd.current_dir(workspace);
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd
+}
+
+/// Why a turn cannot start in `workspace` (agy would silently run in
+/// Vicuna's own folder otherwise), or None when it exists.
+pub fn workspace_error(workspace: &Path) -> Option<String> {
+    (!workspace.is_dir()).then(|| {
+        format!("workspace folder not found: {} (pick an existing folder for this Work chat)", workspace.display())
+    })
+}
+
+/// End agy's process group (agy and every command it started).
+pub fn kill_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.filter(|p| *p > 1) {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", "--", &format!("-{pid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 pub fn acp_args(ask: bool) -> Vec<&'static str> {
@@ -236,6 +262,13 @@ mod tests {
         assert_eq!(m[0].name.as_deref(), Some("Gemini 3.8 Flash (Medium)"));
         assert_eq!(m.iter().map(|x| x.provider.as_str()).collect::<Vec<_>>(), ["google", "anthropic", "openai"]);
         assert_eq!(parse_version("1.5.6\n").as_deref(), Some("1.5.6"));
+    }
+
+    #[test]
+    fn missing_workspace_is_an_error() {
+        let msg = workspace_error(Path::new("/nonexistent/vicuna-ws")).unwrap();
+        assert!(msg.starts_with("workspace folder not found: /nonexistent/vicuna-ws"), "{msg}");
+        assert_eq!(workspace_error(&std::env::temp_dir()), None);
     }
 
     #[test]
