@@ -37,6 +37,18 @@
   import Tooltip from "$lib/Tooltip.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
+  import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
+  import {
+    APP_UPDATE_RELEASES_URL,
+    createReleaseNotesPreview,
+    fetchGithubReleaseNotesMetadata,
+    formatAppUpdateInstallError,
+    loadAppUpdatePreferenceFromStorage,
+    normalizeUpdateErrorMessage,
+    persistAppUpdatePreference,
+    type AppUpdateInfo,
+    type AppUpdateStatus
+  } from "$lib/appUpdate";
   import { CONTINUE_MODES, buildRawContinuePrompt, isRunawayRepetition, normalizeContinueMode, normalizePromptStyle, promptStyleForFamily, stripRunawayTail, useRawContinue, type ContinueMode, type PromptStyle } from "$lib/continue";
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
@@ -1512,6 +1524,233 @@
   let updateError = $state<string | null>(null);
   let updateNote = $state<string | null>(null);
   let downloadedPath = $state<string | null>(null);
+
+  // --- Signed in-app updates (Tauri updater; same flow as cojudge's
+  // src/routes/+page.svelte: auto-check on startup + manual check +
+  // download/install + relaunch). The manifest is latest.json on the newest
+  // stable GitHub release (tauri.conf.json → plugins.updater.endpoints).
+  // Plain-browser/bridge mode has no updater and keeps the download flow above.
+  let showUpdatePrompt = $state(false);
+  let availableAppUpdate = $state<AppUpdateInfo | null>(null);
+  let appUpdateStatus = $state<AppUpdateStatus>("idle");
+  let appUpdateError = $state<string | null>(null);
+  let appUpdateProgress = $state<{ downloadedBytes: number; totalBytes: number | null } | null>(null);
+  let skippedAppUpdateVersion = $state<string | null>(null);
+  let autoCheckAppUpdatesEnabled = $state(true);
+  let suppressAutoUpdatePromptUntilNextCheck = false;
+  /** the plugin's Update handle (not reactive: it owns a native resource) */
+  let updateObject: {
+    version: string;
+    currentVersion?: string;
+    downloadAndInstall: (cb?: (event: unknown) => void) => Promise<void>;
+  } | null = null;
+  const appUpdateLabel = $derived(
+    appUpdateStatus === "checking"
+      ? "Checking for updates…"
+      : appUpdateStatus === "installing"
+        ? "Installing update…"
+        : appUpdateStatus === "installed"
+          ? "Restart to apply update"
+          : appUpdateStatus === "available" && availableAppUpdate
+            ? `Update to v${availableAppUpdate.version}`
+            : "Check for updates"
+  );
+
+  function initializeAppUpdatePreference() {
+    const stored = loadAppUpdatePreferenceFromStorage();
+    skippedAppUpdateVersion = stored.skippedVersion;
+    autoCheckAppUpdatesEnabled = stored.autoCheckEnabled;
+  }
+
+  function setAutoCheckAppUpdates(enabled: boolean) {
+    autoCheckAppUpdatesEnabled = enabled;
+    try {
+      persistAppUpdatePreference({ skippedVersion: skippedAppUpdateVersion, autoCheckEnabled: enabled });
+    } catch {
+      /* storage unavailable: keep the in-memory choice */
+    }
+  }
+
+  function closeUpdatePrompt() {
+    showUpdatePrompt = false;
+  }
+
+  function skipAvailableAppUpdateVersion() {
+    const version = availableAppUpdate?.version?.trim();
+    if (version) {
+      skippedAppUpdateVersion = version;
+      try {
+        persistAppUpdatePreference({ skippedVersion: version, autoCheckEnabled: autoCheckAppUpdatesEnabled });
+      } catch {
+        /* storage unavailable */
+      }
+    }
+    suppressAutoUpdatePromptUntilNextCheck = false;
+    closeUpdatePrompt();
+  }
+
+  function remindAboutAppUpdateLater() {
+    suppressAutoUpdatePromptUntilNextCheck = true;
+    closeUpdatePrompt();
+  }
+
+  async function triggerAutomaticAppUpdateCheck() {
+    if (typeof navigator !== "undefined" && !navigator.onLine) return;
+    if (!autoCheckAppUpdatesEnabled) return;
+    if (appUpdateStatus === "checking" || appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
+    const suppressPrompt = suppressAutoUpdatePromptUntilNextCheck;
+    suppressAutoUpdatePromptUntilNextCheck = false;
+    await checkForAppUpdates({ source: "automatic", suppressAutoPrompt: suppressPrompt });
+  }
+
+  async function resolveAppUpdateReleaseNotes(update: {
+    body?: string | null;
+  }): Promise<{ notesPreview: string | null; releaseNotesUrl: string }> {
+    const fallback = createReleaseNotesPreview(update.body ?? null);
+    try {
+      return await fetchGithubReleaseNotesMetadata();
+    } catch (err) {
+      console.warn("Failed to fetch GitHub release notes preview:", err);
+      return { notesPreview: fallback, releaseNotesUrl: APP_UPDATE_RELEASES_URL };
+    }
+  }
+
+  async function checkForAppUpdates(
+    options: { source?: "manual" | "automatic"; suppressAutoPrompt?: boolean } = {}
+  ) {
+    const source = options.source ?? "manual";
+    const suppressAutoPrompt = options.suppressAutoPrompt ?? false;
+    if (!isTauriRuntime()) {
+      void openExternal(APP_UPDATE_RELEASES_URL);
+      return;
+    }
+    if (appUpdateStatus === "checking" || appUpdateStatus === "installing") return;
+
+    const previousAvailable = availableAppUpdate;
+    const previousStatus = appUpdateStatus;
+    const previousError = appUpdateError;
+    const previousUpdateObject = updateObject;
+
+    appUpdateStatus = "checking";
+    appUpdateError = null;
+    appUpdateProgress = null;
+    availableAppUpdate = null;
+    updateObject = null;
+
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (update) {
+        const rawTarget = (update as unknown as { rawJson?: { target?: unknown } }).rawJson?.target;
+        const releaseNotes = await resolveAppUpdateReleaseNotes({
+          body: (update as unknown as { body?: string | null }).body ?? null
+        });
+        availableAppUpdate = {
+          version: update.version,
+          currentVersion: update.currentVersion || "",
+          notes: releaseNotes.notesPreview,
+          publishedAt: (update as unknown as { date?: string | null }).date ?? null,
+          target: typeof rawTarget === "string" ? rawTarget : "",
+          releaseNotesUrl: releaseNotes.releaseNotesUrl
+        };
+        updateObject = update as unknown as typeof updateObject;
+        appUpdateStatus = "available";
+        if (source === "manual") {
+          showUpdatePrompt = true;
+        } else if (!suppressAutoPrompt && update.version !== skippedAppUpdateVersion) {
+          showUpdatePrompt = true;
+        } else {
+          closeUpdatePrompt();
+        }
+      } else {
+        appUpdateStatus = "up_to_date";
+        closeUpdatePrompt();
+        if (source === "manual") flashNotice("Vicuna is already up to date.");
+      }
+    } catch (err) {
+      console.error("Failed to check for app updates:", err);
+      if (source === "automatic") {
+        // background checks never surface errors (offline, no release yet…)
+        availableAppUpdate = previousAvailable;
+        appUpdateStatus = previousStatus;
+        appUpdateError = previousError;
+        updateObject = previousUpdateObject;
+        return;
+      }
+      availableAppUpdate = null;
+      updateObject = null;
+      appUpdateStatus = "error";
+      appUpdateError = normalizeUpdateErrorMessage(err);
+      showUpdatePrompt = false;
+    }
+  }
+
+  async function installAppUpdate() {
+    if (appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
+    // The modal can outlive the in-memory updater handle: re-check instead
+    // of silently doing nothing.
+    if (!updateObject) {
+      appUpdateError = null;
+      await checkForAppUpdates({ source: "manual" });
+      if (!updateObject || appUpdateStatus !== "available") return;
+    }
+    if (appUpdateStatus !== "available" && appUpdateStatus !== "error") return;
+    const handle = updateObject;
+    if (!handle) return;
+    appUpdateStatus = "installing";
+    appUpdateError = null;
+    appUpdateProgress = { downloadedBytes: 0, totalBytes: null };
+    // Keep the dialog visible so progress is seen; it stays dismissible and
+    // the install continues in the background if hidden.
+    showUpdatePrompt = true;
+    try {
+      await handle.downloadAndInstall((event) => {
+        const name = (event as { event?: string })?.event;
+        const data = (event as { data?: { chunkLength?: unknown; contentLength?: unknown } })?.data ?? {};
+        if (name === "Started") {
+          const total = typeof data.contentLength === "number" ? data.contentLength : null;
+          appUpdateProgress = { downloadedBytes: 0, totalBytes: total };
+        } else if (name === "Progress") {
+          const chunk = typeof data.chunkLength === "number" ? data.chunkLength : 0;
+          const prev = appUpdateProgress ?? { downloadedBytes: 0, totalBytes: null };
+          appUpdateProgress = { downloadedBytes: prev.downloadedBytes + chunk, totalBytes: prev.totalBytes };
+        }
+      });
+      appUpdateProgress = null;
+      appUpdateStatus = "installed";
+    } catch (err) {
+      console.error("Failed to install app update:", err);
+      appUpdateProgress = null;
+      appUpdateStatus = "error";
+      appUpdateError = formatAppUpdateInstallError(err);
+    }
+  }
+
+  async function restartToApplyUpdate() {
+    try {
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (err) {
+      console.error("Failed to restart after installing update:", err);
+      appUpdateError = normalizeUpdateErrorMessage(err);
+    }
+  }
+
+  /** Settings → App updates button: reopen a known update (incl. one that
+   *  is installing/installed/failed) instead of starting a conflicting check. */
+  async function openAppUpdate() {
+    if (
+      availableAppUpdate &&
+      (appUpdateStatus === "available" ||
+        appUpdateStatus === "installing" ||
+        appUpdateStatus === "installed" ||
+        appUpdateStatus === "error")
+    ) {
+      showUpdatePrompt = true;
+      return;
+    }
+    await checkForAppUpdates({ source: "manual" });
+  }
   /** update errors fade like the main error box (a manual × also exists);
    *  same plain-timer shape as `errorTimer` above */
   let updateErrorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6445,6 +6684,11 @@
     window.addEventListener("pointercancel", onMessagesPointerUp);
     window.addEventListener("keydown", onMessagesKeyDown);
     void initApp();
+    // Automatic update detection on startup (desktop only), same as cojudge.
+    initializeAppUpdatePreference();
+    const updateCheckTimer = isTauriRuntime()
+      ? setTimeout(() => void triggerAutomaticAppUpdateCheck(), 2500)
+      : null;
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
     let unlistenDeepLink: (() => void) | null = null;
@@ -6469,6 +6713,7 @@
       window.removeEventListener("pointercancel", onMessagesPointerUp);
       window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
     };
   });
 
@@ -8428,6 +8673,18 @@
     {/if}
   </div>
 {/if}
+{#if showUpdatePrompt && availableAppUpdate}
+  <UpdatePromptModal
+    {availableAppUpdate}
+    {appUpdateStatus}
+    {appUpdateError}
+    downloadProgress={appUpdateProgress}
+    onInstall={appUpdateStatus === "installed" ? restartToApplyUpdate : installAppUpdate}
+    onSkipVersion={skipAvailableAppUpdateVersion}
+    onRemindLater={remindAboutAppUpdateLater}
+    onClose={remindAboutAppUpdateLater}
+  />
+{/if}
 {#if lightboxSrc}
   <button
     class="lightbox-backdrop"
@@ -8750,37 +9007,59 @@
     </div>
     <div class="setting-stacked">
       <span class="setting-label">App updates</span>
-      <div class="browse-actions">
-        {#if buildInfo}
-          <span class="setting-note" data-testid="app-version">v{buildInfo.version} · built {formatBuildDate(buildInfo.builtAtUnix) || "date unknown"}</span>
-        {:else}
-          <span class="setting-note">Current version unknown.</span>
-        {/if}
-        <button class="mini-btn" data-testid="update-check-btn" disabled={updateOp !== null} onclick={checkForUpdates}>{updateOp === "check" ? "Checking…" : "Check for updates"}</button>
-      </div>
-      {#if updateRelease}
-        {@const platform = currentPlatform()}
-        {@const stamp = releaseTimestamp(updateRelease, platform)}
-        {@const behind = !buildInfo || isNewerRelease(stamp, buildInfo.builtAtUnix)}
-        {@const asset = pickAssetForPlatform(updateRelease.assets, platform)}
-        <span class="setting-note" data-testid="update-latest">Latest: {updateRelease.tag} · installer built {formatBuildDate(Math.floor(Date.parse(stamp) / 1000)) || "date unknown"}</span>
-        {#if behind && asset}
-          <div class="browse-actions">
-            <button class="mini-btn primary" data-testid="update-install-btn" disabled={updateOp !== null} onclick={applyUpdate}>{updateOp === "download" ? "Downloading…" : `Download ${asset.name} (${formatAssetSize(asset.size)})`}</button>
-            <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
-          </div>
-        {:else if behind}
-          <span class="setting-note">No installer for this platform in {updateRelease.tag} — see the release notes.</span>
-          <div class="browse-actions">
-            <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
-          </div>
-        {:else}
+      {#if isTauriRuntime()}
+        <div class="browse-actions">
+          {#if buildInfo}
+            <span class="setting-note" data-testid="app-version">v{buildInfo.version} · built {formatBuildDate(buildInfo.builtAtUnix) || "date unknown"}</span>
+          {:else}
+            <span class="setting-note">Current version unknown.</span>
+          {/if}
+          <button class="mini-btn {appUpdateStatus === 'available' || appUpdateStatus === 'installed' ? 'primary' : ''}" data-testid="update-check-btn" disabled={appUpdateStatus === "checking"} onclick={() => void openAppUpdate()}>{appUpdateLabel}</button>
+        </div>
+        {#if appUpdateStatus === "up_to_date"}
           <span class="setting-note" data-testid="update-uptodate">You're up to date.</span>
         {/if}
+        {#if appUpdateStatus === "error" && appUpdateError && !showUpdatePrompt}
+          <p class="goto-error" data-testid="update-error">Update check failed: {appUpdateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => { appUpdateError = null; appUpdateStatus = "idle"; }}>×</button></p>
+        {/if}
+        <label class="setting-note approval-row" data-testid="update-autocheck">
+          <input type="checkbox" data-testid="update-autocheck-toggle" checked={autoCheckAppUpdatesEnabled} onchange={(e) => setAutoCheckAppUpdates((e.currentTarget as HTMLInputElement).checked)} />
+          Check for updates automatically on startup.
+        </label>
+        <span class="setting-note">Signed updates from the newest <a href={APP_UPDATE_RELEASES_URL} onclick={(e) => { e.preventDefault(); void openExternal(APP_UPDATE_RELEASES_URL); }}>GitHub release</a>: install in-app, then restart to apply. macOS: run Vicuna from /Applications. Linux: in-app install works for the AppImage; .deb installs update by downloading the new package.</span>
+      {:else}
+        <div class="browse-actions">
+          {#if buildInfo}
+            <span class="setting-note" data-testid="app-version">v{buildInfo.version} · built {formatBuildDate(buildInfo.builtAtUnix) || "date unknown"}</span>
+          {:else}
+            <span class="setting-note">Current version unknown.</span>
+          {/if}
+          <button class="mini-btn" data-testid="update-check-btn" disabled={updateOp !== null} onclick={checkForUpdates}>{updateOp === "check" ? "Checking…" : "Check for updates"}</button>
+        </div>
+        {#if updateRelease}
+          {@const platform = currentPlatform()}
+          {@const stamp = releaseTimestamp(updateRelease, platform)}
+          {@const behind = !buildInfo || isNewerRelease(stamp, buildInfo.builtAtUnix)}
+          {@const asset = pickAssetForPlatform(updateRelease.assets, platform)}
+          <span class="setting-note" data-testid="update-latest">Latest: {updateRelease.tag} · installer built {formatBuildDate(Math.floor(Date.parse(stamp) / 1000)) || "date unknown"}</span>
+          {#if behind && asset}
+            <div class="browse-actions">
+              <button class="mini-btn primary" data-testid="update-install-btn" disabled={updateOp !== null} onclick={applyUpdate}>{updateOp === "download" ? "Downloading…" : `Download ${asset.name} (${formatAssetSize(asset.size)})`}</button>
+              <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
+            </div>
+          {:else if behind}
+            <span class="setting-note">No installer for this platform in {updateRelease.tag} — see the release notes.</span>
+            <div class="browse-actions">
+              <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
+            </div>
+          {:else}
+            <span class="setting-note" data-testid="update-uptodate">You're up to date.</span>
+          {/if}
+        {/if}
+        {#if updateNote}<span class="setting-note" data-testid="update-note">{updateNote}</span>{/if}
+        {#if updateError}<p class="goto-error" data-testid="update-error">{updateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => (updateError = null)}>×</button></p>{/if}
+        <span class="setting-note">Compares your build date against the rolling <code>latest</code> prerelease and opens the downloaded installer for you to run.</span>
       {/if}
-      {#if updateNote}<span class="setting-note" data-testid="update-note">{updateNote}</span>{/if}
-      {#if updateError}<p class="goto-error" data-testid="update-error">{updateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => (updateError = null)}>×</button></p>{/if}
-      <span class="setting-note">Compares your build date against the rolling <code>latest</code> prerelease and opens the downloaded installer for you to run.</span>
     </div>
     {#if isTauriRuntime()}
       <div class="setting-stacked">
