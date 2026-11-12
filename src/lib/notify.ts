@@ -1,7 +1,7 @@
 // Native OS notification when a Chat/Work turn finishes while the window is
 // not in front. Decision logic is pure in ./notifyGate (unit-tested).
 import { isTauriRuntime } from "$lib/ollama";
-import { shouldNotify, notifyTitle, notifyBody, parseNotifyPref, NOTIFY_PREF_KEY, NOTIFY_SOUND_PREF_KEY, NOTIFY_SOUND_CHOICE_KEY, type TurnEnd, type TurnMode } from "$lib/notifyGate";
+import { shouldNotify, notifyTitle, notifyBody, parseNotifyPref, askBody, NOTIFY_PREF_KEY, NOTIFY_SOUND_PREF_KEY, NOTIFY_SOUND_CHOICE_KEY, type TurnEnd, type TurnMode } from "$lib/notifyGate";
 import { playChime, normalizeChime, type ChimeId } from "$lib/chime";
 
 export function getNotifyEnabled(): boolean {
@@ -74,5 +74,26 @@ export async function notifyTurnEnd(opts: { title?: string | null; mode: TurnMod
     if (!granted) granted = (await n.requestPermission()) === "granted";
     if (!granted) return;
     n.sendNotification({ title: notifyTitle(opts.title), body: notifyBody(opts.mode, opts.end, opts.reply), ...(osSound ? { sound: osSound } : {}) });
+  } catch {}
+}
+
+/** Fire-and-forget OS notification + chime when an agent raises a question
+ *  (ask card) while the user can't see the window — otherwise the turn just
+ *  sits there waiting with nothing visible to come back to. Never throws. */
+export async function notifyAgentAsk(question: string): Promise<void> {
+  try {
+    if (!isTauriRuntime()) return;
+    const { focused, visible } = await windowState();
+    if (!shouldNotify({ enabled: getNotifyEnabled(), focused, visible, userStopped: false })) return;
+    // Chime first (plays even if notification permission is denied). If Web
+    // Audio is unavailable/still locked, ask macOS for its notification sound.
+    const chimed = getNotifySound() ? await playChime(getNotifySoundChoice()) : true;
+    const osSound = !chimed && /Mac/i.test(navigator.userAgent) ? "default" : undefined;
+    const n = await import("@tauri-apps/plugin-notification");
+    let granted = await n.isPermissionGranted();
+    // macOS asks on first use
+    if (!granted) granted = (await n.requestPermission()) === "granted";
+    if (!granted) return;
+    n.sendNotification({ title: "Vicuna — question", body: askBody(question), ...(osSound ? { sound: osSound } : {}) });
   } catch {}
 }
