@@ -354,7 +354,9 @@ fn resolve_executable(name: &str) -> Option<String> {
     if p.is_absolute() && p.is_file() {
         return Some(name.to_string());
     }
-    let path = std::env::var_os("PATH")?;
+    // the terminal's PATH (login shell + process PATH): a GUI app's own PATH
+    // misses nvm/uv/homebrew tools, and fx only accepts absolute commands
+    let path = crate::exe_resolve::child_path(None).or_else(|| std::env::var_os("PATH"))?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
         if candidate.is_file() {
@@ -362,6 +364,22 @@ fn resolve_executable(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Stdio entries need an absolute command for fx; HTTP entries pass.
+/// Returns (kept, names of the dropped servers).
+fn split_absolute_commands(mcp: Vec<Value>) -> (Vec<Value>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for e in mcp {
+        match e.get("command").and_then(Value::as_str) {
+            Some(c) if !Path::new(c).is_absolute() => {
+                dropped.push(e.get("name").and_then(Value::as_str).unwrap_or(c).to_string());
+            }
+            _ => kept.push(e),
+        }
+    }
+    (kept, dropped)
 }
 
 /// Params for session/new, resume and load.
@@ -1439,6 +1457,21 @@ async fn run_turn_inner(
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
     let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
+    // fx rejects the whole session when one stdio server's command is not an
+    // absolute path; leave out the ones that did not resolve and say so
+    let mcp = if engine == Engine::Fx {
+        let (kept, dropped) = split_absolute_commands(mcp);
+        if !dropped.is_empty() {
+            let note = format!(
+                "MCP servers not available to fx this turn (command not found on your PATH): {}",
+                dropped.join(", ")
+            );
+            emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
+        }
+        kept
+    } else {
+        mcp
+    };
     let (acp_session, resumed, mut used_model) = open_session(engine, &client, saved, workspace, &mcp).await?;
     if let Some(k) = key {
         state.set(k, acp_session.clone());
@@ -1789,6 +1822,18 @@ mod tests {
         assert_eq!(engine_model(Engine::Opencode, &r).as_deref(), Some("deepseek-v4.1-flash:cloud"));
         assert_eq!(session_key(Engine::Fx, Some("c1"), "/ws").as_deref(), Some("fx|c1|/ws"));
         assert_eq!(engine_process_label(Engine::Fx), "fx acp");
+    }
+
+    #[test]
+    fn fx_drops_stdio_servers_without_an_absolute_command() {
+        let mcp = vec![
+            json!({ "name": "a", "command": "/usr/bin/python3", "args": [], "env": [] }),
+            json!({ "name": "b", "command": "uvx", "args": [], "env": [] }),
+            json!({ "type": "http", "name": "vicuna-mcp", "url": "http://127.0.0.1:1/mcp/x", "headers": [] }),
+        ];
+        let (kept, dropped) = split_absolute_commands(mcp);
+        assert_eq!(kept.iter().map(|e| e["name"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "vicuna-mcp"]);
+        assert_eq!(dropped, ["b"]);
     }
 
     /// fx sends its own tool name (`name`) next to a generic title; MCP tools

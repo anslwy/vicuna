@@ -153,6 +153,15 @@ pub fn process_env(ask: bool) -> Vec<(String, String)> {
     if ask {
         env.push((PERMISSION_ENV.to_string(), "ask".to_string()));
     }
+    // `fx acp` refuses to initialize when its default provider is not signed
+    // in, even if every turn then picks another one: start it on the
+    // provider of the model picked in Vicuna (turns still set provider+model
+    // per session; FX_PROVIDER is process-only, never saved).
+    if let Some(m) = saved_model() {
+        if let Some((provider, _)) = split_model(&m) {
+            env.push(("FX_PROVIDER".to_string(), provider.to_string()));
+        }
+    }
     if let Some(s) = fx_settings() {
         env.extend(loopback_auth_env(&s, |k| std::env::var_os(k).is_some_and(|v| !v.is_empty())));
     }
