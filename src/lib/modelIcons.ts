@@ -23,3 +23,8 @@ export const OPENCODE_ICON_INNER_PATH = "M15 10.5v6H9v-6z";
 export const CODEX_ICON_OUTLINE_PATH =
   "M19.69 9.79A4 4 0 0 1 17.75 17.56A4 4 0 0 1 10.06 19.76A4 4 0 0 1 4.31 14.21A4 4 0 0 1 6.25 6.44A4 4 0 0 1 13.94 4.24A4 4 0 0 1 19.69 9.79Z";
 export const CODEX_ICON_PROMPT_PATH = "M7.5 9.2l2.5 2.8-2.5 2.8M12.6 14.7h3.3";
+
+// Antigravity (agy) mark: a rising arch drawn as one stroke (fill none,
+// stroke currentColor, width 2, round caps), Vicuna's own line drawing
+// in the spirit of the CLI's arch logo, so it follows the theme.
+export const AGY_ICON_PATH = "M4 19.5c2 0 2.9-1.3 3.8-3.6L12 4.5l4.2 11.4c.9 2.3 1.8 3.6 3.8 3.6";
