@@ -31,6 +31,7 @@ pub mod fx;
 pub mod work_engine;
 pub mod work_agent;
 pub mod vicuna_mcp;
+pub mod git_panel;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -1559,7 +1560,9 @@ pub async fn work_read_file_logic(
         return Err("not a file".to_string());
     }
     let size = meta.len();
-    let cap = max_bytes.unwrap_or(65536).clamp(1024, 262144) as usize;
+    // upper bound matches the write cap so the in-app editor can round-trip
+    // anything it may save; agent reads keep the 64KB default
+    let cap = max_bytes.unwrap_or(65536).clamp(1024, 524288) as usize;
     let bytes = std::fs::read(&full).map_err(|e| format!("cannot read file: {e}"))?;
     // reject obvious binaries (NUL byte in the head sample)
     if bytes.iter().take(4096).any(|&b| b == 0) {
@@ -2074,6 +2077,54 @@ async fn work_grep(root: String, pattern: String, include: Option<String>) -> Re
 #[tauri::command]
 async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
     work_write_file_logic(root, path, content).await
+}
+
+/// Open a workspace file/folder with the OS default app. Sandboxed through
+/// `work_join` (the opener capability itself carries no path scope, so the
+/// frontend's `openPath` was refused for every path).
+#[tauri::command]
+async fn work_open_path(app: AppHandle, root: String, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join(&canon, &path)?;
+    if !full.exists() {
+        return Err("file not found".to_string());
+    }
+    app.opener()
+        .open_path(full.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("cannot open: {e}"))
+}
+
+// ---- Git panel (side panel Git tab; logic in git_panel.rs, shared with the bridge) ----
+
+#[tauri::command]
+async fn git_status(root: String) -> Result<git_panel::GitStatus, String> {
+    git_panel::git_status_logic(root).await
+}
+
+#[tauri::command]
+async fn git_diff(root: String, path: String, staged: bool, untracked: bool) -> Result<git_panel::GitDiff, String> {
+    git_panel::git_diff_logic(root, path, staged, untracked).await
+}
+
+#[tauri::command]
+async fn git_stage(root: String, paths: Vec<String>) -> Result<(), String> {
+    git_panel::git_stage_logic(root, paths).await
+}
+
+#[tauri::command]
+async fn git_unstage(root: String, paths: Vec<String>) -> Result<(), String> {
+    git_panel::git_unstage_logic(root, paths).await
+}
+
+#[tauri::command]
+async fn git_discard(root: String, paths: Vec<String>, untracked: Vec<String>) -> Result<(), String> {
+    git_panel::git_discard_logic(root, paths, untracked).await
+}
+
+#[tauri::command]
+async fn git_apply(root: String, patch: String, cached: bool, reverse: bool, intent_to_add: Vec<String>) -> Result<(), String> {
+    git_panel::git_apply_logic(root, patch, cached, reverse, intent_to_add).await
 }
 
 #[tauri::command]
@@ -5148,6 +5199,13 @@ pub fn run() {
             work_read_image,
             work_grep,
             work_write_file,
+            work_open_path,
+            git_status,
+            git_diff,
+            git_stage,
+            git_unstage,
+            git_discard,
+            git_apply,
             work_exec,
             work_fetch_url,
             work_exec_start,

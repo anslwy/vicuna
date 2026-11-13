@@ -34,8 +34,9 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, multiAnswer } from "$lib/askCard";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
+  import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
@@ -162,10 +163,10 @@
   /** explorer panel width (drag the left edge; in-memory only) */
   let explorerWidth = $state(300);
   let expResizing = $state(false);
-  /** side-panel tabs: one Files view max, one Browser max, any number of terminals */
+  /** side-panel tabs: one Files view max, one Browser max, one Git max, any number of terminals */
   interface SideTab {
     key: string;
-    kind: "files" | "terminal" | "browser";
+    kind: "files" | "terminal" | "browser" | "git";
     title: string;
     termId?: string;
     dead?: boolean;
@@ -4088,6 +4089,7 @@
       explorerError = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
       explorerLoading = false;
+      gitRefreshTick++; // renames / deletes / imports change git status too
     }
   }
 
@@ -4785,13 +4787,50 @@
     expCtx = null;
   }
 
+  // in-app code editor (CodeMirror, lazy-loaded on first open so the initial
+  // bundle stays lean, like xterm). Click, double-click and menu → Open all
+  // land here for files; folders keep opening in the OS.
+  let codeEditorPath = $state<string | null>(null);
+  let codeEditorRoot = $state("");
+  let CodeEditorComp = $state<any>(null);
+
+  async function openInEditor(path: string) {
+    if (codeEditorPath === path) return; // dblclick's second click
+    try {
+      if (!CodeEditorComp) CodeEditorComp = (await import("$lib/CodeEditorModal.svelte")).default;
+      codeEditorRoot = explorerRoot.trim();
+      codeEditorPath = path;
+    } catch (e: any) {
+      flashExpNotice(`Couldn't load the editor: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  function closeCodeEditor() {
+    codeEditorPath = null;
+  }
+
   async function expOpenFile() {
     const p = expCtx;
     closeExpCtx();
-    if (!p || !isTauriRuntime()) return;
+    if (!p) return;
+    if (p.isDir) await openPathExternal(p.path);
+    else await openInEditor(p.path);
+  }
+
+  async function expOpenExternal() {
+    const p = expCtx;
+    closeExpCtx();
+    if (p) await openPathExternal(p.path);
+  }
+
+  /** OS default app, sandboxed backend-side (work_open_path) */
+  async function openPathExternal(path: string) {
+    if (!isTauriRuntime()) {
+      flashExpNotice("Opening in the default app needs the desktop app.");
+      return;
+    }
     try {
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(absExpPath(p.path));
+      await openWorkPathExternal(explorerRoot.trim(), path);
     } catch (e: any) {
       flashExpNotice(`Couldn't open: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
@@ -4838,6 +4877,31 @@
       activeSideTab = "files";
     }
     if (!explorerEntries.length && !explorerLoading) void loadExplorer();
+  }
+
+  /** side-panel tabs: focus the Git view, creating it if closed */
+  function openSideGit() {
+    newTabMenu = false;
+    if (!sideTabs.some((t) => t.kind === "git")) {
+      sideTabs = [...sideTabs, { key: "git", kind: "git", title: "Git" }];
+    }
+    activeSideTab = "git";
+  }
+
+  /** bumped whenever files may have changed, so a visible Git tab re-reads status */
+  let gitRefreshTick = $state(0);
+
+  async function revealWorkPath(rel: string) {
+    if (!isTauriRuntime()) {
+      flashExpNotice("Reveal needs the desktop app.");
+      return;
+    }
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(absExpPath(rel));
+    } catch (e: any) {
+      flashExpNotice(`Couldn't reveal: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
+    }
   }
 
   // ---- Browser tab (shared `lb` daemon: iframe view + `lb mcp` agent tools) ----
@@ -5531,6 +5595,7 @@
   $effect(() => {
     if (wasWorkRunning && !workRunning) {
       if (explorerOpen && !explorerLoading) void loadExplorer();
+      gitRefreshTick++;
       void syncMcpServersAfterTurn();
     }
     wasWorkRunning = workRunning;
@@ -6689,7 +6754,7 @@
         e.preventDefault();
         return;
       }
-      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen) return;
+      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
       if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
@@ -8390,6 +8455,8 @@
       ></div>
       <div class="side-tabs" data-testid="side-tabs" role="tablist" aria-label="Side panel tabs">
         {#each sideTabs as t (t.key)}
+          {@const tabTitle = t.kind === "files" || t.kind === "git" ? explorerRootBase || t.title : t.title}
+          <!-- Files / Git follow the workspace: titled by its folder name, like terminal tabs -->
           <div
             class="side-tab {t.key === activeSideTab ? 'sel' : ''}"
             data-testid="side-tab"
@@ -8419,22 +8486,24 @@
           >
             <button
               class="side-tab-label"
-              aria-label={t.kind === "files" ? "Files tab" : `${t.title} tab`}
+              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : `${t.title} tab`}
               onclick={() => switchSideTab(t.key)}
             >
               {#if t.kind === "files"}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              {:else if t.kind === "git"}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
               {:else if t.kind === "browser"}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
               {:else}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
               {/if}
-              <span class="side-tab-title">{t.title}</span>
+              <span class="side-tab-title">{tabTitle}</span>
             </button>
             <button
               class="side-tab-x"
               data-testid="side-tab-close"
-              aria-label="Close {t.title} tab"
+              aria-label="Close {tabTitle} tab"
               title="Close tab"
               onclick={(e) => {
                 e.stopPropagation();
@@ -8447,7 +8516,7 @@
           class="icon-btn side-add"
           data-testid="side-add"
           aria-label="New panel tab"
-          title="New tab: Explorer, Terminal or Browser"
+          title="New tab: Explorer, Terminal, Browser or Git Diff"
           onclick={() => (newTabMenu = !newTabMenu)}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -8499,11 +8568,15 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
               <span>Browser</span>
             </button>
+            <button class="ctx-item" data-testid="new-tab-git" onclick={openSideGit}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
+              <span>Git Diff</span>
+            </button>
           </div>
         {/if}
       </div>
       {#if sideTabs.length === 0}
-        <div class="exp-empty">No tabs open — press + to add an Explorer, Terminal or Browser.</div>
+        <div class="exp-empty">No tabs open — press + to add an Explorer, Terminal, Browser or Git Diff.</div>
       {/if}
       {#each sideTabs as t (t.key)}
         <div class="side-view" class:hidden={t.key !== activeSideTab}>
@@ -8583,7 +8656,7 @@
                 style="padding-left: {10 + e.depth * 14}px"
                 data-testid="explorer-file"
                 title={e.path}
-                onclick={() => insertExplorerPath(e.path)}
+                onclick={() => void openInEditor(e.path)}
                 oncontextmenu={(ev) => openExpCtx(ev, e.path, false)}
               >
                 <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
@@ -8599,6 +8672,14 @@
       {#if expNotice}
         <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
       {/if}
+          {:else if t.kind === "git"}
+            <GitPanel
+              root={explorerRoot.trim()}
+              active={explorerOpen && t.key === activeSideTab}
+              refreshTick={gitRefreshTick}
+              onopenfile={(p) => void openInEditor(p)}
+              onreveal={(p) => void revealWorkPath(p)}
+            />
           {:else if t.kind === "browser"}
             {#if browserDaemon?.running}
               {#if browserDaemon.health?.ui_ok === false}
@@ -8696,6 +8777,9 @@
     style="left: {expCtx.x}px; top: {expCtx.y}px;"
   >
     <button class="ctx-item" data-testid="explorer-open" onclick={() => void expOpenFile()}>Open</button>
+    {#if !expCtx.isDir}
+      <button class="ctx-item" data-testid="explorer-open-external" onclick={() => void expOpenExternal()}>Open in default app</button>
+    {/if}
     <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
     <button class="ctx-item" data-testid="explorer-rename" onclick={renameFromMenu}>Rename</button>
     <button
@@ -9394,6 +9478,18 @@
     {/if}
   </div>
 {/if}
+{/if}
+
+{#if codeEditorPath && CodeEditorComp}
+  {#key codeEditorPath}
+    <CodeEditorComp
+      root={codeEditorRoot}
+      path={codeEditorPath}
+      onclose={closeCodeEditor}
+      onsaved={() => { gitRefreshTick++; if (explorerOpen && !explorerLoading) void loadExplorer(); }}
+      onopenexternal={isTauriRuntime() ? (p: string) => void openPathExternal(p) : undefined}
+    />
+  {/key}
 {/if}
 
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />

@@ -108,6 +108,13 @@ fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+fn arg_str_list(args: &serde_json::Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 /// Test-only resource root for browser_* (see header comment).
 fn test_resource_dir() -> Option<std::path::PathBuf> {
     std::env::var("VICUNA_TEST_RESOURCE_DIR")
@@ -305,6 +312,39 @@ async fn dispatch(
         "work_exec_kill" => {
             let r: BgJobStatus = vicuna_lib::bg_kill(&st.bg, &s("id")?)?;
             Ok(serde_json::json!(r))
+        }
+        // ----- git panel -----
+        "git_status" => Ok(serde_json::json!(vicuna_lib::git_panel::git_status_logic(s("root")?).await?)),
+        "git_diff" => {
+            let b = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(serde_json::json!(
+                vicuna_lib::git_panel::git_diff_logic(s("root")?, s("path")?, b("staged"), b("untracked")).await?
+            ))
+        }
+        "git_stage" => {
+            vicuna_lib::git_panel::git_stage_logic(s("root")?, arg_str_list(args, "paths")).await?;
+            Ok(serde_json::Value::Null)
+        }
+        "git_unstage" => {
+            vicuna_lib::git_panel::git_unstage_logic(s("root")?, arg_str_list(args, "paths")).await?;
+            Ok(serde_json::Value::Null)
+        }
+        "git_discard" => {
+            vicuna_lib::git_panel::git_discard_logic(s("root")?, arg_str_list(args, "paths"), arg_str_list(args, "untracked"))
+                .await?;
+            Ok(serde_json::Value::Null)
+        }
+        "git_apply" => {
+            let b = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            vicuna_lib::git_panel::git_apply_logic(
+                s("root")?,
+                s("patch")?,
+                b("cached"),
+                b("reverse"),
+                arg_str_list(args, "intentToAdd"),
+            )
+            .await?;
+            Ok(serde_json::Value::Null)
         }
         "work_rename" => {
             Ok(serde_json::json!(vicuna_lib::work_rename_logic(s("root")?, s("path")?, s("newName")?).await?))
