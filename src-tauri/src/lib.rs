@@ -31,6 +31,7 @@ pub mod fx;
 pub mod work_engine;
 pub mod work_agent;
 pub mod vicuna_mcp;
+pub mod git_panel;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -2092,6 +2093,38 @@ async fn work_open_path(app: AppHandle, root: String, path: String) -> Result<()
     app.opener()
         .open_path(full.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| format!("cannot open: {e}"))
+}
+
+// ---- Git panel (side panel Git tab; logic in git_panel.rs, shared with the bridge) ----
+
+#[tauri::command]
+async fn git_status(root: String) -> Result<git_panel::GitStatus, String> {
+    git_panel::git_status_logic(root).await
+}
+
+#[tauri::command]
+async fn git_diff(root: String, path: String, staged: bool, untracked: bool) -> Result<git_panel::GitDiff, String> {
+    git_panel::git_diff_logic(root, path, staged, untracked).await
+}
+
+#[tauri::command]
+async fn git_stage(root: String, paths: Vec<String>) -> Result<(), String> {
+    git_panel::git_stage_logic(root, paths).await
+}
+
+#[tauri::command]
+async fn git_unstage(root: String, paths: Vec<String>) -> Result<(), String> {
+    git_panel::git_unstage_logic(root, paths).await
+}
+
+#[tauri::command]
+async fn git_discard(root: String, paths: Vec<String>, untracked: Vec<String>) -> Result<(), String> {
+    git_panel::git_discard_logic(root, paths, untracked).await
+}
+
+#[tauri::command]
+async fn git_apply(root: String, patch: String, cached: bool, reverse: bool, intent_to_add: Vec<String>) -> Result<(), String> {
+    git_panel::git_apply_logic(root, patch, cached, reverse, intent_to_add).await
 }
 
 #[tauri::command]
@@ -5167,6 +5200,12 @@ pub fn run() {
             work_grep,
             work_write_file,
             work_open_path,
+            git_status,
+            git_diff,
+            git_stage,
+            git_unstage,
+            git_discard,
+            git_apply,
             work_exec,
             work_fetch_url,
             work_exec_start,
