@@ -127,11 +127,18 @@ export async function stopServer(): Promise<void> {
  * plus an elapsed line under Quit while sessions run). Best-effort: never
  * fails a turn.
  */
-export async function setTrayStatus(label: string, elapsed: string | null): Promise<void> {
+export async function setTrayStatus(
+  label: string,
+  elapsed: string | null,
+  scheduled: string[] = [],
+  scheduledCount = 0
+): Promise<void> {
   if (!isTauriRuntime()) return;
   try {
     const { invoke } = await tauri();
-    await invoke("tray_set_status", { status: label, elapsed });
+    // `scheduled` = the tray's scheduled-messages rows (header first);
+    // `scheduledCount` also arms the backend's quit prompt
+    await invoke("tray_set_status", { status: label, elapsed, scheduled, scheduledCount });
   } catch {
     // tray is best-effort (e.g. Linux without a tray host)
   }

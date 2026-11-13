@@ -34,6 +34,7 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, multiAnswer } from "$lib/askCard";
+  import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -1178,6 +1179,7 @@
   // rebuilding the menu more often flashes an open menu (round boundaries
   // alone can fire every few seconds on fast turns).
   let lastTrayKey: string | null = null;
+  let lastTraySchedKey = "";
   let lastTrayRunning = false;
   let lastTraySentAt = 0;
   $effect(() => {
@@ -1203,20 +1205,260 @@
       ? "No running sessions"
       : `${n} running work session${n === 1 ? "" : "s"}`;
     const elapsed = !running ? null : formatLiveElapsed(at - (oldest ?? at));
+    // scheduled-messages section: header row + one row per message. Its
+    // changes are rare (schedule/send/delete), so they bypass the throttle.
+    const schedLines = scheduled.length
+      ? [scheduledCountLabel(scheduled.length), ...trayScheduleLines(scheduled, at)]
+      : [];
+    const schedKey = schedLines.join("\n");
     const key = `${status}\n${elapsed ?? ""}`;
-    if (key === lastTrayKey) return;
-    if (running && lastTrayRunning && at - lastTraySentAt < 60000) return;
+    if (key === lastTrayKey && schedKey === lastTraySchedKey) return;
+    if (schedKey === lastTraySchedKey && running && lastTrayRunning && at - lastTraySentAt < 60000) return;
     lastTrayKey = key;
+    lastTraySchedKey = schedKey;
     lastTrayRunning = running;
     lastTraySentAt = at;
-    void setTrayStatus(status, elapsed);
+    void setTrayStatus(status, elapsed, schedLines, scheduled.length);
   });
-  async function quitVicuna() {
+  /** Quit from the UI. With scheduled messages pending it asks first (they
+   *  are only sent while Vicuna is open); `force` is the prompt's own
+   *  "Quit anyway". Tray Quit / Cmd+Q reach the same prompt through the
+   *  backend's `vicuna-quit-requested` event. */
+  async function quitVicuna(force = false) {
+    if (!force && scheduled.length > 0) {
+      settingsOpen = false;
+      quitPromptOpen = true;
+      return;
+    }
     try {
       await quitApp();
     } catch (e: any) {
       error = e?.message ?? String(e);
     }
+  }
+
+  // ---------- scheduled sends (Work mode) ----------
+  // Messages wait here (localStorage) and a timer in the running app sends
+  // them, so they only go out while Vicuna is open. Rules: $lib/schedule.
+  let scheduled = $state<ScheduledItem[]>([]);
+  const scheduledSorted = $derived(sortScheduled(scheduled));
+  /** split-button menu above the send button */
+  let scheduleMenuOpen = $state(false);
+  /** sidebar "Scheduled" list */
+  let scheduleListOpen = $state(false);
+  /** "quit with scheduled messages?" prompt */
+  let quitPromptOpen = $state(false);
+  /** custom-time dialog; `rescheduleId` set = moving an existing item */
+  let scheduleCustom = $state<{ date: string; time: string; rescheduleId: string | null; error: string | null } | null>(null);
+  /** clock for the schedule UI (preset times, Today/Tomorrow labels) */
+  let scheduleNow = $state(Date.now());
+  const scheduleTz = (() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+    } catch {
+      return "";
+    }
+  })();
+  /** ids being sent right now (a slow workspace check must not double-send) */
+  const scheduleSending = new Set<string>();
+
+  function persistScheduled() {
+    try {
+      localStorage.setItem(SCHEDULE_KEY, JSON.stringify(scheduled));
+    } catch {
+      error = "Could not save scheduled messages (storage is full). They will be lost when Vicuna closes.";
+    }
+  }
+  function removeScheduled(id: string) {
+    scheduled = scheduled.filter((x) => x.id !== id);
+    persistScheduled();
+  }
+  function scheduleTarget(it: ScheduledItem): string {
+    const live = it.chatId ? chats.find((c) => c.id === it.chatId) : undefined;
+    return live ? live.title : `New session in ${workspaceBase(it.workspace)}`;
+  }
+  function toggleScheduleMenu() {
+    scheduleNow = Date.now();
+    scheduleMenuOpen = !scheduleMenuOpen;
+  }
+  function openScheduleCustom(rescheduleId: string | null = null) {
+    scheduleMenuOpen = false;
+    scheduleNow = Date.now();
+    const base = defaultCustomTime(scheduleNow);
+    scheduleCustom = { date: dateInputValue(base), time: timeInputValue(base), rescheduleId, error: null };
+  }
+  async function confirmScheduleCustom() {
+    const c = scheduleCustom;
+    if (!c) return;
+    const at = parseCustomTime(c.date, c.time);
+    const err = customTimeError(at, Date.now());
+    if (err || at == null) {
+      scheduleCustom = { ...c, error: err };
+      return;
+    }
+    scheduleCustom = null;
+    if (c.rescheduleId) {
+      scheduled = scheduled.map((x) => {
+        if (x.id !== c.rescheduleId) return x;
+        const { missed: _m, error: _e, ...rest } = x;
+        return { ...rest, at };
+      });
+      persistScheduled();
+      flashNotice(`Rescheduled for ${formatWhen(at, Date.now())}.`);
+    } else {
+      await scheduleSend(at);
+    }
+  }
+
+  /** Schedule the composer's message for `at` instead of sending it now. */
+  async function scheduleSend(at: number) {
+    scheduleMenuOpen = false;
+    const text = input.trim();
+    const images = attachImages.length ? [...attachImages] : undefined;
+    if (!text && !images) return;
+    if (attachFiles.length) {
+      error = "Scheduled messages can't carry attached files. Remove them, or send now.";
+      return;
+    }
+    if (customTimeError(at, Date.now())) {
+      error = "Pick a time in the future.";
+      return;
+    }
+    if (workspacePickerOpen) await commitWorkspacePicker();
+    const chat = chats.find((c) => c.id === activeId);
+    // an empty session is discarded on navigation, so only a real thread is
+    // a target; otherwise the message starts a new session in the workspace
+    const thread = chat && chat.messages.length > 0 ? chat : null;
+    const rawWs = thread ? (thread.workspace ?? pendingWorkspace) : pendingWorkspace;
+    if (!rawWs?.trim()) {
+      workspaceError = "Pick a workspace folder first.";
+      error = "Work mode needs a workspace folder. Set one, then schedule.";
+      return;
+    }
+    let ws: string;
+    try {
+      ws = await canonicalWorkspace(rawWs);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+      workspaceError = msg;
+      error = `Workspace invalid: ${msg}`;
+      return;
+    }
+    scheduled = [
+      ...scheduled,
+      {
+        id: crypto.randomUUID(),
+        chatId: thread ? thread.id : null,
+        title: thread ? thread.title : "",
+        workspace: ws,
+        text,
+        ...(images ? { images } : {}),
+        at,
+        createdAt: Date.now()
+      }
+    ];
+    persistScheduled();
+    input = "";
+    historyIndex = null;
+    historyDraft = "";
+    mention = null;
+    clearDraft(null);
+    attachImages = [];
+    error = null;
+    flashNotice(`Scheduled for ${formatWhen(at, Date.now())}. ${SCHEDULE_OPEN_NOTE}`, 7000);
+  }
+
+  /** Send a scheduled message: into its session's running turn (queued, like
+   *  typing while it runs), as a new turn of that session, or as a new
+   *  session when the target is gone. A failure keeps the message in the
+   *  list (flagged) so nothing is lost. */
+  async function deliverScheduled(id: string) {
+    const item = scheduled.find((x) => x.id === id);
+    if (!item || scheduleSending.has(id)) return;
+    scheduleSending.add(id);
+    try {
+      const find = () => {
+        const c = item.chatId ? chats.find((x) => x.id === item.chatId) : undefined;
+        return c && (c.mode ?? "chat") === "work" ? c : undefined;
+      };
+      const msg: ChatMsg = { role: "user", content: item.text, ...(item.images?.length ? { images: [...item.images] } : {}) };
+      let chat = find();
+      // a compaction or a plain stream holds the session: try again next tick
+      if (chat && (isCompacting(chat.id) || isChatStreaming(chat.id))) return;
+      let ws = chat?.workspace ?? item.workspace;
+      if (!chat || !isWorkRunning(chat.id)) {
+        const gate = workSendGate(workEngineInfo);
+        if (gate.blocked) throw new Error(gate.reason ?? "The Work engine is not available.");
+        ws = await canonicalWorkspace(ws);
+        // the await may have outlived the item or the session's idle state
+        if (!scheduled.some((x) => x.id === id)) return;
+        chat = find();
+        if (chat && (isCompacting(chat.id) || isChatStreaming(chat.id))) return;
+      }
+      if (chat && isWorkRunning(chat.id)) {
+        const qid = crypto.randomUUID();
+        queuedMsgs = [...queuedMsgs, { chatId: chat.id, id: qid, msg }];
+        const turnId = workTurnIds.get(chat.id);
+        if (turnId) void queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
+        removeScheduled(id);
+        flashNotice(`Scheduled message queued in "${chat.title}".`);
+        return;
+      }
+      const titleSrc = item.text || "Image";
+      const title = titleSrc.slice(0, 32) + (titleSrc.length > 32 ? ".." : "");
+      const reply: ChatMsg = { role: "assistant", content: "", thinking: "", model: selectedModel };
+      if (!chat) {
+        // complete before it enters reactive state (see send())
+        chat = {
+          id: crypto.randomUUID(),
+          title,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          messages: [msg, reply],
+          mode: "work",
+          workspace: ws
+        };
+        chats = [chat, ...chats];
+      } else {
+        chat.updatedAt = Date.now();
+        if (!chat.workspace) chat.workspace = ws;
+        chat.messages = [...chat.messages, msg, reply];
+        chats = [chat, ...chats.filter((x) => x.id !== chat!.id)];
+      }
+      save();
+      removeScheduled(id);
+      flashNotice(`Scheduled message sent to "${chat.title}".`);
+      if (chat.id === activeId) {
+        isPinned = true;
+        scrollBottom();
+      }
+      void runWorkTurn(chat, chat.messages.length - 1, ws);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+      scheduled = scheduled.map((x) => (x.id === id ? { ...x, missed: true, error: msg } : x));
+      persistScheduled();
+      error = `Scheduled message not sent: ${msg}`;
+    } finally {
+      scheduleSending.delete(id);
+    }
+  }
+  function scheduleTick() {
+    if (!ready) return;
+    const at = Date.now();
+    // keep Today/Tomorrow labels and the tray rows honest across midnight
+    if (scheduled.length && Math.floor(at / 60000) !== Math.floor(scheduleNow / 60000)) scheduleNow = at;
+    for (const it of dueItems(scheduled, at)) void deliverScheduled(it.id);
+  }
+  /** Esc closes the top schedule overlay before any other handler sees it */
+  function onScheduleEscape(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    if (scheduleCustom) scheduleCustom = null;
+    else if (quitPromptOpen) quitPromptOpen = false;
+    else if (scheduleListOpen) scheduleListOpen = false;
+    else if (scheduleMenuOpen) scheduleMenuOpen = false;
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
   }
   /** workspace the explorer panel shows: the thread's, else the pending one */
   const explorerRoot = $derived(
@@ -1394,6 +1636,11 @@
     // not — their turn is gone)
     if (queuedMsgs.some((q) => q.chatId === id)) {
       queuedMsgs = queuedMsgs.filter((q) => q.chatId !== id);
+    }
+    // messages scheduled into the deleted session go with it
+    if (scheduled.some((x) => x.chatId === id)) {
+      scheduled = scheduled.filter((x) => x.chatId !== id);
+      persistScheduled();
     }
     unmarkStreaming(id);
     unmarkWorkRunning(id);
@@ -6781,6 +7028,36 @@
     window.addEventListener("pointerup", onMessagesPointerUp);
     window.addEventListener("pointercancel", onMessagesPointerUp);
     window.addEventListener("keydown", onMessagesKeyDown);
+    // scheduled sends: anything already due was missed while Vicuna was
+    // closed, so it waits for a decision instead of firing late
+    {
+      let stored: string | null = null;
+      try {
+        stored = localStorage.getItem(SCHEDULE_KEY);
+      } catch {}
+      const loaded = markMissed(parseScheduled(stored), Date.now());
+      if (loaded.length) {
+        scheduled = loaded;
+        persistScheduled();
+        if (loaded.some((x) => x.missed)) scheduleListOpen = true;
+      }
+    }
+    const scheduleTimer = setInterval(scheduleTick, 5000);
+    window.addEventListener("keydown", onScheduleEscape, true);
+    // tray Quit / Cmd+Q with scheduled messages pending: the backend shows
+    // the window and asks here instead of quitting
+    let unlistenQuit: (() => void) | null = null;
+    if (isTauriRuntime()) {
+      void import("@tauri-apps/api/event")
+        .then(({ listen }) => listen("vicuna-quit-requested", () => {
+          if (scheduled.length > 0) quitPromptOpen = true;
+          else void quitVicuna(true);
+        }))
+        .then((u) => {
+          unlistenQuit = u;
+        })
+        .catch(() => {});
+    }
     void initApp();
     // Automatic update detection on startup (desktop only), same as cojudge.
     initializeAppUpdatePreference();
@@ -6811,6 +7088,9 @@
       window.removeEventListener("pointercancel", onMessagesPointerUp);
       window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
+      unlistenQuit?.();
+      clearInterval(scheduleTimer);
+      window.removeEventListener("keydown", onScheduleEscape, true);
       if (updateCheckTimer) clearTimeout(updateCheckTimer);
     };
   });
@@ -6972,6 +7252,49 @@
 </script>
 
 {#if ready}
+{#snippet scheduleCaret(empty: boolean)}
+  <button class="send send-caret" data-testid="schedule-btn" aria-label="Schedule message" aria-haspopup="menu" aria-expanded={scheduleMenuOpen} title="Schedule for later" disabled={empty} onclick={toggleScheduleMenu}>
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 4 4 4-4"/></svg>
+  </button>
+  {#if scheduleMenuOpen}
+    <button class="sched-backdrop" data-testid="schedule-backdrop" aria-label="Close schedule menu" onclick={() => (scheduleMenuOpen = false)} tabindex="-1"></button>
+    <div class="sched-menu" data-testid="schedule-menu" role="menu" aria-label="Schedule message">
+      <div class="sched-menu-head">Schedule message</div>
+      {#each schedulePresets(scheduleNow) as p (p.id)}
+        <button class="ctx-item sched-opt" role="menuitem" data-testid="schedule-preset-{p.id}" onclick={() => void scheduleSend(Date.now() + (p.at - scheduleNow))}>
+          <span>{p.label}</span><span class="sched-opt-at">{formatClock(p.at)}</span>
+        </button>
+      {/each}
+      <div class="sched-menu-sep"></div>
+      <button class="ctx-item sched-opt" role="menuitem" data-testid="schedule-custom" onclick={() => openScheduleCustom()}>Custom time</button>
+      <div class="sched-menu-note">{SCHEDULE_OPEN_NOTE}</div>
+    </div>
+  {/if}
+{/snippet}
+{#snippet scheduledRows(actions: boolean)}
+  <div class="sched-list" data-testid="scheduled-list">
+    {#each scheduledSorted as it (it.id)}
+      <div class="sched-row {it.missed ? 'missed' : ''}" data-testid="scheduled-row">
+        <div class="sched-row-main">
+          <div class="sched-row-when">
+            {#if it.missed}<span class="sched-missed-tag">{it.error ? "Not sent" : "Missed"}</span>{/if}
+            {formatWhen(it.at, scheduleNow)}
+            <span class="sched-row-target">· {scheduleTarget(it)}</span>
+          </div>
+          <div class="sched-row-text">{previewText(it, 140)}{#if it.images?.length && it.text}{" "}· {it.images.length} image{it.images.length === 1 ? "" : "s"}{/if}</div>
+          {#if it.error}<div class="sched-row-err">{it.error}</div>{/if}
+        </div>
+        {#if actions}
+          <div class="sched-row-actions">
+            <button class="mini-btn primary" data-testid="scheduled-send-now" onclick={() => void deliverScheduled(it.id)}>Send now</button>
+            <button class="mini-btn" data-testid="scheduled-reschedule" onclick={() => openScheduleCustom(it.id)}>Reschedule</button>
+            <button class="mini-btn danger" data-testid="scheduled-delete" onclick={() => removeScheduled(it.id)}>Delete</button>
+          </div>
+        {/if}
+      </div>
+    {/each}
+  </div>
+{/snippet}
 {#snippet engineIcon(id: string)}
   {#if id === "claude"}
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
@@ -7014,6 +7337,13 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
           <span>Search</span>
           <span class="kbd-hint">{isMac ? "⌘P" : "Ctrl+P"}</span>
+        </button>
+        <button class="goto" data-testid="scheduled-btn" title="Scheduled messages" onclick={() => { scheduleNow = Date.now(); scheduleListOpen = true; }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          <span>Scheduled</span>
+          {#if scheduled.length > 0}
+            <span class="sched-count {scheduled.some((x) => x.missed) ? 'missed' : ''}" data-testid="scheduled-count">{scheduled.length}</span>
+          {/if}
         </button>
       </div>
 
@@ -7998,12 +8328,20 @@
             </div>
           {/if}
           {#if activeWorkRunning}
-            <button class="send" data-testid="queue-btn" aria-label="Queue message" title="Queue for the next tool call" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
+            <div class="send-split">
+              <button class="send" data-testid="queue-btn" aria-label="Queue message" title="Queue for the next tool call" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
+              {@render scheduleCaret(input.trim() === "" && attachImages.length === 0)}
+            </div>
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" title="Stop (Esc twice)" onclick={stop}>■</button>
           {:else if activeStreaming}
             <button class="send streaming" data-testid="stop-btn" aria-label="Stop" onclick={stop}>■</button>
+          {:else if composerMode === "work"}
+            <div class="send-split">
+              <button class="send" data-testid="send-btn" aria-label="Send" title={workGate.blocked ? (workGate.reason ?? "") : undefined} disabled={(input.trim() === "" && attachImages.length === 0) || workGate.blocked} onclick={send}>↑</button>
+              {@render scheduleCaret(input.trim() === "" && attachImages.length === 0)}
+            </div>
           {:else}
-            <button class="send" data-testid="send-btn" aria-label="Send" title={composerMode === "work" && workGate.blocked ? (workGate.reason ?? "") : undefined} disabled={(input.trim() === "" && attachImages.length === 0) || (composerMode === "work" && workGate.blocked)} onclick={send}>↑</button>
+            <button class="send" data-testid="send-btn" aria-label="Send" disabled={input.trim() === "" && attachImages.length === 0} onclick={send}>↑</button>
           {/if}
         </div>
       </div>
@@ -8886,6 +9224,53 @@
     </div>
   </div>
 {/if}
+{#if scheduleListOpen}
+  <button class="confirm-backdrop sched-dim" data-testid="scheduled-backdrop" aria-label="Close" onclick={() => (scheduleListOpen = false)} tabindex="-1"></button>
+  <div class="confirm-card sched-card" data-testid="scheduled-dialog" role="dialog" aria-modal="true" aria-label="Scheduled messages">
+    <button class="modal-x" data-testid="scheduled-close" aria-label="Close" onclick={() => (scheduleListOpen = false)}>×</button>
+    <p class="confirm-text sched-title">Scheduled messages</p>
+    <p class="sched-note" data-testid="scheduled-note">{SCHEDULE_OPEN_NOTE} Closing the window keeps it running in the tray; quitting does not.</p>
+    {#if scheduled.some((x) => x.missed)}
+      <p class="sched-warn" data-testid="scheduled-missed-note">Some messages were not sent at their time. Send them now, pick a new time, or delete them.</p>
+    {/if}
+    {#if scheduled.length === 0}
+      <p class="sched-empty" data-testid="scheduled-empty">Nothing scheduled. In Work mode, use the arrow next to the send button to schedule a message.</p>
+    {:else}
+      {@render scheduledRows(true)}
+    {/if}
+  </div>
+{/if}
+{#if quitPromptOpen}
+  <button class="confirm-backdrop sched-dim" data-testid="quit-prompt-backdrop" aria-label="Cancel" onclick={() => (quitPromptOpen = false)} tabindex="-1"></button>
+  <div class="confirm-card sched-card" data-testid="quit-prompt" role="alertdialog" aria-modal="true" aria-label="Quit Vicuna">
+    <p class="confirm-text sched-title">Quit Vicuna?</p>
+    <p class="sched-warn" data-testid="quit-prompt-warning">{scheduled.length === 1 ? "1 scheduled message" : `${scheduled.length} scheduled messages`} will not be sent while Vicuna is closed. {scheduled.length === 1 ? "It stays" : "They stay"} saved, and Vicuna will ask what to do with {scheduled.length === 1 ? "it" : "them"} the next time it opens.</p>
+    {@render scheduledRows(false)}
+    <div class="confirm-actions sched-actions">
+      <button class="confirm-cancel" data-testid="quit-prompt-cancel" onclick={() => (quitPromptOpen = false)}>Keep running</button>
+      <button class="confirm-ok sched-quit" data-testid="quit-prompt-confirm" onclick={() => void quitVicuna(true)}>Quit anyway</button>
+    </div>
+  </div>
+{/if}
+{#if scheduleCustom}
+  {@const sc = scheduleCustom}
+  <button class="confirm-backdrop sched-dim sched-top" data-testid="schedule-custom-backdrop" aria-label="Cancel" onclick={() => (scheduleCustom = null)} tabindex="-1"></button>
+  <div class="confirm-card sched-custom sched-top" data-testid="schedule-custom-dialog" role="dialog" aria-modal="true" aria-label="Schedule message">
+    <button class="modal-x" data-testid="schedule-custom-close" aria-label="Close" onclick={() => (scheduleCustom = null)}>×</button>
+    <p class="confirm-text sched-title">{sc.rescheduleId ? "Reschedule message" : "Schedule message"}</p>
+    {#if scheduleTz}<p class="sched-note">Time zone: {scheduleTz.replace(/_/g, " ")}</p>{/if}
+    <div class="sched-fields">
+      <input type="date" class="sched-input" data-testid="schedule-date" aria-label="Date" min={dateInputValue(scheduleNow)} value={sc.date} oninput={(e) => (scheduleCustom = { ...sc, date: e.currentTarget.value, error: null })} />
+      <input type="time" class="sched-input" data-testid="schedule-time" aria-label="Time" value={sc.time} oninput={(e) => (scheduleCustom = { ...sc, time: e.currentTarget.value, error: null })} onkeydown={(e) => { if (e.key === "Enter") void confirmScheduleCustom(); }} />
+    </div>
+    {#if sc.error}<p class="sched-row-err" data-testid="schedule-custom-error">{sc.error}</p>{/if}
+    <p class="sched-note">{SCHEDULE_OPEN_NOTE}</p>
+    <div class="confirm-actions sched-actions">
+      <button class="confirm-cancel" data-testid="schedule-custom-cancel" onclick={() => (scheduleCustom = null)}>Cancel</button>
+      <button class="confirm-ok" data-testid="schedule-custom-confirm" onclick={() => void confirmScheduleCustom()}>{sc.rescheduleId ? "Reschedule" : "Schedule message"}</button>
+    </div>
+  </div>
+{/if}
 {#if gotoOpen}
   <button
     class="confirm-backdrop"
@@ -9205,7 +9590,7 @@
       </div>
       <div class="setting-row quit-row">
         <span class="setting-label">Quit Vicuna</span>
-        <button class="mini-btn danger" data-testid="quit-app-btn" onclick={quitVicuna}>Quit Vicuna</button>
+        <button class="mini-btn danger" data-testid="quit-app-btn" onclick={() => void quitVicuna()}>Quit Vicuna</button>
       </div>
       <span class="setting-note">Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.</span>
     {/if}
@@ -9839,6 +10224,46 @@
   .send { width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--send-disabled); color: #fff; font-size: 18px; cursor: pointer; }
   .send:disabled { opacity: .8; cursor: default; }
   .send:not(:disabled) { background: var(--accent); color: var(--accent-fg); }
+  /* Work mode: send + schedule caret joined into one pill */
+  .send-split { position: relative; display: inline-flex; align-items: stretch; }
+  .send-split > .send:first-child { border-radius: 16px 0 0 16px; width: 34px; }
+  .send-split > .send-caret { border-radius: 0 16px 16px 0; width: 24px; display: flex; align-items: center; justify-content: center; padding: 0 2px 0 0; border-left: 1px solid color-mix(in srgb, currentColor 35%, transparent); }
+  .send-split > .send-caret:not(:disabled):hover, .send-split > .send:first-child:not(:disabled):hover { background: var(--accent-hover); }
+  .sched-backdrop { position: fixed; inset: 0; z-index: 40; border: none; background: transparent; cursor: default; padding: 0; }
+  .sched-menu { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 41; width: 250px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; display: flex; flex-direction: column; text-align: left; }
+  .sched-menu-head { font-size: 12.5px; color: var(--muted); padding: 8px 14px 4px 14px; }
+  .sched-opt { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .sched-opt:hover { background: var(--hover); }
+  .sched-opt-at { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .sched-menu-sep { height: 1px; background: var(--border); margin: 4px 8px; }
+  .sched-menu-note { font-size: 11.5px; line-height: 1.4; color: var(--muted-2); padding: 6px 14px 8px 14px; border-top: 1px solid var(--border); margin-top: 4px; }
+  .sched-count { margin-left: auto; min-width: 18px; height: 18px; box-sizing: border-box; padding: 0 6px; border-radius: 9px; background: var(--accent); color: var(--accent-fg); font-size: 11.5px; font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+  .sched-count.missed { background: var(--danger); color: #fff; }
+  .confirm-backdrop.sched-dim { background: rgba(0,0,0,.35); }
+  .sched-top.confirm-backdrop { z-index: 52; }
+  .sched-top.confirm-card { z-index: 53; }
+  .confirm-card.sched-card { width: min(560px, calc(100vw - 48px)); max-height: 76vh; top: 50%; display: flex; flex-direction: column; }
+  .confirm-card.sched-custom { width: min(420px, calc(100vw - 48px)); }
+  .confirm-text.sched-title { margin-bottom: 6px; }
+  .sched-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); margin: 0 0 12px 0; }
+  .sched-warn { font-size: 13px; line-height: 1.45; color: var(--danger); margin: 0 0 12px 0; }
+  .sched-empty { font-size: 13.5px; line-height: 1.5; color: var(--text-dim); margin: 6px 0 4px 0; }
+  .sched-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; margin: 0 -6px; padding: 0 6px 2px 6px; }
+  .sched-row { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .sched-row.missed { border-color: var(--danger); }
+  .sched-row-main { min-width: 0; }
+  .sched-row-when { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sched-row-target { font-weight: 400; color: var(--muted); }
+  .sched-missed-tag { display: inline-block; font-size: 11px; font-weight: 600; color: #fff; background: var(--danger); border-radius: 6px; padding: 1px 6px; margin-right: 6px; }
+  .sched-row-text { font-size: 13.5px; line-height: 1.45; color: var(--text-dim); margin-top: 3px; overflow-wrap: anywhere; user-select: text; }
+  .sched-row-err { font-size: 12.5px; color: var(--danger); margin: 4px 0 0 0; overflow-wrap: anywhere; }
+  .sched-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sched-fields { display: flex; gap: 10px; margin: 4px 0 12px 0; }
+  .sched-input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; padding: 9px 12px; font: inherit; font-size: 14.5px; background: var(--card); color: var(--text); color-scheme: light dark; }
+  .sched-input:focus { outline: none; border-color: var(--accent); }
+  .sched-actions { margin-top: 14px; }
+  .confirm-ok.sched-quit { background: var(--danger); color: #fff; }
+  .confirm-ok.sched-quit:hover { background: var(--danger); filter: brightness(.93); }
   .editbox { width: 100%; border: 1.5px solid var(--border-strong); border-radius: 16px; padding: 10px 12px 8px 12px; background: var(--card); }
   .editbox textarea { width: 100%; box-sizing: border-box; border: none; outline: none; resize: none; font: inherit; font-size: 14.5px; line-height: 1.5; background: transparent; color: var(--text); }
   .edit-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
