@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Source for every app icon. Regenerate: npx tauri icon src-tauri/icons/icon.svg -o <tmp>, then copy the desktop files + static/favicon.png. -->
+  <!-- Orange = the app's default accent (#ef6c00). V + prompt cursor. -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#ef6c00"/>
+  <path d="M310 352 L472 672 L634 352" fill="none" stroke="#fff" stroke-width="100" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="614" y="622" width="150" height="100" rx="50" fill="#fff"/>
+</svg>
