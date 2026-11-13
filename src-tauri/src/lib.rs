@@ -5145,7 +5145,20 @@ pub fn run() {
     // Finder/Dock launches get launchd's minimal PATH: read the user's shell
     // PATH in the background so engine detection sees what a terminal sees.
     exe_resolve::warm_up();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be the first plugin: a second launch exits before anything else
+    // starts and hands its args (incl. vicuna:// links, via the deep-link
+    // feature) to this instance, which un-hides (tray) / restores / focuses
+    // the existing window.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_deep_link::init())
