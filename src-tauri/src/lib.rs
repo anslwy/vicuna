@@ -15,7 +15,7 @@ use tokio::io::AsyncReadExt as _;
 use tauri::ipc::Channel;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Runtime, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
 use tauri_plugin_sql::{DbInstances, DbPool};
 pub mod acp;
 pub mod agy;
@@ -4887,8 +4887,71 @@ fn allow_quit(app: &AppHandle) {
     }
 }
 
-/// Explicit quit (tray menu / Settings button): kill everything Vicuna
-/// started, then exit. Window-close hides to the tray instead (see
+/// What the frontend last reported about scheduled sends. They only go out
+/// while the app runs, so a quit request with some pending asks first.
+#[derive(Default)]
+struct ScheduleState {
+    count: Mutex<usize>,
+}
+
+fn quit_now(app: &AppHandle) {
+    allow_quit(app);
+    shutdown_children(app);
+    app.exit(0);
+}
+
+/// Quit asked from the tray menu or the app menu (Cmd+Q). With scheduled
+/// messages pending, the window comes up and the frontend shows the list
+/// with a warning ("Quit anyway" then calls `quit_app`); otherwise quit.
+fn request_quit(app: &AppHandle) {
+    let pending = app
+        .try_state::<ScheduleState>()
+        .and_then(|s| s.count.lock().ok().map(|g| *g))
+        .unwrap_or(0);
+    if pending > 0 {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+            if app.emit("vicuna-quit-requested", pending).is_ok() {
+                return;
+            }
+        }
+    }
+    quit_now(app);
+}
+
+/// macOS app menu: the stock Quit item terminates the process directly, so
+/// it is swapped for one that goes through `request_quit` (same id as the
+/// tray's Quit; the tray's menu handler receives every menu event).
+#[cfg(target_os = "macos")]
+fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::MenuItemKind;
+    let menu = Menu::default(app)?;
+    if let Some(MenuItemKind::Submenu(app_sub)) = menu.items()?.into_iter().next() {
+        for item in app_sub.items()? {
+            if let MenuItemKind::Predefined(p) = item {
+                // muda labels it "&Quit" (the app name is added at draw time)
+                if p
+                    .text()
+                    .map(|t| t.trim_start_matches('&').starts_with("Quit"))
+                    .unwrap_or(false)
+                {
+                    app_sub.remove(&p)?;
+                    let quit =
+                        MenuItem::with_id(app, "quit", "Quit Vicuna", true, Some("CmdOrCtrl+Q"))?;
+                    app_sub.append(&quit)?;
+                    break;
+                }
+            }
+        }
+    }
+    app.set_menu(menu)?;
+    Ok(())
+}
+
+/// Explicit quit (Settings button, or "Quit anyway" in the scheduled-messages
+/// prompt): kill everything Vicuna started, then exit. Window-close hides to the tray instead (see
 /// `on_window_event` below) so background streams survive.
 #[tauri::command]
 async fn quit_app(
@@ -4896,20 +4959,21 @@ async fn quit_app(
     _ollama: State<'_, OllamaServerState>,
     _terms: State<'_, TermState>,
 ) -> Result<(), String> {
-    allow_quit(&app);
-    shutdown_children(&app);
-    app.exit(0);
+    quit_now(&app);
     Ok(())
 }
 
 /// Build the tray menu: a disabled live-session status line ("No running
 /// sessions" / "N running work session(s)"), a separator, Show / Quit —
 /// plus, while sessions run, a second separator and a disabled elapsed line
-/// ("32m 25s") under Quit. Rebuilt on every frontend report.
+/// ("32m 25s") under Quit. With scheduled messages pending, a disabled
+/// section ("2 scheduled messages" + one row each) sits under the status
+/// line. Rebuilt on every frontend report.
 fn tray_menu<R: Runtime>(
     manager: &impl Manager<R>,
     status: &str,
     elapsed: Option<&str>,
+    scheduled: &[String],
 ) -> tauri::Result<Menu<R>> {
     let status_item = MenuItem::with_id(manager, "status", status, false, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(manager)?;
@@ -4920,12 +4984,29 @@ fn tray_menu<R: Runtime>(
         Some(e) => Some(MenuItem::with_id(manager, "elapsed", e, false, None::<&str>)?),
         None => None,
     };
-    let mut items: Vec<&dyn IsMenuItem<R>> = vec![
-        &status_item as &dyn IsMenuItem<R>,
+    let sched_sep = PredefinedMenuItem::separator(manager)?;
+    let mut sched_items = Vec::new();
+    for (i, line) in scheduled.iter().enumerate() {
+        sched_items.push(MenuItem::with_id(
+            manager,
+            format!("scheduled-{i}"),
+            line,
+            false,
+            None::<&str>,
+        )?);
+    }
+    let mut items: Vec<&dyn IsMenuItem<R>> = vec![&status_item as &dyn IsMenuItem<R>];
+    if !sched_items.is_empty() {
+        items.push(&sched_sep as &dyn IsMenuItem<R>);
+        for it in &sched_items {
+            items.push(it as &dyn IsMenuItem<R>);
+        }
+    }
+    items.extend([
         &sep as &dyn IsMenuItem<R>,
         &show as &dyn IsMenuItem<R>,
         &quit as &dyn IsMenuItem<R>,
-    ];
+    ]);
     if let Some(ref e) = elapsed_item {
         items.push(&sep2 as &dyn IsMenuItem<R>);
         items.push(e as &dyn IsMenuItem<R>);
@@ -4934,10 +5015,15 @@ fn tray_menu<R: Runtime>(
 }
 
 /// Refresh the tray menu (no-op when the tray is unavailable).
-fn refresh_tray_menu(app: &AppHandle, status: &str, elapsed: Option<&str>) -> Result<(), String> {
+fn refresh_tray_menu(
+    app: &AppHandle,
+    status: &str,
+    elapsed: Option<&str>,
+    scheduled: &[String],
+) -> Result<(), String> {
     if let Some(tray) = app.tray_by_id("main") {
-        let menu =
-            tray_menu(app, status, elapsed).map_err(|e| format!("tray menu failed: {e}"))?;
+        let menu = tray_menu(app, status, elapsed, scheduled)
+            .map_err(|e| format!("tray menu failed: {e}"))?;
         tray.set_menu(Some(menu))
             .map_err(|e| format!("tray menu failed: {e}"))?;
     }
@@ -4952,7 +5038,23 @@ async fn tray_set_status(
     app: AppHandle,
     status: String,
     elapsed: Option<String>,
+    scheduled: Option<Vec<String>>,
+    scheduled_count: Option<usize>,
 ) -> Result<(), String> {
+    // header row first ("2 scheduled messages"), then one row per message
+    let scheduled: Vec<String> = scheduled
+        .unwrap_or_default()
+        .into_iter()
+        .map(|l| l.trim().chars().take(80).collect::<String>())
+        .filter(|l| !l.is_empty())
+        .take(8)
+        .collect();
+    // the count gates the quit prompt, so it is stored even without a tray
+    if let Some(s) = app.try_state::<ScheduleState>() {
+        if let Ok(mut g) = s.count.lock() {
+            *g = scheduled_count.unwrap_or(0);
+        }
+    }
     let short: String = status.trim().chars().take(80).collect();
     let elapsed: Option<String> = elapsed
         .map(|e| e.trim().chars().take(20).collect::<String>())
@@ -4965,6 +5067,7 @@ async fn tray_set_status(
             &short
         },
         elapsed.as_deref(),
+        &scheduled,
     )
 }
 
@@ -5177,6 +5280,7 @@ pub fn run() {
         .manage(work_agent::WorkAgentState::default())
         .manage(acp::AcpState::default())
         .manage(AppQuitState::default())
+        .manage(ScheduleState::default())
         .manage(browser::BrowserState::default())
         .manage(mcp::McpManager::default())
         .manage(ZoomState {
@@ -5291,7 +5395,9 @@ pub fn run() {
             // System tray: closing the window hides here (streams keep
             // running); only Quit exits. The menu opens on either click;
             // Show reopens the window.
-            let menu = tray_menu(app, "No running sessions", None)?;
+            #[cfg(target_os = "macos")]
+            let _ = install_app_menu(app.handle());
+            let menu = tray_menu(app, "No running sessions", None, &[])?;
             if let Some(icon) = app.default_window_icon().cloned() {
                 TrayIconBuilder::with_id("main")
                     .icon(icon)
@@ -5305,11 +5411,7 @@ pub fn run() {
                                 let _ = w.set_focus();
                             }
                         }
-                        "quit" => {
-                            allow_quit(app);
-                            shutdown_children(app);
-                            app.exit(0);
-                        }
+                        "quit" => request_quit(app),
                         _ => {}
                     })
                     .build(app)?;
