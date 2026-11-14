@@ -1,7 +1,7 @@
 // Work engines: which external agent CLI a Work turn runs on.
 //
-// opencode, Antigravity (agy) and fx speak ACP (acp.rs), Claude Code stream-json (claude_cli.rs) and
-// Codex its app-server JSON-RPC (codex_cli.rs); this module owns the choice
+// opencode, Antigravity (agy) and fx speak ACP (acp.rs), Claude Code stream-json (claude_cli.rs),
+// Codex its app-server JSON-RPC (codex_cli.rs) and pi its RPC mode (pi.rs); this module owns the choice
 // between them (persisted in ~/vicuna/config/work-engine.json), the combined
 // detection the UI renders (engine picker when more than one is installed),
 // and per-engine model lists + saved model picks.
@@ -20,10 +20,11 @@ pub enum Engine {
     Codex,
     Agy,
     Fx,
+    Pi,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 5] = [Engine::Opencode, Engine::Claude, Engine::Codex, Engine::Agy, Engine::Fx];
+    pub const ALL: [Engine; 6] = [Engine::Opencode, Engine::Claude, Engine::Codex, Engine::Agy, Engine::Fx, Engine::Pi];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -32,6 +33,7 @@ impl Engine {
             Engine::Codex => "codex",
             Engine::Agy => "agy",
             Engine::Fx => "fx",
+            Engine::Pi => "pi",
         }
     }
 
@@ -42,6 +44,7 @@ impl Engine {
             Engine::Codex => "Codex",
             Engine::Agy => "Antigravity",
             Engine::Fx => "fx",
+            Engine::Pi => "pi",
         }
     }
 
@@ -52,6 +55,7 @@ impl Engine {
             "codex" | "codex-cli" => Some(Engine::Codex),
             "agy" | "antigravity" => Some(Engine::Agy),
             "fx" => Some(Engine::Fx),
+            "pi" | "pi-coding-agent" => Some(Engine::Pi),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl Engine {
             Engine::Codex => crate::codex::find_codex().is_some(),
             Engine::Agy => crate::agy::find_agy().is_some(),
             Engine::Fx => crate::fx::find_fx().is_some(),
+            Engine::Pi => crate::pi::find_pi().is_some(),
         }
     }
 
@@ -74,6 +79,7 @@ impl Engine {
             Engine::Codex => crate::codex::missing_message(),
             Engine::Agy => crate::agy::missing_message(),
             Engine::Fx => crate::fx::missing_message(),
+            Engine::Pi => crate::pi::missing_message(),
         }
     }
 
@@ -87,6 +93,7 @@ impl Engine {
             Engine::Codex => format!("codex/{model}"),
             Engine::Agy => format!("agy/{model}"),
             Engine::Fx => format!("fx/{model}"),
+            Engine::Pi => format!("pi/{model}"),
         }
     }
 
@@ -97,6 +104,7 @@ impl Engine {
             Engine::Codex => crate::codex::saved_model(),
             Engine::Agy => crate::agy::saved_model(),
             Engine::Fx => crate::fx::saved_model(),
+            Engine::Pi => crate::pi::saved_model(),
         }
     }
 
@@ -107,6 +115,7 @@ impl Engine {
             Engine::Codex => crate::codex::save_model(model),
             Engine::Agy => crate::agy::save_model(model),
             Engine::Fx => crate::fx::save_model(model),
+            Engine::Pi => crate::pi::save_model(model),
         }
     }
 
@@ -117,6 +126,7 @@ impl Engine {
             Engine::Codex => crate::codex::engine_info().await,
             Engine::Agy => crate::agy::engine_info().await,
             Engine::Fx => crate::fx::engine_info().await,
+            Engine::Pi => crate::pi::engine_info().await,
         }
     }
 }
@@ -245,6 +255,10 @@ pub async fn list_models(engine: Engine, acp: &crate::acp::AcpState) -> Result<O
             models: acp.fx_models().await?,
             current: crate::fx::saved_model(),
         }),
+        Engine::Pi => Ok(OpencodeModels {
+            models: crate::pi::list_models().await?,
+            current: crate::pi::saved_model(),
+        }),
     }
 }
 
@@ -310,6 +324,9 @@ mod tests {
         assert_eq!(Engine::parse("FX"), Some(Engine::Fx));
         assert_eq!(Engine::Fx.reply_label("codex/gpt-6-luna"), "fx/codex/gpt-6-luna");
         assert_eq!(Engine::Fx.label(), "fx");
+        assert_eq!(Engine::parse("PI"), Some(Engine::Pi));
+        assert_eq!(Engine::Pi.reply_label("ollama/deepseek-v4.1-flash:cloud"), "pi/ollama/deepseek-v4.1-flash:cloud");
+        assert_eq!(Engine::Pi.label(), "pi");
     }
 
     #[test]

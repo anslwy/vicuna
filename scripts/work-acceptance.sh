@@ -17,10 +17,12 @@
 #   scripts/work-acceptance.sh always <model> [engine]   # 'ask' mode: "Always allow" on the first shell command approves the second
 #   scripts/work-acceptance.sh stoptool <model> [engine] # Stop during a long shell command ends the turn AND the command; missing workspace errors
 #   scripts/work-acceptance.sh plan <model> codex       # Codex goal/plan updates show as a transcript note (1 turn)
+#   scripts/work-acceptance.sh deny <model> [engine]     # 'ask' mode: Deny blocks the call, clean error, turn finishes
+#   scripts/work-acceptance.sh plugin <model> pi        # a pi extension from ~/vicuna/config/pi/extensions loads; its tool runs in a Work turn
 #   scripts/work-acceptance.sh finder                    # Finder-style launch must not pick a stale opencode
 #   scripts/work-acceptance.sh finder-codex              # Finder-style launch finds the newest codex (no model turn)
 #
-#   engine = opencode (default) | claude | codex | agy | fx
+#   engine = opencode (default) | claude | codex | agy | fx | pi
 #   e.g.  present opencode/beam-free          present haiku claude
 #         present gpt-6-luna codex            combo gpt-6-luna codex
 #         present gemini-3.8-flash-medium agy
@@ -53,7 +55,7 @@ mode="${1:-}"
 model="${2:-}"
 engine="${3:-opencode}"
 [ "$mode" = "missing" ] && engine="${2:-opencode}"
-case "$engine" in opencode|claude|codex|agy|fx) ;; *) echo "engine must be opencode, claude, codex, agy or fx"; exit 2 ;; esac
+case "$engine" in opencode|claude|codex|agy|fx|pi) ;; *) echo "engine must be opencode, claude, codex, agy, fx or pi"; exit 2 ;; esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${PORT:-1427}"
 bridge="${BRIDGE:-}"
@@ -74,7 +76,7 @@ trap cleanup EXIT
 
 # temp HOME with the engines' real logins linked in
 mkdir -p "$work/home/vicuna/config" "$work/ws"
-for f in .claude .claude.json .gemini; do
+for f in .claude .claude.json .gemini .pi; do
   [ -e "$real_home/$f" ] && ln -s "$real_home/$f" "$work/home/$f"
 done
 # macOS looks the login keychain up under $HOME, and Claude Code keeps its
@@ -88,6 +90,7 @@ cx_bin="${VICUNA_CODEX_BIN:-$(command -v codex || true)}"
 agy_bin="${VICUNA_AGY_BIN:-$(command -v agy || true)}"
 [ -z "$agy_bin" ] && [ -x "$real_home/.local/bin/agy" ] && agy_bin="$real_home/.local/bin/agy"
 fx_bin="${VICUNA_FX_BIN:-$(command -v fx || true)}"
+pi_bin="${VICUNA_PI_BIN:-$(command -v pi || true)}"
 codex_home="${CODEX_HOME:-$real_home/.codex}"
 if [ "$engine" = "codex" ] && [ -n "${VICUNA_CODEX_FAKE:-}" ]; then
   fake_port=$((port + 1000))
@@ -109,6 +112,7 @@ start_bridge() { # extra env assignments...
     VICUNA_CLAUDE_BIN="${cl_bin:-/nonexistent/claude}" \
     VICUNA_CODEX_BIN="${cx_bin:-/nonexistent/codex}" \
     VICUNA_AGY_BIN="${agy_bin:-/nonexistent/agy}" \
+    VICUNA_PI_BIN="${pi_bin:-/nonexistent/pi}" \
     VICUNA_FX_BIN="${fx_bin:-/nonexistent/fx}" VICUNA_FX_HOME="${VICUNA_FX_HOME:-$real_home}" \
     CODEX_HOME="$codex_home" VICUNA_CODEX_EFFORT="${VICUNA_CODEX_EFFORT:-low}" \
     "$@" "$bridge" "$port" >"$work/bridge.log" 2>&1 &
@@ -160,7 +164,7 @@ saved_session() { # the engine session id Vicuna saved for this chat
   python3 - "$work/home/vicuna/config/opencode-sessions.json" "$engine" "accept-$$|$work/ws" <<'PY'
 import json, sys
 path, engine, key = sys.argv[1:]
-if engine in ("claude", "codex", "agy", "fx"):
+if engine in ("claude", "codex", "agy", "fx", "pi"):
     key = engine + "|" + key
 try:
     print(json.load(open(path)).get(key, ""))
@@ -169,7 +173,7 @@ except FileNotFoundError:
 PY
 }
 
-want_label() { case "$engine" in claude|codex|agy|fx) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
+want_label() { case "$engine" in claude|codex|agy|fx|pi) echo "$engine/$model" ;; *) echo "$model" ;; esac; }
 
 check_turn() { # expect-substring label-check(yes|no)
   python3 - "$work/events.jsonl" "$1" "$2" "$(want_label)" <<'PY'
@@ -196,7 +200,7 @@ PY
 case "$mode" in
   missing)
     # exclusive overrides that do not exist: detection must report missing
-    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex VICUNA_AGY_BIN=/nonexistent/agy VICUNA_FX_BIN=/nonexistent/fx
+    start_bridge VICUNA_OPENCODE_BIN=/nonexistent/opencode VICUNA_CLAUDE_BIN=/nonexistent/claude VICUNA_CODEX_BIN=/nonexistent/codex VICUNA_AGY_BIN=/nonexistent/agy VICUNA_FX_BIN=/nonexistent/fx VICUNA_PI_BIN=/nonexistent/pi
     [ "$engine" = "opencode" ] || invoke work_engine_select "{\"engine\":\"$engine\"}" >/dev/null
     info="$(invoke work_engine_info '{}')"
     echo "work_engine_info: $info"
@@ -223,6 +227,10 @@ elif engine == "fx":
     assert d["label"] == "fx" and d["installUrl"].startswith("https://fx.sh"), d
     assert "fx CLI not found, install it:" in d["missing"], d
     assert "fx CLI not found, install it:" in start.get("error", ""), start
+elif engine == "pi":
+    assert d["label"] == "pi" and d["installUrl"].startswith("https://pi.dev"), d
+    assert "pi CLI not found, install it:" in d["missing"], d
+    assert "pi CLI not found, install it:" in start.get("error", ""), start
 else:
     assert d["path"] is None and d["installUrl"].startswith("https://opencode.ai/"), d
     assert "OpenCode CLI not found, install it:" in start.get("error", ""), start
@@ -406,6 +414,76 @@ start = json.loads(sys.argv[2])
 msgs = [e.get("message", "") for e in evs if e.get("type") == "error"] + [start.get("error") or ""]
 assert any("workspace folder not found: /nonexistent/vicuna-ws" in m for m in msgs), (start, evs[-3:])
 print("PASS missing workspace: readable error:", [m for m in msgs if m][0])
+PY
+    ;;
+  deny)
+    [ -n "$model" ] || { echo "usage: $0 deny <model> [engine]"; exit 2; }
+    # "Ask before running tools" + Deny: the call is blocked (file never
+    # written), the model gets a clean error result and the turn finishes.
+    start_bridge
+    invoke work_set_approval '{"ask":true}' >/dev/null
+    start="$(invoke work_agent_start "$(turn_args "dn-$$" true "Use your shell/bash tool to run exactly: echo vicuna-deny > denied.txt . If the tool call is refused, do not retry; just reply with the word REFUSED.")")"
+    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
+    : >"$work/events.jsonl"
+    seen=""
+    for _ in $(seq 1 600); do
+      curl -sS "$base/poll/dn-$$" | python3 -c '
+import json, sys
+for ev in json.load(sys.stdin).get("events", []):
+    print(json.dumps(ev))' >>"$work/events.jsonl"
+      for aid in $(python3 -c '
+import json, sys
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e.get("type") == "askrequest": print(e["ask_id"])' "$work/events.jsonl"); do
+        case " $seen " in *" $aid "*) continue ;; esac
+        seen="$seen $aid"; echo "ask card $aid -> Deny"
+        invoke work_agent_answer "{\"turnId\":\"$turn_id\",\"askId\":\"$aid\",\"answer\":\"Deny\"}" >/dev/null
+      done
+      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
+      sleep 0.5
+    done
+    invoke work_set_approval '{"ask":false}' >/dev/null
+    python3 - "$work/events.jsonl" "$work/ws" <<'PY'
+import json, os, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+assert [e for e in evs if e.get("type") == "askrequest"], "no ask card appeared"
+done = [e for e in evs if e.get("type") == "done"]
+assert done and done[-1].get("stopped") is False, "turn did not finish after Deny"
+notes = "".join(e.get("text", "") for e in evs if e.get("type") == "displaynote")
+assert "Denied:" in notes, notes
+outs = [e.get("output", "") for e in evs if e.get("type") == "toolend"]
+print("  tool results:", [o[:80] for o in outs])
+assert any(o.startswith("Error:") for o in outs), outs
+assert not os.path.exists(os.path.join(sys.argv[2], "denied.txt")), "the denied command ran anyway"
+print("PASS deny: call blocked (no file), clean error result, turn finished; transcript says Denied")
+PY
+    ;;
+  plugin)
+    [ -n "$model" ] || { echo "usage: $0 plugin <model> pi"; exit 2; }
+    # A pi extension in Vicuna's plugin folder loads into the Work turn: it
+    # registers a tool whose result only the plugin knows.
+    mkdir -p "$work/home/vicuna/config/pi/extensions"
+    cat >"$work/home/vicuna/config/pi/extensions/vicuna-stamp.ts" <<'TS'
+export default function (pi: any) {
+  pi.registerTool({ name: "vicuna_stamp", label: "Stamp", description: "Returns the secret plugin stamp.",
+    parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "STAMP-PLUGIN-OK-7781" }], details: {} }; } });
+}
+TS
+    start_bridge
+    run_turn "pl-$$" true "Call the vicuna_stamp tool once, then reply with exactly the stamp it returned."
+    python3 - "$work/events.jsonl" <<'PY'
+import json, sys
+evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
+starts = [e.get("name") for e in evs if e.get("type") == "toolstart"]
+outs = " ".join(e.get("output", "") for e in evs if e.get("type") == "toolend")
+text = "".join(e.get("text", "") for e in evs if e.get("type") == "token")
+print("  tool cards:", starts, " reply:", repr(text[:120]))
+assert "vicuna_stamp" in starts and "STAMP-PLUGIN-OK-7781" in outs, (starts, outs[:200])
+print("PASS plugin: the extension from ~/vicuna/config/pi/extensions loaded and its tool ran in the turn")
 PY
     ;;
   always)

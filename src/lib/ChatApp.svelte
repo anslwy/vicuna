@@ -69,7 +69,7 @@
     type ViewAnchor
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
-  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH, FX_ICON_PATH, AGY_ICON_PATH } from "$lib/modelIcons";
+  import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH, FX_ICON_PATH, AGY_ICON_PATH, PI_ICON_PATH } from "$lib/modelIcons";
   import type { Terminal as XTerm, ITheme as XTermTheme } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -6650,7 +6650,18 @@
       }, 1000);
     }
     const live = () => chats.find((x) => x.id === chat.id);
+    // buffered tokens land before anything appended out of band (a tool
+    // card head, a note), or text streamed just before a tool call ends up
+    // inside that call's card
+    function flushNow() {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      flushTokens();
+    }
     function appendContent(s: string) {
+      flushNow();
       const c = live();
       if (!c?.messages[curIndex]) return;
       const m = c.messages[curIndex];
@@ -6837,6 +6848,7 @@
           scrollIfOpen();
           break;
         case "toolend": {
+          flushNow();
           const head = pendingHead;
           pendingHead = null;
           const t = live();
@@ -7606,6 +7618,8 @@
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={CODEX_ICON_OUTLINE_PATH}/><path d={CODEX_ICON_PROMPT_PATH}/></svg>
   {:else if id === "fx"}
     <svg class="engine-ico" data-engine-icon="fx" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={FX_ICON_PATH}/></svg>
+  {:else if id === "pi"}
+    <svg class="engine-ico" data-engine-icon="pi" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={PI_ICON_PATH}/></svg>
   {:else if id === "agy"}
     <svg class="engine-ico" data-engine-icon="agy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={AGY_ICON_PATH}/></svg>
   {:else}
@@ -9783,7 +9797,7 @@
       {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
         <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
       {/each}
-      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>), your <code>claude</code> CLI (headless <code>claude -p</code> stream-json), your <code>codex</code> CLI (<code>codex app-server</code>), your Antigravity <code>agy</code> CLI (<code>agy acp</code>) or your <code>fx</code> CLI (<code>fx acp</code>), each with your own login and config; nothing else to install. Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code>, <code>VICUNA_CODEX_BIN</code>, <code>VICUNA_AGY_BIN</code> and <code>VICUNA_FX_BIN</code>. fx models are <code>provider/model</code> for every provider fx can use: its own (e.g. <code>codex</code> after <code>fx login codex</code>) and the ones under <code>"providers"</code> in <code>~/.fx/settings.json</code> (e.g. a local Ollama).</span>
+      <span class="setting-note">Work mode runs your <code>opencode</code> CLI (<code>opencode acp</code>), your <code>claude</code> CLI (headless <code>claude -p</code> stream-json), your <code>codex</code> CLI (<code>codex app-server</code>), your Antigravity <code>agy</code> CLI (<code>agy acp</code>), your <code>fx</code> CLI (<code>fx acp</code>) or your <code>pi</code> CLI (<code>pi --mode rpc</code>), each with your own login and config; nothing else to install. Vicuna looks for them like your terminal does (login-shell PATH, then the usual install folders) and uses the newest version it finds. Models and credentials come from the engine; pick the model from the composer's model menu. Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code>, <code>VICUNA_CODEX_BIN</code>, <code>VICUNA_AGY_BIN</code>, <code>VICUNA_FX_BIN</code> and <code>VICUNA_PI_BIN</code>. fx models are <code>provider/model</code> for every provider fx can use: its own (e.g. <code>codex</code> after <code>fx login codex</code>) and the ones under <code>"providers"</code> in <code>~/.fx/settings.json</code> (e.g. a local Ollama). pi models are <code>provider/model</code> from <code>pi --list-models</code>; pi plugins (extensions) placed in <code>~/vicuna/config/pi/extensions</code> load into every pi Work turn.</span>
       <label class="setting-note approval-row" data-testid="work-approval">
         <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
         Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.

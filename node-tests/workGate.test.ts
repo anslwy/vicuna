@@ -175,3 +175,26 @@ test("Antigravity engine: label, reply label, gate and picker", () => {
   const missing = { ...agy, installed: false, missing: "Antigravity CLI (agy) not found, install it: https://antigravity.google/" } as WorkEngineInfo;
   assert.deepEqual(workSendGate(missing), { blocked: true, reason: missing.missing });
 });
+
+// ---------- pi as a sixth engine ----------
+test("pi engine: label, provider/model reply label, gate and picker", () => {
+  const pi: WorkEngineInfo = {
+    id: "pi", label: "pi", installed: true, path: "/home/u/.pi/agent/bin/pi", version: "1.5.0",
+    installUrl: "https://pi.dev", model: null, configPath: null,
+    engines: [
+      { id: "opencode", label: "OpenCode", installed: false, version: null, missing: "opencode CLI not found" },
+      { id: "pi", label: "pi", installed: true, version: "1.5.0", missing: null },
+    ],
+  } as WorkEngineInfo;
+  assert.equal(engineId(pi), "pi");
+  assert.equal(engineLabel(pi), "pi");
+  assert.equal(engineLabel({ ...pi, label: "" } as WorkEngineInfo), "pi");
+  assert.deepEqual(workEngineChoices(pi).map((e) => e.id), ["pi"]);
+  assert.equal(workSendGate(pi).blocked, false);
+  assert.equal(workReplyModel(null, "ollama/deepseek-v4.1-flash:cloud", "pi"), "pi/ollama/deepseek-v4.1-flash:cloud");
+  assert.equal(workReplyModel("pi/ollama/deepseek-v4.1-flash:cloud", "openai/gpt-6-luna", "pi"), "pi/ollama/deepseek-v4.1-flash:cloud");
+  assert.equal(workReplyModel(null, null, "pi"), "pi");
+  const missing = { ...pi, installed: false, missing: "pi CLI not found, install it: https://pi.dev" } as WorkEngineInfo;
+  assert.equal(workSendGate(missing).blocked, true);
+  assert.equal(workSendGate(missing).reason, missing.missing);
+});
