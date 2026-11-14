@@ -11,8 +11,19 @@ Features:
 - Chat Mode: Suitable for general query with features like forking sessions, continuing from mid-sentence, editing user / assistant responses with/without triggering regeneration and more.
 - Work Mode: Designed to work autonomously to finish a task with features like built-in sidebar file explorer & terminal, MCP servers management and more.
 
-## Download (Windows / MacOS / Linux)
-https://github.com/anslwy/vicuna/releases
+## Install
+
+**macOS / Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/anslwy/vicuna/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/anslwy/vicuna/main/install.ps1 | iex
+```
 
 ## Prerequisites
 
