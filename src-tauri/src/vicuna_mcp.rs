@@ -42,6 +42,15 @@ const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// How often a waiting `ask_user` call sends a progress heartbeat on its SSE
+/// stream. Clients' idle timers (Claude: 5 min for HTTP servers, reset on
+/// progress) must never fire while the user is still typing.
+const HEARTBEAT: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(15) };
+/// Per-call timeout written into the engines' config for vicuna-mcp (Claude
+/// `timeout` ms, Codex `tool_timeout_sec`): a question waits for the user, so
+/// the engines' 60 s defaults would cut a slow answer off mid-typing.
+pub const ASK_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the chat. \
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
@@ -250,6 +259,37 @@ pub fn parse_ask_args(args: &Value) -> Result<(String, Vec<String>, bool), Strin
     Ok((question, choices, multiple))
 }
 
+/// The ask card's answer: plain text, or (when the user pasted images) the
+/// envelope `{"vicunaAskAnswer": {"text": "...", "images": ["data:image/...;base64,..."]}}`.
+#[derive(Debug, Default, PartialEq)]
+pub struct AskAnswer {
+    pub text: String,
+    /// (mime type, base64 data)
+    pub images: Vec<(String, String)>,
+}
+
+pub fn parse_ask_answer(raw: &str) -> AskAnswer {
+    let env = serde_json::from_str::<Value>(raw.trim()).ok();
+    let Some(inner) = env.as_ref().and_then(|v| v.get("vicunaAskAnswer")) else {
+        return AskAnswer { text: raw.to_string(), images: Vec::new() };
+    };
+    let text = inner.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+    let images = inner
+        .get("images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.as_str())
+        .filter_map(|url| {
+            let rest = url.strip_prefix("data:")?;
+            let (mime, data) = rest.split_once(";base64,")?;
+            let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+            (mime.starts_with("image/") && !data.is_empty()).then(|| (mime.to_string(), data))
+        })
+        .collect();
+    AskAnswer { text, images }
+}
+
 /// The tool result text for the user's answer. Multi-select answers arrive as
 /// a JSON array of labels; a dismissal arrives as the UI's own sentence.
 pub fn format_answer(answer: &str, multiple: bool) -> String {
@@ -297,9 +337,28 @@ async fn ask(target: &Target, args: &Value, client_gone: impl std::future::Futur
         m.remove(&ask_id);
     }
     match answer {
-        Some(a) if !turn.stop.load(Ordering::Relaxed) => text_result(&format_answer(&a, multiple), false),
+        Some(a) if !turn.stop.load(Ordering::Relaxed) => answer_result(&parse_ask_answer(&a), multiple),
         _ => text_result("The user stopped the turn before answering.", true),
     }
+}
+
+/// Tool result for an answer: the text, then any pasted images as MCP image
+/// content blocks (vision models see them like a pasted picture).
+fn answer_result(a: &AskAnswer, multiple: bool) -> Value {
+    let n = a.images.len();
+    let s = if n == 1 { "" } else { "s" };
+    let text = if a.text.trim().is_empty() && n > 0 {
+        format!("The user answered with {n} image{s} (attached below).")
+    } else if n > 0 {
+        format!("{} (The user also attached {n} image{s}, below.)", format_answer(&a.text, multiple))
+    } else {
+        format_answer(&a.text, multiple)
+    };
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    for (mime, data) in &a.images {
+        content.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+    }
+    json!({ "content": content, "isError": false })
 }
 
 /// One JSON-RPC message -> its response (None for notifications/responses).
@@ -364,6 +423,7 @@ async fn serve(listener: TcpListener, registry: SharedRegistry) {
 struct Request {
     method: String,
     path: String,
+    accept: String,
     body: Vec<u8>,
 }
 
@@ -413,10 +473,13 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let path = first.next()?.to_string();
     let mut content_length = 0usize;
     let mut chunked = false;
+    let mut accept = String::new();
     for l in lines {
         let Some((k, v)) = l.split_once(':') else { continue };
         let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
-        if k == "content-length" {
+        if k == "accept" {
+            accept = v.to_ascii_lowercase();
+        } else if k == "content-length" {
             content_length = v.parse().ok()?;
         } else if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
             chunked = true;
@@ -426,7 +489,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     if chunked {
         loop {
             if let Some(b) = decode_chunked(&body) {
-                return Some(Request { method, path, body: b });
+                return Some(Request { method, path, accept, body: b });
             }
             if body.len() > MAX_BODY {
                 return None;
@@ -449,7 +512,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_length);
-    Some(Request { method, path, body })
+    Some(Request { method, path, accept, body })
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: Option<&Value>, extra: &str) -> std::io::Result<()> {
@@ -495,6 +558,15 @@ async fn handle_conn(mut stream: TcpStream, registry: SharedRegistry) -> std::io
             }
         }
     };
+    // A question waits for the user, possibly for many minutes. Answer it as
+    // an SSE stream: headers go out now (Claude aborts a POST whose headers
+    // take over 60 s with "The operation timed out."), then progress
+    // heartbeats keep idle timers from firing, then the result.
+    let is_call = msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && msg.get("id").is_some_and(|i| !i.is_null());
+    if is_call && req.accept.contains("text/event-stream") {
+        return stream_call(&msg, target.as_ref(), gone, &mut write_half).await;
+    }
     let reply = match &msg {
         Value::Array(batch) => {
             let gone = futures_util::future::FutureExt::shared(Box::pin(gone));
@@ -520,6 +592,54 @@ async fn handle_conn(mut stream: TcpStream, registry: SharedRegistry) -> std::io
     write_half.write_all(head.as_bytes()).await?;
     write_half.write_all(payload.as_bytes()).await?;
     write_half.flush().await
+}
+
+fn sse_event(v: &Value) -> String {
+    format!("event: message\ndata: {v}\n\n")
+}
+
+/// Run one tools/call and stream it as SSE: progress notifications every
+/// HEARTBEAT (a comment line when the client sent no progressToken), then the
+/// JSON-RPC response, then close.
+async fn stream_call(
+    msg: &Value,
+    target: Option<&Target>,
+    gone: impl std::future::Future<Output = ()>,
+    out: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    out.write_all(head.as_bytes()).await?;
+    out.flush().await?;
+    let token = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| !t.is_null());
+    let call = handle_rpc(msg, target, gone);
+    tokio::pin!(call);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+    let mut beats: u64 = 0;
+    let reply = loop {
+        tokio::select! {
+            r = &mut call => break r,
+            _ = tick.tick() => {
+                beats += 1;
+                let frame = match &token {
+                    Some(t) => sse_event(&json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": { "progressToken": t, "progress": beats, "message": "Waiting for the user's answer" }
+                    })),
+                    None => ": waiting for the user\n\n".to_string(),
+                };
+                // a failed write means the client left; the read half's EOF
+                // (the `gone` future) ends the ask itself
+                let _ = out.write_all(frame.as_bytes()).await;
+                let _ = out.flush().await;
+            }
+        }
+    };
+    if let Some(r) = reply {
+        out.write_all(sse_event(&r).as_bytes()).await?;
+    }
+    out.flush().await?;
+    out.shutdown().await
 }
 
 #[cfg(test)]
@@ -548,8 +668,93 @@ mod tests {
             .await
             .unwrap();
         let status = r.status().as_u16();
+        let sse = r.headers().get("content-type").is_some_and(|c| c.to_str().unwrap().starts_with("text/event-stream"));
         let text = r.text().await.unwrap();
+        if sse {
+            // the response is the last event carrying an id
+            let resp = sse_messages(&text).into_iter().rev().find(|m| m.get("id").is_some());
+            return (status, resp);
+        }
         (status, (!text.is_empty()).then(|| serde_json::from_str(&text).unwrap()))
+    }
+
+    fn sse_messages(text: &str) -> Vec<Value> {
+        text.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn slow_answer_streams_headers_first_then_heartbeats() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let mut body = call("Take your time?", json!({}));
+        body["params"]["_meta"] = json!({ "progressToken": 42 });
+        // headers must arrive while the question is still unanswered (Claude
+        // aborts a POST whose headers take over 60 s)
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::Client::new().post(&reg.url).header("accept", "application/json, text/event-stream").json(&body).send(),
+        )
+        .await
+        .expect("headers before the answer")
+        .unwrap();
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        let ev = wait_ask(&seen).await;
+        tokio::time::sleep(HEARTBEAT * 3 + Duration::from_millis(50)).await;
+        crate::work_agent::agent_answer(&turn, ev["ask_id"].as_str().unwrap(), "Later".into()).unwrap();
+        let msgs = sse_messages(&resp.text().await.unwrap());
+        let progress: Vec<&Value> = msgs.iter().filter(|m| m["method"] == "notifications/progress").collect();
+        assert!(progress.len() >= 2, "heartbeats while waiting: {msgs:?}");
+        assert_eq!(progress[0]["params"]["progressToken"], 42);
+        assert!(progress[1]["params"]["progress"].as_u64() > progress[0]["params"]["progress"].as_u64());
+        let last = msgs.last().unwrap();
+        assert_eq!(last["id"], 7);
+        assert_eq!(last["result"]["content"][0]["text"], "The user answered: Later");
+    }
+
+    #[tokio::test]
+    async fn json_only_clients_still_get_plain_json() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move {
+            let r = reqwest::Client::new().post(&url).header("accept", "application/json").json(&call("Q?", json!({}))).send().await.unwrap();
+            (r.headers()["content-type"].to_str().unwrap().to_string(), r.json::<Value>().await.unwrap())
+        });
+        let ev = wait_ask(&seen).await;
+        crate::work_agent::agent_answer(&turn, ev["ask_id"].as_str().unwrap(), "ok".into()).unwrap();
+        let (ctype, r) = pending.await.unwrap();
+        assert_eq!(ctype, "application/json");
+        assert_eq!(r["result"]["content"][0]["text"], "The user answered: ok");
+    }
+
+    #[tokio::test]
+    async fn pasted_images_come_back_as_image_blocks() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, call("Show me?", json!({ "choices": ["A", "B"] }))).await });
+        let ev = wait_ask(&seen).await;
+        let answer = json!({ "vicunaAskAnswer": { "text": "A, but like this", "images": ["data:image/jpeg;base64,QUJD\n", "not-a-data-url"] } });
+        crate::work_agent::agent_answer(&turn, ev["ask_id"].as_str().unwrap(), answer.to_string()).unwrap();
+        let r = pending.await.unwrap().1.unwrap();
+        let content = r["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "The user answered: A, but like this (The user also attached 1 image, below.)");
+        assert_eq!(content[1], json!({ "type": "image", "data": "QUJD", "mimeType": "image/jpeg" }));
+    }
+
+    #[test]
+    fn answer_envelope_parses_and_plain_text_passes_through() {
+        assert_eq!(parse_ask_answer("plain"), AskAnswer { text: "plain".into(), images: vec![] });
+        // a multi-select array is not an envelope
+        assert_eq!(parse_ask_answer(r#"["A"]"#).text, r#"["A"]"#);
+        let a = parse_ask_answer(r#"{"vicunaAskAnswer":{"text":"","images":["data:image/png;base64,eA=="]}}"#);
+        assert_eq!(a.images, vec![("image/png".to_string(), "eA==".to_string())]);
+        let r = answer_result(&a, false);
+        assert_eq!(r["content"][0]["text"], "The user answered with 1 image (attached below).");
     }
 
     fn call(question: &str, extra: Value) -> Value {

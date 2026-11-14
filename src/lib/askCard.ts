@@ -20,3 +20,33 @@ export function toggleChoice(options: string[], picked: string[], opt: string): 
 export function multiAnswer(picked: string[]): { answer: string; display: string } {
   return { answer: JSON.stringify(picked), display: picked.length ? picked.join(", ") : "(none)" };
 }
+
+/**
+ * The agent-question answer from the card's answer box.
+ * - text only: the text as-is (single-select: an edited/typed answer)
+ * - multi-select with picks and no text/images: the JSON array (as before)
+ * - multi-select with picks plus a note: "Selected: a; b" + the note
+ * - images: the envelope `{"vicunaAskAnswer": {text, images}}` that
+ *   vicuna-mcp turns into MCP image blocks (images are data URLs)
+ * Returns null when there is nothing to send.
+ */
+export function buildAskAnswer(input: {
+  text: string;
+  images: string[];
+  multi: boolean;
+  picked: string[];
+}): { answer: string; display: string } | null {
+  const note = input.text.trim();
+  const images = input.images;
+  if (input.multi && input.picked.length && !note && !images.length) return multiAnswer(input.picked);
+  const parts: string[] = [];
+  if (input.multi && input.picked.length) parts.push(`Selected: ${input.picked.join("; ")}`);
+  if (note) parts.push(note);
+  const text = parts.join("\n");
+  if (!text && !images.length) return null;
+  const n = images.length;
+  const imgNote = n ? `(${n} image${n === 1 ? "" : "s"})` : "";
+  const display = [text, imgNote].filter(Boolean).join(" ");
+  const answer = n ? JSON.stringify({ vicunaAskAnswer: { text, images } }) : text;
+  return { answer, display };
+}

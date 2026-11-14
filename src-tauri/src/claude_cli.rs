@@ -197,6 +197,12 @@ pub fn mcp_config(entries: &[Value]) -> Option<String> {
         } else {
             continue;
         };
+        let mut cfg = cfg;
+        // ask_user waits for the user: lift Claude's per-request (60 s until
+        // headers) and idle (5 min) caps for vicuna-mcp only
+        if name == crate::vicuna_mcp::SERVER_NAME {
+            cfg["timeout"] = json!(crate::vicuna_mcp::ASK_TIMEOUT_SECS * 1000);
+        }
         servers.insert(name.to_string(), cfg);
     }
     (!servers.is_empty()).then(|| json!({ "mcpServers": servers }).to_string())
@@ -718,7 +724,7 @@ mod tests {
             vec!["--disallowedTools", "AskUserQuestion", "--allowedTools", "mcp__vicuna-mcp__ask_user"]
         );
         let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();
-        assert_eq!(cfg["mcpServers"]["vicuna-mcp"], json!({ "type": "http", "url": "http://127.0.0.1:9/mcp/t", "headers": {} }));
+        assert_eq!(cfg["mcpServers"]["vicuna-mcp"], json!({ "type": "http", "url": "http://127.0.0.1:9/mcp/t", "headers": {}, "timeout": 86_400_000 }));
     }
 
     #[test]
