@@ -69,7 +69,7 @@
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
   import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH, FX_ICON_PATH, AGY_ICON_PATH } from "$lib/modelIcons";
-  import type { Terminal as XTerm } from "xterm";
+  import type { Terminal as XTerm, ITheme as XTermTheme } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
@@ -5491,7 +5491,7 @@
     })();
   }
 
-  function termTheme(): Record<string, string> {
+  function termTheme(): XTermTheme {
     // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
     // console (yellow prompt segments, white text), so the defaults that
     // ship with xterm go unreadable on a light background. Both palettes
@@ -5501,7 +5501,8 @@
         background: "#161616",
         foreground: "#e8e8e8",
         cursor: "#e8e8e8",
-        selection: "rgba(255,255,255,.25)",
+        selectionBackground: "rgba(255,255,255,.25)",
+        selectionInactiveBackground: "rgba(255,255,255,.16)",
         black: "#000000",
         red: "#cd3131",
         green: "#0dbc79",
@@ -5524,7 +5525,8 @@
       background: "#f4f4f4",
       foreground: "#1a1a1a",
       cursor: "#1a1a1a",
-      selection: "rgba(0,0,0,.15)",
+      selectionBackground: "rgba(0,0,0,.20)",
+      selectionInactiveBackground: "rgba(0,0,0,.12)",
       black: "#000000",
       red: "#b3261e",
       green: "#0a7a42",
@@ -5549,7 +5551,7 @@
     const t = termTheme();
     for (const [, v] of termViews) {
       try {
-        v.term.options.theme = t as never;
+        v.term.options.theme = t;
       } catch {
         /* terminal mid-dispose */
       }
@@ -7829,9 +7831,11 @@
                 {/if}
               {/if}
               <div class="actions">
-                <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
-                  {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
-                </button>
+                {#if !isWorkMsg}
+                  <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
+                    {#if copiedKey === copyKey}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
+                  </button>
+                {/if}
                 <button class="act" data-testid="edit-btn" aria-label="Edit message" title="Edit" disabled={busy} onclick={() => startEdit(i)}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                 </button>
