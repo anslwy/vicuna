@@ -323,6 +323,10 @@ pub fn mcp_servers(entries: &[Value], ask: bool) -> Option<Value> {
         // gate it behind an Allow card
         let approve = !ask || name == crate::vicuna_mcp::SERVER_NAME;
         cfg["default_tools_approval_mode"] = json!(if approve { "approve" } else { "prompt" });
+        // ask_user waits for the user; Codex's default tool timeout is 60 s
+        if name == crate::vicuna_mcp::SERVER_NAME {
+            cfg["tool_timeout_sec"] = json!(crate::vicuna_mcp::ASK_TIMEOUT_SECS);
+        }
         servers.insert(name, cfg);
     }
     (!servers.is_empty()).then_some(Value::Object(servers))
@@ -619,6 +623,8 @@ fn handle_user_input(server: &Server, id: &Value, params: &Value, turn: &Arc<Tur
             }
             match answer {
                 Some(a) if !turn.stop.load(Ordering::Relaxed) => {
+                    // native questions take text only (pasted images dropped)
+                    let a = crate::vicuna_mcp::parse_ask_answer(&a).text;
                     answers.insert(qid, json!({ "answers": [a.trim()] }));
                 }
                 _ => break,
@@ -996,7 +1002,7 @@ mod tests {
     fn ask_user_server_is_never_gated_and_native_question_is_pinned_off() {
         let mcp = crate::vicuna_mcp::with_ask_server(vec![json!({ "name": "p", "command": "x" })], Some("http://127.0.0.1:9/mcp/t"));
         let p = thread_params("/w", true, None, None, &mcp);
-        assert_eq!(p["config"]["mcp_servers"]["vicuna-mcp"], json!({ "url": "http://127.0.0.1:9/mcp/t", "default_tools_approval_mode": "approve" }));
+        assert_eq!(p["config"]["mcp_servers"]["vicuna-mcp"], json!({ "url": "http://127.0.0.1:9/mcp/t", "default_tools_approval_mode": "approve", "tool_timeout_sec": 86_400 }));
         assert_eq!(p["config"]["mcp_servers"]["p"]["default_tools_approval_mode"], "prompt");
         assert_eq!(p["config"]["features"]["default_mode_request_user_input"], false);
         assert_eq!(thread_params("/w", false, None, None, &[])["config"], json!({ "features": { "default_mode_request_user_input": false } }));

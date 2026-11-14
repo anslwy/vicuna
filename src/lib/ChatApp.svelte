@@ -33,7 +33,7 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { isAgentQuestion, toggleChoice, multiAnswer } from "$lib/askCard";
+  import { isAgentQuestion, toggleChoice, buildAskAnswer } from "$lib/askCard";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
@@ -124,7 +124,15 @@
     multi: boolean;
     /** the labels picked so far in a multi-select question */
     picked: string[];
-    other: string;
+    /** agent question (vicuna-mcp ask_user): choices prefill the answer box
+     *  instead of answering, and the box takes pasted images. Permission
+     *  asks (Allow/Deny) still answer on click. */
+    agentQuestion: boolean;
+    /** the answer box's draft text */
+    text: string;
+    /** images pasted into the answer box (data URLs) */
+    images: string[];
+    /** Other… opened the box on a permission ask */
     otherOpen: boolean;
     resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel", display?: string) => void;
   }
@@ -5881,6 +5889,39 @@
     scrollBottom();
   }
 
+  /** a choice on an agent question: copy it into the answer box to edit,
+   *  caret at the end — sending stays a separate, deliberate step */
+  function prefillAsk(card: PendingAsk, opt: string) {
+    card.text = opt;
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLTextAreaElement>('[data-testid="ask-input"]');
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }
+
+  /** send the agent-question answer box (text, multi-select picks, images) */
+  function sendAskBox(card: PendingAsk) {
+    const r = buildAskAnswer(card);
+    if (r) answerAsk(r.answer, r.display);
+  }
+
+  /** images pasted into the ask answer box attach as thumbnails (same
+   *  downscale as the composer); text pastes stay native */
+  async function onAskPaste(e: ClipboardEvent, card: PendingAsk) {
+    const files = pastedImageFiles(e);
+    if (!files.length) return;
+    e.preventDefault();
+    for (const f of files) {
+      try {
+        card.images = [...card.images, await imageFileToDataUrl(f)];
+      } catch {
+        error = `Couldn't read pasted image (${f.name || f.type || "unknown type"})`;
+      }
+    }
+  }
+
   /** user dismissed the question without answering: tell the model so it
    *  stops waiting and doesn't re-ask */
   function dismissAsk() {
@@ -6714,7 +6755,9 @@
               options: ev.options,
               multi: !!ev.multi,
               picked: [],
-              other: "",
+              agentQuestion: isAgentQuestion(ev.ask_id),
+              text: "",
+              images: [],
               otherOpen: false,
               resolve: (answer, outcome, display) => {
                 // cancel (Stop / chat deleted) needs no backend call: the stop
@@ -7770,34 +7813,78 @@
                           aria-pressed={askCard.picked.includes(opt)}
                           onclick={() => (askCard.picked = toggleChoice(askCard.options, askCard.picked, opt))}
                         ><span class="ask-check" aria-hidden="true">{askCard.picked.includes(opt) ? "✓" : ""}</span>{opt}</button>
+                      {:else if askCard.agentQuestion}
+                        <!-- prefill, never answer: most answers are a choice plus an edit -->
+                        <button
+                          class="ask-option"
+                          class:picked={askCard.text.trim() === opt}
+                          data-testid="ask-option-{oi}"
+                          title="Use this answer (you can edit it before sending)"
+                          onclick={() => prefillAsk(askCard, opt)}
+                        >{opt}</button>
                       {:else}
                         <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
                       {/if}
                     {/each}
-                    {#if askCard.multi}
-                      <button
-                        class="ask-send ask-submit"
-                        data-testid="ask-submit"
-                        disabled={!askCard.picked.length}
-                        onclick={() => {
-                          const { answer, display } = multiAnswer(askCard.picked);
-                          answerAsk(answer, display);
-                        }}
-                      >Submit{askCard.picked.length ? ` (${askCard.picked.length})` : ""}</button>
-                    {/if}
-                    {#if askCard.otherOpen}
+                    {#if askCard.agentQuestion}
+                      {@const ready = buildAskAnswer(askCard) != null}
+                      <div class="ask-compose">
+                        {#if askCard.images.length}
+                          <div class="image-strip ask-image-strip" data-testid="ask-image-strip">
+                            {#each askCard.images as img, k}
+                              <div class="image-chip">
+                                <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                                  <img src={img} alt="" />
+                                </button>
+                                <button class="image-remove" aria-label="remove image {k + 1}" data-testid="ask-image-remove-{k}" onclick={() => { askCard.images = askCard.images.filter((_, j) => j !== k); }}>×</button>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                        <div class="ask-other">
+                          <textarea
+                            class="ask-input"
+                            data-testid="ask-input"
+                            rows={Math.min(8, Math.max(1, askCard.text.split("\n").length))}
+                            bind:value={askCard.text}
+                            placeholder={askCard.multi
+                              ? "Add a note or paste an image (optional)…"
+                              : askCard.options.length
+                                ? "Pick a choice to edit it, or type your answer…"
+                                : "Type your answer or paste an image…"}
+                            aria-label="Your answer"
+                            onpaste={(e) => onAskPaste(e, askCard)}
+                            onkeydown={(e) => {
+                              if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+                                e.preventDefault();
+                                sendAskBox(askCard);
+                              } else if (e.key === "Escape") {
+                                // leave the box without arming double-Esc interrupt
+                                e.preventDefault();
+                                e.stopPropagation();
+                                (e.currentTarget as HTMLTextAreaElement).blur();
+                              }
+                            }}
+                          ></textarea>
+                          <button class="ask-send" data-testid={askCard.multi ? "ask-submit" : "ask-send"} disabled={!ready} onclick={() => sendAskBox(askCard)}>
+                            {askCard.multi ? `Submit${askCard.picked.length ? ` (${askCard.picked.length})` : ""}` : "Send"}
+                          </button>
+                          <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
+                        </div>
+                      </div>
+                    {:else if askCard.otherOpen}
                       <form
                         class="ask-other"
                         onsubmit={(e) => {
                           e.preventDefault();
-                          const v = askCard.other.trim() ?? "";
+                          const v = askCard.text.trim();
                           if (v) answerAsk(v);
                         }}
                       >
                         <input
                           class="ask-input"
                           data-testid="ask-input"
-                          bind:value={askCard.other}
+                          bind:value={askCard.text}
                           placeholder="Type your answer…"
                           aria-label="Custom answer"
                           onkeydown={(e) => {
@@ -7808,7 +7895,7 @@
                             }
                           }}
                         />
-                        <button class="ask-send" type="submit" data-testid="ask-send" disabled={!askCard.other.trim()}>Send</button>
+                        <button class="ask-send" type="submit" data-testid="ask-send" disabled={!askCard.text.trim()}>Send</button>
                         <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
                       </form>
                     {:else}
@@ -10039,7 +10126,6 @@
   .ask-option-multi.picked { border-color: var(--accent); }
   .ask-check { width: 16px; height: 16px; flex: none; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border-3); border-radius: 4px; font-size: 11px; line-height: 1; color: var(--accent-fg); }
   .ask-option-multi.picked .ask-check { background: var(--accent); border-color: var(--accent); }
-  .ask-submit { align-self: flex-start; padding: 8px 14px; }
   .ask-other-toggle { color: var(--muted); border-style: dashed; }
   .ask-other { display: flex; gap: 6px; }
   .ask-other-closed { align-items: stretch; }
@@ -10048,6 +10134,12 @@
   .ask-dismiss:hover { color: var(--text); border-color: var(--border-3); background: var(--hover-3); }
   .ask-input { flex: 1; min-width: 0; border: 1px solid var(--border-2); border-radius: 10px; background: var(--bg); color: var(--text); padding: 7px 10px; font: inherit; font-size: 13.5px; }
   .ask-input:focus { outline: none; border-color: var(--accent); }
+  textarea.ask-input { resize: none; line-height: 1.45; max-height: 200px; overflow-y: auto; user-select: text; }
+  .ask-option.picked { border-color: var(--accent); }
+  .ask-compose { display: flex; flex-direction: column; margin-top: 4px; }
+  .ask-compose .ask-other { align-items: stretch; }
+  .ask-compose .ask-send, .ask-compose .ask-dismiss { align-self: flex-end; min-height: 34px; }
+  .ask-image-strip { padding: 2px 0 8px 0; }
   .ask-send { border: none; border-radius: 10px; background: var(--accent); color: var(--accent-fg); padding: 0 13px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
   .ask-send:disabled { opacity: .45; cursor: default; }
   .col { display: flex; flex-direction: column; }
