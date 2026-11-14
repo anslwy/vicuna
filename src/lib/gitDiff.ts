@@ -312,6 +312,18 @@ export function itemsUnder(items: SectionItem[], dir: string): SectionItem[] {
   return items.filter((i) => i.path === dir || i.path.startsWith(dir + "/"));
 }
 
+/** Pick the next (+1) or previous (-1) visible file in a section's tree rows.
+ *  Starts from the first (+1) or last (-1) file when `currentPath` is null or
+ *  hidden, and clamps at the ends of the section. */
+export function stepTreeFile(rows: TreeRow[], currentPath: string | null, dir: 1 | -1): SectionItem | null {
+  const files = rows.flatMap((r) => (r.item ? [r.item] : []));
+  if (!files.length) return null;
+  if (currentPath === null) return dir > 0 ? files[0] : files[files.length - 1];
+  const idx = files.findIndex((f) => f.path === currentPath);
+  if (idx < 0) return dir > 0 ? files[0] : files[files.length - 1];
+  return files[Math.max(0, Math.min(files.length - 1, idx + dir))];
+}
+
 /** highlight.js language id from a file name (null = plain). */
 export function hljsLanguageFor(path: string): string | null {
   const base = path.split("/").pop() ?? path;

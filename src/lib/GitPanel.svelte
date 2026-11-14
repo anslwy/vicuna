@@ -5,7 +5,7 @@
   // files and folders, single hunks, or the lines selected in a hunk
   // (click, shift-click for a range). Patches for hunks and lines come from
   // gitDiff.ts; the backend is src-tauri/src/git_panel.rs.
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import hljs from "highlight.js/lib/common";
   import { gitApply, gitDiff, gitDiscard, gitStage, gitStatus, gitUnstage, type GitStatus } from "./git";
   import {
@@ -16,6 +16,7 @@
     itemsUnder,
     parseDiff,
     splitStatus,
+    stepTreeFile,
     type FileDiff,
     type PatchMode,
     type Picks,
@@ -392,13 +393,39 @@
   });
 
   function onKey(e: KeyboardEvent) {
-    if (e.key !== "Escape") return;
-    if (menu) menu = null;
-    else if (confirm) confirm = null;
-    else if (lineSel.size) lineSel = new Set();
-    else return;
+    if (e.defaultPrevented) return;
+    if (e.key === "Escape") {
+      if (menu) menu = null;
+      else if (confirm) confirm = null;
+      else if (lineSel.size) lineSel = new Set();
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if ((e.key !== "ArrowDown" && e.key !== "ArrowUp") || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (menu || confirm) return;
+    const el = e.target instanceof Element ? e.target : null;
+    if (el && (el.closest("input, textarea, select") || (el as HTMLElement).isContentEditable)) return;
+
+    const secEl = el?.closest("[data-testid='git-staged'], [data-testid='git-unstaged']");
+    const focusedStaged = secEl ? secEl.getAttribute("data-testid") === "git-staged" : null;
+    const staged = focusedStaged ?? (selected ? selected.staged : unRows.some((r) => r.item) ? false : true);
+    const rows = staged ? stRows : unRows;
+    const currentPath = selected && selected.staged === staged ? selected.path : null;
+    const dir = e.key === "ArrowDown" ? 1 : -1;
+    const next = stepTreeFile(rows, currentPath, dir);
     e.preventDefault();
-    e.stopPropagation();
+    if (!next) return;
+    select(next, staged);
+    void tick().then(() => {
+      const row = shell?.querySelector<HTMLButtonElement>(
+        `[data-testid="${staged ? "git-staged" : "git-unstaged"}"] .gp-file.sel`
+      );
+      if (!row) return;
+      row.scrollIntoView({ block: "nearest" });
+      if (el?.closest(".gp-top")) row.focus({ preventScroll: true });
+    });
   }
 </script>
 
@@ -426,7 +453,10 @@
             class="gp-row gp-dir"
             style="padding-left: {8 + row.depth * 14}px"
             title={row.path}
-            onclick={() => toggleDir(staged, row.path)}
+            onclick={(e) => {
+              (e.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
+              toggleDir(staged, row.path);
+            }}
             oncontextmenu={(e) => openMenu(e, staged, null, row.path)}
           >
             <span class="gp-chev">{(staged ? collapsedSt : collapsedUn).has(row.path) ? "▸" : "▾"}</span>
@@ -443,9 +473,13 @@
             data-path={row.item.path}
             style="padding-left: {22 + row.depth * 14}px"
             title={row.item.origPath ? `${row.item.origPath} → ${row.item.path}` : row.item.path}
-            onclick={() => select(row.item!, staged)}
+            onclick={(e) => {
+              (e.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
+              select(row.item!, staged);
+            }}
             ondblclick={() => (staged ? unstageItems([row.item!]) : stageItems([row.item!]))}
             oncontextmenu={(e) => {
+              (e.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
               select(row.item!, staged);
               openMenu(e, staged, row.item!, null);
             }}
@@ -459,7 +493,7 @@
   </div>
 {/snippet}
 
-<div class="gp" bind:this={shell} data-testid="git-panel" role="presentation" onkeydown={onKey}>
+<div class="gp" bind:this={shell} data-testid="git-panel" role="presentation" tabindex="-1" onkeydown={onKey}>
   <div class="gp-bar">
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M6 8.5v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1"/><path d="M12 12.5v3"/></svg>
     <span class="gp-branch" data-testid="git-branch">{status?.repo ? (status.branch ?? "detached") : "Git"}</span>
@@ -610,6 +644,7 @@
 
 <style>
   .gp { position: relative; display: flex; flex-direction: column; height: 100%; min-height: 0; font-size: 13px; }
+  .gp:focus { outline: none; }
   .gp-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--border); color: var(--muted); }
   .gp-branch { font-size: 12.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .gp-grow { flex: 1; }

@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { badgeFor, buildPatch, buildTree, hljsLanguageFor, parseDiff, splitStatus, type Picks } from "../src/lib/gitDiff.ts";
+import { badgeFor, buildPatch, buildTree, hljsLanguageFor, parseDiff, splitStatus, stepTreeFile, type Picks } from "../src/lib/gitDiff.ts";
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "vicuna-gitdiff-"));
@@ -174,4 +174,23 @@ test("buildTree nests folders first and hides collapsed dirs", () => {
   assert.ok(collapsed.some((r) => r.key === "d:src/lib"));
   assert.equal(hljsLanguageFor("src/lib/ChatApp.svelte"), "xml");
   assert.equal(hljsLanguageFor("x.unknown"), null);
+});
+
+test("stepTreeFile navigates visible files and clamps at section ends", () => {
+  assert.equal(stepTreeFile([], null, 1), null);
+  const items = ["src/a.ts", "src/b.ts", "README.md"].map((path) => ({
+    path, origPath: null, letter: "M", newFile: false, untracked: false
+  }));
+  const rows = buildTree(items, new Set());
+  // visible order: src/a.ts, src/b.ts, README.md (dir row skipped)
+  assert.equal(stepTreeFile(rows, null, 1)?.path, "src/a.ts");
+  assert.equal(stepTreeFile(rows, null, -1)?.path, "README.md");
+  assert.equal(stepTreeFile(rows, "src/a.ts", 1)?.path, "src/b.ts");
+  assert.equal(stepTreeFile(rows, "src/b.ts", 1)?.path, "README.md");
+  assert.equal(stepTreeFile(rows, "README.md", 1)?.path, "README.md");
+  assert.equal(stepTreeFile(rows, "README.md", -1)?.path, "src/b.ts");
+  assert.equal(stepTreeFile(rows, "src/a.ts", -1)?.path, "src/a.ts");
+
+  const collapsed = buildTree(items, new Set(["src"]));
+  assert.equal(stepTreeFile(collapsed, "src/a.ts", 1)?.path, "README.md");
 });
