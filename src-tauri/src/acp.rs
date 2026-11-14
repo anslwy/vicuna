@@ -1373,9 +1373,16 @@ pub(crate) fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage
 }
 
 pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Option<&str>) -> String {
-    let uploads = session_id
-        .map(|id| format!("Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."))
-        .unwrap_or_default();
+    let session_info = session_id
+        .map(|id| {
+            format!(
+                "- Session context: your Vicuna session ID is `{id}` (call `get_session_id` on vicuna-mcp anytime to check it). If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
+Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."
+            )
+        })
+        .unwrap_or_else(|| {
+            "- Session context: call `get_session_id` on vicuna-mcp to check the current Vicuna session ID, `read_session` (paginated) to read session history if the workspace/harness changed or earlier context was omitted, and `list_sessions` to browse other sessions.".to_string()
+        });
     format!(
         "You are Vicuna Work mode, operating inside this workspace: {workspace}\n\
 \n\
@@ -1386,7 +1393,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Read before overwriting a file. Prefer targeted reads/searches over dumping large files.\n\
 - When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 - Run anything that may take more than a few seconds (builds, test suites, installs, dev servers, long scripts) with the `run` tool (vicuna-mcp server) instead of your own shell tool: the user can move it to the background, and its output then reaches you as a message when it finishes. When a command goes to the background, keep working on what does not depend on it, or end your turn; do not poll or re-run it.\n\
-{uploads}\n{goal}",
+{session_info}\n{goal}",
         goal = goal
             .filter(|g| !g.trim().is_empty())
             .map(|g| format!(
@@ -1445,7 +1452,7 @@ pub async fn run_turn(
     // process (agy: one per workspace), so the same stable per-workspace
     // route as opencode.
     let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx).then(|| format!("{}|{workspace}", engine_process_label(engine)));
-    let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, turn.clone(), on_event.clone()).await {
+    let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
             eprintln!("{e}");

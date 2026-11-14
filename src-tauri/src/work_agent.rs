@@ -205,6 +205,7 @@ pub async fn work_agent_start(
     if !engine.is_present() {
         return Err(engine.missing_message());
     }
+    crate::vicuna_mcp::set_app_handle(app.clone());
     let turn = Arc::new(TurnState::new());
     let turn_id = agent_state.next_turn(turn.clone());
     // the MCP dialog's servers (+ built-in browser) go to opencode

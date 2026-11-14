@@ -219,6 +219,9 @@ pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
         args.push(crate::vicuna_mcp::CLAUDE_TOOL_ID.to_string());
         // vicuna-mcp gates `run` itself in ask mode (no double prompt)
         args.push(crate::vicuna_mcp::CLAUDE_RUN_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_GET_SESSION_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_READ_SESSION_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_LIST_SESSIONS_TOOL_ID.to_string());
     }
     args
 }
@@ -723,7 +726,16 @@ mod tests {
         let mcp = crate::vicuna_mcp::with_ask_server(vec![], Some("http://127.0.0.1:9/mcp/t"));
         assert_eq!(
             question_tool_args(&mcp),
-            vec!["--disallowedTools", "AskUserQuestion", "--allowedTools", "mcp__vicuna-mcp__ask_user", "mcp__vicuna-mcp__run"]
+            vec![
+                "--disallowedTools",
+                "AskUserQuestion",
+                "--allowedTools",
+                "mcp__vicuna-mcp__ask_user",
+                "mcp__vicuna-mcp__run",
+                "mcp__vicuna-mcp__get_session_id",
+                "mcp__vicuna-mcp__read_session",
+                "mcp__vicuna-mcp__list_sessions",
+            ]
         );
         let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();
         assert_eq!(cfg["mcpServers"]["vicuna-mcp"], json!({ "type": "http", "url": "http://127.0.0.1:9/mcp/t", "headers": {}, "timeout": 86_400_000 }));

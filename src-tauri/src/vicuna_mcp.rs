@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sqlx::Row;
 use tauri::ipc::Channel;
+use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -35,12 +37,18 @@ pub const SERVER_NAME: &str = "vicuna-mcp";
 pub const TOOL_NAME: &str = "ask_user";
 /// Vicuna-owned shell command the user can move to the background.
 pub const RUN_TOOL: &str = "run";
+pub const GET_SESSION_TOOL: &str = "get_session_id";
+pub const READ_SESSION_TOOL: &str = "read_session";
+pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 2;
-/// Claude's tool ids, pre-approved: ask_user is itself the question, and
-/// `run` raises Vicuna's own Allow card in ask mode (no double prompt).
+pub const TOOL_COUNT: usize = 5;
+/// Claude's tool ids, pre-approved: ask_user is itself the question, `run`
+/// raises Vicuna's own Allow card in ask mode, and session readers are read-only.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
 pub const CLAUDE_RUN_TOOL_ID: &str = "mcp__vicuna-mcp__run";
+pub const CLAUDE_GET_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__get_session_id";
+pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
+pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -72,13 +80,37 @@ When you need a decision, a preference or missing information from the user, cal
 (with short choices when there are a few likely answers) instead of asking in plain text or \
 using a built-in question tool; it waits for the answer and returns it. Run long commands (builds, tests, \
 installs, servers) with `run` instead of your own shell tool: the user can move them to the background, and \
-their output reaches you as a message when they finish.";
+their output reaches you as a message when they finish. Use `get_session_id`, `read_session` (paginated), \
+and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
+changed or earlier messages were truncated.";
+
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
+async fn db_pool() -> Result<sqlx::SqlitePool, String> {
+    let app = APP_HANDLE
+        .get()
+        .ok_or_else(|| "vicuna.db is not available (app handle not initialized)".to_string())?;
+    let instances = app
+        .try_state::<tauri_plugin_sql::DbInstances>()
+        .ok_or_else(|| "vicuna.db is not available (DbInstances not loaded)".to_string())?;
+    let guard = instances.0.read().await;
+    match guard.get("sqlite:vicuna.db") {
+        Some(tauri_plugin_sql::DbPool::Sqlite(pool)) => Ok(pool.clone()),
+        None => Err("vicuna.db is not loaded".to_string()),
+    }
+}
 
 #[derive(Clone)]
 struct Target {
     seq: u64,
     /// the turn's workspace (where `run` commands execute)
     workspace: String,
+    /// Vicuna chat session id (if known)
+    session_id: Option<String>,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 }
@@ -174,11 +206,12 @@ impl Drop for AskRegistration {
 pub async fn register(
     route: Option<&str>,
     workspace: &str,
+    session_id: Option<&str>,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 ) -> Result<AskRegistration, String> {
     let srv = server()?;
-    Ok(register_on(&srv.registry, srv.port, route, workspace, turn, on_event))
+    Ok(register_on(&srv.registry, srv.port, route, workspace, session_id, turn, on_event))
 }
 
 fn register_on(
@@ -186,6 +219,7 @@ fn register_on(
     port: u16,
     route: Option<&str>,
     workspace: &str,
+    session_id: Option<&str>,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 ) -> AskRegistration {
@@ -195,7 +229,13 @@ fn register_on(
         Some(k) => r.tokens.entry(k.to_string()).or_insert_with(random_token).clone(),
         None => random_token(),
     };
-    r.targets.entry(token.clone()).or_default().push(Target { seq, workspace: workspace.to_string(), turn, on_event });
+    r.targets.entry(token.clone()).or_default().push(Target {
+        seq,
+        workspace: workspace.to_string(),
+        session_id: session_id.map(str::to_string),
+        turn,
+        on_event,
+    });
     AskRegistration {
         registry: registry.clone(),
         url: format!("http://127.0.0.1:{port}/mcp/{token}"),
@@ -261,6 +301,53 @@ fn run_schema() -> Value {
                 "background": { "type": "boolean", "description": "Start it in the background and return at once (default false)." }
             },
             "required": ["command"]
+        }
+    })
+}
+
+fn get_session_schema() -> Value {
+    json!({
+        "name": GET_SESSION_TOOL,
+        "title": "Get current Vicuna session ID",
+        "description": "Return the current Vicuna chat session_id, workspace, and title (if available). Use this when you need to pass session_id to `read_session` or check which Vicuna session you are in.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    })
+}
+
+fn read_session_schema() -> Value {
+    json!({
+        "name": READ_SESSION_TOOL,
+        "title": "Read Vicuna session history (paginated)",
+        "description": "Read messages from a Vicuna session stored in vicuna.db. Useful when the workspace or harness/engine changed mid-conversation, when earlier messages were truncated from the prompt, or when inspecting another session. Paginated with `offset` and `limit` (or `tail: true` for the latest page).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Vicuna session ID to read. Defaults to the current session if omitted." },
+                "offset": { "type": "integer", "minimum": 0, "description": "0-based message index to start from (default 0)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of messages to return (default 20, max 100)." },
+                "tail": { "type": "boolean", "description": "When true and `offset` is omitted, return the last `limit` messages (default false)." },
+                "max_chars_per_message": { "type": "integer", "minimum": 0, "maximum": 50000, "description": "Truncate each message's content to this many characters (default 8000; 0 = no truncation)." },
+                "include_thinking": { "type": "boolean", "description": "Include model thinking/reasoning text for assistant messages (default false)." }
+            }
+        }
+    })
+}
+
+fn list_sessions_schema() -> Value {
+    json!({
+        "name": LIST_SESSIONS_TOOL,
+        "title": "List Vicuna sessions",
+        "description": "List recent Vicuna chat/work sessions from vicuna.db with pagination and optional search filter.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional case-insensitive substring filter matched against session title or workspace." },
+                "offset": { "type": "integer", "minimum": 0, "description": "0-based offset (default 0)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum number of sessions to return (default 20, max 50)." }
+            }
         }
     })
 }
@@ -523,6 +610,254 @@ fn answer_result(a: &AskAnswer, multiple: bool) -> Value {
     json!({ "content": content, "isError": false })
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (s.to_string(), false);
+    }
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        (format!("{head}…[truncated]"), true)
+    } else {
+        (head, false)
+    }
+}
+
+async fn get_session_id(target: &Target) -> Value {
+    let mut out = json!({
+        "session_id": target.session_id,
+        "workspace": target.workspace,
+    });
+    if let (Some(sid), Ok(pool)) = (target.session_id.as_deref(), db_pool().await) {
+        if let Ok(Some(row)) = sqlx::query("SELECT title, mode FROM chats WHERE id = $1")
+            .bind(sid)
+            .fetch_optional(&pool)
+            .await
+        {
+            out["title"] = json!(row.try_get::<String, _>("title").unwrap_or_default());
+            out["mode"] = json!(row.try_get::<Option<String>, _>("mode").ok().flatten());
+        }
+    }
+    text_result(&out.to_string(), false)
+}
+
+async fn read_session_from_pool(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let chat_row = sqlx::query("SELECT id, title, mode, workspace, goal FROM chats WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read_session failed: {e}"))?;
+    let Some(chat_row) = chat_row else {
+        return Err(format!("Session not found: {session_id}"));
+    };
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE chat_id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("read_session count failed: {e}"))?;
+
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let tail = args.get("tail").and_then(Value::as_bool).unwrap_or(false);
+    let offset = match args.get("offset").and_then(Value::as_i64) {
+        Some(o) => o.max(0),
+        None if tail => (total - limit).max(0),
+        None => 0,
+    };
+    let max_chars = args
+        .get("max_chars_per_message")
+        .and_then(Value::as_i64)
+        .unwrap_or(8000)
+        .clamp(0, 50_000) as usize;
+    let include_thinking = args
+        .get("include_thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let rows = sqlx::query(
+        "SELECT idx, role, content, thinking, model FROM messages WHERE chat_id = $1 ORDER BY idx ASC LIMIT $2 OFFSET $3",
+    )
+    .bind(session_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("read_session query failed: {e}"))?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for r in rows {
+        let idx: i64 = r.try_get("idx").unwrap_or(0);
+        let role: String = r.try_get("role").unwrap_or_default();
+        let raw_content: String = r.try_get("content").unwrap_or_default();
+        let model: Option<String> = r.try_get("model").ok().flatten();
+        let (content, truncated) = truncate_chars(&raw_content, max_chars);
+        let mut msg = json!({
+            "idx": idx,
+            "role": role,
+            "model": model,
+            "content": content,
+            "truncated": truncated,
+        });
+        if include_thinking {
+            let raw_thinking: String = r.try_get("thinking").unwrap_or_default();
+            if !raw_thinking.is_empty() {
+                let (thinking, _) = truncate_chars(&raw_thinking, max_chars);
+                msg["thinking"] = json!(thinking);
+            }
+        }
+        messages.push(msg);
+    }
+
+    let returned = messages.len() as i64;
+    let next_offset = offset + returned;
+    let has_more = next_offset < total;
+
+    Ok(json!({
+        "session": {
+            "id": chat_row.try_get::<String, _>("id").unwrap_or_default(),
+            "title": chat_row.try_get::<String, _>("title").unwrap_or_default(),
+            "mode": chat_row.try_get::<Option<String>, _>("mode").ok().flatten(),
+            "workspace": chat_row.try_get::<Option<String>, _>("workspace").ok().flatten(),
+            "goal": chat_row.try_get::<Option<String>, _>("goal").ok().flatten(),
+        },
+        "total_messages": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "has_more": has_more,
+        "next_offset": if has_more { json!(next_offset) } else { Value::Null },
+        "messages": messages,
+    }))
+}
+
+async fn read_session(target: &Target, args: &Value) -> Value {
+    let requested = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| target.session_id.clone());
+    let Some(session_id) = requested else {
+        return text_result("No `session_id` provided and current turn has no session_id.", true);
+    };
+    let pool = match db_pool().await {
+        Ok(p) => p,
+        Err(e) => return text_result(&e, true),
+    };
+    match read_session_from_pool(&pool, &session_id, args).await {
+        Ok(v) => text_result(&v.to_string(), false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
+async fn list_sessions_from_pool(pool: &sqlx::SqlitePool, args: &Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 50);
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let query_str = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+
+    let total: i64 = if let Some(ref pat) = query_str {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chats WHERE LOWER(title) LIKE $1 OR LOWER(COALESCE(workspace, '')) LIKE $1",
+        )
+        .bind(pat)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("list_sessions count failed: {e}"))?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("list_sessions count failed: {e}"))?
+    };
+
+    let rows = if let Some(ref pat) = query_str {
+        sqlx::query(
+            "SELECT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at, \
+             (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
+             FROM chats c \
+             WHERE LOWER(c.title) LIKE $1 OR LOWER(COALESCE(c.workspace, '')) LIKE $1 \
+             ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(pat)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("list_sessions query failed: {e}"))?
+    } else {
+        sqlx::query(
+            "SELECT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at, \
+             (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
+             FROM chats c \
+             ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("list_sessions query failed: {e}"))?
+    };
+
+    let mut sessions = Vec::with_capacity(rows.len());
+    for r in rows {
+        sessions.push(json!({
+            "id": r.try_get::<String, _>("id").unwrap_or_default(),
+            "title": r.try_get::<String, _>("title").unwrap_or_default(),
+            "mode": r.try_get::<Option<String>, _>("mode").ok().flatten(),
+            "workspace": r.try_get::<Option<String>, _>("workspace").ok().flatten(),
+            "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
+            "updated_at": r.try_get::<Option<i64>, _>("updated_at").ok().flatten(),
+            "message_count": r.try_get::<i64, _>("message_count").unwrap_or(0),
+        }));
+    }
+
+    let returned = sessions.len() as i64;
+    let next_offset = offset + returned;
+    let has_more = next_offset < total;
+
+    Ok(json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": if has_more { json!(next_offset) } else { Value::Null },
+        "sessions": sessions,
+    }))
+}
+
+async fn list_sessions(args: &Value) -> Value {
+    let pool = match db_pool().await {
+        Ok(p) => p,
+        Err(e) => return text_result(&e, true),
+    };
+    match list_sessions_from_pool(&pool, args).await {
+        Ok(v) => text_result(&v.to_string(), false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
 /// One JSON-RPC message -> its response (None for notifications/responses).
 async fn handle_rpc(
     msg: &Value,
@@ -544,18 +879,26 @@ async fn handle_rpc(
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": [tool_schema(), run_schema()] }),
+        "tools/list" => json!({ "tools": [
+            tool_schema(),
+            run_schema(),
+            get_session_schema(),
+            read_session_schema(),
+            list_sessions_schema(),
+        ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name != TOOL_NAME && name != RUN_TOOL {
-                return Some(rpc_error(id, -32602, &format!("unknown tool: {name}")));
-            }
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             match (target, name) {
                 (Some(t), TOOL_NAME) => ask(t, &args, client_gone).await,
-                (Some(t), _) => run(t, &args, client_gone).await,
+                (Some(t), RUN_TOOL) => run(t, &args, client_gone).await,
+                (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
+                (Some(t), READ_SESSION_TOOL) => read_session(t, &args).await,
+                (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
-                (None, _) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
+                (None, RUN_TOOL) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
+                (None, GET_SESSION_TOOL | READ_SESSION_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
         "resources/list" => json!({ "resources": [] }),
@@ -850,7 +1193,7 @@ mod tests {
     async fn slow_answer_streams_headers_first_then_heartbeats() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let mut body = call("Take your time?", json!({}));
         body["params"]["_meta"] = json!({ "progressToken": 42 });
         // headers must arrive while the question is still unanswered (Claude
@@ -880,7 +1223,7 @@ mod tests {
     async fn json_only_clients_still_get_plain_json() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move {
             let r = reqwest::Client::new().post(&url).header("accept", "application/json").json(&call("Q?", json!({}))).send().await.unwrap();
@@ -897,7 +1240,7 @@ mod tests {
     async fn pasted_images_come_back_as_image_blocks() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Show me?", json!({ "choices": ["A", "B"] }))).await });
         let ev = wait_ask(&seen).await;
@@ -963,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn run_waits_for_the_command_and_returns_its_output() {
         let (ch, seen) = capture();
-        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
         let r = post(&reg.url, run_call("echo hello-run; echo oops >&2; exit 3", json!({}))).await.1.unwrap();
         let text = result_text(&r);
         assert!(text.starts_with("[exit 3 · "), "{text}");
@@ -976,7 +1319,7 @@ mod tests {
     async fn background_button_returns_early_and_the_job_keeps_running() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, run_call("sleep 1; echo bg-finished", json!({}))).await });
         let started = wait_event(&seen, "runstarted").await;
@@ -1001,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn model_started_background_returns_at_once() {
         let (ch, seen) = capture();
-        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
         let r = post(&reg.url, run_call("sleep 0.3", json!({ "background": true }))).await.1.unwrap();
         assert!(result_text(&r).starts_with("Started in the background"), "{r}");
         let kinds: Vec<String> = seen.lock().unwrap().iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
@@ -1012,7 +1355,7 @@ mod tests {
     async fn stop_kills_a_foreground_command() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, run_call("sleep 30", json!({}))).await });
         let job = wait_event(&seen, "runstarted").await["job_id"].as_str().unwrap().to_string();
@@ -1032,7 +1375,7 @@ mod tests {
     async fn answer_later_returns_without_an_answer() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Which db?", json!({}))).await });
         let ev = wait_ask(&seen).await;
@@ -1045,7 +1388,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_lists_ask_user() {
         let (ch, _) = capture();
-        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
         let (s, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } })).await;
         let r = r.unwrap();
         assert_eq!(s, 200);
@@ -1063,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_token_is_404_and_get_is_405() {
         let (ch, _) = capture();
-        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
         let bad = format!("{}x", reg.url);
         let (s, _) = post(&bad, json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })).await;
         assert_eq!(s, 404);
@@ -1075,7 +1418,7 @@ mod tests {
     async fn call_shows_card_and_returns_the_answer() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Which color?", json!({ "choices": ["Red", "Green", "Blue"] }))).await });
         let ev = wait_ask(&seen).await;
@@ -1096,7 +1439,7 @@ mod tests {
     async fn multi_select_answer_is_a_list() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Toppings?", json!({ "choices": ["Ham", "Olives", "Basil"], "multiple": true }))).await });
         let ev = wait_ask(&seen).await;
@@ -1110,7 +1453,7 @@ mod tests {
     async fn stop_while_pending_cancels_the_call() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Proceed?", json!({}))).await });
         wait_ask(&seen).await;
@@ -1130,8 +1473,8 @@ mod tests {
         let (ch2, seen2) = capture();
         let (t1, t2) = (Arc::new(TurnState::new()), Arc::new(TurnState::new()));
         let key = format!("opencode|/ws-{}", random_token());
-        let r1 = register(Some(&key), &ws(), t1.clone(), ch1).await.unwrap();
-        let r2 = register(Some(&key), &ws(), t2.clone(), ch2).await.unwrap();
+        let r1 = register(Some(&key), &ws(), None, t1.clone(), ch1).await.unwrap();
+        let r2 = register(Some(&key), &ws(), None, t2.clone(), ch2).await.unwrap();
         assert_eq!(r1.url, r2.url, "one URL per workspace route");
         let url = r1.url.clone();
         let url_again = r1.url.clone();
@@ -1179,5 +1522,73 @@ mod tests {
     fn chunked_bodies_decode() {
         assert_eq!(decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(), b"Wikipedia");
         assert!(decode_chunked(b"4\r\nWi").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_id_returns_registered_session() {
+        let (ch, _) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, "/tmp/ws-test", Some("sess-123"), turn, ch).await.unwrap();
+        let resp = post(&reg.url, json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": GET_SESSION_TOOL, "arguments": {} }
+        }))
+        .await
+        .1
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let txt = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(txt).unwrap();
+        assert_eq!(v["session_id"], "sess-123");
+        assert_eq!(v["workspace"], "/tmp/ws-test");
+    }
+
+    #[tokio::test]
+    async fn read_and_list_sessions_paginate_cleanly() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL, forked_from TEXT, fork_from_index INTEGER, mode TEXT, workspace TEXT, goal TEXT, updated_at INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL, model TEXT, idx INTEGER NOT NULL, images TEXT, gen_ms REAL, gen_tps REAL, summary INTEGER, gen_cost REAL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO chats (id, title, created_at, mode, workspace, updated_at) VALUES ('s1', 'First chat', 100, 'work', '/repo/a', 200), ('s2', 'Second chat', 150, 'chat', '/repo/b', 150)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            sqlx::query("INSERT INTO messages (chat_id, role, content, thinking, model, idx) VALUES ('s1', $1, $2, 'thought', 'm1', $3)")
+                .bind(if i % 2 == 0 { "user" } else { "assistant" })
+                .bind(format!("msg-{i}-abcdefghij"))
+                .bind(i)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let page1 = read_session_from_pool(&pool, "s1", &json!({ "offset": 0, "limit": 2, "max_chars_per_message": 6 })).await.unwrap();
+        assert_eq!(page1["total_messages"], 5);
+        assert_eq!(page1["returned"], 2);
+        assert_eq!(page1["has_more"], true);
+        assert_eq!(page1["next_offset"], 2);
+        assert_eq!(page1["messages"][0]["content"], "msg-0-…[truncated]");
+        assert_eq!(page1["messages"][0]["truncated"], true);
+
+        let tail = read_session_from_pool(&pool, "s1", &json!({ "tail": true, "limit": 2, "include_thinking": true })).await.unwrap();
+        assert_eq!(tail["offset"], 3);
+        assert_eq!(tail["has_more"], false);
+        assert_eq!(tail["next_offset"], Value::Null);
+        assert_eq!(tail["messages"][0]["idx"], 3);
+        assert_eq!(tail["messages"][1]["idx"], 4);
+        assert_eq!(tail["messages"][0]["thinking"], "thought");
+
+        let listed = list_sessions_from_pool(&pool, &json!({ "query": "first", "limit": 10 })).await.unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["sessions"][0]["id"], "s1");
+        assert_eq!(listed["sessions"][0]["message_count"], 5);
     }
 }
