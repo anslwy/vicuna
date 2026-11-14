@@ -521,7 +521,7 @@ export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> 
 }
 
 export interface WorkTurnParams {
-  /** "opencode" | "claude" | "codex" | "fx" | "agy" (absent = the backend's saved choice) */
+  /** "opencode" | "claude" | "codex" | "fx" | "agy" | "pi" (absent = the backend's saved choice) */
   engine?: string;
   /** engine model id; empty = saved pick / engine default */
   model: string;

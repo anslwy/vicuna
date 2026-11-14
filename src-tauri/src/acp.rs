@@ -220,6 +220,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Codex => "codex app-server",
         Engine::Agy => "agy acp",
         Engine::Fx => "fx acp",
+        Engine::Pi => "pi --mode rpc",
     }
 }
 
@@ -249,6 +250,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Codex => format!("codex|{id}|{workspace}"),
         Engine::Agy => format!("agy|{id}|{workspace}"),
         Engine::Fx => format!("fx|{id}|{workspace}"),
+        Engine::Pi => format!("pi|{id}|{workspace}"),
     })
 }
 
@@ -1466,6 +1468,21 @@ pub async fn run_turn(
             ask_url.as_deref(),
         )
         .await
+    } else if engine == Engine::Pi {
+        super::pi::run_turn_inner(
+            &turn,
+            model.as_deref(),
+            &workspace,
+            &messages,
+            session_id.as_deref(),
+            goal_text.as_deref(),
+            fresh_session,
+            &on_event,
+            state,
+            &mcp_snapshot,
+            ask_url.as_deref(),
+        )
+        .await
     } else if engine == Engine::Codex {
         super::codex_cli::run_turn_inner(
             &turn,
@@ -1600,6 +1617,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
             Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
             Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
+            Engine::Pi => format!("{e}\npi needs a signed-in provider for this model: run `pi` in a terminal once and /login (or set the provider's API key), or pick another model."),
         }
     } else {
         e

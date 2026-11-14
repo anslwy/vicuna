@@ -32,4 +32,8 @@ export const FX_ICON_PATH =
 // Antigravity (agy) mark: a rising arch drawn as one stroke (fill none,
 // stroke currentColor, width 2, round caps), Vicuna's own line drawing
 // in the spirit of the CLI's arch logo, so it follows the theme.
+// pi mark: the Greek letter pi drawn as strokes (a bar with two legs, the
+// right one curling out), Vicuna's own line drawing; follows the theme.
+export const PI_ICON_PATH = "M4.5 7.5c1-1.4 2.2-2 4-2h11M9 5.5c0 5.5-.8 9.8-3 13M15 5.5v10.2c0 1.8.8 2.8 2.3 2.8 1 0 1.8-.5 2.2-1.3";
+
 export const AGY_ICON_PATH = "M4 19.5c2 0 2.9-1.3 3.8-3.6L12 4.5l4.2 11.4c.9 2.3 1.8 3.6 3.8 3.6";
