@@ -25,7 +25,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sqlx::Row;
 use tauri::ipc::Channel;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -40,15 +40,17 @@ pub const RUN_TOOL: &str = "run";
 pub const GET_SESSION_TOOL: &str = "get_session_id";
 pub const READ_SESSION_TOOL: &str = "read_session";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
+pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 5;
+pub const TOOL_COUNT: usize = 6;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, `run`
-/// raises Vicuna's own Allow card in ask mode, and session readers are read-only.
+/// raises Vicuna's own Allow card in ask mode, and session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
 pub const CLAUDE_RUN_TOOL_ID: &str = "mcp__vicuna-mcp__run";
 pub const CLAUDE_GET_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__get_session_id";
 pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
 pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
+pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -82,7 +84,8 @@ using a built-in question tool; it waits for the answer and returns it. Run long
 installs, servers) with `run` instead of your own shell tool: the user can move them to the background, and \
 their output reaches you as a message when they finish. Use `get_session_id`, `read_session` (paginated), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
-changed or earlier messages were truncated.";
+changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
+custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server).";
 
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
@@ -348,6 +351,65 @@ fn list_sessions_schema() -> Value {
                 "offset": { "type": "integer", "minimum": 0, "description": "0-based offset (default 0)." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum number of sessions to return (default 20, max 50)." }
             }
+        }
+    })
+}
+
+fn manage_mcp_schema() -> Value {
+    json!({
+        "name": MANAGE_MCP_TOOL,
+        "title": "Manage Vicuna custom MCP servers",
+        "description": "List, add, edit, enable, disable, or remove custom MCP servers configured in Vicuna (~/vicuna/config/vicuna.json). The fixed `vicuna-mcp` server cannot be modified, disabled, or removed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "add", "edit", "enable", "disable", "remove"],
+                    "description": "Operation to perform."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Server name / ID (required for add, edit, enable, disable, remove)."
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "Optional new server name when renaming via action='edit'."
+                },
+                "transport": {
+                    "type": "string",
+                    "enum": ["http", "stdio"],
+                    "description": "Server transport: 'http' (remote streamable-HTTP endpoint) or 'stdio' (local command). Inferred from url/command on 'add' if omitted."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS endpoint URL for 'http' servers (required on 'add' for http)."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Optional HTTP headers map (e.g. {\"Authorization\": \"Bearer ...\"})."
+                },
+                "command": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Command and arguments for 'stdio' servers (e.g. [\"npx\", \"-y\", \"@org/mcp\"])."
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Optional environment variables map for 'stdio' servers."
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether the server is enabled (defaults to true on 'add'; preserves existing value on 'edit' if omitted)."
+                },
+                "wake": {
+                    "type": "boolean",
+                    "description": "When true (default for 'add' and 'enable' once the server connects), Vicuna automatically starts a follow-up turn after this turn finishes so you can immediately call the newly active MCP server without waiting for the user. Set false if no follow-up turn is needed."
+                }
+            },
+            "required": ["action"]
         }
     })
 }
@@ -858,6 +920,460 @@ async fn list_sessions(args: &Value) -> Value {
     }
 }
 
+fn is_fixed_vicuna_mcp(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(SERVER_NAME)
+}
+
+fn parse_string_map_arg(v: Option<&Value>) -> Result<Option<HashMap<String, String>>, String> {
+    let Some(val) = v else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let Some(obj) = val.as_object() else {
+        return Err("expected a JSON object of string key/value pairs".to_string());
+    };
+    if obj.is_empty() {
+        return Ok(None);
+    }
+    let mut out = HashMap::with_capacity(obj.len());
+    for (k, v) in obj {
+        let s = v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| v.to_string());
+        out.insert(k.clone(), s);
+    }
+    Ok(Some(out))
+}
+
+fn parse_command_arg(v: Option<&Value>) -> Result<Option<Vec<String>>, String> {
+    let Some(val) = v else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    if let Some(arr) = val.as_array() {
+        let parts: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+            .collect();
+        return Ok((!parts.is_empty()).then_some(parts));
+    }
+    if let Some(s) = val.as_str() {
+        let parts: Vec<String> = s.split_whitespace().map(str::to_string).collect();
+        return Ok((!parts.is_empty()).then_some(parts));
+    }
+    Err("`command` must be an array of strings".to_string())
+}
+
+fn normalize_transport_arg(raw: &str) -> Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "http" | "remote" => Ok("http".to_string()),
+        "stdio" | "local" => Ok("stdio".to_string()),
+        other => Err(format!("invalid transport `{other}`; expected `http` or `stdio`")),
+    }
+}
+
+fn validate_http_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("`url` is required for http MCP servers".to_string());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("`url` must start with http:// or https://".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_server_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 100 {
+        return Err("server `name` must be 1..100 characters".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("server `name` cannot contain slashes".to_string());
+    }
+    if is_fixed_vicuna_mcp(trimmed) {
+        return Err("`vicuna-mcp` is a fixed built-in server and cannot be added, modified, disabled, or removed.".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn find_server<'a>(servers: &'a [crate::mcp::McpServerConfig], name: &str) -> Option<&'a crate::mcp::McpServerConfig> {
+    let q = name.trim();
+    servers
+        .iter()
+        .find(|s| s.name == q || s.id == q)
+        .or_else(|| servers.iter().find(|s| s.name.eq_ignore_ascii_case(q) || s.id.eq_ignore_ascii_case(q)))
+}
+
+fn list_servers_in(path: Option<&std::path::Path>) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
+    match path {
+        Some(p) => crate::mcp::list_file_servers_in(p),
+        None => crate::mcp::list_file_servers(),
+    }
+}
+
+fn save_server_in(
+    path: Option<&std::path::Path>,
+    cfg: &crate::mcp::McpServerConfig,
+) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
+    match path {
+        Some(p) => crate::mcp::save_file_server_in(p, cfg),
+        None => crate::mcp::save_file_server(cfg),
+    }
+}
+
+fn delete_server_in(
+    path: Option<&std::path::Path>,
+    id: &str,
+) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
+    match path {
+        Some(p) => crate::mcp::delete_file_server_in(p, id),
+        None => crate::mcp::delete_file_server(id),
+    }
+}
+
+struct ManageMcpOutcome {
+    value: Value,
+    changed: bool,
+    wake_server: Option<(String, Option<usize>)>,
+}
+
+async fn connect_summary(
+    mgr: Option<&crate::mcp::McpManager>,
+    cfg: &crate::mcp::McpServerConfig,
+) -> (Value, bool, Option<usize>) {
+    let Some(m) = mgr else {
+        return (Value::Null, false, None);
+    };
+    match m.connect(cfg).await {
+        Ok(info) => {
+            let n = info.tools.len();
+            (json!({ "connected": true, "tools": n }), true, Some(n))
+        }
+        Err(e) => (json!({ "connected": false, "error": e }), false, None),
+    }
+}
+
+async fn manage_mcp_in(
+    path: Option<&std::path::Path>,
+    args: &Value,
+    mgr: Option<&crate::mcp::McpManager>,
+) -> Result<ManageMcpOutcome, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match action.as_str() {
+        "list" => {
+            let servers = list_servers_in(path)?;
+            let (connected_ids, tool_counts) = match mgr {
+                Some(m) => (m.connected_ids().await, m.tool_counts().await),
+                None => (Vec::new(), HashMap::new()),
+            };
+            let items: Vec<Value> = servers
+                .iter()
+                .map(|s| {
+                    let is_conn = connected_ids.iter().any(|id| id == &s.id);
+                    let mut header_keys: Vec<&String> = s.headers.as_ref().map(|h| h.keys().collect()).unwrap_or_default();
+                    header_keys.sort();
+                    let mut env_keys: Vec<&String> = s.env.as_ref().map(|e| e.keys().collect()).unwrap_or_default();
+                    env_keys.sort();
+                    json!({
+                        "name": s.name,
+                        "transport": s.normalized_transport(),
+                        "url": s.url,
+                        "command": s.command,
+                        "header_keys": header_keys,
+                        "env_keys": env_keys,
+                        "enabled": s.enabled,
+                        "connected": is_conn,
+                        "tools": tool_counts.get(&s.id).copied(),
+                    })
+                })
+                .collect();
+            Ok(ManageMcpOutcome {
+                value: json!({
+                    "fixed_server": {
+                        "name": SERVER_NAME,
+                        "enabled": true,
+                        "fixed": true,
+                        "note": "Built-in Vicuna MCP server; cannot be edited, disabled, or removed."
+                    },
+                    "servers": items,
+                }),
+                changed: false,
+                wake_server: None,
+            })
+        }
+        "add" => {
+            let raw_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = validate_server_name(raw_name)?;
+            let existing = list_servers_in(path)?;
+            if find_server(&existing, &name).is_some() {
+                return Err(format!("MCP server `{name}` already exists. Use action='edit' to update it."));
+            }
+            let url = args.get("url").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let command = parse_command_arg(args.get("command"))?;
+            let transport = match args.get("transport").and_then(|v| v.as_str()) {
+                Some(t) => normalize_transport_arg(t)?,
+                None if url.is_some() => "http".to_string(),
+                None if command.is_some() => "stdio".to_string(),
+                None => return Err("provide `url` (for http) or `command` (for stdio)".to_string()),
+            };
+            let (final_url, final_headers, final_cmd, final_env) = if transport == "http" {
+                let u = validate_http_url(url.unwrap_or(""))?;
+                let h = parse_string_map_arg(args.get("headers"))?;
+                (Some(u), h, None, None)
+            } else {
+                let cmd = command.ok_or_else(|| "`command` is required for stdio MCP servers".to_string())?;
+                let env = parse_string_map_arg(args.get("env"))?;
+                (None, None, Some(cmd), env)
+            };
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let cfg = crate::mcp::McpServerConfig {
+                id: name.clone(),
+                name: name.clone(),
+                transport,
+                command: final_cmd,
+                env: final_env,
+                url: final_url,
+                headers: final_headers,
+                oauth: None,
+                enabled,
+            };
+            save_server_in(path, &cfg)?;
+            let (conn, connected_ok, tools_n) = if enabled {
+                connect_summary(mgr, &cfg).await
+            } else {
+                (Value::Null, false, None)
+            };
+            let wake_arg = args.get("wake").and_then(|v| v.as_bool());
+            let waking = enabled && connected_ok && wake_arg != Some(false);
+            let note = if waking {
+                "Saved to vicuna.json and connected. Vicuna will automatically start a follow-up turn when this turn finishes so you can use this server right away."
+            } else {
+                "Saved to vicuna.json. Work engines pick up MCP config changes on the next turn."
+            };
+            Ok(ManageMcpOutcome {
+                value: json!({
+                    "ok": true,
+                    "action": "add",
+                    "name": cfg.name,
+                    "transport": cfg.transport,
+                    "enabled": cfg.enabled,
+                    "connection": conn,
+                    "waking_next_turn": waking,
+                    "note": note
+                }),
+                changed: true,
+                wake_server: waking.then(|| (cfg.name.clone(), tools_n)),
+            })
+        }
+        "edit" => {
+            let raw_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if is_fixed_vicuna_mcp(raw_name) {
+                return Err("`vicuna-mcp` is a fixed built-in server and cannot be modified.".to_string());
+            }
+            let existing_list = list_servers_in(path)?;
+            let prev = find_server(&existing_list, raw_name)
+                .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
+                .clone();
+            let target_name = match args.get("new_name").and_then(|v| v.as_str()) {
+                Some(nn) => {
+                    let validated = validate_server_name(nn)?;
+                    if !validated.eq_ignore_ascii_case(&prev.name) && find_server(&existing_list, &validated).is_some() {
+                        return Err(format!("Cannot rename to `{validated}`: a server with that name already exists."));
+                    }
+                    validated
+                }
+                None => prev.name.clone(),
+            };
+            let transport = match args.get("transport").and_then(|v| v.as_str()) {
+                Some(t) => normalize_transport_arg(t)?,
+                None => prev.normalized_transport().to_string(),
+            };
+            let url = match args.get("url") {
+                Some(v) if v.is_null() => None,
+                Some(v) => v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                None => prev.url.clone(),
+            };
+            let headers = match args.get("headers") {
+                Some(v) => parse_string_map_arg(Some(v))?,
+                None => prev.headers.clone(),
+            };
+            let command = match args.get("command") {
+                Some(v) => parse_command_arg(Some(v))?,
+                None => prev.command.clone(),
+            };
+            let env = match args.get("env") {
+                Some(v) => parse_string_map_arg(Some(v))?,
+                None => prev.env.clone(),
+            };
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(prev.enabled);
+
+            let (final_url, final_headers, final_cmd, final_env) = if transport == "http" {
+                let u = validate_http_url(url.as_deref().unwrap_or(""))?;
+                (Some(u), headers, None, None)
+            } else {
+                let cmd = command.filter(|c| !c.is_empty()).ok_or_else(|| "`command` is required for stdio MCP servers".to_string())?;
+                (None, None, Some(cmd), env)
+            };
+
+            let updated = crate::mcp::McpServerConfig {
+                id: target_name.clone(),
+                name: target_name.clone(),
+                transport,
+                command: final_cmd,
+                env: final_env,
+                url: final_url,
+                headers: final_headers,
+                oauth: prev.oauth.clone(),
+                enabled,
+            };
+
+            if let Some(m) = mgr {
+                let _ = m.disconnect(&prev.id).await;
+            }
+            save_server_in(path, &updated)?;
+            if target_name != prev.id {
+                delete_server_in(path, &prev.id)?;
+            }
+            let (conn, connected_ok, tools_n) = if updated.enabled {
+                connect_summary(mgr, &updated).await
+            } else {
+                (Value::Null, false, None)
+            };
+            let wake_arg = args.get("wake").and_then(|v| v.as_bool());
+            let waking = updated.enabled && connected_ok && wake_arg == Some(true);
+            let note = if waking {
+                "Updated in vicuna.json and connected. Vicuna will automatically start a follow-up turn when this turn finishes so you can use this server right away."
+            } else {
+                "Updated in vicuna.json. Work engines pick up MCP config changes on the next turn."
+            };
+            Ok(ManageMcpOutcome {
+                value: json!({
+                    "ok": true,
+                    "action": "edit",
+                    "name": updated.name,
+                    "transport": updated.transport,
+                    "enabled": updated.enabled,
+                    "connection": conn,
+                    "waking_next_turn": waking,
+                    "note": note
+                }),
+                changed: true,
+                wake_server: waking.then(|| (updated.name.clone(), tools_n)),
+            })
+        }
+        "enable" | "disable" => {
+            let raw_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if is_fixed_vicuna_mcp(raw_name) {
+                return Err("`vicuna-mcp` is a fixed built-in server and cannot be enabled or disabled.".to_string());
+            }
+            let existing_list = list_servers_in(path)?;
+            let mut cfg = find_server(&existing_list, raw_name)
+                .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
+                .clone();
+            let enable = action == "enable";
+            cfg.enabled = enable;
+            save_server_in(path, &cfg)?;
+            let (conn, connected_ok, tools_n) = if enable {
+                connect_summary(mgr, &cfg).await
+            } else {
+                if let Some(m) = mgr {
+                    let _ = m.disconnect(&cfg.id).await;
+                    (json!({ "connected": false }), false, None)
+                } else {
+                    (Value::Null, false, None)
+                }
+            };
+            let wake_arg = args.get("wake").and_then(|v| v.as_bool());
+            let waking = enable && connected_ok && wake_arg != Some(false);
+            let note = if waking {
+                "Updated in vicuna.json and connected. Vicuna will automatically start a follow-up turn when this turn finishes so you can use this server right away."
+            } else {
+                "Updated in vicuna.json. Work engines pick up MCP config changes on the next turn."
+            };
+            Ok(ManageMcpOutcome {
+                value: json!({
+                    "ok": true,
+                    "action": action,
+                    "name": cfg.name,
+                    "enabled": cfg.enabled,
+                    "connection": conn,
+                    "waking_next_turn": waking,
+                    "note": note
+                }),
+                changed: true,
+                wake_server: waking.then(|| (cfg.name.clone(), tools_n)),
+            })
+        }
+        "remove" => {
+            let raw_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if is_fixed_vicuna_mcp(raw_name) {
+                return Err("`vicuna-mcp` is a fixed built-in server and cannot be removed.".to_string());
+            }
+            let existing_list = list_servers_in(path)?;
+            let prev = find_server(&existing_list, raw_name)
+                .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
+                .clone();
+            if let Some(m) = mgr {
+                let _ = m.disconnect(&prev.id).await;
+            }
+            delete_server_in(path, &prev.id)?;
+            Ok(ManageMcpOutcome {
+                value: json!({
+                    "ok": true,
+                    "action": "remove",
+                    "name": prev.name,
+                    "note": "Removed from vicuna.json. Work engines pick up MCP config changes on the next turn."
+                }),
+                changed: true,
+                wake_server: None,
+            })
+        }
+        _ => Err("`action` must be one of: list, add, edit, enable, disable, remove".to_string()),
+    }
+}
+
+async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
+    let app = APP_HANDLE.get();
+    let mgr_state = app.and_then(|a| a.try_state::<crate::mcp::McpManager>());
+    let mgr = mgr_state.as_deref();
+    match manage_mcp_in(None, args, mgr).await {
+        Ok(out) => {
+            if let Some(a) = app {
+                if out.changed {
+                    let _ = a.emit("vicuna-mcp-changed", ());
+                }
+                if let (Some((name, tools)), Some(session_id)) = (
+                    out.wake_server,
+                    target.and_then(|t| t.session_id.as_deref()),
+                ) {
+                    let _ = a.emit(
+                        "vicuna-mcp-wake",
+                        json!({
+                            "sessionId": session_id,
+                            "name": name,
+                            "tools": tools,
+                        }),
+                    );
+                }
+            }
+            text_result(&out.value.to_string(), false)
+        }
+        Err(e) => text_result(&e, true),
+    }
+}
+
 /// One JSON-RPC message -> its response (None for notifications/responses).
 async fn handle_rpc(
     msg: &Value,
@@ -885,6 +1401,7 @@ async fn handle_rpc(
             get_session_schema(),
             read_session_schema(),
             list_sessions_schema(),
+            manage_mcp_schema(),
         ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -895,6 +1412,7 @@ async fn handle_rpc(
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
                 (Some(t), READ_SESSION_TOOL) => read_session(t, &args).await,
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
+                (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, RUN_TOOL) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
                 (None, GET_SESSION_TOOL | READ_SESSION_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
@@ -1590,5 +2108,116 @@ mod tests {
         assert_eq!(listed["total"], 1);
         assert_eq!(listed["sessions"][0]["id"], "s1");
         assert_eq!(listed["sessions"][0]["message_count"], 5);
+    }
+
+    #[tokio::test]
+    async fn manage_mcp_crud_and_vicuna_mcp_protection() {
+        let dir = std::env::temp_dir().join(format!("vicuna-mcp-manage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("vicuna.json");
+
+        // 1. list on empty config still shows fixed vicuna-mcp
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap();
+        let (listed, changed) = (out.value, out.changed);
+        assert!(!changed);
+        assert!(out.wake_server.is_none());
+        assert_eq!(listed["fixed_server"]["name"], SERVER_NAME);
+        assert_eq!(listed["servers"].as_array().unwrap().len(), 0);
+
+        // 2. vicuna-mcp cannot be added, edited, enabled, disabled, or removed
+        for act in ["add", "edit", "enable", "disable", "remove"] {
+            let err = manage_mcp_in(
+                Some(&cfg_path),
+                &json!({ "action": act, "name": "vicuna-mcp", "url": "http://127.0.0.1:9999/mcp" }),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(err.contains("fixed"), "expected fixed error for {act}, got {err}");
+        }
+
+        // 3. add http server (transport inferred from url)
+        let out = manage_mcp_in(
+            Some(&cfg_path),
+            &json!({
+                "action": "add",
+                "name": "kurisu",
+                "url": "http://100.118.224.35:8793/mcp/5471aba1",
+                "headers": { "Authorization": "Bearer secret" }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let (added, changed) = (out.value, out.changed);
+        assert!(changed);
+        assert_eq!(added["name"], "kurisu");
+        assert_eq!(added["transport"], "http");
+        assert_eq!(added["enabled"], true);
+
+        // duplicate add fails
+        let dup_err = manage_mcp_in(
+            Some(&cfg_path),
+            &json!({ "action": "add", "name": "Kurisu", "url": "http://127.0.0.1:1/mcp" }),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(dup_err.contains("already exists"));
+
+        // 4. disable / enable (case-insensitive)
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "disable", "name": "KURISU" }), None)
+            .await
+            .unwrap();
+        let (dis, changed) = (out.value, out.changed);
+        assert!(changed);
+        assert_eq!(dis["enabled"], false);
+
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "enable", "name": "kurisu" }), None)
+            .await
+            .unwrap();
+        let (en, changed) = (out.value, out.changed);
+        assert!(changed);
+        assert_eq!(en["enabled"], true);
+
+        // 5. edit url + rename
+        let out = manage_mcp_in(
+            Some(&cfg_path),
+            &json!({
+                "action": "edit",
+                "name": "kurisu",
+                "new_name": "kurisu-prod",
+                "url": "https://example.com/mcp"
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let (ed, changed) = (out.value, out.changed);
+        assert!(changed);
+        assert_eq!(ed["name"], "kurisu-prod");
+
+        // list shows renamed server with header_keys (not raw secret)
+        let listed2 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap().value;
+        let servers = listed2["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], "kurisu-prod");
+        assert_eq!(servers[0]["url"], "https://example.com/mcp");
+        assert_eq!(servers[0]["header_keys"], json!(["Authorization"]));
+
+        // 6. remove
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "remove", "name": "kurisu-prod" }), None)
+            .await
+            .unwrap();
+        let (rem, changed) = (out.value, out.changed);
+        assert!(changed);
+        assert_eq!(rem["name"], "kurisu-prod");
+        let listed3 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap().value;
+        assert_eq!(listed3["servers"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

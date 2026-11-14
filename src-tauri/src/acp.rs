@@ -1393,6 +1393,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Read before overwriting a file. Prefer targeted reads/searches over dumping large files.\n\
 - When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 - Run anything that may take more than a few seconds (builds, test suites, installs, dev servers, long scripts) with the `run` tool (vicuna-mcp server) instead of your own shell tool: the user can move it to the background, and its output then reaches you as a message when it finishes. When a command goes to the background, keep working on what does not depend on it, or end your turn; do not poll or re-run it.\n\
+- To add, edit, list, enable, disable, or remove custom MCP servers in Vicuna (e.g. when the user gives an MCP URL endpoint), use the `manage_mcp` tool on vicuna-mcp (the fixed `vicuna-mcp` server itself cannot be modified or disabled). When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
 {session_info}\n{goal}",
         goal = goal
             .filter(|g| !g.trim().is_empty())

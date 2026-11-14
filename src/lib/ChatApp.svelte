@@ -34,7 +34,7 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
-  import { bgDoneMessage, formatRunElapsed, parseBgDoneMessage, type BgRun } from "$lib/backgroundRun";
+  import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
@@ -494,7 +494,7 @@
       // an auth failure is an invitation, not a dead end: selecting the
       // row starts the browser sign-in flow (see toggleMcpServer)
       if (isAuthError(live.error)) return { kind: "error", label: "Sign in required →" };
-      return { kind: "error", label: live.error.slice(0, 80) };
+      return { kind: "error", label: "Error ✕" };
     }
     if (mcpIsBusy(s.id)) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
     return { kind: "idle", label: "Disconnected ○" };
@@ -705,6 +705,7 @@
     mcpFormError = null;
     mcpConfirmDelete = null;
     mcpOpen = true;
+    void syncMcpServersAfterTurn();
   }
 
   function openMcpForm(existing?: McpServerConfig) {
@@ -1505,6 +1506,7 @@
 
   // watch backgrounded `run` jobs; a finished one wakes its session with
   // the output (the "callback")
+  const pendingMcpWakes = new Map<string, Array<{ name: string; tools: number | null }>>();
   const bgDelivering = new Set<string>();
   async function pollBgRuns() {
     for (const run of bgRuns) {
@@ -6741,11 +6743,20 @@
       // Only the current turn clears its session (a superseded turn's late
       // settle must never wipe the newer turn's state).
       if (isCurrentTurn()) {
-        void notifyTurnEnd({ title: live()?.title, mode: "work", end: "done", reply: lastReply(chat.id), userStopped: workStopIds.has(chat.id) });
+        const userStopped = workStopIds.has(chat.id);
+        void notifyTurnEnd({ title: live()?.title, mode: "work", end: "done", reply: lastReply(chat.id), userStopped });
         unmarkWorkRunning(chat.id);
         workStopIds.delete(chat.id);
         workTurnSeqByChat.delete(chat.id);
         workTurnIds.delete(chat.id);
+        const wakeServers = pendingMcpWakes.get(chat.id);
+        pendingMcpWakes.delete(chat.id);
+        if (wakeServers?.length && !userStopped) {
+          void sendToWorkSession(chat.id, {
+            role: "user",
+            content: mcpWakeMessage(wakeServers),
+          });
+        }
       }
     }
 
@@ -7283,14 +7294,28 @@
     // tray Quit / Cmd+Q with scheduled messages pending: the backend shows
     // the window and asks here instead of quitting
     let unlistenQuit: (() => void) | null = null;
+    let unlistenMcpChanged: (() => void) | null = null;
+    let unlistenMcpWake: (() => void) | null = null;
     if (isTauriRuntime()) {
       void import("@tauri-apps/api/event")
-        .then(({ listen }) => listen("vicuna-quit-requested", () => {
-          if (scheduled.length > 0) quitPromptOpen = true;
-          else void quitVicuna(true);
-        }))
-        .then((u) => {
-          unlistenQuit = u;
+        .then(async ({ listen }) => {
+          unlistenQuit = await listen("vicuna-quit-requested", () => {
+            if (scheduled.length > 0) quitPromptOpen = true;
+            else void quitVicuna(true);
+          });
+          unlistenMcpChanged = await listen("vicuna-mcp-changed", () => {
+            void syncMcpServersAfterTurn();
+          });
+          unlistenMcpWake = await listen<{ sessionId?: string; name?: string; tools?: number | null }>("vicuna-mcp-wake", (ev) => {
+            const sid = ev.payload?.sessionId;
+            const name = ev.payload?.name;
+            if (!sid || !name) return;
+            const list = pendingMcpWakes.get(sid) ?? [];
+            if (!list.some((x) => x.name === name)) {
+              list.push({ name, tools: ev.payload?.tools ?? null });
+            }
+            pendingMcpWakes.set(sid, list);
+          });
         })
         .catch(() => {});
     }
@@ -7325,6 +7350,8 @@
       window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
       unlistenQuit?.();
+      unlistenMcpChanged?.();
+      unlistenMcpWake?.();
       clearInterval(scheduleTimer);
       window.removeEventListener("keydown", onScheduleEscape, true);
       if (updateCheckTimer) clearTimeout(updateCheckTimer);
@@ -7969,6 +7996,7 @@
         {#each activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
           {@const bgDone = m.role === "user" && editingIndex !== i ? parseBgDoneMessage(m.content) : null}
+          {@const mcpWake = !bgDone && m.role === "user" && editingIndex !== i ? parseMcpWakeMessage(m.content) : null}
           {#if bgDone}
             <!-- a finished background job wakes the agent with a user message;
                  show it as the tool result it is, on the agent's side -->
@@ -7984,6 +8012,17 @@
                 {#if bgDone.stderr}<div class="bg-done-label">stderr</div><pre class="bg-done-out bg-done-err">{bgDone.stderr}</pre>{/if}
                 {#if !bgDone.output && !bgDone.stderr}<div class="bg-done-label">(no output)</div>{/if}
                 {#if bgDone.truncated}<div class="bg-done-label">output truncated at 32KB per stream</div>{/if}
+              </details>
+            </div></div>
+          {:else if mcpWake}
+            <div class="row asst-row bg-done-row" data-msg-index={i}><div class="col">
+              <details class="bg-done" data-testid="mcp-wake">
+                <summary>
+                  <span class="bg-done-mark" aria-hidden="true">✓</span>
+                  <span class="bg-done-title">MCP server active</span>
+                  <span class="bg-done-meta">{mcpWake.summary}</span>
+                </summary>
+                <div class="bg-done-label">{m.content}</div>
               </details>
             </div></div>
           {:else if m.role === "user"}
@@ -8230,7 +8269,7 @@
           {#each queuedMsgs as q, qi}
             {#if q.chatId === activeId}
               <div class="queue-chip">
-                <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : q.msg.content || "Image"}</span>
+                <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : parseMcpWakeMessage(q.msg.content) ? `MCP server active: ${parseMcpWakeMessage(q.msg.content)?.summary}` : q.msg.content || "Image"}</span>
                 <button class="queue-x" aria-label="Remove queued message" title="Remove from queue" onclick={() => unqueue(qi)}>×</button>
               </div>
             {/if}
@@ -10876,23 +10915,23 @@
   .mcp-row.sel .builtin-add { border-color: currentColor; color: inherit; }
   .mcp-row.sel .builtin-add:hover:not(:disabled) { background: rgba(255,255,255,.22); }
   .mcp-list { display: flex; flex-direction: column; }
-  .mcp-row { display: flex; align-items: center; gap: 10px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 15.5px; padding: 5px 8px; border-radius: 8px; cursor: pointer; text-align: left; }
+  .mcp-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; overflow: hidden; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 15.5px; padding: 5px 8px; border-radius: 8px; cursor: pointer; text-align: left; }
   .mcp-row.sel { background: var(--accent); color: var(--accent-fg); }
   .mcp-row.sel .mcp-status, .mcp-row.sel .mcp-tools-n, .mcp-row.sel .mcp-mini { color: inherit; opacity: .9; }
-  .mcp-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mcp-tools-n { font-size: 12px; color: var(--muted); white-space: nowrap; }
-  .mcp-status { margin-left: auto; white-space: nowrap; font-size: 14.5px; }
+  .mcp-name { font-weight: 700; min-width: 0; flex-shrink: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-tools-n { font-size: 12px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+  .mcp-status { margin-left: auto; min-width: 0; flex-shrink: 1; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14.5px; }
   .mcp-status.connected { color: var(--accent); }
   .mcp-row.sel .mcp-status.connected { color: inherit; }
   .mcp-status.disabled { color: var(--muted); }
   .mcp-status.error { color: #d9732b; }
   .mcp-status.idle { color: var(--muted); }
-  .mcp-row-actions { display: flex; align-items: center; gap: 2px; }
+  .mcp-row-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
   .mcp-mini { border: none; background: transparent; color: var(--faint); font-size: 13px; line-height: 1; width: 22px; height: 22px; border-radius: 6px; cursor: pointer; padding: 0; }
   .mcp-mini:hover { background: rgba(127,127,127,.25); color: var(--text); }
   .mcp-row.sel .mcp-mini:hover { background: rgba(255,255,255,.25); color: inherit; }
   .mcp-mini.danger { width: auto; padding: 0 6px; font-size: 12px; }
-  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 4.5em; overflow-y: auto; }
   .mcp-empty { padding: 12px 8px; font-size: 13.5px; color: var(--muted); }
   .mcp-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 2px 4px 2px; }
   .mcp-type { align-self: stretch; }

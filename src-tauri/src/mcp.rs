@@ -1515,7 +1515,7 @@ fn write_doc_in(path: &std::path::Path, doc: &serde_json::Value) -> Result<(), S
     Ok(())
 }
 
-fn list_file_servers_in(path: &std::path::Path) -> Result<Vec<McpServerConfig>, String> {
+pub(crate) fn list_file_servers_in(path: &std::path::Path) -> Result<Vec<McpServerConfig>, String> {
     let doc = read_doc_in(path);
     let Some(map) = doc.get("mcp").and_then(|m| m.as_object()) else {
         return Ok(vec![]);
@@ -1528,7 +1528,7 @@ fn list_file_servers_in(path: &std::path::Path) -> Result<Vec<McpServerConfig>, 
     Ok(out)
 }
 
-fn save_file_server_in(
+pub(crate) fn save_file_server_in(
     path: &std::path::Path,
     cfg: &McpServerConfig,
 ) -> Result<Vec<McpServerConfig>, String> {
@@ -1578,7 +1578,7 @@ fn save_file_server_in(
     list_file_servers_in(path)
 }
 
-fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<Vec<McpServerConfig>, String> {
+pub(crate) fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<Vec<McpServerConfig>, String> {
     let mut doc = read_doc_in(path);
     if let Some(map) = doc.get_mut("mcp").and_then(|m| m.as_object_mut()) {
         map.remove(id);

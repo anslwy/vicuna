@@ -101,3 +101,25 @@ export function bgDoneMessage(run: BgRun, st: BgRunStatus, now: number): string 
   lines.push("", "Continue from here.");
   return lines.join("\n");
 }
+
+const MCP_WAKE_RE = /^MCP server\(s\) now active: (.+?)\. You can call their tools now\.$/;
+
+export interface McpWakeServer {
+  name: string;
+  tools: number | null;
+}
+
+/** The user message that wakes the agent when a newly added/enabled MCP server is ready. */
+export function mcpWakeMessage(servers: McpWakeServer[]): string {
+  const summary = servers
+    .map((s) => (typeof s.tools === "number" ? `\`${s.name}\` (${s.tools} tool${s.tools === 1 ? "" : "s"})` : `\`${s.name}\``))
+    .join(", ");
+  return `MCP server(s) now active: ${summary}. You can call their tools now.`;
+}
+
+/** Parse an `mcpWakeMessage` back for display as a tool-style card; null when it isn't one. */
+export function parseMcpWakeMessage(content: string): { summary: string } | null {
+  const m = MCP_WAKE_RE.exec(content.trim());
+  if (!m) return null;
+  return { summary: m[1].replace(/`/g, "") };
+}

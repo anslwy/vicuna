@@ -1,7 +1,7 @@
 // Backgrounded vicuna-mcp `run` jobs + late ask answers (run: `npm test`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bgDoneMessage, formatRunElapsed, isBgDoneMessage, parseBgDoneMessage } from "../src/lib/backgroundRun.ts";
+import { bgDoneMessage, formatRunElapsed, isBgDoneMessage, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "../src/lib/backgroundRun.ts";
 
 test("finished-job messages parse back for the tool-result display", () => {
   const msg = bgDoneMessage(
@@ -27,6 +27,21 @@ test("finished-job messages parse back for the tool-result display", () => {
   // a user typing something similar is not mistaken for one
   assert.equal(isBgDoneMessage("Background command finished? not really"), false);
   assert.equal(parseBgDoneMessage("hello"), null);
+});
+
+test("mcp wake-up message formats and parses back for card display", () => {
+  const msg = mcpWakeMessage([
+    { name: "dummy-echo", tools: 1 },
+    { name: "kurisu", tools: 4 },
+  ]);
+  assert.equal(
+    msg,
+    "MCP server(s) now active: `dummy-echo` (1 tool), `kurisu` (4 tools). You can call their tools now."
+  );
+  assert.deepEqual(parseMcpWakeMessage(msg), {
+    summary: "dummy-echo (1 tool), kurisu (4 tools)",
+  });
+  assert.equal(parseMcpWakeMessage("hello"), null);
 });
 import { laterAnswerMessage } from "../src/lib/askCard.ts";
 
