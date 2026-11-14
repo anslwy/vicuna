@@ -50,3 +50,22 @@ export function buildAskAnswer(input: {
   const answer = n ? JSON.stringify({ vicunaAskAnswer: { text, images } }) : text;
   return { answer, display };
 }
+
+/**
+ * The user message for a question answered after "Answer later": the agent's
+ * ask_user call already returned, so the answer arrives as a normal message
+ * that quotes the question (images ride the message like a pasted picture).
+ */
+export function laterAnswerMessage(
+  question: string,
+  input: { text: string; images: string[]; multi: boolean; picked: string[] }
+): { text: string; images: string[] } | null {
+  const note = input.text.trim();
+  const parts: string[] = [];
+  if (input.multi && input.picked.length) parts.push(`Selected: ${input.picked.join("; ")}`);
+  if (note) parts.push(note);
+  if (!parts.length && !input.images.length) return null;
+  const body = parts.length ? parts.join("\n") : "(see the attached image" + (input.images.length === 1 ? ")" : "s)");
+  const q = question.replace(/\s+/g, " ").trim();
+  return { text: `Answer to your earlier question "${q}":\n\n${body}`, images: [...input.images] };
+}

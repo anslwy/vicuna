@@ -33,10 +33,26 @@ use crate::work_agent::{emit_ev, TurnState, WorkAgentEvent};
 /// Server name as the engines see it (Claude: `mcp__vicuna-mcp__ask_user`).
 pub const SERVER_NAME: &str = "vicuna-mcp";
 pub const TOOL_NAME: &str = "ask_user";
+/// Vicuna-owned shell command the user can move to the background.
+pub const RUN_TOOL: &str = "run";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 1;
-/// Claude's tool id, pre-approved so ask mode doesn't gate the question.
+pub const TOOL_COUNT: usize = 2;
+/// Claude's tool ids, pre-approved: ask_user is itself the question, and
+/// `run` raises Vicuna's own Allow card in ask mode (no double prompt).
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
+pub const CLAUDE_RUN_TOOL_ID: &str = "mcp__vicuna-mcp__run";
+
+/// The ask card's "Answer later" sentinel: the waiting ask_user call returns
+/// at once and the answer reaches the session later as a message.
+pub const ASK_LATER: &str = "{\"vicunaAskLater\":true}";
+
+/// Jobs started by `run`. Process-wide (not per turn): a backgrounded job
+/// outlives its turn and the frontend polls it via `work_run_status`.
+static JOBS: std::sync::LazyLock<crate::BgExecState> = std::sync::LazyLock::new(crate::BgExecState::default);
+
+pub fn jobs() -> &'static crate::BgExecState {
+    &JOBS
+}
 
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -54,11 +70,15 @@ pub const ASK_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the chat. \
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
-using a built-in question tool; it waits for the answer and returns it.";
+using a built-in question tool; it waits for the answer and returns it. Run long commands (builds, tests, \
+installs, servers) with `run` instead of your own shell tool: the user can move them to the background, and \
+their output reaches you as a message when they finish.";
 
 #[derive(Clone)]
 struct Target {
     seq: u64,
+    /// the turn's workspace (where `run` commands execute)
+    workspace: String,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 }
@@ -153,17 +173,19 @@ impl Drop for AskRegistration {
 /// start; the turn then simply runs without ask_user.
 pub async fn register(
     route: Option<&str>,
+    workspace: &str,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 ) -> Result<AskRegistration, String> {
     let srv = server()?;
-    Ok(register_on(&srv.registry, srv.port, route, turn, on_event))
+    Ok(register_on(&srv.registry, srv.port, route, workspace, turn, on_event))
 }
 
 fn register_on(
     registry: &SharedRegistry,
     port: u16,
     route: Option<&str>,
+    workspace: &str,
     turn: Arc<TurnState>,
     on_event: Channel<WorkAgentEvent>,
 ) -> AskRegistration {
@@ -173,7 +195,7 @@ fn register_on(
         Some(k) => r.tokens.entry(k.to_string()).or_insert_with(random_token).clone(),
         None => random_token(),
     };
-    r.targets.entry(token.clone()).or_default().push(Target { seq, turn, on_event });
+    r.targets.entry(token.clone()).or_default().push(Target { seq, workspace: workspace.to_string(), turn, on_event });
     AskRegistration {
         registry: registry.clone(),
         url: format!("http://127.0.0.1:{port}/mcp/{token}"),
@@ -223,6 +245,22 @@ fn tool_schema() -> Value {
                 "multiple": { "type": "boolean", "description": "Let the user select more than one choice (default false)." }
             },
             "required": ["question"]
+        }
+    })
+}
+
+fn run_schema() -> Value {
+    json!({
+        "name": RUN_TOOL,
+        "title": "Run a command (backgroundable)",
+        "description": "Run a shell command in the workspace through Vicuna and wait for it. Prefer this over your own shell/bash tool for anything that may take more than a few seconds — builds, test suites, installs, dev servers, long scripts: while it runs, the user can move it to the background, and you then get its output as a message when it finishes. Set `background: true` to start it in the background yourself (servers, watchers). Quick commands can stay on your own shell tool. Each call is a fresh shell in the workspace root (no cd/env carry-over).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "The shell command (POSIX sh; PowerShell on Windows)." },
+                "background": { "type": "boolean", "description": "Start it in the background and return at once (default false)." }
+            },
+            "required": ["command"]
         }
     })
 }
@@ -337,8 +375,132 @@ async fn ask(target: &Target, args: &Value, client_gone: impl std::future::Futur
         m.remove(&ask_id);
     }
     match answer {
+        Some(a) if a.trim() == ASK_LATER => text_result(
+            "The user will answer this later. Continue with work that does not depend on the answer, or end your turn if everything depends on it. Do not ask the same question again: the answer will reach you as a message.",
+            false,
+        ),
         Some(a) if !turn.stop.load(Ordering::Relaxed) => answer_result(&parse_ask_answer(&a), multiple),
         _ => text_result("The user stopped the turn before answering.", true),
+    }
+}
+
+/// A finished job as tool-result text: exit code + runtime, stdout, stderr.
+fn job_output(st: &crate::BgJobStatus, secs: u64) -> String {
+    let mut out = String::new();
+    let exit = st.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
+    out.push_str(&format!("[exit {exit} · {secs}s]\n"));
+    if !st.stdout.trim().is_empty() {
+        out.push_str(st.stdout.trim_end());
+        out.push('\n');
+    }
+    if !st.stderr.trim().is_empty() {
+        out.push_str("[stderr]\n");
+        out.push_str(st.stderr.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn background_text(job_id: &str, by_user: bool) -> String {
+    let who = if by_user { "The user moved this command to the background" } else { "Started in the background" };
+    format!(
+        "{who} (job {job_id}); it is still running. Continue with work that does not depend on it, or end your turn if everything depends on it. Do not poll or re-run it: its output will reach you as a message when it finishes."
+    )
+}
+
+/// vicuna-mcp `run`: a Vicuna-owned job the user can move to the background.
+async fn run(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
+    let command = args.get("command").and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    if command.is_empty() {
+        return text_result("run needs a non-empty `command`", true);
+    }
+    let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+    let turn = &target.turn;
+    if turn.stop.load(Ordering::Relaxed) {
+        return text_result("The user stopped the turn; the command was not run.", true);
+    }
+    let (on_event, stop) = (&target.on_event, &turn.stop);
+    tokio::pin!(client_gone);
+    // "ask before running tools": Vicuna's own Allow card (engines see
+    // vicuna-mcp as pre-approved, so this is the only gate)
+    if crate::work_engine::approval_ask() && !cfg!(test) {
+        let ask_id = format!("perm-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel::<String>();
+        if let Ok(mut m) = turn.ask_pending.lock() {
+            m.insert(ask_id.clone(), tx);
+        }
+        let title = format!("run `{command}`");
+        emit_ev(on_event, stop, WorkAgentEvent::AskRequest { ask_id: ask_id.clone(), question: format!("Allow {title}?"), options: vec!["Allow".into(), "Deny".into()], multi: false });
+        let answer = tokio::select! { a = rx => a.ok(), _ = &mut client_gone => None };
+        if let Ok(mut m) = turn.ask_pending.lock() {
+            m.remove(&ask_id);
+        }
+        let allow = answer.as_deref().is_some_and(|a| a.trim().eq_ignore_ascii_case("allow")) && !stop.load(Ordering::Relaxed);
+        emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n> {}: {title}\n", if allow { "Approved" } else { "Denied" }) });
+        if !allow {
+            return text_result("The user denied running this command.", true);
+        }
+    }
+    // the job's real start (epoch ms): elapsed labels and the finished-job
+    // message must not count from whenever the frontend heard about it
+    let started_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let job_id = match crate::bg_start(jobs(), target.workspace.clone(), command.clone()).await {
+        Ok(id) => id,
+        Err(e) => return text_result(&format!("Cannot run the command: {e}"), true),
+    };
+    if background {
+        emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
+        return text_result(&background_text(&job_id, false), false);
+    }
+    let (tx, mut to_bg) = oneshot::channel::<()>();
+    if let Ok(mut m) = turn.run_pending.lock() {
+        m.insert(job_id.clone(), tx);
+    }
+    emit_ev(on_event, stop, WorkAgentEvent::RunStarted { job_id: job_id.clone(), command: command.clone(), started_ms });
+    let started = std::time::Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    enum End {
+        Done(crate::BgJobStatus),
+        Background,
+        Stopped,
+    }
+    let mut bg_open = true;
+    let end = loop {
+        tokio::select! {
+            r = &mut to_bg, if bg_open => {
+                if r.is_ok() {
+                    break End::Background;
+                }
+                bg_open = false; // sender dropped: never poll the receiver again
+            }
+            _ = &mut client_gone => break End::Stopped,
+            _ = tick.tick() => {
+                if stop.load(Ordering::Relaxed) {
+                    break End::Stopped;
+                }
+                match crate::bg_snapshot(jobs(), &job_id) {
+                    Ok(st) if !st.running => break End::Done(st),
+                    Ok(_) => {}
+                    Err(e) => return text_result(&format!("Lost track of the command: {e}"), true),
+                }
+            }
+        }
+    };
+    if let Ok(mut m) = turn.run_pending.lock() {
+        m.remove(&job_id);
+    }
+    emit_ev(on_event, stop, WorkAgentEvent::RunEnded { job_id: job_id.clone() });
+    match end {
+        End::Done(st) => text_result(&job_output(&st, started.elapsed().as_secs()), false),
+        End::Background => {
+            emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
+            text_result(&background_text(&job_id, true), false)
+        }
+        End::Stopped => {
+            // a foreground command dies with its turn, like the engines' own shell
+            let _ = crate::bg_kill(jobs(), &job_id);
+            text_result("The turn was stopped; the command was killed.", true)
+        }
     }
 }
 
@@ -382,16 +544,18 @@ async fn handle_rpc(
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": [tool_schema()] }),
+        "tools/list" => json!({ "tools": [tool_schema(), run_schema()] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name != TOOL_NAME {
+            if name != TOOL_NAME && name != RUN_TOOL {
                 return Some(rpc_error(id, -32602, &format!("unknown tool: {name}")));
             }
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            match target {
-                Some(t) => ask(t, &args, client_gone).await,
-                None => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
+            match (target, name) {
+                (Some(t), TOOL_NAME) => ask(t, &args, client_gone).await,
+                (Some(t), _) => run(t, &args, client_gone).await,
+                (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
+                (None, _) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
             }
         }
         "resources/list" => json!({ "resources": [] }),
@@ -686,7 +850,7 @@ mod tests {
     async fn slow_answer_streams_headers_first_then_heartbeats() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let mut body = call("Take your time?", json!({}));
         body["params"]["_meta"] = json!({ "progressToken": 42 });
         // headers must arrive while the question is still unanswered (Claude
@@ -716,7 +880,7 @@ mod tests {
     async fn json_only_clients_still_get_plain_json() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move {
             let r = reqwest::Client::new().post(&url).header("accept", "application/json").json(&call("Q?", json!({}))).send().await.unwrap();
@@ -733,7 +897,7 @@ mod tests {
     async fn pasted_images_come_back_as_image_blocks() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Show me?", json!({ "choices": ["A", "B"] }))).await });
         let ev = wait_ask(&seen).await;
@@ -766,19 +930,122 @@ mod tests {
     }
 
     async fn wait_ask(seen: &Arc<Mutex<Vec<Value>>>) -> Value {
-        for _ in 0..200 {
-            if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == "askrequest").cloned() {
+        wait_event(seen, "askrequest").await
+    }
+
+    async fn wait_event(seen: &Arc<Mutex<Vec<Value>>>, kind: &str) -> Value {
+        for _ in 0..500 {
+            if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == kind).cloned() {
                 return e;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("no askrequest event");
+        panic!("no {kind} event");
+    }
+
+    /// a real directory to run commands in
+    fn ws() -> String {
+        std::env::temp_dir().to_string_lossy().to_string()
+    }
+
+    fn run_call(command: &str, extra: Value) -> Value {
+        let mut args = json!({ "command": command });
+        if let (Some(a), Some(e)) = (args.as_object_mut(), extra.as_object()) {
+            a.extend(e.clone());
+        }
+        json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": { "name": "run", "arguments": args } })
+    }
+
+    fn result_text(r: &Value) -> String {
+        r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn run_waits_for_the_command_and_returns_its_output() {
+        let (ch, seen) = capture();
+        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let r = post(&reg.url, run_call("echo hello-run; echo oops >&2; exit 3", json!({}))).await.1.unwrap();
+        let text = result_text(&r);
+        assert!(text.starts_with("[exit 3 · "), "{text}");
+        assert!(text.contains("hello-run") && text.contains("[stderr]\noops"), "{text}");
+        let kinds: Vec<String> = seen.lock().unwrap().iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, vec!["runstarted", "runended"]);
+    }
+
+    #[tokio::test]
+    async fn background_button_returns_early_and_the_job_keeps_running() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, run_call("sleep 1; echo bg-finished", json!({}))).await });
+        let started = wait_event(&seen, "runstarted").await;
+        let job = started["job_id"].as_str().unwrap().to_string();
+        crate::work_agent::agent_background(&turn, &job).unwrap();
+        let r = pending.await.unwrap().1.unwrap();
+        assert!(result_text(&r).contains("The user moved this command to the background"), "{r}");
+        assert_eq!(wait_event(&seen, "runbackground").await["job_id"], job.as_str());
+        // the tool call came back while the job still runs; it finishes later
+        assert!(crate::bg_snapshot(jobs(), &job).unwrap().running);
+        for _ in 0..60 {
+            let st = crate::bg_snapshot(jobs(), &job).unwrap();
+            if !st.running {
+                assert!(st.stdout.contains("bg-finished"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("background job never finished");
+    }
+
+    #[tokio::test]
+    async fn model_started_background_returns_at_once() {
+        let (ch, seen) = capture();
+        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
+        let r = post(&reg.url, run_call("sleep 0.3", json!({ "background": true }))).await.1.unwrap();
+        assert!(result_text(&r).starts_with("Started in the background"), "{r}");
+        let kinds: Vec<String> = seen.lock().unwrap().iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, vec!["runbackground"]);
+    }
+
+    #[tokio::test]
+    async fn stop_kills_a_foreground_command() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, run_call("sleep 30", json!({}))).await });
+        let job = wait_event(&seen, "runstarted").await["job_id"].as_str().unwrap().to_string();
+        crate::work_agent::agent_stop(&turn);
+        let r = pending.await.unwrap().1.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        for _ in 0..40 {
+            if !crate::bg_snapshot(jobs(), &job).unwrap().running {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the stopped command kept running");
+    }
+
+    #[tokio::test]
+    async fn answer_later_returns_without_an_answer() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, call("Which db?", json!({}))).await });
+        let ev = wait_ask(&seen).await;
+        crate::work_agent::agent_answer(&turn, ev["ask_id"].as_str().unwrap(), ASK_LATER.into()).unwrap();
+        let r = pending.await.unwrap().1.unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        assert!(result_text(&r).starts_with("The user will answer this later"), "{r}");
     }
 
     #[tokio::test]
     async fn handshake_lists_ask_user() {
         let (ch, _) = capture();
-        let reg = register(None, Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
         let (s, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } })).await;
         let r = r.unwrap();
         assert_eq!(s, 200);
@@ -796,7 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_token_is_404_and_get_is_405() {
         let (ch, _) = capture();
-        let reg = register(None, Arc::new(TurnState::new()), ch).await.unwrap();
+        let reg = register(None, &ws(), Arc::new(TurnState::new()), ch).await.unwrap();
         let bad = format!("{}x", reg.url);
         let (s, _) = post(&bad, json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })).await;
         assert_eq!(s, 404);
@@ -808,7 +1075,7 @@ mod tests {
     async fn call_shows_card_and_returns_the_answer() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Which color?", json!({ "choices": ["Red", "Green", "Blue"] }))).await });
         let ev = wait_ask(&seen).await;
@@ -829,7 +1096,7 @@ mod tests {
     async fn multi_select_answer_is_a_list() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Toppings?", json!({ "choices": ["Ham", "Olives", "Basil"], "multiple": true }))).await });
         let ev = wait_ask(&seen).await;
@@ -843,7 +1110,7 @@ mod tests {
     async fn stop_while_pending_cancels_the_call() {
         let (ch, seen) = capture();
         let turn = Arc::new(TurnState::new());
-        let reg = register(None, turn.clone(), ch).await.unwrap();
+        let reg = register(None, &ws(), turn.clone(), ch).await.unwrap();
         let url = reg.url.clone();
         let pending = tokio::spawn(async move { post(&url, call("Proceed?", json!({}))).await });
         wait_ask(&seen).await;
@@ -863,8 +1130,8 @@ mod tests {
         let (ch2, seen2) = capture();
         let (t1, t2) = (Arc::new(TurnState::new()), Arc::new(TurnState::new()));
         let key = format!("opencode|/ws-{}", random_token());
-        let r1 = register(Some(&key), t1.clone(), ch1).await.unwrap();
-        let r2 = register(Some(&key), t2.clone(), ch2).await.unwrap();
+        let r1 = register(Some(&key), &ws(), t1.clone(), ch1).await.unwrap();
+        let r2 = register(Some(&key), &ws(), t2.clone(), ch2).await.unwrap();
         assert_eq!(r1.url, r2.url, "one URL per workspace route");
         let url = r1.url.clone();
         let url_again = r1.url.clone();

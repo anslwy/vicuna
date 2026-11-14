@@ -33,9 +33,10 @@
     DEFAULT_STOP_WORDS,
     type Chat
   } from "$lib/store";
-  import { isAgentQuestion, toggleChoice, buildAskAnswer } from "$lib/askCard";
+  import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
+  import { bgDoneMessage, formatRunElapsed, parseBgDoneMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge } from "$lib/bridge";
@@ -134,11 +135,30 @@
     images: string[];
     /** Other… opened the box on a permission ask */
     otherOpen: boolean;
-    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel", display?: string) => void;
+    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel" | "later", display?: string) => void;
   }
   let pendingAsks = $state<Record<string, PendingAsk>>({});
   /** the open session's ask card (null when it has none pending) */
   const pendingAsk = $derived(activeId != null ? (pendingAsks[activeId] ?? null) : null);
+  /** agent questions the user put off with "Answer later": the ask_user call
+   *  already returned, so the answer goes to the session as a message */
+  interface LaterAsk {
+    id: string;
+    chatId: string;
+    index: number;
+    question: string;
+    options: string[];
+    multi: boolean;
+    picked: string[];
+    text: string;
+    images: string[];
+  }
+  let laterAsks = $state<LaterAsk[]>([]);
+  /** vicuna-mcp `run` calls still waiting on their command (Background-able) */
+  let runningRuns = $state<(BgRun & { index: number })[]>([]);
+  /** `run` jobs moved to the background, watched until they finish; their
+   *  output then goes to the session as a message */
+  let bgRuns = $state<BgRun[]>([]);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
   let explorerEntries = $state<WorkTreeEntry[]>([]);
@@ -1174,7 +1194,7 @@
   // advance the live clock while a turn runs (or a browser start is in
   // flight) so elapsed tooltips/labels stay current
   $effect(() => {
-    if (!streaming && !workRunning && !browserStarting) return;
+    if (!streaming && !workRunning && !browserStarting && !bgRuns.length) return;
     const t = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -1450,6 +1470,109 @@
       scheduleSending.delete(id);
     }
   }
+  /** Send a message to a Work session from outside the composer (a finished
+   *  background job, a late ask answer): queued into its live turn, else a
+   *  new background turn. Returns false while the session is busy with a
+   *  compaction or plain stream (the caller retries) or gone. */
+  async function sendToWorkSession(chatId: string, msg: ChatMsg): Promise<boolean> {
+    const chat = chats.find((x) => x.id === chatId);
+    if (!chat || (chat.mode ?? "chat") !== "work" || !chat.workspace) return false;
+    if (isCompacting(chat.id) || isChatStreaming(chat.id)) return false;
+    if (isWorkRunning(chat.id)) {
+      const qid = crypto.randomUUID();
+      queuedMsgs = [...queuedMsgs, { chatId: chat.id, id: qid, msg }];
+      const turnId = workTurnIds.get(chat.id);
+      if (turnId) void queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
+      return true;
+    }
+    const gate = workSendGate(workEngineInfo);
+    if (gate.blocked) throw new Error(gate.reason ?? "The Work engine is not available.");
+    const ws = await canonicalWorkspace(chat.workspace);
+    // the await may have outlived the session or its idle state
+    if (!chats.some((x) => x.id === chatId) || isWorkRunning(chatId) || isCompacting(chatId) || isChatStreaming(chatId)) return false;
+    const reply: ChatMsg = { role: "assistant", content: "", thinking: "", model: selectedModel };
+    chat.updatedAt = Date.now();
+    chat.messages = [...chat.messages, msg, reply];
+    chats = [chat, ...chats.filter((x) => x.id !== chat.id)];
+    save();
+    if (chat.id === activeId) {
+      isPinned = true;
+      scrollBottom();
+    }
+    void runWorkTurn(chat, chat.messages.length - 1, ws);
+    return true;
+  }
+
+  // watch backgrounded `run` jobs; a finished one wakes its session with
+  // the output (the "callback")
+  const bgDelivering = new Set<string>();
+  async function pollBgRuns() {
+    for (const run of bgRuns) {
+      if (bgDelivering.has(run.jobId)) continue;
+      bgDelivering.add(run.jobId);
+      try {
+        const st = await workRunStatus(run.jobId).catch(() => null);
+        if (!st || st.running) continue;
+        if (!chats.some((c) => c.id === run.chatId)) {
+          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId); // session deleted
+          continue;
+        }
+        const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) });
+        if (sent) {
+          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
+          const title = chats.find((c) => c.id === run.chatId)?.title ?? "the session";
+          if (run.chatId !== activeId) flashNotice(`Background command finished in "${title}".`);
+        }
+      } catch (e: any) {
+        bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
+        error = `Background command finished, but its output could not be sent: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+      } finally {
+        bgDelivering.delete(run.jobId);
+      }
+    }
+  }
+  $effect(() => {
+    if (!bgRuns.length) return;
+    const t = setInterval(() => void pollBgRuns(), 2000);
+    return () => clearInterval(t);
+  });
+
+  /** Background button on a waiting `run` call */
+  async function moveRunToBackground(chatId: string, jobId: string) {
+    const turnId = workTurnIds.get(chatId);
+    if (!turnId) return;
+    try {
+      await backgroundWorkRun(turnId, jobId);
+    } catch (e: any) {
+      // it finished in the meantime: nothing to move
+      flashNotice(typeof e === "string" ? e : (e?.message ?? "That command already finished."));
+    }
+  }
+
+  /** Stop a backgrounded job (its output still arrives, marked killed) */
+  async function stopBgRun(jobId: string) {
+    await workRunKill(jobId).catch(() => {});
+  }
+
+  /** send a question answered after "Answer later" */
+  async function sendLaterAsk(id: string) {
+    const a = laterAsks.find((x) => x.id === id);
+    if (!a) return;
+    const m = laterAnswerMessage(a.question, a);
+    if (!m) return;
+    const msg: ChatMsg = { role: "user", content: m.text, ...(m.images.length ? { images: m.images } : {}) };
+    try {
+      const sent = await sendToWorkSession(a.chatId, msg);
+      if (!sent) {
+        error = "The session is busy right now; try again in a moment.";
+        return;
+      }
+      laterAsks = laterAsks.filter((x) => x.id !== id);
+    } catch (e: any) {
+      error = `Answer not sent: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+    }
+  }
+
   function scheduleTick() {
     if (!ready) return;
     const at = Date.now();
@@ -1631,6 +1754,10 @@
   function deleteChat(id: string) {
     // stop only THIS session's live turn — other sessions keep running
     if (pendingAsks[id]) cancelPendingAsk(id, "(the chat was deleted before answering)");
+    // its background commands and put-off questions go with it
+    for (const r of bgRuns) if (r.chatId === id) void workRunKill(r.jobId).catch(() => {});
+    bgRuns = bgRuns.filter((r) => r.chatId !== id);
+    laterAsks = laterAsks.filter((a) => a.chatId !== id);
     const turnId = workTurnIds.get(id);
     if (turnId) {
       workStopIds.add(id);
@@ -5893,10 +6020,12 @@
 
   /** a choice on an agent question: copy it into the answer box to edit,
    *  caret at the end — sending stays a separate, deliberate step */
-  function prefillAsk(card: PendingAsk, opt: string) {
+  function prefillAsk(card: { text: string }, opt: string, from: HTMLElement) {
     card.text = opt;
+    // the box of the card that was clicked (live and put-off cards coexist)
+    const box = from.closest(".ask-card");
     requestAnimationFrame(() => {
-      const el = document.querySelector<HTMLTextAreaElement>('[data-testid="ask-input"]');
+      const el = box?.querySelector<HTMLTextAreaElement>("textarea.ask-input");
       if (!el) return;
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
@@ -5911,7 +6040,7 @@
 
   /** images pasted into the ask answer box attach as thumbnails (same
    *  downscale as the composer); text pastes stay native */
-  async function onAskPaste(e: ClipboardEvent, card: PendingAsk) {
+  async function onAskPaste(e: ClipboardEvent, card: { images: string[] }) {
     const files = pastedImageFiles(e);
     if (!files.length) return;
     e.preventDefault();
@@ -5922,6 +6051,32 @@
         error = `Couldn't read pasted image (${f.name || f.type || "unknown type"})`;
       }
     }
+  }
+
+  /** "Answer later": the agent stops waiting (it continues or ends its turn)
+   *  and the card stays here, detached; sending it later delivers the answer
+   *  to the session as a message */
+  function answerLater() {
+    const id = activeId;
+    const a = id != null ? pendingAsks[id] : undefined;
+    if (!id || !a || !a.agentQuestion) return;
+    const { [id]: _, ...rest } = pendingAsks;
+    pendingAsks = rest;
+    laterAsks = [
+      ...laterAsks,
+      {
+        id: crypto.randomUUID(),
+        chatId: id,
+        index: a.index,
+        question: a.question,
+        options: [...a.options],
+        multi: a.multi,
+        picked: [...a.picked],
+        text: a.text,
+        images: [...a.images]
+      }
+    ];
+    a.resolve(ASK_LATER, "later");
   }
 
   /** user dismissed the question without answering: tell the model so it
@@ -6765,6 +6920,12 @@
                 // cancel (Stop / chat deleted) needs no backend call: the stop
                 // path already unblocked the waiting tool with no record
                 if (outcome === "cancel") return;
+                if (outcome === "later") {
+                  // the card lives on in laterAsks; the tool call returns now
+                  const tid = workTurnIds.get(chat.id);
+                  if (tid) void answerWorkAgentAsk(tid, ev.ask_id, ASK_LATER).catch(() => {});
+                  return;
+                }
                 askOutcome = outcome;
                 askText = answer;
                 // vicuna-mcp questions: record the Q/A in the transcript here
@@ -6787,7 +6948,24 @@
           };
           requestAnimationFrame(() => scrollIfOpen());
           break;
+        case "runstarted":
+          runningRuns = [...runningRuns, { chatId: chat.id, jobId: ev.job_id, command: ev.command, startedAt: ev.started_ms || Date.now(), index: curIndex }];
+          requestAnimationFrame(() => scrollIfOpen());
+          break;
+        case "runended":
+          runningRuns = runningRuns.filter((r) => r.jobId !== ev.job_id);
+          break;
+        case "runbackground": {
+          // started_ms is the job's real start (runended already dropped the
+          // strip, so the frontend's own copy is gone by now)
+          runningRuns = runningRuns.filter((r) => r.jobId !== ev.job_id);
+          if (!bgRuns.some((r) => r.jobId === ev.job_id)) {
+            bgRuns = [...bgRuns, { chatId: chat.id, jobId: ev.job_id, command: ev.command, startedAt: ev.started_ms || Date.now() }];
+          }
+          break;
+        }
         case "done":
+          runningRuns = runningRuns.filter((r) => r.chatId !== chat.id);
           setToolStatus(chat.id, null);
           void settle(ev.stopped);
           break;
@@ -6795,6 +6973,7 @@
           void warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false).then((warned) => {
             if (!warned) error = ev.message;
           });
+          runningRuns = runningRuns.filter((r) => r.chatId !== chat.id);
           setToolStatus(chat.id, null);
           void settle(false);
           break;
@@ -7297,6 +7476,86 @@
 </script>
 
 {#if ready}
+<!-- agent question body (vicuna-mcp ask_user): choices prefill the answer
+     box (never answer directly), the box takes pasted images; shared by the
+     live card and the put-off "Answer later" cards -->
+{#snippet agentAskBody(card: { options: string[]; multi: boolean; picked: string[]; text: string; images: string[] }, tid: string, onSend: () => void, onDismiss: () => void, onLater: (() => void) | null)}
+  {@const canSend = buildAskAnswer(card) != null}
+  <div class="ask-options">
+    {#each card.options as opt, oi}
+      {#if card.multi}
+        <button
+          class="ask-option ask-option-multi"
+          class:picked={card.picked.includes(opt)}
+          data-testid="{tid}-option-{oi}"
+          aria-pressed={card.picked.includes(opt)}
+          onclick={() => (card.picked = toggleChoice(card.options, card.picked, opt))}
+        ><span class="ask-check" aria-hidden="true">{card.picked.includes(opt) ? "✓" : ""}</span>{opt}</button>
+      {:else}
+        <button
+          class="ask-option"
+          class:picked={card.text.trim() === opt}
+          data-testid="{tid}-option-{oi}"
+          title="Use this answer (you can edit it before sending)"
+          onclick={(e) => prefillAsk(card, opt, e.currentTarget)}
+        >{opt}</button>
+      {/if}
+    {/each}
+    <div class="ask-compose">
+      {#if card.images.length}
+        <div class="image-strip ask-image-strip" data-testid="{tid}-image-strip">
+          {#each card.images as img, k}
+            <div class="image-chip">
+              <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                <img src={img} alt="" />
+              </button>
+              <button class="image-remove" aria-label="remove image {k + 1}" data-testid="{tid}-image-remove-{k}" onclick={() => { card.images = card.images.filter((_, j) => j !== k); }}>×</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <div class="ask-other">
+        <textarea
+          class="ask-input"
+          data-testid="{tid}-input"
+          rows={Math.min(8, Math.max(1, card.text.split("\n").length))}
+          bind:value={card.text}
+          placeholder={card.multi
+            ? "Add a note or paste an image (optional)…"
+            : card.options.length
+              ? "Pick a choice to edit it, or type your answer…"
+              : "Type your answer or paste an image…"}
+          aria-label="Your answer"
+          onpaste={(e) => onAskPaste(e, card)}
+          onkeydown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+              e.preventDefault();
+              if (canSend) onSend();
+            } else if (e.key === "Escape") {
+              // leave the box without arming double-Esc interrupt
+              e.preventDefault();
+              e.stopPropagation();
+              (e.currentTarget as HTMLTextAreaElement).blur();
+            }
+          }}
+        ></textarea>
+        <button class="ask-send" data-testid={card.multi ? `${tid}-submit` : `${tid}-send`} disabled={!canSend} onclick={onSend}>
+          {card.multi ? `Submit${card.picked.length ? ` (${card.picked.length})` : ""}` : "Send"}
+        </button>
+        <button class="ask-dismiss" type="button" data-testid="{tid}-dismiss" onclick={onDismiss}>Dismiss</button>
+      </div>
+      {#if onLater}
+        <button
+          class="ask-later"
+          type="button"
+          data-testid="{tid}-later"
+          title="The agent stops waiting and keeps going (or ends its turn); send your answer whenever you're ready"
+          onclick={onLater}
+        >Answer later</button>
+      {/if}
+    </div>
+  </div>
+{/snippet}
 {#snippet scheduleCaret(empty: boolean)}
   <button class="send send-caret" data-testid="schedule-btn" aria-label="Schedule message" aria-haspopup="menu" aria-expanded={scheduleMenuOpen} title="Schedule for later" disabled={empty} onclick={toggleScheduleMenu}>
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 4 4 4-4"/></svg>
@@ -7695,7 +7954,25 @@
         {/if}
         {#each activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
-          {#if m.role === "user"}
+          {@const bgDone = m.role === "user" && editingIndex !== i ? parseBgDoneMessage(m.content) : null}
+          {#if bgDone}
+            <!-- a finished background job wakes the agent with a user message;
+                 show it as the tool result it is, on the agent's side -->
+            <div class="row asst-row bg-done-row" data-msg-index={i}><div class="col">
+              <details class="bg-done" data-testid="bg-done">
+                <summary>
+                  <span class="bg-done-mark" class:bad={!bgDone.ok} aria-hidden="true">{bgDone.ok ? "✓" : "✕"}</span>
+                  <span class="bg-done-title">Background command finished</span>
+                  <span class="bg-done-meta">{bgDone.status} · {bgDone.elapsed}</span>
+                  <code class="bg-done-cmd" title={bgDone.command}>{bgDone.command}</code>
+                </summary>
+                {#if bgDone.output}<pre class="bg-done-out">{bgDone.output}</pre>{/if}
+                {#if bgDone.stderr}<div class="bg-done-label">stderr</div><pre class="bg-done-out bg-done-err">{bgDone.stderr}</pre>{/if}
+                {#if !bgDone.output && !bgDone.stderr}<div class="bg-done-label">(no output)</div>{/if}
+                {#if bgDone.truncated}<div class="bg-done-label">output truncated at 32KB per stream</div>{/if}
+              </details>
+            </div></div>
+          {:else if m.role === "user"}
             <div class="row user-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if editingIndex === i}
                 <div class="editbox" data-testid="edit-box">
@@ -7800,81 +8077,34 @@
                 </div>
               {/if}
               <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
+              {#each runningRuns.filter((r) => r.chatId === activeId && r.index === i) as run (run.jobId)}
+                <div class="run-strip" data-testid="run-strip">
+                  <span class="run-spin" aria-hidden="true"></span>
+                  <code class="run-cmd" title={run.command}>{run.command}</code>
+                  <span class="run-elapsed">{formatRunElapsed(now - run.startedAt)}</span>
+                  {#if now - run.startedAt >= 1000}
+                    <button
+                      class="run-bg-btn"
+                      data-testid="run-background"
+                      title="Let the agent continue; you'll get the output as a message when it finishes"
+                      onclick={() => moveRunToBackground(run.chatId, run.jobId)}
+                    >Background</button>
+                  {/if}
+                </div>
+              {/each}
               {#if pendingAsk && pendingAsk.index === i && activeId != null}
                 {@const askCard = pendingAsks[activeId]}
                 {#if askCard}
                 <div class="ask-card" data-testid="ask-card">
                   <div class="ask-question">{askCard.question}</div>
+                  {#if askCard.agentQuestion}
+                    {@render agentAskBody(askCard, "ask", () => sendAskBox(askCard), dismissAsk, answerLater)}
+                  {:else}
                   <div class="ask-options">
                     {#each askCard.options as opt, oi}
-                      {#if askCard.multi}
-                        <button
-                          class="ask-option ask-option-multi"
-                          class:picked={askCard.picked.includes(opt)}
-                          data-testid="ask-option-{oi}"
-                          aria-pressed={askCard.picked.includes(opt)}
-                          onclick={() => (askCard.picked = toggleChoice(askCard.options, askCard.picked, opt))}
-                        ><span class="ask-check" aria-hidden="true">{askCard.picked.includes(opt) ? "✓" : ""}</span>{opt}</button>
-                      {:else if askCard.agentQuestion}
-                        <!-- prefill, never answer: most answers are a choice plus an edit -->
-                        <button
-                          class="ask-option"
-                          class:picked={askCard.text.trim() === opt}
-                          data-testid="ask-option-{oi}"
-                          title="Use this answer (you can edit it before sending)"
-                          onclick={() => prefillAsk(askCard, opt)}
-                        >{opt}</button>
-                      {:else}
-                        <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
-                      {/if}
+                      <button class="ask-option" data-testid="ask-option-{oi}" onclick={() => answerAsk(opt)}>{opt}</button>
                     {/each}
-                    {#if askCard.agentQuestion}
-                      {@const ready = buildAskAnswer(askCard) != null}
-                      <div class="ask-compose">
-                        {#if askCard.images.length}
-                          <div class="image-strip ask-image-strip" data-testid="ask-image-strip">
-                            {#each askCard.images as img, k}
-                              <div class="image-chip">
-                                <button class="image-open" aria-label="View attached image {k + 1} fullscreen" onclick={() => openLightbox(img)}>
-                                  <img src={img} alt="" />
-                                </button>
-                                <button class="image-remove" aria-label="remove image {k + 1}" data-testid="ask-image-remove-{k}" onclick={() => { askCard.images = askCard.images.filter((_, j) => j !== k); }}>×</button>
-                              </div>
-                            {/each}
-                          </div>
-                        {/if}
-                        <div class="ask-other">
-                          <textarea
-                            class="ask-input"
-                            data-testid="ask-input"
-                            rows={Math.min(8, Math.max(1, askCard.text.split("\n").length))}
-                            bind:value={askCard.text}
-                            placeholder={askCard.multi
-                              ? "Add a note or paste an image (optional)…"
-                              : askCard.options.length
-                                ? "Pick a choice to edit it, or type your answer…"
-                                : "Type your answer or paste an image…"}
-                            aria-label="Your answer"
-                            onpaste={(e) => onAskPaste(e, askCard)}
-                            onkeydown={(e) => {
-                              if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-                                e.preventDefault();
-                                sendAskBox(askCard);
-                              } else if (e.key === "Escape") {
-                                // leave the box without arming double-Esc interrupt
-                                e.preventDefault();
-                                e.stopPropagation();
-                                (e.currentTarget as HTMLTextAreaElement).blur();
-                              }
-                            }}
-                          ></textarea>
-                          <button class="ask-send" data-testid={askCard.multi ? "ask-submit" : "ask-send"} disabled={!ready} onclick={() => sendAskBox(askCard)}>
-                            {askCard.multi ? `Submit${askCard.picked.length ? ` (${askCard.picked.length})` : ""}` : "Send"}
-                          </button>
-                          <button class="ask-dismiss" type="button" data-testid="ask-dismiss" onclick={dismissAsk}>Dismiss</button>
-                        </div>
-                      </div>
-                    {:else if askCard.otherOpen}
+                    {#if askCard.otherOpen}
                       <form
                         class="ask-other"
                         onsubmit={(e) => {
@@ -7914,9 +8144,17 @@
                       </div>
                     {/if}
                   </div>
+                  {/if}
                 </div>
                 {/if}
               {/if}
+              {#each laterAsks.filter((a) => a.chatId === activeId && a.index === i) as la (la.id)}
+                <div class="ask-card ask-card-later" data-testid="later-ask-card">
+                  <div class="ask-later-tag">Answer later · the agent isn't waiting; your answer goes to it as a message</div>
+                  <div class="ask-question">{la.question}</div>
+                  {@render agentAskBody(la, "later-ask", () => void sendLaterAsk(la.id), () => { laterAsks = laterAsks.filter((x) => x.id !== la.id); }, null)}
+                </div>
+              {/each}
               <div class="actions">
                 {#if !isWorkMsg}
                   <button class="act" data-testid="copy-btn" aria-label="Copy message" title="Copy" onclick={() => copyMessage(i)}>
@@ -7978,12 +8216,25 @@
           {#each queuedMsgs as q, qi}
             {#if q.chatId === activeId}
               <div class="queue-chip">
-                <span class="queue-text">{q.msg.content || "Image"}</span>
+                <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : q.msg.content || "Image"}</span>
                 <button class="queue-x" aria-label="Remove queued message" title="Remove from queue" onclick={() => unqueue(qi)}>×</button>
               </div>
             {/if}
           {/each}
           <span class="queue-hint">queued · joins at the next tool call</span>
+        </div>
+      {/if}
+      {#if bgRuns.some((r) => r.chatId === activeId)}
+        <div class="queue-strip bg-strip" data-testid="bg-strip">
+          {#each bgRuns.filter((r) => r.chatId === activeId) as r (r.jobId)}
+            <div class="queue-chip bg-chip" data-testid="bg-chip">
+              <span class="run-spin" aria-hidden="true"></span>
+              <span class="queue-text" title={r.command}>{r.command}</span>
+              <span class="run-elapsed">{formatRunElapsed(now - r.startedAt)}</span>
+              <button class="queue-x" data-testid="bg-stop" aria-label="Stop background command" title="Stop it (the agent still gets the output so far)" onclick={() => void stopBgRun(r.jobId)}>×</button>
+            </div>
+          {/each}
+          <span class="queue-hint">in background · the agent gets the output when it finishes</span>
         </div>
       {/if}
       {#if busy}
@@ -10144,6 +10395,37 @@
   .ask-compose .ask-other { align-items: stretch; }
   .ask-compose .ask-send, .ask-compose .ask-dismiss { align-self: flex-end; min-height: 34px; }
   .ask-image-strip { padding: 2px 0 8px 0; }
+  .ask-later { align-self: flex-start; margin-top: 6px; border: none; background: transparent; color: var(--muted); font: inherit; font-size: 12.5px; padding: 2px 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+  .ask-later:hover { color: var(--text); }
+  .ask-card-later { border-style: dashed; }
+  .ask-later-tag { font-size: 11.5px; color: var(--muted-2); margin-bottom: 6px; }
+  /* a finished background job (a user-role message underneath), shown like
+     a collapsed tool result on the agent's side */
+  .bg-done-row .col { min-width: 0; }
+  .bg-done { background: var(--code-bg); border-radius: 12px; margin: 4px 0 8px; overflow: hidden; max-width: 100%; }
+  .bg-done summary { display: flex; align-items: baseline; gap: 8px; cursor: pointer; padding: 9px 12px; font-size: 12.5px; color: var(--muted-2); list-style: none; white-space: nowrap; overflow: hidden; }
+  .bg-done summary::-webkit-details-marker { display: none; }
+  .bg-done summary::before { content: "▸"; color: var(--muted); }
+  .bg-done[open] summary::before { content: "▾"; }
+  .bg-done summary:hover { color: var(--text); }
+  .bg-done-mark { color: var(--ok, #2f9e44); font-weight: 600; }
+  .bg-done-mark.bad { color: var(--danger, #e03131); }
+  .bg-done-title { color: var(--text); }
+  .bg-done-meta { font-variant-numeric: tabular-nums; }
+  .bg-done-cmd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: transparent; padding: 0; }
+  .bg-done-out { margin: 0; border-radius: 0; border-top: 1px solid var(--border-2); background: transparent; padding: 10px 12px; font-size: 12.5px; max-height: 360px; overflow: auto; user-select: text; white-space: pre-wrap; }
+  .bg-done-err { color: var(--danger, #e03131); }
+  .bg-done-label { border-top: 1px solid var(--border-2); padding: 6px 12px; font-size: 11.5px; color: var(--muted-2); }
+  /* a vicuna-mcp `run` call waiting on its command */
+  .run-strip { display: flex; align-items: center; gap: 8px; margin: 10px 0 2px; max-width: 560px; border: 1px solid var(--border-2); border-radius: 10px; background: var(--card); padding: 6px 8px 6px 10px; font-size: 12.5px; color: var(--muted); }
+  .run-cmd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  .run-elapsed { font-variant-numeric: tabular-nums; color: var(--muted-2); white-space: nowrap; }
+  .run-spin { width: 10px; height: 10px; flex: none; border-radius: 50%; border: 2px solid var(--border-3); border-top-color: var(--accent); animation: run-spin 0.9s linear infinite; }
+  @keyframes run-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .run-spin { animation: none; } }
+  .run-bg-btn { border: 1px solid var(--border-2); background: var(--bg); color: var(--text); border-radius: 8px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .run-bg-btn:hover { border-color: var(--accent); background: var(--hover-3); }
+  .bg-chip .queue-text { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, ui-monospace, monospace); }
   .ask-send { border: none; border-radius: 10px; background: var(--accent); color: var(--accent-fg); padding: 0 13px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
   .ask-send:disabled { opacity: .45; cursor: default; }
   .col { display: flex; flex-direction: column; }

@@ -217,6 +217,13 @@ async fn dispatch(
             agent_answer(&turn, &s("askId")?, s("answer")?)?;
             Ok(serde_json::Value::Null)
         }
+        "work_agent_background" => {
+            let turn = st.agent.get_turn(&s("turnId")?).ok_or("unknown turn")?;
+            vicuna_lib::work_agent::agent_background(&turn, &s("jobId")?)?;
+            Ok(serde_json::Value::Null)
+        }
+        "work_run_status" => Ok(serde_json::json!(vicuna_lib::bg_snapshot(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
+        "work_run_kill" => Ok(serde_json::json!(vicuna_lib::bg_kill(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
         // ----- workspace validation / tools -----
         "work_validate_root" => {
             Ok(serde_json::json!(vicuna_lib::work_validate_root_logic(s("path")?).await?))

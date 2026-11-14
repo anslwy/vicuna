@@ -2487,6 +2487,21 @@ pub fn bg_kill(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
     bg_snapshot(state, id)
 }
 
+/// Kill every still-running job (Quit).
+pub fn bg_kill_running(state: &BgExecState) {
+    if let Ok(jobs) = state.jobs.lock() {
+        for (_, rec) in jobs.iter() {
+            if let Ok(g) = rec.lock() {
+                if g.running {
+                    if let Some(pid) = g.pid {
+                        kill_pid(pid);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start a detached shell command; returns the job id immediately.
 #[tauri::command]
 async fn work_exec_start(root: String, command: String, state: State<'_, BgExecState>) -> Result<String, String> {
@@ -4862,18 +4877,10 @@ fn shutdown_children(app: &AppHandle) {
         }
     }
     if let Some(s) = app.try_state::<BgExecState>() {
-        if let Ok(jobs) = s.jobs.lock() {
-            for (_, rec) in jobs.iter() {
-                if let Ok(g) = rec.lock() {
-                    if g.running {
-                        if let Some(pid) = g.pid {
-                            kill_pid(pid);
-                        }
-                    }
-                }
-            }
-        }
+        bg_kill_running(&s);
     }
+    // vicuna-mcp `run` jobs (foreground and backgrounded) die with the app
+    bg_kill_running(vicuna_mcp::jobs());
     if let Some(s) = app.try_state::<AgentShellState>() {
         kill_agent_shells(&s);
     }
@@ -5369,6 +5376,9 @@ pub fn run() {
             work_agent::work_agent_queue,
             work_agent::work_agent_remove,
             work_agent::work_agent_answer,
+            work_agent::work_agent_background,
+            work_agent::work_run_status,
+            work_agent::work_run_kill,
             work_engine_info,
             opencode::opencode_models,
             opencode::opencode_set_model,
