@@ -31,6 +31,7 @@ pub mod fx;
 pub mod pi;
 pub mod work_engine;
 pub mod work_agent;
+pub mod work_usage;
 pub mod vicuna_mcp;
 pub mod git_panel;
 #[cfg(windows)]
@@ -5386,7 +5387,8 @@ pub fn run() {
             work_engine::work_engine_select,
             work_engine::work_models,
             work_engine::work_set_model,
-            work_engine::work_set_approval
+            work_engine::work_set_approval,
+            work_usage::work_usage
         ])
         .setup(|app| {
             // Warm the long-lived `opencode acp` process so the first Work

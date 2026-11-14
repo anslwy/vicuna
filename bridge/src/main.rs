@@ -188,6 +188,10 @@ async fn dispatch(
             )?;
             Ok(serde_json::Value::Null)
         }
+        "work_usage" => Ok(serde_json::to_value(
+            vicuna_lib::work_usage::fetch_usage_logic(arg_opt_str(args, "engine")).await?,
+        )
+        .map_err(|e| e.to_string())?),
         "opencode_models" => Ok(serde_json::to_value(vicuna_lib::opencode::list_models().await?)
             .map_err(|e| e.to_string())?),
         "opencode_set_model" => {

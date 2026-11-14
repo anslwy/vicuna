@@ -103,3 +103,29 @@ export function workReplyModel(
   // keep them apart from the Codex engine's own `codex/<model>`
   return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" || engine === "pi" ? `${engine}/${p}` : p;
 }
+
+/** Harnesses whose /usage popup shows a subscription quota. OpenCode and pi
+ *  only have local stats (or nothing), so they get no tab. */
+export const USAGE_ENGINES = ["claude", "codex", "agy"] as const;
+
+/** Installed quota harnesses for the /usage tabs, plus the tab to open on:
+ *  the active engine when it has a quota, else the first installed one
+ *  (null when none is installed). */
+export function usageTabs<T extends { id: string; installed: boolean }>(
+  engines: T[],
+  active: string,
+): { tabs: T[]; initial: string | null } {
+  const tabs = engines.filter((e) => e.installed && (USAGE_ENGINES as readonly string[]).includes(e.id));
+  const initial = tabs.some((e) => e.id === active) ? active : (tabs[0]?.id ?? null);
+  return { tabs, initial };
+}
+
+/** Visual tone for a usage/quota bar: green ("ok") when plenty of headroom
+ *  remains, amber ("warn") mid-way, red ("low") near exhaustion. */
+export function usageMeterTone(percent: number, kind: string): "ok" | "warn" | "low" {
+  const pct = Math.max(0, Math.min(100, Number.isFinite(percent) ? percent : 0));
+  if (kind === "remaining") {
+    return pct >= 50 ? "ok" : pct >= 20 ? "warn" : "low";
+  }
+  return pct < 50 ? "ok" : pct < 80 ? "warn" : "low";
+}

@@ -3,7 +3,7 @@
 // which has no Node typings here; Node runs this file directly (type stripping).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workSendGate, opencodeModelChoices, workReplyModel, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
+import { workSendGate, opencodeModelChoices, workReplyModel, usageMeterTone, usageTabs, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
 
 const base: WorkEngineInfo = {
   installed: true,
@@ -197,4 +197,28 @@ test("pi engine: label, provider/model reply label, gate and picker", () => {
   const missing = { ...pi, installed: false, missing: "pi CLI not found, install it: https://pi.dev" } as WorkEngineInfo;
   assert.equal(workSendGate(missing).blocked, true);
   assert.equal(workSendGate(missing).reason, missing.missing);
+});
+
+test("usageTabs keeps only installed quota harnesses and picks the opening tab", () => {
+  const engines = [
+    { id: "opencode", installed: true },
+    { id: "claude", installed: true },
+    { id: "codex", installed: false },
+    { id: "agy", installed: true },
+    { id: "pi", installed: true },
+  ];
+  assert.deepEqual(usageTabs(engines, "agy").tabs.map((e) => e.id), ["claude", "agy"]);
+  assert.equal(usageTabs(engines, "agy").initial, "agy");
+  assert.equal(usageTabs(engines, "opencode").initial, "claude");
+  assert.equal(usageTabs(engines, "codex").initial, "claude");
+  assert.equal(usageTabs([{ id: "pi", installed: true }], "pi").initial, null);
+});
+
+test("usageMeterTone colors remaining vs used quotas consistently", () => {
+  assert.equal(usageMeterTone(85, "remaining"), "ok");
+  assert.equal(usageMeterTone(49.3, "remaining"), "warn");
+  assert.equal(usageMeterTone(15, "remaining"), "low");
+  assert.equal(usageMeterTone(12, "used"), "ok");
+  assert.equal(usageMeterTone(60, "used"), "warn");
+  assert.equal(usageMeterTone(100, "used"), "low");
 });

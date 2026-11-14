@@ -8,7 +8,7 @@ import { isTauriRuntime } from "./ollama";
 import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
-export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices } from "./workGate";
+export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, usageMeterTone, usageTabs } from "./workGate";
 export type { WorkEngineInfo, OpencodeModel, OpencodeModels, EngineSummary } from "./workGate";
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {
@@ -611,4 +611,40 @@ export async function workRunStatus(id: string): Promise<BackgroundJobStatus> {
 }
 export async function workRunKill(id: string): Promise<BackgroundJobStatus> {
   return await invokeCmd<BackgroundJobStatus>("work_run_kill", { id });
+}
+
+export type UsageMeter = {
+  label: string;
+  percent: number;
+  kind: "remaining" | "used" | string;
+  valueText: string;
+  resetText: string | null;
+};
+
+export type UsageGroup = {
+  title: string;
+  subtitle: string | null;
+  meters: UsageMeter[];
+};
+
+export type UsageStat = {
+  label: string;
+  value: string;
+};
+
+export type WorkUsageReport = {
+  engine: string;
+  engineLabel: string;
+  account: string | null;
+  plan: string | null;
+  groups: UsageGroup[];
+  stats: UsageStat[];
+  note: string | null;
+  raw: string | null;
+  error: string | null;
+};
+
+/** Fetch quota / usage for a Work harness (defaults to the active engine). */
+export async function fetchWorkUsage(engine?: string): Promise<WorkUsageReport> {
+  return await invokeCmd<WorkUsageReport>("work_usage", { engine: engine ?? null });
 }
