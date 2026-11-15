@@ -1621,6 +1621,35 @@ pub struct WorkImageContent {
 /// Read a workspace image file for vision models (png/jpg/webp/gif, 10MB cap).
 /// Returns raw base64 — the frontend feeds it as Ollama `images[]` so the
 /// agent actually SEES the picture instead of getting a binary-dump error.
+/// Raw byte range of a workspace file as base64, for remote-server downloads
+/// (the desktop pulls a server file chunk by chunk into ~/Downloads).
+pub async fn work_read_chunk_logic(
+    root: String,
+    path: String,
+    offset: u64,
+    length: u64,
+) -> Result<serde_json::Value, String> {
+    use std::io::{Read as _, Seek as _};
+    let canon = work_canonical_root(root.trim())?;
+    let full = work_join_allow_temp(&canon, &path)?;
+    let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    let size = meta.len();
+    let len = length.clamp(1, 4 * 1024 * 1024).min(size.saturating_sub(offset));
+    let mut f = std::fs::File::open(&full).map_err(|e| format!("cannot read file: {e}"))?;
+    f.seek(std::io::SeekFrom::Start(offset.min(size)))
+        .map_err(|e| format!("cannot read file: {e}"))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).map_err(|e| format!("cannot read file: {e}"))?;
+    use base64::Engine as _;
+    Ok(serde_json::json!({
+        "size": size,
+        "data": base64::engine::general_purpose::STANDARD.encode(&buf),
+    }))
+}
+
 pub async fn work_read_image_logic(root: String, path: String) -> Result<WorkImageContent, String> {
     let canon = work_canonical_root(root.trim())?;
     let full = work_join_allow_temp(&canon, &path)?;
@@ -2171,6 +2200,11 @@ async fn server_call(
     timeout_ms: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     servers::call(&id, &path, body, timeout_ms).await
+}
+
+#[tauri::command]
+async fn server_download_file(id: String, root: String, path: String) -> Result<String, String> {
+    servers::download_file(&id, &root, &path, &downloads_dir()?).await
 }
 
 #[tauri::command]
@@ -5558,6 +5592,7 @@ pub fn run() {
             server_touch,
             server_remove,
             server_call,
+            server_download_file,
             server_lb_proxy_url,
             work_exec,
             work_fetch_url,

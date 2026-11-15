@@ -5597,6 +5597,29 @@
     }
   }
 
+  /** Server window: copy the file from the server into this computer's ~/Downloads, then reveal it. */
+  async function expDownload() {
+    const p = expCtx;
+    closeExpCtx();
+    if (!p || !activeServer || !isTauriRuntime()) return;
+    flashExpNotice(`Downloading ${p.path.split("/").pop()}…`);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const dest = await invoke<string>("server_download_file", {
+        id: activeServer,
+        root: explorerRoot.trim(),
+        path: p.path,
+      });
+      flashExpNotice(`Saved to ${dest}`);
+      try {
+        const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+        await revealItemInDir(dest);
+      } catch {}
+    } catch (e: any) {
+      flashExpNotice(`Couldn't download: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
+    }
+  }
+
   async function expReveal() {
     const p = expCtx;
     closeExpCtx();
@@ -10098,7 +10121,11 @@
     {#if !expCtx.isDir}
       <button class="ctx-item" data-testid="explorer-open-external" onclick={() => void expOpenExternal()}>Open in default app</button>
     {/if}
-    <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
+    {#if onServer && !expCtx.isDir}
+      <button class="ctx-item" data-testid="explorer-download" onclick={() => void expDownload()}>Download</button>
+    {:else}
+      <button class="ctx-item" data-testid="explorer-reveal" onclick={() => void expReveal()}>Reveal in Finder</button>
+    {/if}
     <button class="ctx-item" data-testid="explorer-rename" onclick={renameFromMenu}>Rename</button>
     <button
       class="ctx-item {expCtx && expConfirmDelete === expCtx.path ? 'danger' : ''}"
