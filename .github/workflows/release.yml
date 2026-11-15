@@ -326,13 +326,8 @@ jobs:
       matrix:
         include:
           - { target: linux-x86_64, os: ubuntu-22.04 }
-          - { target: linux-aarch64, os: ubuntu-22.04-arm }
           - { target: macos-universal, os: macos-latest }
     runs-on: ${{ matrix.os }}
-    # arm64 Linux still links libgtk-3 (x86_64 links no GUI libs; cause under
-    # investigation), so the guard below fails it. Don't let it block the
-    # release: publish ships whichever CLI builds passed.
-    continue-on-error: ${{ matrix.target == 'linux-aarch64' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -449,7 +444,6 @@ jobs:
             'vicuna-macos-universal.tar.gz',
             'install-cli.sh'
           ];
-          // optional: vicuna-linux-aarch64.tar.gz (non-blocking build-cli job)
           const files = readdirSync('release', { withFileTypes: true })
             .filter((entry) => entry.isFile())
             .map((entry) => entry.name);
