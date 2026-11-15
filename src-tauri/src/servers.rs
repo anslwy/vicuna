@@ -220,6 +220,73 @@ pub async fn call(id: &str, path: &str, body: Option<Value>, timeout_ms: Option<
     request(&s.url, &s.token, path, body.as_ref(), timeout).await
 }
 
+/// Copy a file from a server's workspace into `dest_dir` (~/Downloads) in
+/// 4MB base64 chunks over `/invoke work_read_chunk`. A clashing name gets
+/// ` (N)` appended; a failed transfer removes the partial file.
+pub async fn download_file(id: &str, root: &str, path: &str, dest_dir: &std::path::Path) -> Result<String, String> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    const CHUNK: u64 = 4 * 1024 * 1024;
+    let name = std::path::Path::new(path.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .ok_or("invalid file name")?
+        .to_string();
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("download failed: {e}"))?;
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name.clone(), String::new()),
+    };
+    let mut dest = dest_dir.join(&name);
+    let mut n = 1;
+    while dest.exists() {
+        dest = dest_dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    let mut file = std::fs::File::create(&dest).map_err(|e| format!("download failed: {e}"))?;
+    let result: Result<(), String> = async {
+        let mut offset = 0u64;
+        loop {
+            let body = serde_json::json!({
+                "cmd": "work_read_chunk",
+                "args": {"root": root, "path": path, "offset": offset, "length": CHUNK},
+            });
+            let v = call(id, "/invoke", Some(body), Some(120_000)).await.map_err(|e| {
+                if e.contains("unknown bridge command") {
+                    "The server's Vicuna is too old to download files; update it.".to_string()
+                } else {
+                    e
+                }
+            })?;
+            if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                let msg = v.get("error").and_then(Value::as_str).unwrap_or("download failed");
+                if msg.contains("unknown bridge command") {
+                    return Err("The server's Vicuna is too old to download files; update it.".into());
+                }
+                return Err(msg.to_string());
+            }
+            let data = v.get("data").unwrap_or(&v);
+            let size = data.get("size").and_then(Value::as_u64).ok_or("bad server response")?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.get("data").and_then(Value::as_str).unwrap_or(""))
+                .map_err(|e| format!("bad server response: {e}"))?;
+            file.write_all(&bytes).map_err(|e| format!("download failed: {e}"))?;
+            offset += bytes.len() as u64;
+            if offset >= size || bytes.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
 #[cfg(feature = "desktop")]
 mod lb_proxy {
     use std::collections::HashMap;

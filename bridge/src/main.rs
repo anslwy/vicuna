@@ -264,6 +264,11 @@ async fn dispatch(
                 vicuna_lib::work_read_file_logic(s("root")?, s("path")?, max, offset, limit).await?
             ))
         }
+        "work_read_chunk" => {
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let length = args.get("length").and_then(|v| v.as_u64()).unwrap_or(4 * 1024 * 1024);
+            Ok(vicuna_lib::work_read_chunk_logic(s("root")?, s("path")?, offset, length).await?)
+        }
         "work_read_image" => {
             Ok(serde_json::json!(vicuna_lib::work_read_image_logic(s("root")?, s("path")?).await?))
         }
