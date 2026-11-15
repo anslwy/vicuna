@@ -220,6 +220,342 @@ pub async fn call(id: &str, path: &str, body: Option<Value>, timeout_ms: Option<
     request(&s.url, &s.token, path, body.as_ref(), timeout).await
 }
 
+#[cfg(feature = "desktop")]
+mod lb_proxy {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+    fn full_body(data: impl Into<bytes::Bytes>) -> BoxBody {
+        use http_body_util::BodyExt;
+        http_body_util::Full::new(data.into()).boxed()
+    }
+
+    fn err_resp(status: u16, msg: &str) -> hyper::Response<BoxBody> {
+        hyper::Response::builder()
+            .status(status)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(full_body(msg.to_string()))
+            .unwrap()
+    }
+
+    fn http_client() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client")
+        })
+    }
+
+    enum UpstreamStream {
+        Plain(tokio::net::TcpStream),
+        Tls(tokio_native_tls::TlsStream<tokio::net::TcpStream>),
+    }
+
+    impl AsyncRead for UpstreamStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match &mut *self {
+                Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+                Self::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for UpstreamStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match &mut *self {
+                Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+                Self::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            }
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match &mut *self {
+                Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+                Self::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            }
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match &mut *self {
+                Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+                Self::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Target {
+        base_url: String,
+        token: String,
+        is_tls: bool,
+        host: String,
+        port: u16,
+        host_header: String,
+    }
+
+    async fn connect_upstream(t: &Target) -> Result<UpstreamStream, String> {
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect((t.host.as_str(), t.port)),
+        )
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| e.to_string())?;
+        if !t.is_tls {
+            return Ok(UpstreamStream::Plain(tcp));
+        }
+        let cx = tokio_native_tls::native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
+        let tls = tokio_native_tls::TlsConnector::from(cx)
+            .connect(&t.host, tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(UpstreamStream::Tls(tls))
+    }
+
+    async fn handle_ws(
+        mut req: hyper::Request<hyper::body::Incoming>,
+        target: Target,
+        path_and_query: String,
+    ) -> hyper::Response<BoxBody> {
+        let mut upstream = match connect_upstream(&target).await {
+            Ok(s) => s,
+            Err(e) => return err_resp(502, &format!("remote connect failed: {e}")),
+        };
+        let mut raw_req = format!(
+            "{} /lb{path_and_query} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n",
+            req.method(),
+            target.host_header,
+            target.token
+        );
+        for (name, val) in req.headers() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if lower == "host" || lower == "authorization" {
+                continue;
+            }
+            if let Ok(v) = val.to_str() {
+                raw_req.push_str(&format!("{name}: {v}\r\n"));
+            }
+        }
+        raw_req.push_str("\r\n");
+
+        if upstream.write_all(raw_req.as_bytes()).await.is_err() {
+            return err_resp(502, "remote write failed");
+        }
+
+        let mut buf = Vec::with_capacity(2048);
+        let mut tmp = [0u8; 1024];
+        let header_end = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), upstream.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => return err_resp(502, "remote handshake failed"),
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                    if buf.len() > 16 * 1024 {
+                        return err_resp(502, "remote header too large");
+                    }
+                }
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buf[..header_end]);
+        let leftover = buf[header_end + 4..].to_vec();
+        let mut lines = head.split("\r\n");
+        let status_code: u16 = lines
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(502);
+
+        let mut builder = hyper::Response::builder().status(status_code);
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                builder = builder.header(k.trim(), v.trim());
+            }
+        }
+        if status_code != 101 {
+            return builder.body(full_body(leftover)).unwrap_or_else(|_| err_resp(502, "bad response"));
+        }
+
+        tokio::spawn(async move {
+            if let Ok(upgraded) = hyper::upgrade::on(&mut req).await {
+                let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
+                if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await;
+            }
+        });
+
+        builder.body(full_body("")).unwrap()
+    }
+
+    async fn handle_req(
+        req: hyper::Request<hyper::body::Incoming>,
+        target: Target,
+    ) -> hyper::Response<BoxBody> {
+        use http_body_util::BodyExt;
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        let is_ws = req
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+        if is_ws {
+            return handle_ws(req, target, path_and_query).await;
+        }
+
+        let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+            Ok(m) => m,
+            Err(_) => return err_resp(405, "unsupported method"),
+        };
+        let url = format!("{}/lb{path_and_query}", target.base_url);
+        let mut fwd = http_client()
+            .request(method, &url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", target.token));
+        for (name, val) in req.headers() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if matches!(lower.as_str(), "host" | "authorization" | "connection" | "transfer-encoding" | "content-length") {
+                continue;
+            }
+            if let (Ok(rn), Ok(rv)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
+            ) {
+                fwd = fwd.header(rn, rv);
+            }
+        }
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return err_resp(400, "unreadable body"),
+        };
+        if !body_bytes.is_empty() {
+            fwd = fwd.body(body_bytes);
+        }
+
+        let resp = match fwd.send().await {
+            Ok(r) => r,
+            Err(e) => return err_resp(502, &format!("remote request failed: {e}")),
+        };
+        let status = resp.status().as_u16();
+        let mut builder = hyper::Response::builder().status(status);
+        for (name, val) in resp.headers() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if matches!(lower.as_str(), "transfer-encoding" | "connection" | "content-length") {
+                continue;
+            }
+            if let (Ok(hn), Ok(hv)) = (
+                hyper::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+                hyper::header::HeaderValue::from_bytes(val.as_bytes()),
+            ) {
+                builder = builder.header(hn, hv);
+            }
+        }
+        let bytes = resp.bytes().await.unwrap_or_default();
+        builder.body(full_body(bytes)).unwrap_or_else(|_| err_resp(502, "bad response"))
+    }
+
+    pub async fn proxy_url(id: &str) -> Result<String, String> {
+        static PROXIES: OnceLock<Mutex<HashMap<String, u16>>> = OnceLock::new();
+        let map = PROXIES.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(g) = map.lock() {
+            if let Some(&port) = g.get(id) {
+                return Ok(format!("http://127.0.0.1:{port}"));
+            }
+        }
+
+        let s = super::load()
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or("That server is no longer in your list.")?;
+        let parsed = reqwest::Url::parse(&s.url).map_err(|e| format!("bad server url: {e}"))?;
+        let is_tls = parsed.scheme() == "https";
+        let host = parsed.host_str().ok_or("server url missing host")?.to_string();
+        let port = parsed.port_or_known_default().ok_or("server url missing port")?;
+        let host_header = match parsed.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.clone(),
+        };
+        let target = Target {
+            base_url: s.url.trim_end_matches('/').to_string(),
+            token: s.token,
+            is_tls,
+            host,
+            port,
+            host_header,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| format!("lb proxy bind failed: {e}"))?;
+        let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+        if let Ok(mut g) = map.lock() {
+            if let Some(&existing) = g.get(id) {
+                return Ok(format!("http://127.0.0.1:{existing}"));
+            }
+            g.insert(id.to_string(), local_port);
+        }
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req| {
+                        let target = target.clone();
+                        async move { Ok::<_, std::convert::Infallible>(handle_req(req, target).await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+
+        Ok(format!("http://127.0.0.1:{local_port}"))
+    }
+}
+
+#[cfg(feature = "desktop")]
+pub async fn lb_proxy_url(id: &str) -> Result<String, String> {
+    lb_proxy::proxy_url(id).await
+}
+
+#[cfg(not(feature = "desktop"))]
+pub async fn lb_proxy_url(_id: &str) -> Result<String, String> {
+    Err("lb proxy requires desktop build".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
