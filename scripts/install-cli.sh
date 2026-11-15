@@ -49,7 +49,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading $asset ..."
-fetch "$base/$asset" "$tmp/$asset" || die "download failed: $base/$asset"
+fetch "$base/$asset" "$tmp/$asset" || die "no $target build in this release yet ($base/$asset). Supported: linux-x86_64, macos-universal (linux-aarch64 when available)."
 if fetch "$base/$asset.sha256" "$tmp/$asset.sha256" 2>/dev/null; then
   want=$(cut -d' ' -f1 < "$tmp/$asset.sha256")
   if command -v sha256sum >/dev/null 2>&1; then
