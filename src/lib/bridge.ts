@@ -157,8 +157,10 @@ export class BridgeChannel {
   private failures = 0;
   private inFlight = false;
 
-  constructor() {
-    this.id = crypto.randomUUID();
+  /** `id` reattaches to an existing server-side channel (a Work turn that
+   *  kept running while this window was closed); omitted = a new channel. */
+  constructor(id?: string) {
+    this.id = id ?? crypto.randomUUID();
     if (isRemoteServer()) void this.longPollLoop();
     else this.timer = setInterval(() => void this.poll(), 200);
   }

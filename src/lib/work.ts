@@ -612,6 +612,25 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
   }
 }
 
+/** A Work turn the server is still running for this session (the window that
+ *  started it closed or reloaded). Only remote servers / bridged browsers keep
+ *  turns across windows; local Tauri turns end with their window.
+ *  Keyed by Vicuna session id. */
+export async function liveWorkTurns(): Promise<Record<string, { turnId: string; channel: string }>> {
+  if (useLocalIpc()) return {};
+  try {
+    return ((await bridgeInvoke("work_agent_live", {})) ?? {}) as Record<string, { turnId: string; channel: string }>;
+  } catch {
+    return {}; // older server without the command, or bridge down
+  }
+}
+
+/** Follow an already-running turn's event stream (see liveWorkTurns). */
+export function attachWorkAgentTurn(channel: string, onEvent: (ev: WorkAgentEvent) => void): void {
+  const ch = new BridgeChannel(channel);
+  ch.onmessage = (ev) => onEvent(ev as WorkAgentEvent);
+}
+
 /** Interrupt a running turn (double-Esc, Stop, chat deleted). */
 export async function stopWorkAgentTurn(turnId: string): Promise<void> {
   if (useLocalIpc()) {

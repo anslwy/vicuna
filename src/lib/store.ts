@@ -126,6 +126,9 @@ export interface PendingStream {
    *  model whose chat template closes the assistant turn): the prompt is
    *  rebuilt from this style + the persisted partial. */
   rawStyle?: PromptStyle;
+  /** written by a Work turn: never resumed through the Chat path (the
+   *  server-side turn is reattached instead, see liveWorkTurns) */
+  work?: boolean;
 }
 
 export function writePendingStream(p: PendingStream): void {

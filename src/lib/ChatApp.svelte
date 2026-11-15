@@ -37,7 +37,7 @@
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -7022,7 +7022,29 @@
    *  markdown results for persistence, ask cards, steering bubbles) exactly
    *  like the old in-thread loop did. Settle paths (leftovers, follow-up
    *  turns, goal retirement, stats) are unchanged. */
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean } = {}) {
+  /** Follow Work turns the server is still running for sessions this window
+   *  shows (the window that started them closed or reloaded). Without this
+   *  the turn ran on unseen, its output was never saved, and the next send
+   *  started a second engine process on the same session. */
+  async function reattachLiveWorkTurns() {
+    const live = await liveWorkTurns();
+    for (const [id, t] of Object.entries(live)) {
+      const c = chats.find((x) => x.id === id);
+      if (!c || c.mode !== "work" || workTurnIds.has(id) || workRunningIds.includes(id)) continue;
+      // its live bubble is the trailing assistant message; a user message
+      // last means the placeholder never got saved, so add it back
+      let idx = c.messages.length - 1;
+      if (idx < 0) continue;
+      if (c.messages[idx].role !== "assistant") {
+        c.messages = [...c.messages, { role: "assistant", content: "" }];
+        idx = c.messages.length - 1;
+        chats = [...chats];
+      }
+      void runWorkTurn(c, idx, c.workspace ?? "", [], { attach: t });
+    }
+  }
+
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
     const turnEngine = engineId(workEngineInfo);
@@ -7051,7 +7073,7 @@
     markWorkRunning(chat.id);
     workStopIds.delete(chat.id);
     // a new turn invalidates /redo (backend clears its stack in undo_begin_turn)
-    dropUndoStash(chat.id);
+    if (!opts.attach) dropUndoStash(chat.id);
     let curIndex = index;
     // in-flight tool head (for say/ask/done display) + the ask answer the
     // frontend itself sent (the record mirrors it once the result lands)
@@ -7240,7 +7262,9 @@
         case "roundstart":
           // a generation round is in flight: persist the resume marker (same
           // shape the old per-round streamInto wrote) so a refresh resumes it
-          writePendingStream({ chatId: chat.id, index: curIndex, mode: ev.mode as "fresh" | "continue", model: selectedModel, think });
+          // `work` keeps initApp from "resuming" it through the tool-less Chat
+          // path with the Chat model (that once replaced opus's real reply)
+          writePendingStream({ chatId: chat.id, index: curIndex, mode: ev.mode as "fresh" | "continue", model: selectedModel, think, work: true });
           save();
           armStall();
           break;
@@ -7494,6 +7518,13 @@
     }
 
     let agentTurn: string;
+    if (opts.attach) {
+      // the server kept this turn running while no window followed it: keep
+      // polling its channel (the queue held every event since then)
+      attachWorkAgentTurn(opts.attach.channel, (ev) => handleEvent(ev));
+      workTurnIds.set(chat.id, opts.attach.turnId);
+      return;
+    }
     try {
       agentTurn = await startWorkAgentTurn({
         engine: turnEngine,
@@ -7994,9 +8025,18 @@
     // resume a stream interrupted by a refresh: the partial tokens persisted
     // via the regular save, the pending marker tells us how to continue it
     // (user-stopped streams clear the marker, so they never resume here)
-    const pending = readPendingStream();
+    let pending = readPendingStream();
+    if (pending && (pending.work || chats.find((c) => c.id === pending!.chatId)?.mode === "work")) {
+      // a Work turn's marker: the Chat resume below would wipe the agent's
+      // partial reply and regenerate it with the Chat model and no tools.
+      // Work turns live on the backend; a still-running one is reattached
+      // just below, a finished one keeps whatever was saved.
+      clearPendingStream();
+      pending = null;
+    }
+    void reattachLiveWorkTurns();
     if (pending && (!sessionId || sessionId === pending.chatId)) {
-      const pc = chats.find((c) => c.id === pending.chatId);
+      const pc = chats.find((c) => c.id === pending!.chatId);
       const pm = pc?.messages[pending.index];
       if (pc && pm && pm.role === "assistant") {
         activeId = pc.id;
