@@ -40,7 +40,7 @@
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
@@ -827,7 +827,13 @@
    *  implementation), so when framed lb posts out instead and the app opens
    *  the URL natively. Strict loopback-origin + shape check. */
   function onBrowserFrameMessage(e: MessageEvent) {
-    if (e.origin !== LB_URL) return;
+    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
+    if (!base) return;
+    try {
+      if (e.origin !== new URL(base).origin) return;
+    } catch {
+      return;
+    }
     const d = e.data as { type?: unknown; url?: unknown } | null;
     if (!d || d.type !== "live-browser:open-external" || typeof d.url !== "string") return;
     if (!/^https?:\/\//.test(d.url)) return;
@@ -5683,16 +5689,19 @@
   /** iframe key: bumped whenever the daemon behind a live frame is (re)started,
    *  so the frame re-navigates instead of sitting on a failed navigation. */
   let browserFrameRev = $state(0);
+  let browserProxyUrl = $state<string | null>(null);
   /** lb UI url + Vicuna theme/accent: lb reads `?theme=`/`?accent=`/
    *  `?accentfg=` pre-paint (older lb builds ignore unknown params and fall
    *  back to their saved theme + built-in greens). Derived from
    *  `theme`/`accent`, so appearance flips re-navigate the frame into the
    *  matching lb look with no extra wiring. */
   const browserFrameSrc = $derived.by(() => {
+    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
+    if (!base) return "about:blank";
     const a = ACCENTS[accent] ?? ACCENTS.orange;
     const v = theme === "dark" ? a.dark : a.light;
     const hex = (c: string) => c.replace(/^#/, "");
-    return `${browserDaemon?.url ?? LB_URL}/?theme=${theme}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
+    return `${base}/?theme=${theme}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
   });
 
   /** status → start when down. Throws on failure (callers surface it).
@@ -5770,6 +5779,10 @@
           BROWSER_START_TIMEOUT_MS,
           BROWSER_START_TIMEOUT_MESSAGE
         );
+      }
+      if (onServer && !browserProxyUrl) {
+        const sid = activeServerId();
+        if (sid) browserProxyUrl = await serverLbProxyUrl(sid);
       }
       browserDaemon = st;
       if (!browserMcpArgv && st.bin) {
@@ -9869,13 +9882,10 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
               <span>Terminal</span>
             </button>
-            <!-- the Browser tab frames a daemon on THIS machine: hidden on a server -->
-            {#if !onServer}
             <button class="ctx-item" data-testid="new-tab-browser" onclick={openSideBrowser}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
               <span>Browser</span>
             </button>
-            {/if}
             <button class="ctx-item" data-testid="new-tab-git" onclick={openSideGit}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
               <span>Git Diff</span>
@@ -9989,7 +9999,7 @@
               onreveal={(p) => void revealWorkPath(p)}
             />
           {:else if t.kind === "browser"}
-            {#if browserDaemon?.running}
+            {#if browserDaemon?.running && (!onServer || browserProxyUrl)}
               {#if browserDaemon.health?.ui_ok === false}
                 <div class="exp-empty browser-error" data-testid="browser-broken-ui">
                   <span>Browser engine files changed while it was running (usually an app update) — the view can't load. Restart the browser to pick up the new files.{#if !browserDaemon.owned} Vicuna didn't start this daemon; taking it over asks first and loses its tabs.{/if}</span>

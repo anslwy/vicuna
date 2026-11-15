@@ -574,51 +574,231 @@ async fn dispatch(
     }
 }
 
-fn json_resp(body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    use tiny_http::Header;
-    let h = |n: &[u8], v: &[u8]| Header::from_bytes(n, v).unwrap();
-    tiny_http::Response::from_string(body)
-        .with_header(h(b"Access-Control-Allow-Origin", b"*"))
-        .with_header(h(b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"))
-        .with_header(h(b"Access-Control-Allow-Headers", b"Content-Type, Authorization"))
-        .with_header(h(b"Content-Type", b"application/json"))
+type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+fn full_body(data: impl Into<bytes::Bytes>) -> BoxBody {
+    use http_body_util::BodyExt;
+    http_body_util::Full::new(data.into()).boxed()
 }
 
-fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http::Request) {
-    use tiny_http::Method::{Get, Options, Post};
-    let path = req.url().split('?').next().unwrap_or("/").to_string();
-    if *req.method() == Options {
-        let _ = req.respond(json_resp(String::new()));
-        return;
+fn json_resp(status: u16, body: impl Into<bytes::Bytes>) -> hyper::Response<BoxBody> {
+    hyper::Response::builder()
+        .status(status)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        .header("Content-Type", "application/json")
+        .body(full_body(body))
+        .unwrap()
+}
+
+fn lb_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client")
+    })
+}
+
+fn strip_lb_uri(uri: &hyper::Uri) -> String {
+    let path = uri.path();
+    let stripped = path.strip_prefix("/lb").unwrap_or(path);
+    let target_path = if stripped.is_empty() { "/" } else { stripped };
+    match uri.query() {
+        Some(q) => format!("{target_path}?{q}"),
+        None => target_path.to_string(),
     }
-    if *req.method() == Get && path == "/health" {
+}
+
+async fn proxy_lb_ws(
+    mut req: hyper::Request<hyper::body::Incoming>,
+    target_uri: String,
+    port: u16,
+) -> hyper::Response<BoxBody> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut lb_stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return json_resp(502, r#"{"ok":false,"error":"live-browser unreachable"}"#),
+    };
+
+    let mut raw_req = format!("{} {target_uri} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n", req.method());
+    for (name, val) in req.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower == "host" || lower == "authorization" {
+            continue;
+        }
+        if let Ok(v) = val.to_str() {
+            raw_req.push_str(&format!("{name}: {v}\r\n"));
+        }
+    }
+    raw_req.push_str("\r\n");
+
+    if lb_stream.write_all(raw_req.as_bytes()).await.is_err() {
+        return json_resp(502, r#"{"ok":false,"error":"live-browser write failed"}"#);
+    }
+
+    let mut buf = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lb_stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {
+                return json_resp(502, r#"{"ok":false,"error":"live-browser handshake failed"}"#);
+            }
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                if buf.len() > 16 * 1024 {
+                    return json_resp(502, r#"{"ok":false,"error":"live-browser header too large"}"#);
+                }
+            }
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let leftover = buf[header_end + 4..].to_vec();
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(502);
+
+    let mut builder = hyper::Response::builder().status(status_code);
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            builder = builder.header(k.trim(), v.trim());
+        }
+    }
+
+    if status_code != 101 {
+        return builder.body(full_body(leftover)).unwrap_or_else(|_| json_resp(502, ""));
+    }
+
+    tokio::spawn(async move {
+        if let Ok(upgraded) = hyper::upgrade::on(&mut req).await {
+            let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
+            if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+                return;
+            }
+            let _ = tokio::io::copy_bidirectional(&mut client_io, &mut lb_stream).await;
+        }
+    });
+
+    builder.body(full_body("")).unwrap()
+}
+
+async fn proxy_lb(req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
+    use http_body_util::BodyExt;
+    let port = vicuna_lib::browser::lb_port();
+    let target_uri = strip_lb_uri(req.uri());
+
+    let is_ws = req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    if is_ws {
+        return proxy_lb_ws(req, target_uri, port).await;
+    }
+
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return json_resp(405, r#"{"ok":false,"error":"unsupported method"}"#),
+    };
+    let url = format!("http://127.0.0.1:{port}{target_uri}");
+    let mut fwd = lb_client().request(method, &url);
+    for (name, val) in req.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(lower.as_str(), "host" | "authorization" | "connection" | "transfer-encoding" | "content-length") {
+            continue;
+        }
+        if let (Ok(rn), Ok(rv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            fwd = fwd.header(rn, rv);
+        }
+    }
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return json_resp(400, r#"{"ok":false,"error":"unreadable request body"}"#),
+    };
+    if !body_bytes.is_empty() {
+        fwd = fwd.body(body_bytes);
+    }
+
+    let resp = match fwd.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = serde_json::json!({"ok": false, "error": format!("live-browser unreachable: {e}")}).to_string();
+            return json_resp(502, msg);
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let mut builder = hyper::Response::builder().status(status);
+    for (name, val) in resp.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(lower.as_str(), "transfer-encoding" | "connection" | "content-length") {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            hyper::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            hyper::header::HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            builder = builder.header(hn, hv);
+        }
+    }
+    let bytes = resp.bytes().await.unwrap_or_default();
+    builder.body(full_body(bytes)).unwrap_or_else(|_| json_resp(502, ""))
+}
+
+async fn handle(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
+    use http_body_util::BodyExt;
+    use hyper::Method;
+    let path = req.uri().path().to_string();
+    if *req.method() == Method::OPTIONS {
+        return json_resp(200, "");
+    }
+    if *req.method() == Method::GET && path == "/health" {
         let body = if st.token.is_some() { r#"{"ok":true,"bridge":1,"server":true}"# } else { r#"{"ok":true,"bridge":1}"# };
-        let _ = req.respond(json_resp(body.to_string()));
-        return;
+        return json_resp(200, body);
     }
     if let Some(want) = &st.token {
         let given = req
             .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .map(|h| h.value.as_str().trim().to_string())
-            .unwrap_or_default();
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim();
         let given = given.strip_prefix("Bearer ").unwrap_or("").trim();
         if !token_eq(given, want) {
-            let resp = json_resp(r#"{"ok":false,"error":"wrong or missing token"}"#.to_string()).with_status_code(401);
-            let _ = req.respond(resp);
-            return;
+            return json_resp(401, r#"{"ok":false,"error":"wrong or missing token"}"#);
         }
     }
-    if *req.method() == Get && path.starts_with("/poll/") {
+    if path == "/lb" || path.starts_with("/lb/") {
+        return proxy_lb(req).await;
+    }
+    if *req.method() == Method::GET && path.starts_with("/poll/") {
         let id = path.trim_start_matches("/poll/").to_string();
         // `?wait=<ms>` long-polls (remote clients): hold the request until
         // events arrive or the wait runs out, so terminal echo and turn
         // tokens arrive at once instead of on the next poll tick.
         let wait_ms: u64 = req
-            .url()
-            .split_once('?')
-            .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("wait=")))
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("wait=")))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
             .min(25_000);
@@ -627,38 +807,35 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
                 lp.insert(id.clone(), std::time::Instant::now());
             }
         };
-        touch(st);
+        touch(&st);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         let mut events = drain_events(&st.events, &id);
         while events.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             events = drain_events(&st.events, &id);
         }
-        touch(st);
+        touch(&st);
         let body = serde_json::json!({"events": events}).to_string();
-        let _ = req.respond(json_resp(body));
-        return;
+        return json_resp(200, body);
     }
-    if *req.method() == Post && path == "/invoke" {
-        let mut body: Vec<u8> = Vec::new();
+    if *req.method() == Method::POST && path == "/invoke" {
+        let mut body = Vec::new();
         let mut ok = true;
-        {
-            let reader = req.as_reader();
-            let mut buf = [0u8; 8192];
-            loop {
-                match std::io::Read::read(reader, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if body.len() + n > BODY_CAP as usize {
+        let mut incoming = req.into_body();
+        while let Some(frame) = incoming.frame().await {
+            match frame {
+                Ok(f) => {
+                    if let Some(chunk) = f.data_ref() {
+                        if body.len() + chunk.len() > BODY_CAP as usize {
                             ok = false;
                             break;
                         }
-                        body.extend_from_slice(&buf[..n]);
+                        body.extend_from_slice(chunk);
                     }
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
+                }
+                Err(_) => {
+                    ok = false;
+                    break;
                 }
             }
         }
@@ -670,17 +847,16 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
                 Ok(v) => {
                     let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
                     let args = v.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                    match rt.block_on(dispatch(st, cmd, &args)) {
+                    match dispatch(&st, cmd, &args).await {
                         Ok(data) => serde_json::json!({"ok": true, "data": data}).to_string(),
                         Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
                     }
                 }
             }
         };
-        let _ = req.respond(json_resp(out));
-        return;
+        return json_resp(200, out);
     }
-    let _ = req.respond(json_resp(r#"{"ok":false,"error":"not found"}"#.to_string()));
+    json_resp(404, r#"{"ok":false,"error":"not found"}"#)
 }
 
 fn token_eq(a: &str, b: &str) -> bool {
@@ -785,7 +961,9 @@ pub fn run(cfg: Config) {
         });
     }
     let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let server = tiny_http::Server::http(&addr).unwrap_or_else(|e| panic!("bridge bind {addr}: {e}"));
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind(&addr))
+        .unwrap_or_else(|e| panic!("bridge bind {addr}: {e}"));
     match (&cfg.token, &cfg.db) {
         (Some(t), Some(db)) => {
             println!("vicuna server {} on http://{addr}", env!("CARGO_PKG_VERSION"));
@@ -809,11 +987,25 @@ pub fn run(cfg: Config) {
         }
         _ => println!("vicuna bridge on http://{addr}"),
     }
-    for req in server.incoming_requests() {
-        let st = state.clone();
-        let h = rt.handle().clone();
-        std::thread::spawn(move || handle(&h, &st, req));
-    }
+    rt.block_on(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let st = state.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let svc = hyper::service::service_fn(move |req| {
+                    let st = st.clone();
+                    async move { Ok::<_, std::convert::Infallible>(handle(st, req).await) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
 }
 
 const USAGE: &str = "vicuna — Vicuna's command line

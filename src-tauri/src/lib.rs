@@ -2174,6 +2174,11 @@ async fn server_call(
 }
 
 #[tauri::command]
+async fn server_lb_proxy_url(id: String) -> Result<String, String> {
+    servers::lb_proxy_url(&id).await
+}
+
+#[tauri::command]
 async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
     work_exec_logic(root, command, timeout_ms).await
 }
@@ -5553,6 +5558,7 @@ pub fn run() {
             server_touch,
             server_remove,
             server_call,
+            server_lb_proxy_url,
             work_exec,
             work_fetch_url,
             work_exec_start,

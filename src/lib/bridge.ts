@@ -73,8 +73,15 @@ const LOCAL_CMDS = new Set([
   "open_chat_window",
   "server_connect",
   "server_touch",
-  "server_remove"
+  "server_remove",
+  "server_lb_proxy_url"
 ]);
+
+/** Local HTTP+WS proxy URL for a remote server's `lb` daemon. */
+export async function serverLbProxyUrl(id: string): Promise<string> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<string>("server_lb_proxy_url", { id });
+}
 
 /** One call to the active server: `{ok, data | error}` unwrapped. */
 async function serverInvoke(cmd: string, args: Record<string, any>): Promise<any> {
