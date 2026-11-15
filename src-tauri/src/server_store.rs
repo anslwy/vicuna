@@ -188,6 +188,136 @@ pub(crate) async fn merge_chats(pool: &SqlitePool, chats: Vec<crate::ChatSaveRow
     tx.commit().await.map_err(err)
 }
 
+/// Escape a user string for a SQLite `LIKE … ESCAPE '\'` pattern.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// A display excerpt around the first match (or the opening user message).
+fn excerpt(text: &str, q: &str) -> String {
+    let flat = text.replace(['\r', '\n'], " ");
+    let flat = flat.trim();
+    if q.is_empty() {
+        return flat.chars().take(160).collect();
+    }
+    let low = flat.to_lowercase();
+    let Some(idx) = low.find(&q.to_lowercase()) else {
+        return flat.chars().take(160).collect();
+    };
+    let chars: Vec<char> = flat.chars().collect();
+    // byte index → char index (the match may follow multi-byte text)
+    let start_char = flat[..idx].chars().count();
+    let len = q.chars().count();
+    let from = start_char.saturating_sub(40);
+    let to = (start_char + len + 80).min(chars.len());
+    let body: String = chars[from..to].iter().collect();
+    let mut out = String::new();
+    if from > 0 {
+        out.push('…');
+    }
+    out.push_str(&body);
+    if to < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// One chat's snippet: the message that matches `q`, else its first user
+/// message, else its first message.
+async fn chat_snippet(pool: &SqlitePool, chat_id: &str, q: &str) -> Result<String, String> {
+    let err = |e: sqlx::Error| format!("search chats: {e}");
+    if !q.is_empty() {
+        let like = format!("%{}%", escape_like(q));
+        let hit: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE chat_id = $1 AND content LIKE $2 ESCAPE '\\' ORDER BY idx LIMIT 1",
+        )
+        .bind(chat_id)
+        .bind(&like)
+        .fetch_optional(pool)
+        .await
+        .map_err(err)?;
+        if let Some(c) = hit.filter(|c| !c.trim().is_empty()) {
+            return Ok(excerpt(&c, q));
+        }
+    }
+    let first: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE chat_id = $1 AND role = 'user' ORDER BY idx LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(err)?;
+    let first = match first.filter(|c| !c.trim().is_empty()) {
+        Some(c) => Some(c),
+        None => sqlx::query_scalar("SELECT content FROM messages WHERE chat_id = $1 ORDER BY idx LIMIT 1")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(err)?,
+    };
+    Ok(excerpt(first.as_deref().unwrap_or(""), ""))
+}
+
+async fn chat_hit(pool: &SqlitePool, r: &sqlx::sqlite::SqliteRow, q: &str) -> Result<Value, String> {
+    let id: String = r.try_get("id").unwrap_or_default();
+    let created: i64 = r.try_get("created_at").unwrap_or(0);
+    Ok(json!({
+        "id": id,
+        "title": r.try_get::<String, _>("title").unwrap_or_default(),
+        "updatedAt": r.try_get::<Option<i64>, _>("updated_at").ok().flatten().unwrap_or(created),
+        "mode": if r.try_get::<Option<String>, _>("mode").ok().flatten().as_deref() == Some("work") { "work" } else { "chat" },
+        "workspace": r.try_get::<Option<String>, _>("workspace").ok().flatten(),
+        "snippet": chat_snippet(pool, &r.try_get::<String, _>("id").unwrap_or_default(), q).await?,
+    }))
+}
+
+const HIT_COLS: &str = "id, title, created_at, updated_at, mode, workspace";
+
+/// Lightweight cross-host search used by the Cmd+P palette of another window:
+/// chats whose id, title or message text matches `query`, plus the chats named
+/// by `ids` (a pasted session link). Display rows only — no message bodies.
+pub async fn search_chats(pool: &SqlitePool, query: &str, ids: &[String], limit: i64) -> Result<Value, String> {
+    let limit = limit.clamp(1, 50);
+    let err = |e: sqlx::Error| format!("search chats: {e}");
+    let q = query.trim();
+    let mut hits: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for id in ids.iter().take(10) {
+        let row = sqlx::query(&format!("SELECT {HIT_COLS} FROM chats WHERE lower(id) = lower($1)"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(err)?;
+        if let Some(r) = row {
+            let hit = chat_hit(pool, &r, "").await?;
+            seen.push(hit["id"].as_str().unwrap_or_default().to_string());
+            hits.push(hit);
+        }
+    }
+    if !q.is_empty() {
+        let like = format!("%{}%", escape_like(q));
+        let rows = sqlx::query(&format!(
+            "SELECT {HIT_COLS} FROM chats c WHERE c.id LIKE $1 ESCAPE '\\' OR c.title LIKE $1 ESCAPE '\\' \
+             OR EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.content LIKE $1 ESCAPE '\\') \
+             ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $2"
+        ))
+        .bind(&like)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(err)?;
+        for r in &rows {
+            let id: String = r.try_get("id").unwrap_or_default();
+            if seen.contains(&id) {
+                continue;
+            }
+            hits.push(chat_hit(pool, r, q).await?);
+            seen.push(id);
+        }
+    }
+    Ok(Value::Array(hits))
+}
+
 /// Merge the frontend's save payload (same shape as `chats_save`).
 pub async fn merge_json(pool: &SqlitePool, chats: &Value, deleted: Vec<String>) -> Result<(), String> {
     merge_chats(pool, parse_rows(chats)?, deleted).await
@@ -234,6 +364,43 @@ mod tests {
         merge_chats(&pool, vec![], vec!["b".into()]).await.unwrap();
         let all = load_chats(&pool).await.unwrap();
         assert_eq!(all.as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_finds_titles_ids_and_message_text() {
+        let dir = std::env::temp_dir().join(format!("vicuna-server-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = open(&dir.join("vicuna.db")).await.unwrap();
+        merge_chats(
+            &pool,
+            parse_rows(&json!([
+                row("id-alpha", "Deploy notes", &[("user", "the haystack needle lives here")]),
+                row("id-beta", "Groceries", &[("user", "milk and eggs")]),
+            ]))
+            .unwrap(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // title match
+        let hits = search_chats(&pool, "deploy", &[], 10).await.unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1, "{hits}");
+        assert_eq!(hits[0]["id"], "id-alpha");
+        assert_eq!(hits[0]["title"], "Deploy notes");
+        // message-text match carries an excerpt around the hit
+        let hits = search_chats(&pool, "NEEDLE", &[], 10).await.unwrap();
+        assert_eq!(hits[0]["id"], "id-alpha");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("needle"), "{hits}");
+        // pasted session id wins, even with no matching text
+        let hits = search_chats(&pool, "", &["ID-BETA".to_string()], 10).await.unwrap();
+        assert_eq!(hits[0]["id"], "id-beta");
+        assert_eq!(hits[0]["mode"], "work");
+        assert_eq!(hits[0]["workspace"], "/srv/p");
+        // LIKE wildcards are literal, not patterns
+        let hits = search_chats(&pool, "%", &[], 10).await.unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 0, "{hits}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

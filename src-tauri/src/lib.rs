@@ -4239,6 +4239,11 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 #[cfg(feature = "desktop")]
 #[tauri::command]
 async fn open_server_window(app: AppHandle, id: String, title: Option<String>) -> Result<(), String> {
+    open_server_window_impl(&app, &id, title.as_deref(), None)
+}
+
+#[cfg(feature = "desktop")]
+fn open_server_window_impl(app: &AppHandle, id: &str, title: Option<&str>, chat: Option<&str>) -> Result<(), String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("bad server id".into());
     }
@@ -4249,12 +4254,47 @@ async fn open_server_window(app: AppHandle, id: String, title: Option<String>) -
         w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
         return Ok(());
     }
-    let name = title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.clone());
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(format!("index.html?server={id}").into()))
+    let name = title.filter(|t| !t.trim().is_empty()).unwrap_or(id);
+    let mut url = format!("index.html?server={id}");
+    if let Some(c) = chat.filter(|c| !c.is_empty()) {
+        url.push_str(&format!("&chat={c}"));
+    }
+    tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App(url.into()))
         .title(format!("{} — {name}", app_title()))
         .inner_size(1200.0, 800.0)
         .build()
         .map_err(|e| format!("cannot open window: {e}"))?;
+    Ok(())
+}
+
+/// Open a session from the search palette on the host it lives on: raise that
+/// host's window (a server's own window, or the main window for This computer)
+/// and have it navigate to `chat_id`. A fresh server window gets `?chat=`, an
+/// already-open window (whose URL must not reload mid-turn) an event instead.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn open_chat_window(app: AppHandle, server_id: Option<String>, chat_id: String, title: Option<String>) -> Result<(), String> {
+    if chat_id.is_empty() || !chat_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("bad chat id".into());
+    }
+    let label = match server_id.as_deref() {
+        Some(id) => {
+            let label = format!("server-{id}");
+            if app.get_webview_window(&label).is_none() {
+                // fresh window: the URL carries the session, no event needed
+                return open_server_window_impl(&app, id, title.as_deref(), Some(&chat_id));
+            }
+            label
+        }
+        None => "main".to_string(),
+    };
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        w.show().map_err(|e| format!("cannot show window: {e}"))?;
+        w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
+    }
+    app.emit_to(label.as_str(), "vicuna-open-chat", serde_json::json!({ "chatId": chat_id }))
+        .map_err(|e| format!("cannot notify window: {e}"))?;
     Ok(())
 }
 
@@ -5512,6 +5552,7 @@ pub fn run() {
             git_apply,
             fs_list_dirs,
             open_server_window,
+            open_chat_window,
             server_list,
             server_connect,
             server_touch,
