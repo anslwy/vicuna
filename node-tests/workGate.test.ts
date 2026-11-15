@@ -3,7 +3,7 @@
 // which has no Node typings here; Node runs this file directly (type stripping).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workSendGate, opencodeModelChoices, workReplyModel, usageMeterTone, usageTabs, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
+import { workSendGate, opencodeModelChoices, workReplyModel, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
 
 const base: WorkEngineInfo = {
   installed: true,
@@ -221,4 +221,20 @@ test("usageMeterTone colors remaining vs used quotas consistently", () => {
   assert.equal(usageMeterTone(12, "used"), "ok");
   assert.equal(usageMeterTone(60, "used"), "warn");
   assert.equal(usageMeterTone(100, "used"), "low");
+});
+
+test("usageHoverRows lists meters, prefixes multi-group titles, falls back to stats", () => {
+  const meter = (label: string, percent: number, kind = "used") => ({ label, percent, kind, valueText: `${percent}% ${kind}`, resetText: "Resets 3pm" });
+  const single = usageHoverRows({ groups: [{ title: "Claude", meters: [meter("Session", 12), meter("Week", 90)] }], stats: [] });
+  assert.deepEqual(single.map((r) => [r.label, r.value, r.tone]), [["Session", "12% used", "ok"], ["Week", "90% used", "low"]]);
+  assert.equal(single[0].reset, "Resets 3pm");
+  const multi = usageHoverRows({ groups: [{ title: "Gemini", meters: [meter("Quota", 80, "remaining")] }, { title: "Claude", meters: [meter("Quota", 10, "remaining")] }], stats: [] });
+  assert.deepEqual(multi.map((r) => r.label), ["Gemini · Quota", "Claude · Quota"]);
+  // remaining quotas flip to used; the gauge shows the most-used one
+  assert.deepEqual(multi.map((r) => r.usedPct), [20, 90]);
+  assert.equal(usageGaugeFrac(single), 0.9);
+  assert.equal(usageGaugeFrac(multi), 0.9);
+  assert.equal(usageGaugeFrac([]), 0);
+  const stats = usageHoverRows({ groups: [], stats: [{ label: "Tokens", value: "1.2M" }] });
+  assert.deepEqual(stats, [{ label: "Tokens", value: "1.2M", reset: null, tone: null, usedPct: null }]);
 });

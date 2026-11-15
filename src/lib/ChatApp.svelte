@@ -36,7 +36,7 @@
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge } from "$lib/bridge";
@@ -1589,6 +1589,30 @@
   let usageError = $state<string | null>(null);
   let usageCache = $state<Record<string, WorkUsageReport>>({});
   let usageReqId = 0;
+  /** last report per engine for the header meter's hover text (kept across
+   *  modal opens, which wipe `usageCache`); refetched on hover after 60s */
+  let usageHoverCache = $state<Record<string, { report: WorkUsageReport | null; error: string | null; at: number }>>({});
+  let usageHoverLoading = $state<string | null>(null);
+
+  function rememberUsageHover(engine: string, report: WorkUsageReport | null, error: string | null) {
+    usageHoverCache = { ...usageHoverCache, [engine]: { report, error, at: Date.now() } };
+  }
+
+  async function primeUsageHover() {
+    const engine = usageHoverEngine;
+    if (!engine || usageHoverLoading === engine || usageLoading) return;
+    const hit = usageHoverCache[engine];
+    if (hit && Date.now() - hit.at < 60_000) return;
+    usageHoverLoading = engine;
+    try {
+      const res = await fetchWorkUsage(engine);
+      rememberUsageHover(engine, res, res.error);
+    } catch (e) {
+      rememberUsageHover(engine, null, e instanceof Error ? e.message : String(e));
+    } finally {
+      if (usageHoverLoading === engine) usageHoverLoading = null;
+    }
+  }
 
   function closeUsageModal() {
     usageOpen = false;
@@ -1610,6 +1634,7 @@
     try {
       const res = await fetchWorkUsage(engine);
       usageCache = { ...usageCache, [engine]: res };
+      rememberUsageHover(engine, res, res.error);
       if (!usageOpen || usageReqId !== reqId) return;
       usageReport = res;
       if (res.error) usageError = res.error;
@@ -1928,6 +1953,8 @@
   }
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
   const workEngines = $derived(workEngineChoices(workEngineInfo));
+  /** quota harness the header meter icon summarizes (null hides the icon) */
+  const usageHoverEngine = $derived(usageTabs(workEngines, engineId(workEngineInfo)).initial);
   /** Send gate: no engine → Work send disabled with the install hint. */
   const workGate = $derived(
     workEngineChecked && workEngineInfo === null
@@ -4779,7 +4806,6 @@
   const SLASH_COMMANDS = [
     { name: "compact", desc: "Summarize older messages into one note to free context" },
     { name: "goal", desc: "Set, show, pause, resume or clear the session objective", takesArgs: true },
-    { name: "usage", desc: "Show quota and usage for the active Work harness" },
     { name: "undo", desc: "Remove the last turn and revert its file changes" },
     { name: "redo", desc: "Re-apply the turn most recently undone" }
   ];
@@ -5133,7 +5159,6 @@
       return;
     }
     if (cmd === "compact") void compactSession();
-    if (cmd === "usage") void openUsageModal();
     if (cmd === "undo") void undoSession();
     if (cmd === "redo") void redoSession();
   }
@@ -7983,6 +8008,47 @@
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
           <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
+          <span class="hdr-meters">
+          {#if usageHoverEngine}
+            {@const hov = usageHoverCache[usageHoverEngine]}
+            {@const hovLabel = workEngines.find((e) => e.id === usageHoverEngine)?.label ?? usageHoverEngine}
+            {@const hovRows = hov?.report && !hov.error ? usageHoverRows(hov.report) : []}
+            {@const gauge = usageGaugeFrac(hovRows)}
+            <span class="ctx-wrap usage-wrap">
+              <!-- same 18px / r=7 / 2.5 stroke as the context ring, but a 270° gauge arc (gap at the bottom) filled by the most-used quota -->
+              <button class="usage-meter-btn" data-testid="usage-meter-btn" aria-label={`${hovLabel} usage${hovRows.length ? ` ${Math.round(gauge * 100)}%` : ""}`} onmouseenter={() => void primeUsageHover()} onfocus={() => void primeUsageHover()} onclick={() => void openUsageModal()}>
+                <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                  <circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-2)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="33 44" transform="rotate(135 9 9)" />
+                  {#if gauge > 0}
+                    <circle cx="9" cy="9" r="7" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray={`${(gauge * 33).toFixed(1)} 44`} transform="rotate(135 9 9)" />
+                  {/if}
+                </svg>
+              </button>
+              <span class="ctx-popup usage-hover" data-testid="usage-hover">
+                <span class="usage-hover-head">{hovLabel}{hov?.report?.plan ? ` · ${hov.report.plan}` : ""}</span>
+                {#if hov?.report && !hov.error}
+                  {#each hovRows as r}
+                    <span class="usage-hover-row">
+                      <span class="usage-hover-line"><span class="usage-hover-label" title={r.label}>{r.label}</span><span class="usage-hover-val {r.tone ? `usage-tone-${r.tone}` : ''}">{r.value}</span></span>
+                      {#if r.usedPct !== null}
+                        <span class="usage-hover-bar"><span class="usage-hover-fill {r.tone ?? ''}" style="width: {r.usedPct}%"></span></span>
+                      {/if}
+                      {#if r.reset}<span class="usage-hover-reset">{r.reset}</span>{/if}
+                    </span>
+                  {:else}
+                    <span class="usage-hover-note">{hov.report.note ?? "No usage reported"}</span>
+                  {/each}
+                {:else if usageHoverLoading === usageHoverEngine}
+                  <span class="usage-hover-note">Fetching usage…</span>
+                {:else if hov?.error}
+                  <span class="usage-hover-note">{hov.error}</span>
+                {:else}
+                  <span class="usage-hover-note">Hover to load usage</span>
+                {/if}
+                <span class="usage-hover-hint">Click for details</span>
+              </span>
+            </span>
+          {/if}
           {#if workCtx}
             {@const pct = Math.round(workCtx.frac * 100)}
             <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
@@ -7997,6 +8063,7 @@
               </span>
             </span>
           {/if}
+          </span>
         </div>
         {#if goalNow || goalPromptSession === activeId}
           {@const goalLive = goalNow && activeWorkRunning}
@@ -11011,7 +11078,27 @@
   .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
-  .ctx-wrap { position: relative; margin-left: auto; display: inline-flex; cursor: default; }
+  .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+  .ctx-wrap { position: relative; display: inline-flex; cursor: default; }
+  .usage-meter-btn { display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; background: none; cursor: pointer; }
+  .usage-meter-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 50%; }
+  .usage-hover { width: 320px; padding: 12px 16px; }
+  .usage-hover-head { display: block; font-size: 13px; font-weight: 600; color: var(--text); padding-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .usage-hover-row { display: block; padding: 6px 0; }
+  .usage-hover-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 13px; }
+  .usage-hover-label { color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .usage-hover-val { white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0; color: var(--text); }
+  .usage-hover-bar { display: block; height: 4px; margin-top: 5px; border-radius: 2px; background: var(--border-2); overflow: hidden; }
+  .usage-hover-fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
+  .usage-hover-fill.ok { background: #16a34a; }
+  .usage-hover-fill.warn { background: #b45309; }
+  .usage-hover-fill.low { background: var(--danger); }
+  .usage-hover-reset { display: block; font-size: 11px; color: var(--muted-2); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .usage-hover-note { display: block; font-size: 12px; color: var(--muted-2); padding: 2px 0; max-width: 280px; }
+  .usage-hover-hint { display: block; font-size: 11px; color: var(--muted-2); border-top: 1px solid var(--border-2); margin-top: 6px; padding-top: 6px; }
+  .usage-tone-ok { color: #15803d; }
+  .usage-tone-warn { color: #b45309; }
+  .usage-tone-low { color: var(--danger); }
   .ctx-popup { display: none; position: absolute; right: 0; top: calc(100% + 8px); background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px 14px; z-index: 30; min-width: 170px; }
   .ctx-wrap:hover .ctx-popup, .ctx-wrap:focus-within .ctx-popup { display: block; }
   .ctx-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; color: var(--text); padding: 2px 0; font-variant-numeric: tabular-nums; }

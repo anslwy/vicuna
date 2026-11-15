@@ -8,7 +8,7 @@ import { isTauriRuntime } from "./ollama";
 import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
-export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, usageMeterTone, usageTabs } from "./workGate";
+export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac } from "./workGate";
 export type { WorkEngineInfo, OpencodeModel, OpencodeModels, EngineSummary } from "./workGate";
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {

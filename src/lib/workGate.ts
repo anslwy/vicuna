@@ -104,11 +104,11 @@ export function workReplyModel(
   return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" || engine === "pi" ? `${engine}/${p}` : p;
 }
 
-/** Harnesses whose /usage popup shows a subscription quota. OpenCode and pi
+/** Harnesses whose usage popup shows a subscription quota. OpenCode and pi
  *  only have local stats (or nothing), so they get no tab. */
 export const USAGE_ENGINES = ["claude", "codex", "agy"] as const;
 
-/** Installed quota harnesses for the /usage tabs, plus the tab to open on:
+/** Installed quota harnesses for the usage popup tabs, plus the tab to open on:
  *  the active engine when it has a quota, else the first installed one
  *  (null when none is installed). */
 export function usageTabs<T extends { id: string; installed: boolean }>(
@@ -118,6 +118,38 @@ export function usageTabs<T extends { id: string; installed: boolean }>(
   const tabs = engines.filter((e) => e.installed && (USAGE_ENGINES as readonly string[]).includes(e.id));
   const initial = tabs.some((e) => e.id === active) ? active : (tabs[0]?.id ?? null);
   return { tabs, initial };
+}
+
+/** Text rows for the header meter icon's hover popup: one row per quota
+ *  meter (prefixed with its group title when the report has several groups,
+ *  e.g. agy's per-model quotas), falling back to the plain stats when the
+ *  harness reported no meters. */
+export function usageHoverRows(report: {
+  groups: { title: string; meters: { label: string; valueText: string; resetText: string | null; percent: number; kind: string }[] }[];
+  stats: { label: string; value: string }[];
+}): { label: string; value: string; reset: string | null; tone: "ok" | "warn" | "low" | null; usedPct: number | null }[] {
+  const multi = report.groups.filter((g) => g.meters.length).length > 1;
+  const rows = report.groups.flatMap((g) =>
+    g.meters.map((m) => {
+      const pct = Math.max(0, Math.min(100, Number.isFinite(m.percent) ? m.percent : 0));
+      return {
+        label: multi && g.title ? `${g.title} · ${m.label}` : m.label,
+        value: m.valueText,
+        reset: m.resetText,
+        tone: usageMeterTone(m.percent, m.kind) as "ok" | "warn" | "low" | null,
+        usedPct: (m.kind === "remaining" ? 100 - pct : pct) as number | null,
+      };
+    }),
+  );
+  if (rows.length) return rows;
+  return report.stats.map((s) => ({ label: s.label, value: s.value, reset: null, tone: null, usedPct: null }));
+}
+
+/** Fill (0–1) for the header meter icon: the most-used quota, since that is
+ *  the one that runs out first. 0 when nothing was reported. */
+export function usageGaugeFrac(rows: { usedPct: number | null }[]): number {
+  const used = rows.map((r) => r.usedPct).filter((p): p is number => p !== null);
+  return used.length ? Math.max(...used) / 100 : 0;
 }
 
 /** Visual tone for a usage/quota bar: green ("ok") when plenty of headroom
