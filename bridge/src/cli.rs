@@ -24,27 +24,53 @@ fn run_ok(cmd: &mut Command) -> Result<String, String> {
 
 // ---------------------------------------------------------------- tailscale
 
-/// The tailscale CLI: PATH first, then the usual install spots (SteamOS keeps
-/// it in /opt/tailscale; the macOS app ships the CLI inside the bundle).
-fn tailscale_bin() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("tailscale");
-            if p.is_file() {
-                return Some(p);
-            }
-        }
+const TAILSCALE_SPOTS: &[&str] = &[
+    "/opt/tailscale/tailscale",
+    "/usr/bin/tailscale",
+    "/usr/local/bin/tailscale",
+    "/usr/sbin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+];
+
+/// Where distrobox/toolbox mount the host's filesystem inside a container.
+const HOST_ROOT: &str = "/run/host";
+
+const TAILSCALE_SOCKETS: &[&str] = &["/run/tailscale/tailscaled.sock", "/var/run/tailscale/tailscaled.sock"];
+
+/// The tailscale CLI and, when the daemon's socket is only reachable through
+/// the host mount, an explicit `--socket`. PATH first, then the usual install
+/// spots (SteamOS keeps it in /opt/tailscale; the macOS app ships the CLI
+/// inside the bundle), then the same spots under `/run/host`: inside a
+/// distrobox/toolbox container the host's tailscale isn't on the container's
+/// filesystem, but the host root is mounted there (SteamOS + distrobox, hit
+/// live). `exists` is injected for tests.
+fn find_tailscale(path_env: Option<&std::ffi::OsStr>, exists: impl Fn(&Path) -> bool) -> Option<(PathBuf, Option<PathBuf>)> {
+    let on_path = path_env.into_iter().flat_map(std::env::split_paths).map(|d| d.join("tailscale"));
+    let spots = TAILSCALE_SPOTS.iter().map(PathBuf::from);
+    let host = TAILSCALE_SPOTS.iter().map(|s| Path::new(HOST_ROOT).join(s.trim_start_matches('/')));
+    let bin = on_path.chain(spots).chain(host).find(|p| exists(p))?;
+    // the CLI's default socket paths; distrobox usually links them to the
+    // host's, but a plain container may not
+    let socket = if TAILSCALE_SOCKETS.iter().any(|s| exists(Path::new(s))) {
+        None
+    } else {
+        TAILSCALE_SOCKETS
+            .iter()
+            .map(|s| Path::new(HOST_ROOT).join(s.trim_start_matches('/')))
+            .find(|p| exists(p))
+    };
+    Some((bin, socket))
+}
+
+/// `tailscale [--socket=…] <args>` for the CLI found by `find_tailscale`.
+fn tailscale_cmd(ts: &(PathBuf, Option<PathBuf>), args: &[&str]) -> Command {
+    let mut c = Command::new(&ts.0);
+    if let Some(sock) = &ts.1 {
+        c.arg(format!("--socket={}", sock.display()));
     }
-    [
-        "/opt/tailscale/tailscale",
-        "/usr/bin/tailscale",
-        "/usr/local/bin/tailscale",
-        "/opt/homebrew/bin/tailscale",
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
+    c.args(args);
+    c
 }
 
 /// Pick the HTTPS port: one already proxying to us (idempotent restarts), else
@@ -80,13 +106,17 @@ pub fn pick_https_port(status: &serde_json::Value, backend_port: u16, wanted: Op
 /// `tailscale serve --bg --https=<p> http://127.0.0.1:<port>` and return the
 /// tailnet URL. Errors carry a hint for the usual permission problem.
 pub fn tailscale_expose(backend_port: u16, wanted: Option<u16>) -> Result<String, String> {
-    let ts = tailscale_bin().ok_or("tailscale is not installed (https://tailscale.com/download)")?;
-    let status: serde_json::Value = run_ok(Command::new(&ts).args(["serve", "status", "--json"]))
+    let path_env = std::env::var_os("PATH");
+    let ts = find_tailscale(path_env.as_deref(), |p| p.exists()).ok_or(
+        "tailscale is not installed (https://tailscale.com/download). In a container, install it on the host; \
+         Vicuna also looks under /run/host",
+    )?;
+    let status: serde_json::Value = run_ok(&mut tailscale_cmd(&ts, &["serve", "status", "--json"]))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
     let https = pick_https_port(&status, backend_port, wanted);
-    run_ok(Command::new(&ts).args(["serve", "--bg", &format!("--https={https}"), &format!("http://127.0.0.1:{backend_port}")]))
+    run_ok(&mut tailscale_cmd(&ts, &["serve", "--bg", &format!("--https={https}"), &format!("http://127.0.0.1:{backend_port}")]))
         .map_err(|e| {
             if e.to_lowercase().contains("access denied") || e.to_lowercase().contains("operator") {
                 format!("{e}\n  fix: sudo tailscale set --operator=$USER   (then run this again)")
@@ -94,7 +124,7 @@ pub fn tailscale_expose(backend_port: u16, wanted: Option<u16>) -> Result<String
                 e
             }
         })?;
-    let me: serde_json::Value = run_ok(Command::new(&ts).args(["status", "--self", "--json"]))
+    let me: serde_json::Value = run_ok(&mut tailscale_cmd(&ts, &["status", "--self", "--json"]))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
@@ -242,6 +272,27 @@ pub fn open_in_app(path: Option<&str>) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tailscale_found_on_path_spots_or_host_mount() {
+        let has = |set: &'static [&'static str]| move |p: &Path| set.iter().any(|s| Path::new(s) == p);
+        // PATH wins
+        let path = std::ffi::OsString::from("/x/bin:/y/bin");
+        let (bin, sock) = find_tailscale(Some(&path), has(&["/y/bin/tailscale", "/opt/tailscale/tailscale", "/run/tailscale/tailscaled.sock"])).unwrap();
+        assert_eq!(bin, PathBuf::from("/y/bin/tailscale"));
+        assert_eq!(sock, None);
+        // SteamOS host
+        let (bin, _) = find_tailscale(None, has(&["/opt/tailscale/tailscale", "/run/tailscale/tailscaled.sock"])).unwrap();
+        assert_eq!(bin, PathBuf::from("/opt/tailscale/tailscale"));
+        // distrobox on SteamOS: CLI only under /run/host, socket already linked
+        let (bin, sock) = find_tailscale(Some(&path), has(&["/run/host/opt/tailscale/tailscale", "/run/tailscale/tailscaled.sock"])).unwrap();
+        assert_eq!(bin, PathBuf::from("/run/host/opt/tailscale/tailscale"));
+        assert_eq!(sock, None);
+        // plain container: socket only through the host mount
+        let (_, sock) = find_tailscale(None, has(&["/run/host/usr/bin/tailscale", "/run/host/run/tailscale/tailscaled.sock"])).unwrap();
+        assert_eq!(sock, Some(PathBuf::from("/run/host/run/tailscale/tailscaled.sock")));
+        assert!(find_tailscale(Some(&path), has(&[])).is_none());
+    }
 
     #[test]
     fn https_port_reuses_ours_else_first_free() {
