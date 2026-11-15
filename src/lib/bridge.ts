@@ -12,6 +12,7 @@
 // When none is present the call fails with the usual desktop error.
 
 import { isTauriRuntime } from "./ollama";
+import { searchLoadedChats, type LoadedChat } from "./serverSearch";
 
 // ---- remote server selection (desktop only) ----
 
@@ -69,6 +70,7 @@ const LOCAL_CMDS = new Set([
   "tray_set_status",
   "server_list",
   "open_server_window",
+  "open_chat_window",
   "server_connect",
   "server_touch",
   "server_remove"
@@ -269,4 +271,90 @@ export async function touchServer(id: string): Promise<void> {
 export async function removeServer(id: string): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("server_remove", { id });
+}
+
+/** One cross-host search hit, shaped for the Cmd+P palette (no message bodies). */
+export interface ServerChatHit {
+  id: string;
+  title: string;
+  snippet: string;
+  updatedAt: number;
+  mode: string;
+  workspace: string | null;
+}
+
+/** One cross-host search result: the rows, plus `degraded` when the server
+ *  runs an older Vicuna without `server_search_chats` and the list was
+ *  searched from its `chats_load` payload instead. */
+export interface ServerSearchResult {
+  hits: ServerChatHit[];
+  degraded: boolean;
+}
+
+/** `chats_load` payloads cached per server for a short while: the fallback
+ *  below downloads every session, and the palette queries on each keystroke. */
+const loadedChatsCache = new Map<string, { at: number; chats: LoadedChat[] }>();
+const loadedChatsInFlight = new Map<string, Promise<LoadedChat[]>>();
+const LOADED_CHATS_TTL = 30_000;
+
+async function loadServerChats(invoke: any, id: string): Promise<LoadedChat[]> {
+  const hit = loadedChatsCache.get(id);
+  if (hit && Date.now() - hit.at < LOADED_CHATS_TTL) return hit.chats;
+  const running = loadedChatsInFlight.get(id);
+  if (running) return running;
+  const p = (async () => {
+    try {
+      const r = await invoke("server_call", {
+        id,
+        path: "/invoke",
+        body: { cmd: "chats_load", args: {} },
+        timeoutMs: 20_000
+      });
+      if (!r?.ok) throw new Error(r?.error ?? "could not load that server's sessions");
+      const chats = (r.data ?? []) as LoadedChat[];
+      loadedChatsCache.set(id, { at: Date.now(), chats });
+      return chats;
+    } finally {
+      loadedChatsInFlight.delete(id);
+    }
+  })();
+  loadedChatsInFlight.set(id, p);
+  return p;
+}
+
+/** Search a connected server's sessions (title/id/message text, plus the
+ *  chats named by `ids` for a pasted link). Desktop only: other windows are
+ *  the only place a server's chats are not already loaded.
+ *
+ *  A server whose `vicuna serve` predates `server_search_chats` still answers
+ *  `chats_load`, so the same search runs over that payload locally and the
+ *  result is flagged `degraded` (works, just slower + a stale list). */
+export async function searchServerChats(
+  id: string,
+  query: string,
+  ids: string[],
+  limit = 6
+): Promise<ServerSearchResult> {
+  if (!isTauriRuntime()) return { hits: [], degraded: false };
+  const { invoke } = await import("@tauri-apps/api/core");
+  const r = await invoke<any>("server_call", {
+    id,
+    path: "/invoke",
+    body: { cmd: "server_search_chats", args: { query, ids, limit } },
+    timeoutMs: 5000
+  });
+  if (r?.ok) return { hits: (r.data ?? []) as ServerChatHit[], degraded: false };
+  const err = String(r?.error ?? "search failed on the server");
+  if (!/unknown (bridge )?command/i.test(err)) throw new Error(err);
+  // the old server has no such command — search its session list instead
+  const chats = await loadServerChats(invoke, id);
+  return { hits: searchLoadedChats(chats, query, ids, limit), degraded: true };
+}
+
+/** Raise the window that owns a host (a server's own window, or the main
+ *  window for This computer) and open `chatId` there. */
+export async function openChatInWindow(serverId: string | null, chatId: string): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("Opening a session on another host needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_chat_window", { serverId, chatId, title: null });
 }

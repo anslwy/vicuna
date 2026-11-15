@@ -423,6 +423,13 @@ async fn dispatch(
             vicuna_lib::server_store::merge_json(db, &chats, arg_str_list(args, "deleted")).await?;
             Ok(serde_json::Value::Null)
         }
+        // cross-host Cmd+P: another window searches this server's sessions
+        "server_search_chats" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
+            let query = arg_opt_str(args, "query").unwrap_or_default();
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+            vicuna_lib::server_store::search_chats(db, &query, &arg_str_list(args, "ids"), limit).await
+        }
         "git_apply" => {
             let b = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
             vicuna_lib::git_panel::git_apply_logic(

@@ -40,7 +40,8 @@
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, type ServerInfo } from "$lib/bridge";
+  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
@@ -2431,6 +2432,17 @@
   // chat list and Work turns then live on that machine. Constant per load.
   const onServer = isRemoteServer();
   const activeServer = activeServerId();
+  /** `?chat=<id>`: this window was opened on a session from the Cmd+P palette
+   *  (a server window gets the session in its URL; read before navigation
+   *  rewrites it). */
+  const launchChatId: string | null = (() => {
+    try {
+      const id = new URLSearchParams(window.location.search).get("chat");
+      return id && /^[A-Za-z0-9_-]+$/.test(id) ? id : null;
+    } catch {
+      return null;
+    }
+  })();
   let srvList = $state<ServerInfo[]>([]);
   let srvMenuOpen = $state(false);
   let srvDialogOpen = $state(false);
@@ -2945,6 +2957,8 @@
     gotoError = null;
     gotoSel = 0;
     gotoOpen = true;
+    // fresh host list: a pasted link is looked up on every connected server
+    void refreshServers();
   }
 
   function closeGoto() {
@@ -2952,16 +2966,30 @@
     gotoInput = "";
     gotoError = null;
     gotoSel = 0;
+    if (remoteTimer) {
+      clearTimeout(remoteTimer);
+      remoteTimer = null;
+    }
+    remoteKey = "";
+    remotePending = null;
+    remoteResolve?.();
+    remoteResolve = null;
+    remoteHits = [];
+    remoteSearching = false;
+    remoteFailures = [];
+    remoteNotices = [];
   }
 
   // search modal: filter sessions by title, message text, or id substring.
-  // A pasted session id/link still resolves directly via gotoIdHit.
+  // A pasted session id/link resolves directly via gotoIdHit AND is looked up
+  // on every connected server (searchServerChats), so a link that belongs to
+  // another machine still lands in the palette, labelled with its host.
   const searchQuery = $derived(gotoInput.trim());
   const searchQueryLow = $derived(searchQuery.toLowerCase());
+  const gotoSessionId = $derived(sessionIdIn(gotoInput));
   const gotoIdHit = $derived.by((): { id: string; chat: Chat | null } | null => {
-    const m = gotoInput.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-    if (!m) return null;
-    const id = m[0].toLowerCase();
+    if (!gotoSessionId) return null;
+    const id = gotoSessionId;
     return { id, chat: chats.find((c) => c.id.toLowerCase() === id) ?? null };
   });
   const searchResults = $derived.by((): Chat[] => {
@@ -2974,21 +3002,102 @@
       return c.messages.some((m) => m.content.toLowerCase().includes(q));
     }).slice(0, 20);
   });
-  type SearchItem = { kind: "new" } | { kind: "chat"; chat: Chat };
+  /** connected hosts whose chats are NOT loaded in this window */
+  const remoteTargets = $derived(srvList.filter((s) => s.id !== activeServer));
+  type RemoteHit = ServerChatHit & { serverId: string; serverName: string };
+  let remoteHits = $state<RemoteHit[]>([]);
+  let remoteSearching = $state(false);
+  let remoteFailures = $state<{ serverName: string; message: string }[]>([]);
+  let remoteNotices = $state<string[]>([]);
+  let remoteKey = "";
+  let remoteTimer: ReturnType<typeof setTimeout> | null = null;
+  let remotePending: Promise<void> | null = null;
+  let remoteResolve: (() => void) | null = null;
+  type SearchItem =
+    | { kind: "new" }
+    | { kind: "chat"; chat: Chat }
+    | { kind: "remote"; hit: RemoteHit };
   const searchItems = $derived.by((): SearchItem[] => {
-    const items: SearchItem[] = [{ kind: "new" }];
+    const rows: SearchItem[] = [];
     const seen = new Set<string>();
-    // a pasted session link surfaces its session first, even though the raw
-    // link text matches nothing
+    // a pasted session link surfaces its local session first, even though the
+    // raw link text matches nothing
     if (gotoIdHit?.chat) {
-      items.push({ kind: "chat", chat: gotoIdHit.chat });
+      rows.push({ kind: "chat", chat: gotoIdHit.chat });
       seen.add(gotoIdHit.chat.id);
     }
     for (const c of searchResults) {
       if (seen.has(c.id)) continue;
-      items.push({ kind: "chat", chat: c });
+      rows.push({ kind: "chat", chat: c });
     }
-    return items;
+    for (const h of remoteHits) rows.push({ kind: "remote", hit: h });
+    // matches first: the keyboard cursor starts at 0, so a query needs no
+    // arrow-key walk (paste a link → Enter)
+    return orderPaletteRows(rows, searchQuery);
+  });
+  const searchShowHosts = $derived(showHostLabels(onServer, remoteHits.length));
+
+  // ask the other connected hosts on every query change (debounced), and by
+  // session id alone when a link was pasted into the box
+  $effect(() => {
+    if (!gotoOpen) return;
+    const { ids, text } = remoteQueryFor(searchQuery, gotoSessionId);
+    const targets = remoteTargets;
+    const key = `${ids.join(",")}|${text}|${targets.map((t) => t.id).join(",")}`;
+    if (key === remoteKey) return;
+    remoteKey = key;
+    if (remoteTimer) {
+      clearTimeout(remoteTimer);
+      remoteTimer = null;
+    }
+    // a superseded lookup answers at once so an Enter waiting on it moves on
+    remoteResolve?.();
+    remoteResolve = null;
+    remoteHits = [];
+    remoteSearching = false;
+    remoteFailures = [];
+    remoteNotices = [];
+    remotePending = null;
+    if (!targets.length || (!ids.length && !text)) return;
+    remoteSearching = true;
+    const wait = ids.length ? 0 : 260;
+    remotePending = new Promise<void>((resolve) => {
+      remoteResolve = resolve;
+      remoteTimer = setTimeout(async () => {
+        const failures: { serverName: string; message: string }[] = [];
+        const notices: string[] = [];
+        const found = await Promise.all(
+          targets.map(async (sv) => {
+            try {
+              const { hits, degraded } = await searchServerChats(sv.id, text, ids, 6);
+              // an older `vicuna serve` has no server_search_chats; the list
+              // search above still answers, so say how the rows were found
+              if (degraded) notices.push(sv.name);
+              return hits.map((h) => ({ ...h, serverId: sv.id, serverName: sv.name }));
+            } catch (e: any) {
+              // shown under the rows: a silent empty result is indistinguishable
+              // from "this session is nowhere"
+              failures.push({
+                serverName: sv.name,
+                message: describeServerSearchError(typeof e === "string" ? e : (e?.message ?? String(e)))
+              });
+              return [] as RemoteHit[];
+            }
+          })
+        );
+        remoteTimer = null;
+        remoteResolve = null;
+        if (remoteKey !== key) {
+          resolve();
+          return;
+        }
+        remoteHits = found.flat();
+        remoteFailures = failures;
+        remoteNotices = notices;
+        remoteSearching = false;
+        resolve();
+      }, wait);
+    });
   });
 
   // excerpt centered on the first content match (or the opening message)
@@ -3020,14 +3129,43 @@
   }
 
   function openSearchItem(it: SearchItem) {
+    if (it.kind === "remote") {
+      void openRemoteHit(it.hit);
+      return;
+    }
     closeGoto();
     if (it.kind === "new") newChat();
     else selectChat(it.chat.id);
   }
 
-  function submitSearch() {
-    if (gotoIdHit && !gotoIdHit.chat) {
-      gotoError = "No chat found for that session.";
+  /** A hit on another host: raise that host's window on the session. The
+   *  palette's own window keeps whatever it was doing. */
+  async function openRemoteHit(hit: RemoteHit) {
+    closeGoto();
+    try {
+      await openChatInWindow(hit.serverId, hit.id);
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
+  }
+
+  async function submitSearch() {
+    // a pasted link may still be resolving on the connected servers
+    if (remotePending) {
+      try {
+        await remotePending;
+      } catch {
+        /* an offline host just contributes no rows */
+      }
+    }
+    if (gotoIdHit && !gotoIdHit.chat && !remoteHits.some((h) => h.id === gotoIdHit.id)) {
+      if (remoteFailures.length) {
+        gotoError = `No session with that link here — ${remoteFailures.map((f) => f.serverName).join(", ")} couldn't be searched.`;
+      } else {
+        gotoError = remoteTargets.length
+          ? "No session with that link here or on your connected servers."
+          : "No chat found for that session.";
+      }
       return;
     }
     const it = searchItems[Math.min(gotoSel, searchItems.length - 1)];
@@ -3047,7 +3185,7 @@
       gotoSel = (gotoSel - 1 + searchItems.length) % searchItems.length;
     } else if (e.key === "Enter") {
       e.preventDefault();
-      submitSearch();
+      void submitSearch();
     } else if (e.key === "Escape") {
       e.preventDefault();
       closeGoto();
@@ -3171,6 +3309,8 @@
   // the deep-link plugin; navigate once chats are loaded, stash until then
   let pendingDeepLinkId: string | null = null;
   let pendingDeepLinkPath: string | null = null;
+  /** a session handed to this (already loaded) window by the search palette */
+  let pendingOpenChatId: string | null = null;
   function extractSessionId(urls: string[]): string | null {
     for (const u of urls) {
       const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
@@ -7659,6 +7799,28 @@
         })
         .catch(() => {});
     }
+    // the Cmd+P palette in another window can hand this one a session
+    // (open_chat_window → emit_to; a fresh window gets ?chat= instead)
+    let unlistenOpenChat: (() => void) | null = null;
+    if (isTauriRuntime()) {
+      void import("@tauri-apps/api/event")
+        .then(({ listen }) =>
+          listen<{ chatId?: string }>("vicuna-open-chat", (ev) => {
+            const id = ev.payload?.chatId;
+            if (!id) return;
+            if (!ready) {
+              pendingOpenChatId = id;
+              return;
+            }
+            if (chats.some((c) => c.id === id)) selectChat(id);
+            else flashNotice("That session isn't loaded in this window.");
+          })
+        )
+        .then((u) => {
+          unlistenOpenChat = u;
+        })
+        .catch(() => {});
+    }
     return () => {
       window.removeEventListener("beforeunload", handleUnload);
       window.removeEventListener("message", onBrowserFrameMessage);
@@ -7666,6 +7828,7 @@
       window.removeEventListener("pointercancel", onMessagesPointerUp);
       window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
+      unlistenOpenChat?.();
       unlistenQuit?.();
       unlistenMcpChanged?.();
       unlistenMcpWake?.();
@@ -7727,7 +7890,11 @@
         chats = chats.filter((c) => c.messages.length > 0);
         save();
       }
-      if (sessionId) {
+      if (launchChatId && chats.some((c) => c.id === launchChatId)) {
+        // opened from the Cmd+P palette on another host: this session wins
+        // over the last one (navigate and let the route effect activate it)
+        void goto(`/s/${launchChatId}`);
+      } else if (sessionId) {
         // deep link: only open the chat named in the URL
         if (chats.some((c) => c.id === sessionId)) {
           activeId = sessionId;
@@ -7759,6 +7926,12 @@
         const p = pendingDeepLinkPath;
         pendingDeepLinkPath = null;
         await openWorkspacePath(p);
+      }
+      // the palette handed this window a session before chats finished loading
+      if (pendingOpenChatId) {
+        const id = pendingOpenChatId;
+        pendingOpenChatId = null;
+        if (chats.some((c) => c.id === id)) void goto(`/s/${id}`);
       }
       // restore the unsent composer text (one global box, not per session)
       input = readDraft(null);
@@ -10247,7 +10420,7 @@
       {/if}
     </div>
     <div class="search-results" data-testid="search-results" role="listbox" aria-label="Matching chats">
-      {#each searchItems as it, idx (it.kind === "new" ? "new" : it.chat.id)}
+      {#each searchItems as it, idx (it.kind === "new" ? "new" : it.kind === "chat" ? it.chat.id : `${it.hit.serverId}:${it.hit.id}`)}
         {#if it.kind === "new"}
           <button
             class="search-row {idx === gotoSel ? 'sel' : ''}"
@@ -10266,14 +10439,27 @@
             role="option"
             aria-selected={idx === gotoSel}
             data-testid="search-result"
-            data-id={it.chat.id}
+            data-id={it.kind === "chat" ? it.chat.id : it.hit.id}
+            data-host={it.kind === "remote" ? it.hit.serverName : srvLabel}
+            data-remote={it.kind === "remote" ? "true" : undefined}
             onclick={() => openSearchItem(it)}
             onmousemove={() => (gotoSel = idx)}
           >
-            <span class="search-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg></span>
+            <span class="search-ico">
+              {#if it.kind === "remote"}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+              {:else}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg>
+              {/if}
+            </span>
             <span class="search-text">
-              <span class="search-title">{@html highlightHtml(it.chat.title, searchQuery)}</span>
-              <span class="search-snippet">{@html highlightHtml(searchSnippet(it.chat, searchQuery), searchQuery)}</span>
+              <span class="search-line">
+                <span class="search-title">{@html highlightHtml(it.kind === "chat" ? it.chat.title : it.hit.title, searchQuery)}</span>
+                {#if searchShowHosts}
+                  <span class="search-host" data-testid="search-host">{it.kind === "remote" ? it.hit.serverName : srvLabel}</span>
+                {/if}
+              </span>
+              <span class="search-snippet">{@html highlightHtml(it.kind === "chat" ? searchSnippet(it.chat, searchQuery) : it.hit.snippet, searchQuery)}</span>
             </span>
           </button>
         {/if}
@@ -10281,6 +10467,15 @@
         <div class="no-match">No matching chats</div>
       {/each}
     </div>
+    {#if remoteSearching}
+      <p class="search-note" data-testid="search-remote-note">Searching connected servers…</p>
+    {/if}
+    {#each remoteFailures as f (f.serverName + f.message)}
+      <p class="search-note search-fail" data-testid="search-remote-error">{f.serverName}: {f.message}</p>
+    {/each}
+    {#each remoteNotices as n (n)}
+      <p class="search-note search-old" data-testid="search-remote-degraded">{n}: older Vicuna there — searched its session list directly (update the CLI for a faster search)</p>
+    {/each}
     {#if gotoError}
       <p class="goto-error" data-testid="goto-error">{gotoError}</p>
     {/if}
@@ -10886,7 +11081,14 @@
   .search-row:hover, .search-row.sel { background: var(--hover-2); }
   .search-ico { flex-shrink: 0; color: var(--muted-2); margin-top: 2px; display: flex; }
   .search-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .search-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .search-line .search-title { min-width: 0; }
   .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .search-host { flex-shrink: 0; margin-left: auto; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--muted-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
+  .search-row.sel .search-host { color: var(--muted); border-color: var(--border-strong); }
+  .search-note { margin: 0; padding: 4px 18px 8px; font-size: 12px; color: var(--muted-2); }
+  .search-note.search-fail { color: var(--danger); }
+  .search-note.search-old { color: var(--muted-2); font-style: italic; }
   .search-snippet { font-size: 13px; color: var(--muted-2); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
   .search-snippet:empty { display: none; }
   .search-card :global(.search-mark) { background: #f0bd76; color: #1e1e1e; border-radius: 3px; padding: 0 1px; }
