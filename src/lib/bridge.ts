@@ -1,13 +1,88 @@
-// Vicuna headless bridge client (src-tauri/src/bridge.rs).
+// Vicuna backend routing.
 //
-// When the app runs as a desktop shell, `isTauriRuntime()` is true and every
-// invoke below goes through Tauri IPC. In a plain browser (`npm run dev`)
-// the same calls route to the loopback bridge instead — `cargo run --bin
-// bridge` in src-tauri/ — so live-browser/Chrome can drive the REAL backend
-// (work turns, FS tools, MCP, registry fetch) with byte-identical frontend
-// code. When neither is present the call fails with the usual desktop error.
+// Three transports, one call shape (same command names + camelCase args):
+//   * desktop, This computer  → Tauri IPC (the local Rust backend)
+//   * desktop, remote server  → `server_call` (Rust forwards over HTTP(S) to
+//     a headless `vicuna serve`, e.g. a VPS behind tailscale serve;
+//     see src-tauri/src/servers.rs). Each server has its own window (opened
+//     from the sidebar's server menu with `?server=<id>` in its URL); the main
+//     window is always This computer. Constant for the life of a window.
+//   * plain browser (`npm run dev`) → the loopback dev bridge
+//     (`cargo run` in bridge/), so live-browser drives the real backend.
+// When none is present the call fails with the usual desktop error.
 
 import { isTauriRuntime } from "./ollama";
+
+// ---- remote server selection (desktop only) ----
+
+/** This window's remote server id (`?server=<id>`), or null for This
+ *  computer. Per window, never shared: other windows keep their own server. */
+const ACTIVE_SERVER: string | null = (() => {
+  try {
+    if (typeof window === "undefined" || !isTauriRuntime()) return null;
+    // `?server=` from open_server_window; sessionStorage (per window) keeps it
+    // across reloads, since in-app navigation rewrites the URL
+    let id = new URLSearchParams(window.location.search).get("server");
+    if (id) sessionStorage.setItem("vicuna-window-server", id);
+    else id = sessionStorage.getItem("vicuna-window-server");
+    // older builds kept the choice in localStorage for the one window
+    if (!id) localStorage.removeItem("vicuna-server");
+    return id && /^[A-Za-z0-9_-]+$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+})();
+
+export function activeServerId(): string | null {
+  return ACTIVE_SERVER;
+}
+
+/** Desktop app pointed at a remote server (backend calls go there). */
+export function isRemoteServer(): boolean {
+  return ACTIVE_SERVER !== null;
+}
+
+/** Desktop app on its own backend: Tauri IPC applies. */
+export function useLocalIpc(): boolean {
+  return isTauriRuntime() && ACTIVE_SERVER === null;
+}
+
+/** Open (or focus) a server's own window, or focus the main window for
+ *  This computer (null). Never replaces what the current window shows. */
+export async function switchServer(id: string | null, title?: string): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  if (id) await invoke("open_server_window", { id, title: title ?? null });
+  else await invoke("show_main_window");
+}
+
+/** Commands about THIS machine/app that stay local even when a server is
+ *  active (app updates, CLI launcher, window, tray, the server list itself). */
+const LOCAL_CMDS = new Set([
+  "app_build_info",
+  "github_latest_release",
+  "github_download_asset",
+  "cli_status",
+  "cli_install",
+  "cli_uninstall",
+  "show_main_window",
+  "quit_app",
+  "tray_set_status",
+  "server_list",
+  "open_server_window",
+  "server_connect",
+  "server_touch",
+  "server_remove"
+]);
+
+/** One call to the active server: `{ok, data | error}` unwrapped. */
+async function serverInvoke(cmd: string, args: Record<string, any>): Promise<any> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const r = await invoke<any>("server_call", { id: ACTIVE_SERVER, path: "/invoke", body: { cmd, args } });
+  if (!r?.ok) throw new Error(r?.error ?? `${cmd} failed on the server`);
+  return r.data ?? null;
+}
+
+// ---- loopback dev bridge (plain browser) ----
 
 function bridgePort(): number {
   try {
@@ -26,10 +101,12 @@ function bridgeBase(): string {
 
 let healthCache: { ok: boolean; at: number } | null = null;
 
-/** Is the loopback bridge up? Cached ~10s; a refused localhost port fails
- *  fast so the common no-bridge case costs one quick probe per burst. */
+/** Is a bridge reachable? A remote server counts (desktop routes through
+ *  it). Loopback probes are cached ~10s; a refused localhost port fails fast
+ *  so the common no-bridge case costs one quick probe per burst. */
 export async function bridgeAvailable(): Promise<boolean> {
   if (typeof window === "undefined") return false;
+  if (isRemoteServer()) return true;
   if (healthCache && Date.now() - healthCache.at < 10000) return healthCache.ok;
   try {
     const ctrl = new AbortController();
@@ -45,17 +122,44 @@ export async function bridgeAvailable(): Promise<boolean> {
   }
 }
 
+/** Remote polls long-poll: the server holds the request until events arrive
+ *  (or REMOTE_WAIT_MS passes), so output shows up at once instead of on the
+ *  next tick — terminal echo needs this. */
+const REMOTE_WAIT_MS = 15000;
+
+async function pollOnce(id: string): Promise<any> {
+  if (isRemoteServer()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<any>("server_call", { id: ACTIVE_SERVER, path: `/poll/${id}?wait=${REMOTE_WAIT_MS}`, body: null, timeoutMs: REMOTE_WAIT_MS + 10000 });
+  }
+  const res = await fetch(`${bridgeBase()}/poll/${id}`);
+  if (!res.ok) throw new Error(`poll ${res.status}`);
+  return await res.json();
+}
+
 /** Poll-based stand-in for a Tauri Channel. The bridge queues events per
- *  channel id; this drains them on a 200ms interval into onmessage. */
+ *  channel id; this drains them into onmessage — every 200ms on loopback,
+ *  back-to-back long-polls to a remote server. Polls never overlap. */
 export class BridgeChannel {
   readonly id: string;
   onmessage: ((ev: any) => void) | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private stopped = false;
   private failures = 0;
+  private inFlight = false;
 
   constructor() {
     this.id = crypto.randomUUID();
-    this.timer = setInterval(() => void this.poll(), 200);
+    if (isRemoteServer()) void this.longPollLoop();
+    else this.timer = setInterval(() => void this.poll(), 200);
+  }
+
+  private async longPollLoop(): Promise<void> {
+    while (!this.stopped) {
+      const ok = await this.poll();
+      // back off after a failure; on success poll again immediately
+      if (!ok && !this.stopped) await new Promise((r) => setTimeout(r, 300));
+    }
   }
 
   /** Marker object to splice into invoke args where Tauri takes a Channel. */
@@ -64,39 +168,53 @@ export class BridgeChannel {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
   }
 
-  private async poll(): Promise<void> {
+  private async poll(): Promise<boolean> {
+    if (this.inFlight) return true;
+    this.inFlight = true;
     try {
-      const res = await fetch(`${bridgeBase()}/poll/${this.id}`);
-      if (!res.ok) throw new Error(`poll ${res.status}`);
-      const j = await res.json();
+      const j = await pollOnce(this.id);
+      if (this.stopped) return true;
       this.failures = 0;
-      for (const ev of j.events ?? []) {
+      for (const ev of j?.events ?? []) {
         try {
           this.onmessage?.(ev);
         } catch (e) {
           console.error("bridge event handler failed:", e);
         }
       }
+      return true;
     } catch {
-      // localhost doesn't flake: repeated poll failures mean the bridge
-      // died mid-turn — surface it as an error event instead of hanging.
+      // repeated poll failures mean the bridge/server went away mid-turn —
+      // surface it as an error event instead of hanging. A remote server
+      // gets more slack (network blips), ~15s instead of ~2s.
       this.failures += 1;
-      if (this.failures >= 10) {
+      if (this.failures >= (isRemoteServer() ? 40 : 10)) {
         this.stop();
-        this.onmessage?.({ type: "error", message: "Bridge unreachable — is `cargo run --bin bridge` still running?" });
+        this.onmessage?.({
+          type: "error",
+          message: isRemoteServer()
+            ? "Lost the connection to the server mid-turn."
+            : "Bridge unreachable — is `cargo run --bin bridge` still running?"
+        });
       }
+      return false;
+    } finally {
+      this.inFlight = false;
     }
   }
 }
 
-/** POST one command to the bridge. Throws the backend's error string. */
+/** POST one command to the bridge (or the active remote server). Throws the
+ *  backend's error string. */
 export async function bridgeInvoke(cmd: string, args: Record<string, any>): Promise<any> {
+  if (isRemoteServer()) return await serverInvoke(cmd, args);
   const res = await fetch(`${bridgeBase()}/invoke`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -108,14 +226,47 @@ export async function bridgeInvoke(cmd: string, args: Record<string, any>): Prom
   return j.data ?? null;
 }
 
-/** Tauri invoke when shelled, bridge POST when plain-browser-with-bridge,
- *  otherwise the classic desktop-needed error. Drop-in for non-streaming
- *  commands (same arg keys as Tauri — the bridge speaks camelCase too). */
+/** Tauri invoke when shelled on This computer, the active server when one is
+ *  picked, bridge POST when plain-browser-with-bridge, otherwise the classic
+ *  desktop-needed error. Drop-in for non-streaming commands (same arg keys
+ *  everywhere — the bridge speaks camelCase too). */
 export async function invokeOrBridge<T>(cmd: string, args: Record<string, any>): Promise<T> {
   if (isTauriRuntime()) {
+    if (isRemoteServer() && !LOCAL_CMDS.has(cmd)) return (await serverInvoke(cmd, args)) as T;
     const { invoke } = await import("@tauri-apps/api/core");
     return await invoke<T>(cmd, args);
   }
   if (await bridgeAvailable()) return (await bridgeInvoke(cmd, args)) as T;
   throw new Error("This needs the Vicuna desktop app (or start `cargo run --bin bridge` for browser testing).");
+}
+
+// ---- server list (desktop) ----
+
+export interface ServerInfo {
+  id: string;
+  url: string;
+  name: string;
+  lastUsed: number;
+}
+
+export async function listServers(): Promise<ServerInfo[]> {
+  if (!isTauriRuntime()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke<ServerInfo[]>("server_list")) ?? [];
+}
+
+/** Verify + save (`url` may carry `#token`). */
+export async function connectServer(url: string, token: string): Promise<ServerInfo> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<ServerInfo>("server_connect", { url, token: token || null });
+}
+
+export async function touchServer(id: string): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("server_touch", { id });
+}
+
+export async function removeServer(id: string): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("server_remove", { id });
 }

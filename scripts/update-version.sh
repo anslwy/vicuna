@@ -57,4 +57,16 @@ if (JSON.parse(updated).version !== process.argv[1]) throw new Error('tauri.conf
 fs.writeFileSync(path, updated);
 " "$VERSION"
 
-echo "Successfully updated version in package.json, package-lock.json, Cargo.toml, Cargo.lock and tauri.conf.json to $VERSION"
+# 5. bridge/ = the `vicuna` CLI (`vicuna serve`): same version as the app
+node -e "
+const fs = require('fs');
+const toml = fs.readFileSync('bridge/Cargo.toml', 'utf8');
+fs.writeFileSync('bridge/Cargo.toml', toml.replace(/^version\s*=\s*\"[^\"]+\"/m, 'version = \"' + process.argv[1] + '\"'));
+if (fs.existsSync('bridge/Cargo.lock')) {
+  const lock = fs.readFileSync('bridge/Cargo.lock', 'utf8');
+  const re = /(name\s*=\s*\"(?:vicuna|vicuna-bridge)\"\s*\r?\nversion\s*=\s*\")[^\"]+(\")/g;
+  fs.writeFileSync('bridge/Cargo.lock', lock.replace(re, '\$1' + process.argv[1] + '\$2'));
+}
+" "$VERSION"
+
+echo "Successfully updated version in package.json, package-lock.json, Cargo.toml, Cargo.lock, tauri.conf.json and bridge/ (vicuna CLI) to $VERSION"

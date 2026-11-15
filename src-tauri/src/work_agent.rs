@@ -49,6 +49,11 @@ pub enum WorkAgentEvent {
     /// and sends its output to the session as a message when it finishes
     RunBackground { job_id: String, command: String, started_ms: u64 },
     ContextCompacted { note: String },
+    /// vicuna-mcp `schedule_wakeup`: the chat window resolves the time in the
+    /// user's timezone, adds a Scheduled send for this session, and answers
+    /// `req_id` (via work_agent_answer) with `{ok, when}` or `{ok:false, error}`.
+    #[serde(rename = "schedulewakeup")]
+    ScheduleWakeup { req_id: String, message: String, at: Option<String>, in_minutes: Option<f64> },
     Done { stopped: bool },
     Error { message: String },
 }
@@ -187,6 +192,7 @@ fn get_turn(agent_state: &WorkAgentState, turn_id: &str) -> Result<Arc<TurnState
 /// `on_event` until done/error. `model` is the engine's model id (opencode
 /// `provider/model`, Claude e.g. "haiku"; empty = the pick saved in Vicuna,
 /// else the engine's default). Unknown extra arguments are ignored.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn work_agent_start(

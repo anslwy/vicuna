@@ -223,6 +223,7 @@ pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
         args.push(crate::vicuna_mcp::CLAUDE_READ_SESSION_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_LIST_SESSIONS_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_MANAGE_MCP_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_SCHEDULE_TOOL_ID.to_string());
     }
     args
 }
@@ -737,6 +738,7 @@ mod tests {
                 "mcp__vicuna-mcp__read_session",
                 "mcp__vicuna-mcp__list_sessions",
                 "mcp__vicuna-mcp__manage_mcp",
+                "mcp__vicuna-mcp__schedule_wakeup",
             ]
         );
         let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();

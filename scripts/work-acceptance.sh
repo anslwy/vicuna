@@ -33,7 +33,7 @@
 #   home: its login, providers and sessions); Vicuna's own config stays temp.
 #
 # Build the bridge first:  (cd bridge && cargo build)
-# Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna-bridge or
+# Env: BRIDGE (bridge binary; default bridge/target/debug/vicuna or
 #      src-tauri/target/debug/vicuna-bridge), PORT (default 1427),
 #      VICUNA_OPENCODE_BIN / VICUNA_CLAUDE_BIN / VICUNA_CODEX_BIN /
 #      VICUNA_AGY_BIN / VICUNA_FX_BIN,
@@ -60,7 +60,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${PORT:-1427}"
 bridge="${BRIDGE:-}"
 if [ -z "$bridge" ]; then
-  for c in "$root/bridge/target/debug/vicuna-bridge" "$root/src-tauri/target/debug/vicuna-bridge"; do
+  for c in "$root/bridge/target/debug/vicuna" "$root/bridge/target/debug/vicuna-bridge"; do
     [ -x "$c" ] && bridge="$c" && break
   done
 fi

@@ -11,6 +11,21 @@
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgba(130, 130, 130, 0.45); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }
       ::-webkit-scrollbar-thumb:hover { background: rgba(130, 130, 130, 0.7); border: 3px solid transparent; background-clip: content-box; }
+      /* launch splash: the app icon with a shimmer, shown before any JS runs
+         (new windows, server windows) and faded out once the app is ready
+         (src/lib/splash.ts). Background matches the theme vars in ChatApp. */
+      #vicuna-splash { position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center; background: #ffffff; transition: opacity 0.28s ease; }
+      html[data-theme="dark"] #vicuna-splash { background: #3d3332; }
+      #vicuna-splash.vs-hide { opacity: 0; pointer-events: none; }
+      #vicuna-splash .vs-icon { position: relative; width: 72px; height: 72px; border-radius: 16px; overflow: hidden; animation: vs-pulse 1.6s ease-in-out infinite; box-shadow: 0 10px 30px rgba(239, 108, 0, 0.22); }
+      #vicuna-splash .vs-icon svg { display: block; width: 100%; height: 100%; }
+      #vicuna-splash .vs-icon::after { content: ""; position: absolute; top: 0; bottom: 0; left: -60%; width: 60%; background: linear-gradient(100deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.55) 50%, rgba(255, 255, 255, 0) 100%); transform: skewX(-12deg); animation: vs-sheen 1.5s ease-in-out infinite; }
+      @keyframes vs-sheen { 0% { left: -60%; } 70%, 100% { left: 120%; } }
+      @keyframes vs-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.96); opacity: 0.88; } }
+      @media (prefers-reduced-motion: reduce) {
+        #vicuna-splash .vs-icon { animation: none; }
+        #vicuna-splash .vs-icon::after { display: none; }
+      }
     </style>
     <script>
       try {
@@ -21,6 +36,22 @@
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
+    <div id="vicuna-splash" aria-hidden="true">
+      <div class="vs-icon">
+        <svg viewBox="100 100 824 824" xmlns="http://www.w3.org/2000/svg">
+          <rect x="100" y="100" width="824" height="824" fill="#ef6c00"/>
+          <path d="M310 352 L472 672 L634 352" fill="none" stroke="#fff" stroke-width="100" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="614" y="622" width="150" height="100" rx="50" fill="#fff"/>
+        </svg>
+      </div>
+    </div>
+    <script>
+      // backstop: never leave the splash up if the app fails to start
+      setTimeout(function () {
+        var s = document.getElementById("vicuna-splash");
+        if (s) s.remove();
+      }, 15000);
+    </script>
     <div style="display: contents">%sveltekit.body%</div>
   </body>
 </html>

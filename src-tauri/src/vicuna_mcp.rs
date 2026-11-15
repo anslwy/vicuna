@@ -41,8 +41,10 @@ pub const GET_SESSION_TOOL: &str = "get_session_id";
 pub const READ_SESSION_TOOL: &str = "read_session";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
+/// The agent schedules a message to itself (a wake-up) in its own session.
+pub const SCHEDULE_TOOL: &str = "schedule_wakeup";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 6;
+pub const TOOL_COUNT: usize = 7;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, `run`
 /// raises Vicuna's own Allow card in ask mode, and session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -51,6 +53,7 @@ pub const CLAUDE_GET_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__get_session_id";
 pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
 pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
+pub const CLAUDE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__schedule_wakeup";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -85,15 +88,39 @@ installs, servers) with `run` instead of your own shell tool: the user can move 
 their output reaches you as a message when they finish. Use `get_session_id`, `read_session` (paginated), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
-custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server).";
+custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedule_wakeup` to have Vicuna send you a \
+message in this session later (check back on slow work, follow up at a time the user names).";
 
+#[cfg(feature = "desktop")]
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
+#[cfg(feature = "desktop")]
 pub fn set_app_handle(app: tauri::AppHandle) {
     let _ = APP_HANDLE.set(app);
 }
 
+/// Headless server (`vicuna serve`): its own vicuna.db, since there is
+/// no app handle / sql plugin there. Wins over the plugin pool when set.
+static DB_OVERRIDE: std::sync::OnceLock<sqlx::SqlitePool> = std::sync::OnceLock::new();
+
+pub fn set_db_pool_override(pool: sqlx::SqlitePool) {
+    let _ = DB_OVERRIDE.set(pool);
+}
+
 async fn db_pool() -> Result<sqlx::SqlitePool, String> {
+    if let Some(p) = DB_OVERRIDE.get() {
+        return Ok(p.clone());
+    }
+    db_pool_app().await
+}
+
+#[cfg(not(feature = "desktop"))]
+async fn db_pool_app() -> Result<sqlx::SqlitePool, String> {
+    Err("vicuna.db is not available (headless server without a database)".to_string())
+}
+
+#[cfg(feature = "desktop")]
+async fn db_pool_app() -> Result<sqlx::SqlitePool, String> {
     let app = APP_HANDLE
         .get()
         .ok_or_else(|| "vicuna.db is not available (app handle not initialized)".to_string())?;
@@ -288,6 +315,23 @@ fn tool_schema() -> Value {
                 "multiple": { "type": "boolean", "description": "Let the user select more than one choice (default false)." }
             },
             "required": ["question"]
+        }
+    })
+}
+
+fn schedule_schema() -> Value {
+    json!({
+        "name": SCHEDULE_TOOL,
+        "title": "Schedule a wake-up",
+        "description": "Schedule a message to yourself in this Vicuna session at a later time: Vicuna sends `message` into this chat then, which starts a new turn (or joins one already running). Use it to check back on something slow (a deploy, a CI run, a long job), to follow up later, or when the user asks you to continue at a certain time. Give exactly one of `in_minutes` (relative) or `at` (a time in the user's local timezone: `HH:MM` for the next occurrence, or `YYYY-MM-DD HH:MM`; ISO 8601 with an offset also works). The result states the exact local time. Up to 30 days ahead. It is delivered only while the user's Vicuna app is open; the user sees it under Scheduled and can cancel it. After scheduling, end your turn unless there is other work to do now.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": { "type": "string", "description": "What to tell yourself when you wake up: enough context to pick the task back up." },
+                "in_minutes": { "type": "number", "description": "Wake up this many minutes from now (e.g. 15, 90)." },
+                "at": { "type": "string", "description": "Wake-up time in the user's local timezone: `HH:MM` or `YYYY-MM-DD HH:MM` (or ISO 8601 with an offset)." }
+            },
+            "required": ["message"]
         }
     })
 }
@@ -530,6 +574,73 @@ async fn ask(target: &Target, args: &Value, client_gone: impl std::future::Futur
         ),
         Some(a) if !turn.stop.load(Ordering::Relaxed) => answer_result(&parse_ask_answer(&a), multiple),
         _ => text_result("The user stopped the turn before answering.", true),
+    }
+}
+
+/// Parse + check `schedule_wakeup` arguments: (message, at, in_minutes).
+fn parse_schedule_args(args: &Value) -> Result<(String, Option<String>, Option<f64>), String> {
+    let message = args.get("message").and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    if message.is_empty() {
+        return Err("`message` is required: what to tell yourself when you wake up.".into());
+    }
+    let at = args.get("at").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let mins = args.get("in_minutes").and_then(Value::as_f64);
+    match (&at, mins) {
+        (Some(_), Some(_)) => Err("Give either `in_minutes` or `at`, not both.".into()),
+        (None, None) => Err("Give `in_minutes` (relative) or `at` (local time) for the wake-up.".into()),
+        (None, Some(m)) if !(m.is_finite() && m >= 1.0 && m <= 30.0 * 24.0 * 60.0) => {
+            Err("`in_minutes` must be between 1 and 43200 (30 days).".into())
+        }
+        _ => Ok((message, at, mins)),
+    }
+}
+
+/// Hand the wake-up to the chat window that runs this turn: it resolves the
+/// time in the user's timezone, adds it to Scheduled (the same delivery as a
+/// user-scheduled send) and answers with the exact time or a reason.
+async fn schedule_wakeup(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
+    let (message, at, in_minutes) = match parse_schedule_args(args) {
+        Ok(v) => v,
+        Err(e) => return text_result(&e, true),
+    };
+    if target.session_id.is_none() {
+        return text_result("This turn has no Vicuna session to schedule into.", true);
+    }
+    let turn = &target.turn;
+    if turn.stop.load(Ordering::Relaxed) {
+        return text_result("The user stopped the turn; nothing was scheduled.", true);
+    }
+    let req_id = format!("wake-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = oneshot::channel::<String>();
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.insert(req_id.clone(), tx);
+    }
+    emit_ev(
+        &target.on_event,
+        &turn.stop,
+        WorkAgentEvent::ScheduleWakeup { req_id: req_id.clone(), message, at, in_minutes },
+    );
+    let reply = tokio::select! {
+        a = rx => a.ok(),
+        _ = client_gone => None,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => None,
+    };
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.remove(&req_id);
+    }
+    let Some(reply) = reply else {
+        return text_result("The Vicuna app did not confirm the wake-up (is its window still open?). Nothing was scheduled.", true);
+    };
+    let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        let when = v.get("when").and_then(Value::as_str).unwrap_or("the requested time");
+        text_result(
+            &format!("Scheduled: Vicuna will send your message into this session at {when}. It is delivered while the user's Vicuna app is open, and the user can see or cancel it under Scheduled. End your turn now unless there is other work to do."),
+            false,
+        )
+    } else {
+        let e = v.get("error").and_then(Value::as_str).unwrap_or("the app refused the wake-up");
+        text_result(&format!("Not scheduled: {e}"), true)
     }
 }
 
@@ -1344,6 +1455,17 @@ async fn manage_mcp_in(
     }
 }
 
+#[cfg(not(feature = "desktop"))]
+async fn manage_mcp(_target: Option<&Target>, args: &Value) -> Value {
+    // headless server: the config file is the source of truth; the desktop
+    // app reconciles its MCP list from it (no live manager / window events)
+    match manage_mcp_in(None, args, None).await {
+        Ok(out) => text_result(&out.value.to_string(), false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
+#[cfg(feature = "desktop")]
 async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
     let app = APP_HANDLE.get();
     let mgr_state = app.and_then(|a| a.try_state::<crate::mcp::McpManager>());
@@ -1402,6 +1524,7 @@ async fn handle_rpc(
             read_session_schema(),
             list_sessions_schema(),
             manage_mcp_schema(),
+            schedule_schema(),
         ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1411,11 +1534,12 @@ async fn handle_rpc(
                 (Some(t), RUN_TOOL) => run(t, &args, client_gone).await,
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
                 (Some(t), READ_SESSION_TOOL) => read_session(t, &args).await,
+                (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, RUN_TOOL) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
-                (None, GET_SESSION_TOOL | READ_SESSION_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                (None, GET_SESSION_TOOL | READ_SESSION_TOOL | SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
@@ -1819,6 +1943,66 @@ mod tests {
 
     fn result_text(r: &Value) -> String {
         r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    fn wake_call(args: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": { "name": "schedule_wakeup", "arguments": args } })
+    }
+
+    #[test]
+    fn schedule_args_need_a_message_and_exactly_one_time() {
+        assert!(parse_schedule_args(&json!({ "in_minutes": 5 })).is_err());
+        assert!(parse_schedule_args(&json!({ "message": "x" })).is_err());
+        assert!(parse_schedule_args(&json!({ "message": "x", "in_minutes": 5, "at": "09:00" })).is_err());
+        assert!(parse_schedule_args(&json!({ "message": "x", "in_minutes": 0.2 })).is_err());
+        assert!(parse_schedule_args(&json!({ "message": "x", "in_minutes": 50000 })).is_err());
+        assert_eq!(parse_schedule_args(&json!({ "message": " check CI ", "in_minutes": 15 })).unwrap(), ("check CI".to_string(), None, Some(15.0)));
+        assert_eq!(parse_schedule_args(&json!({ "message": "x", "at": "09:30" })).unwrap().1.as_deref(), Some("09:30"));
+    }
+
+    #[tokio::test]
+    async fn schedule_wakeup_asks_the_window_and_reports_its_answer() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), Some("sess-1"), turn.clone(), ch).await.unwrap();
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, wake_call(json!({ "message": "check the deploy", "in_minutes": 20 }))).await });
+        // the window gets the request with the raw spec, resolves it, answers
+        let ev = loop {
+            if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == "schedulewakeup").cloned() {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(ev["message"], "check the deploy");
+        assert_eq!(ev["in_minutes"], 20.0);
+        assert!(ev["at"].is_null());
+        crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "when": "Sun 16 Nov, 09:30" }).to_string()).unwrap();
+        let text = result_text(&pending.await.unwrap().1.unwrap());
+        assert!(text.contains("at Sun 16 Nov, 09:30"), "{text}");
+
+        // a refusal from the window comes back as a tool error
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, wake_call(json!({ "message": "x", "at": "yesterday" }))).await });
+        let ev = loop {
+            let found = seen.lock().unwrap().iter().filter(|e| e["type"] == "schedulewakeup").nth(1).cloned();
+            if let Some(e) = found {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": false, "error": "that time is in the past" }).to_string()).unwrap();
+        let r = pending.await.unwrap().1.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("that time is in the past"));
+    }
+
+    #[tokio::test]
+    async fn schedule_wakeup_needs_a_session() {
+        let (ch, _seen) = capture();
+        let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
+        let r = post(&reg.url, wake_call(json!({ "message": "x", "in_minutes": 5 }))).await.1.unwrap();
+        assert!(result_text(&r).contains("no Vicuna session"), "{}", result_text(&r));
     }
 
     #[tokio::test]

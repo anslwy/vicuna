@@ -115,3 +115,29 @@ test("tray lines are capped with a +N more row and flag missed items", () => {
   assert.equal(scheduledCountLabel(1), "1 scheduled message");
   assert.equal(scheduledCountLabel(2), "2 scheduled messages");
 });
+
+// ---- agent wake-ups (vicuna-mcp schedule_wakeup) ----
+import { resolveWakeTime, wakeMessage, WAKE_MAX_MS } from "../src/lib/schedule.ts";
+
+test("wake-ups resolve relative and local times in the user's timezone", () => {
+  const now = new Date(2026, 10, 15, 22, 0, 0).getTime(); // 15 Nov 22:00 local
+  assert.deepEqual(resolveWakeTime({ inMinutes: 15 }, now), { at: now + 15 * 60_000 });
+  // HH:MM later today, and HH:MM already passed → tomorrow
+  assert.deepEqual(resolveWakeTime({ at: "23:30" }, now), { at: new Date(2026, 10, 15, 23, 30).getTime() });
+  assert.deepEqual(resolveWakeTime({ at: "09:05" }, now), { at: new Date(2026, 10, 16, 9, 5).getTime() });
+  // local date-time (space or T), and ISO with an explicit offset
+  assert.deepEqual(resolveWakeTime({ at: "2026-11-17 08:00" }, now), { at: new Date(2026, 10, 17, 8, 0).getTime() });
+  assert.deepEqual(resolveWakeTime({ at: "2026-11-17T08:00" }, now), { at: new Date(2026, 10, 17, 8, 0).getTime() });
+  assert.deepEqual(resolveWakeTime({ at: "2026-11-17T08:00:00Z" }, now), { at: Date.UTC(2026, 10, 17, 8, 0) });
+});
+
+test("wake-ups refuse past, too-soon, too-far and unreadable times", () => {
+  const now = new Date(2026, 10, 15, 22, 0, 0).getTime();
+  assert.ok("error" in resolveWakeTime({ at: "2026-11-14 10:00" }, now));
+  assert.ok("error" in resolveWakeTime({ inMinutes: 0.1 }, now));
+  assert.ok("error" in resolveWakeTime({ at: "25:00" }, now));
+  assert.ok("error" in resolveWakeTime({ at: "next tuesday-ish" }, now));
+  assert.ok("error" in resolveWakeTime({}, now));
+  assert.ok("error" in resolveWakeTime({ inMinutes: WAKE_MAX_MS / 60_000 + 5 }, now));
+  assert.equal(wakeMessage("  check the deploy "), "Scheduled wake-up (you asked Vicuna to wake you now): check the deploy");
+});

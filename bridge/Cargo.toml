@@ -1,13 +1,20 @@
 [package]
 name = "vicuna-bridge"
-version = "0.1.0"
-description = "Vicuna headless bridge: loopback HTTP for driving the real backend without the Tauri shell (dev/test only)"
+version = "0.0.11"
+description = "vicuna — the Vicuna CLI: `vicuna serve` (headless server for the desktop app), `vicuna open`, and the dev bridge"
 authors = ["you"]
 edition = "2024"
 
 [dependencies]
-vicuna_lib = { package = "vicuna", path = "../src-tauri" }
-tauri = { version = "2" }
+# headless: no `desktop` feature, so no WebKit/GTK at runtime; rustls instead
+# of system OpenSSL — the binary runs on a bare VPS
+vicuna_lib = { package = "vicuna", path = "../src-tauri", default-features = false, features = ["rustls"] }
+tauri = { version = "2", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tiny_http = "0.12"
 serde_json = "1"
+getrandom = "0.3"
+
+[[bin]]
+name = "vicuna"
+path = "src/main.rs"

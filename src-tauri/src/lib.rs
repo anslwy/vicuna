@@ -1,3 +1,6 @@
+// Headless server builds (`--no-default-features`, see Cargo.toml) keep every
+// Tauri command wrapper compiled but uncalled; don't drown real warnings.
+#![cfg_attr(not(feature = "desktop"), allow(dead_code, unused_imports))]
 // Vicuna backend: all Ollama inference traffic goes through here.
 // The frontend (JS) is display-only: it invokes these commands and renders
 // the streamed events. Direct `fetch("http://localhost:11434/...")` from JS
@@ -13,9 +16,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
 use tauri::ipc::Channel;
+#[cfg(feature = "desktop")]
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+#[cfg(feature = "desktop")]
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
+use tauri::State;
+#[cfg(feature = "desktop")]
+use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
+#[cfg(feature = "desktop")]
 use tauri_plugin_sql::{DbInstances, DbPool};
 pub mod acp;
 pub mod agy;
@@ -34,6 +42,8 @@ pub mod work_agent;
 pub mod work_usage;
 pub mod vicuna_mcp;
 pub mod git_panel;
+pub mod server_store;
+pub mod servers;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -91,6 +101,7 @@ struct ChatSaveRow {
     messages: Vec<MsgSaveRow>,
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn chats_save(
     instances: State<'_, DbInstances>,
@@ -2084,6 +2095,7 @@ async fn work_write_file(root: String, path: String, content: String) -> Result<
 /// Open a workspace file/folder with the OS default app. Sandboxed through
 /// `work_join` (the opener capability itself carries no path scope, so the
 /// frontend's `openPath` was refused for every path).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_open_path(app: AppHandle, root: String, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -2127,6 +2139,38 @@ async fn git_discard(root: String, paths: Vec<String>, untracked: Vec<String>) -
 #[tauri::command]
 async fn git_apply(root: String, patch: String, cached: bool, reverse: bool, intent_to_add: Vec<String>) -> Result<(), String> {
     git_panel::git_apply_logic(root, patch, cached, reverse, intent_to_add).await
+}
+
+// ---- remote servers (see src/servers.rs) ----
+
+#[tauri::command]
+fn server_list() -> Vec<servers::ServerInfo> {
+    servers::list()
+}
+
+#[tauri::command]
+async fn server_connect(url: String, token: Option<String>) -> Result<servers::ServerInfo, String> {
+    servers::connect(&url, token).await
+}
+
+#[tauri::command]
+fn server_touch(id: String) -> Result<(), String> {
+    servers::touch(&id)
+}
+
+#[tauri::command]
+fn server_remove(id: String) -> Result<(), String> {
+    servers::remove(&id)
+}
+
+#[tauri::command]
+async fn server_call(
+    id: String,
+    path: String,
+    body: Option<serde_json::Value>,
+    timeout_ms: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    servers::call(&id, &path, body, timeout_ms).await
 }
 
 #[tauri::command]
@@ -4172,6 +4216,7 @@ async fn cli_uninstall() -> Result<String, String> {
 
 /// Bring the main window forward (CLI deep links arrive while hidden in the
 /// tray; the OS activates the app but doesn't un-hide the window).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn show_main_window(app: AppHandle) -> Result<(), String> {
     let w = app
@@ -4179,6 +4224,32 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "no main window".to_string())?;
     w.show().map_err(|e| format!("cannot show window: {e}"))?;
     w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
+    Ok(())
+}
+
+/// Open (or focus) the window for a remote server: each server gets its own
+/// window — the frontend reads `?server=<id>` once at load and routes every
+/// backend call there (src/lib/bridge.ts) — so switching servers never
+/// replaces or interrupts what the main window (This computer) is doing.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn open_server_window(app: AppHandle, id: String, title: Option<String>) -> Result<(), String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("bad server id".into());
+    }
+    let label = format!("server-{id}");
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        w.show().map_err(|e| format!("cannot show window: {e}"))?;
+        w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
+        return Ok(());
+    }
+    let name = title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.clone());
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(format!("index.html?server={id}").into()))
+        .title(format!("{} — {name}", app_title()))
+        .inner_size(1200.0, 800.0)
+        .build()
+        .map_err(|e| format!("cannot open window: {e}"))?;
     Ok(())
 }
 
@@ -4191,7 +4262,7 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum TermEvent {
+pub enum TermEvent {
     Output { text: String },
     Exit { code: Option<i32> },
 }
@@ -4203,7 +4274,7 @@ struct TermHandle {
 }
 
 #[derive(Default)]
-struct TermState {
+pub struct TermState {
     terms: Mutex<HashMap<String, TermHandle>>,
     seq: AtomicU64,
 }
@@ -4332,13 +4403,13 @@ where
 }
 
 /// Spawn a login shell rooted at the workspace. Output/exit stream back
-/// over the channel; returns the terminal id for write/resize/kill.
-#[tauri::command]
-async fn term_spawn(
-    root: String,
+/// over the channel; returns the terminal id for write/resize/kill. Shared by
+/// the Tauri command and the headless bridge (remote-server terminals).
+pub fn term_spawn_logic(
+    state: &TermState,
+    root: &str,
     cols: Option<u16>,
     rows: Option<u16>,
-    state: State<'_, TermState>,
     on_event: Channel<TermEvent>,
 ) -> Result<String, String> {
     let canon = work_canonical_root(root.trim())?;
@@ -4368,8 +4439,7 @@ async fn term_spawn(
 }
 
 /// Send keystrokes to a terminal.
-#[tauri::command]
-async fn term_write(id: String, data: String, state: State<'_, TermState>) -> Result<(), String> {
+pub fn term_write_logic(state: &TermState, id: &str, data: &str) -> Result<(), String> {
     let terms = state
         .terms
         .lock()
@@ -4389,13 +4459,7 @@ async fn term_write(id: String, data: String, state: State<'_, TermState>) -> Re
 }
 
 /// Resize a terminal (columns × rows from the xterm fit addon).
-#[tauri::command]
-async fn term_resize(
-    id: String,
-    cols: u16,
-    rows: u16,
-    state: State<'_, TermState>,
-) -> Result<(), String> {
+pub fn term_resize_logic(state: &TermState, id: &str, cols: u16, rows: u16) -> Result<(), String> {
     let terms = state
         .terms
         .lock()
@@ -4410,8 +4474,7 @@ async fn term_resize(
 }
 
 /// Kill a terminal's shell (by pid, best-effort) and drop the entry.
-#[tauri::command]
-async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String> {
+pub fn term_kill_logic(state: &TermState, id: &str) -> Result<(), String> {
     let mut terms = state
         .terms
         .lock()
@@ -4424,6 +4487,96 @@ async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String
         kill_pid(pid);
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn term_spawn(
+    root: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    state: State<'_, TermState>,
+    on_event: Channel<TermEvent>,
+) -> Result<String, String> {
+    term_spawn_logic(&state, &root, cols, rows, on_event)
+}
+
+#[tauri::command]
+async fn term_write(id: String, data: String, state: State<'_, TermState>) -> Result<(), String> {
+    term_write_logic(&state, &id, &data)
+}
+
+#[tauri::command]
+async fn term_resize(
+    id: String,
+    cols: u16,
+    rows: u16,
+    state: State<'_, TermState>,
+) -> Result<(), String> {
+    term_resize_logic(&state, &id, cols, rows)
+}
+
+#[tauri::command]
+async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String> {
+    term_kill_logic(&state, &id)
+}
+
+/// Folder picker (remote servers + browsers, where the native dialog can't
+/// browse the backend machine): the sub-folders of `path` (home when empty,
+/// `~` expanded), sorted case-insensitively, dot-folders only with `hidden`.
+/// Symlinks to folders count as folders. Names only — no file listing.
+pub fn fs_list_dirs_logic(path: Option<String>, hidden: bool) -> Result<serde_json::Value, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok();
+    let raw = path.map(|p| p.trim().to_string()).unwrap_or_default();
+    let target = if raw.is_empty() {
+        home.clone().ok_or("no home folder")?
+    } else if raw == "~" || raw.starts_with("~/") {
+        let h = home.clone().ok_or("no home folder")?;
+        if raw == "~" { h } else { h.join(&raw[2..]) }
+    } else {
+        std::path::PathBuf::from(&raw)
+    };
+    if !target.is_absolute() {
+        return Err(format!("Not an absolute path: {raw}"));
+    }
+    let canon = std::fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("Not a folder: {}", canon.display()));
+    }
+    const CAP: usize = 2000;
+    let mut names: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for entry in std::fs::read_dir(&canon).map_err(|e| format!("{}: {e}", canon.display()))?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !hidden && name.starts_with('.') {
+            continue;
+        }
+        // metadata() follows symlinks, so a link to a folder lists as one
+        if !std::fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if names.len() >= CAP {
+            truncated = true;
+            break;
+        }
+        names.push(name);
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    Ok(serde_json::json!({
+        "path": work_display_string(&canon),
+        "parent": canon.parent().map(work_display_string),
+        "home": home.as_deref().map(work_display_string),
+        "sep": std::path::MAIN_SEPARATOR.to_string(),
+        "entries": names,
+        "truncated": truncated,
+    }))
+}
+
+#[tauri::command]
+async fn fs_list_dirs(path: Option<String>, hidden: Option<bool>) -> Result<serde_json::Value, String> {
+    fs_list_dirs_logic(path, hidden.unwrap_or(false))
 }
 
 /// Rename a file or directory within its own folder (same-directory rename).
@@ -4808,6 +4961,7 @@ fn clamp_zoom(f: f64) -> f64 {
     f.clamp(0.5, 3.0)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn zoom_apply(
     window: tauri::WebviewWindow,
@@ -4828,6 +4982,7 @@ async fn zoom_apply(
         .map_err(|_| "zoom state poisoned".to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn zoom_step(
     window: tauri::WebviewWindow,
@@ -4858,6 +5013,7 @@ struct AppQuitState {
 
 /// Kill everything Vicuna started: a self-launched `ollama serve` plus all
 /// terminal ptys. Best-effort — never fails the quit path.
+#[cfg(feature = "desktop")]
 fn shutdown_children(app: &AppHandle) {
     if let Some(s) = app.try_state::<browser::BrowserState>() {
         browser::kill_owned(&s);
@@ -4888,6 +5044,7 @@ fn shutdown_children(app: &AppHandle) {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn allow_quit(app: &AppHandle) {
     if let Some(s) = app.try_state::<AppQuitState>() {
         if let Ok(mut g) = s.allow.lock() {
@@ -4903,6 +5060,7 @@ struct ScheduleState {
     count: Mutex<usize>,
 }
 
+#[cfg(feature = "desktop")]
 fn quit_now(app: &AppHandle) {
     allow_quit(app);
     shutdown_children(app);
@@ -4912,6 +5070,7 @@ fn quit_now(app: &AppHandle) {
 /// Quit asked from the tray menu or the app menu (Cmd+Q). With scheduled
 /// messages pending, the window comes up and the frontend shows the list
 /// with a warning ("Quit anyway" then calls `quit_app`); otherwise quit.
+#[cfg(feature = "desktop")]
 fn request_quit(app: &AppHandle) {
     let pending = app
         .try_state::<ScheduleState>()
@@ -4933,6 +5092,7 @@ fn request_quit(app: &AppHandle) {
 /// macOS app menu: the stock Quit item terminates the process directly, so
 /// it is swapped for one that goes through `request_quit` (same id as the
 /// tray's Quit; the tray's menu handler receives every menu event).
+#[cfg(feature = "desktop")]
 #[cfg(target_os = "macos")]
 fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
     use tauri::menu::MenuItemKind;
@@ -4962,6 +5122,7 @@ fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
 /// Explicit quit (Settings button, or "Quit anyway" in the scheduled-messages
 /// prompt): kill everything Vicuna started, then exit. Window-close hides to the tray instead (see
 /// `on_window_event` below) so background streams survive.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn quit_app(
     app: AppHandle,
@@ -4978,6 +5139,7 @@ async fn quit_app(
 /// ("32m 25s") under Quit. With scheduled messages pending, a disabled
 /// section ("2 scheduled messages" + one row each) sits under the status
 /// line. Rebuilt on every frontend report.
+#[cfg(feature = "desktop")]
 fn tray_menu<R: Runtime>(
     manager: &impl Manager<R>,
     status: &str,
@@ -5024,6 +5186,7 @@ fn tray_menu<R: Runtime>(
 }
 
 /// Refresh the tray menu (no-op when the tray is unavailable).
+#[cfg(feature = "desktop")]
 fn refresh_tray_menu(
     app: &AppHandle,
     status: &str,
@@ -5042,6 +5205,7 @@ fn refresh_tray_menu(
 /// Update the tray menu: status line plus, while sessions run, an elapsed
 /// line under Quit. The frontend owns streaming state, so it reports both
 /// whenever relevant. Best-effort: never fails a turn.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn tray_set_status(
     app: AppHandle,
@@ -5135,6 +5299,7 @@ async fn mcp_call_tool(
 /// Browser sign-in for an OAuth-protected remote server: runs the PKCE
 /// authorize flow (system browser + loopback callback), persists tokens to
 /// auth.json, then connects. Errors when the server needs no auth.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_signin(
     app: AppHandle,
@@ -5185,10 +5350,12 @@ async fn mcp_login_present(id: String) -> Result<bool, String> {
 /// like `ollama serve` above. The headless bridge reuses the `*_logic`
 /// fns in `browser.rs` with no resource dir (PATH resolution only).
 
+#[cfg(feature = "desktop")]
 fn browser_resource_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
     app.path().resource_dir().ok()
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_status(
     app: AppHandle,
@@ -5197,6 +5364,7 @@ async fn browser_status(
     browser::browser_status_logic(browser_resource_dir(&app), &state).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_start(
     app: AppHandle,
@@ -5210,6 +5378,7 @@ async fn browser_stop(state: State<'_, browser::BrowserState>) -> Result<browser
     browser::browser_stop_logic(&state).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_restart(
     app: AppHandle,
@@ -5218,11 +5387,13 @@ async fn browser_restart(
     browser::browser_restart_logic(browser_resource_dir(&app), &state).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_ensure_engine(app: AppHandle) -> Result<browser::EngineInfo, String> {
     browser::browser_ensure_engine_logic(browser_resource_dir(&app)).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_takeover(
     app: AppHandle,
@@ -5232,6 +5403,7 @@ async fn browser_takeover(
 }
 
 /// Absolute `lb mcp` argv for the default `browser` MCP server entry.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_mcp_command(app: AppHandle) -> Result<Vec<String>, String> {
     let dir = browser_resource_dir(&app);
@@ -5252,6 +5424,7 @@ pub fn app_title() -> &'static str {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Finder/Dock launches get launchd's minimal PATH: read the user's shell
@@ -5332,6 +5505,13 @@ pub fn run() {
             git_unstage,
             git_discard,
             git_apply,
+            fs_list_dirs,
+            open_server_window,
+            server_list,
+            server_connect,
+            server_touch,
+            server_remove,
+            server_call,
             work_exec,
             work_fetch_url,
             work_exec_start,
@@ -5434,7 +5614,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Hide to the tray instead of quitting so the backend (streams,
             // terminals, self-started ollama) survives a window close.
+            // Only the main window hides; server windows (open_server_window)
+            // are just views of a remote server and close for real.
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
                 let allow = window
                     .app_handle()
                     .try_state::<AppQuitState>()
@@ -5453,6 +5638,7 @@ pub fn run() {
 
 /// App event handler: macOS dock click with the window hidden reopens it.
 /// `RunEvent::Reopen` only exists on macOS, so other platforms do nothing.
+#[cfg(feature = "desktop")]
 #[allow(unused_variables)]
 fn on_run_event(app: &AppHandle, event: tauri::RunEvent) {
     #[cfg(target_os = "macos")]
@@ -6477,5 +6663,38 @@ mod work_tests {
         assert_eq!(code, None);
         #[cfg(windows)]
         let _ = code;
+    }
+}
+
+#[cfg(test)]
+mod fs_list_dirs_tests {
+    use super::fs_list_dirs_logic;
+
+    #[test]
+    fn lists_only_folders_sorted_and_hides_dotdirs() {
+        let root = std::env::temp_dir().join(format!("vicuna-fsl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["beta", "Alpha", ".hidden", "gamma/inner"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("beta"), root.join("link-to-beta")).unwrap();
+
+        let v = fs_list_dirs_logic(Some(root.to_string_lossy().into()), false).unwrap();
+        let names: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e.as_str().unwrap()).collect();
+        #[cfg(unix)]
+        assert_eq!(names, ["Alpha", "beta", "gamma", "link-to-beta"]);
+        assert!(v["parent"].is_string());
+        let with_hidden = fs_list_dirs_logic(Some(root.to_string_lossy().into()), true).unwrap();
+        assert!(with_hidden["entries"].as_array().unwrap().iter().any(|e| e == ".hidden"));
+
+        assert!(fs_list_dirs_logic(Some("relative/path".into()), false).is_err());
+        assert!(fs_list_dirs_logic(Some(root.join("file.txt").to_string_lossy().into()), false).is_err());
+        assert!(fs_list_dirs_logic(Some(root.join("missing").to_string_lossy().into()), false).is_err());
+        // empty = home
+        let home = fs_list_dirs_logic(None, false).unwrap();
+        assert_eq!(home["path"], home["home"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

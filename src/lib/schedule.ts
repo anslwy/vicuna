@@ -188,3 +188,53 @@ export function trayScheduleLines(items: ScheduledItem[], now: number, max = 5):
 export function scheduledCountLabel(n: number): string {
   return `${n} scheduled message${n === 1 ? "" : "s"}`;
 }
+
+// ---- agent wake-ups (vicuna-mcp `schedule_wakeup`) ----
+
+/** Longest wake-up the agent may schedule (matches the tool's description). */
+export const WAKE_MAX_MS = 30 * 24 * 60 * MIN;
+
+/**
+ * Resolve an agent's wake-up spec to epoch ms in the user's local timezone:
+ * `inMinutes` from now, or `at` as `HH:MM` (next occurrence),
+ * `YYYY-MM-DD HH:MM` / `YYYY-MM-DDTHH:MM` (local), or ISO 8601 with an
+ * offset. Past, under-a-minute and beyond-30-days times are refused.
+ */
+export function resolveWakeTime(
+  spec: { at?: string | null; inMinutes?: number | null },
+  now: number
+): { at: number } | { error: string } {
+  let at: number;
+  if (typeof spec.inMinutes === "number" && Number.isFinite(spec.inMinutes)) {
+    at = now + Math.round(spec.inMinutes * MIN);
+  } else if (spec.at && spec.at.trim()) {
+    const raw = spec.at.trim();
+    const hm = raw.match(/^(\d{1,2}):(\d{2})$/);
+    const local = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (hm) {
+      const h = Number(hm[1]);
+      const m = Number(hm[2]);
+      if (h > 23 || m > 59) return { error: `"${raw}" is not a valid time` };
+      const d = new Date(now);
+      d.setHours(h, m, 0, 0);
+      if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+      at = d.getTime();
+    } else if (local) {
+      const [, y, mo, da, h, mi, se] = local;
+      at = new Date(Number(y), Number(mo) - 1, Number(da), Number(h), Number(mi), Number(se ?? 0)).getTime();
+    } else {
+      at = Date.parse(raw);
+    }
+    if (!Number.isFinite(at)) return { error: `can't read "${raw}" as a time (use HH:MM or YYYY-MM-DD HH:MM)` };
+  } else {
+    return { error: "no time given" };
+  }
+  if (at < now + 30_000) return { error: "that time is in the past (or less than a minute away)" };
+  if (at > now + WAKE_MAX_MS) return { error: "wake-ups can be at most 30 days ahead" };
+  return { at };
+}
+
+/** The user-role message a wake-up delivers into the session. */
+export function wakeMessage(message: string): string {
+  return `Scheduled wake-up (you asked Vicuna to wake you now): ${message.trim()}`;
+}

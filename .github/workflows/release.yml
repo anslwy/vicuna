@@ -66,9 +66,13 @@ jobs:
           const conf = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
           const cargo = readFileSync('src-tauri/Cargo.toml', 'utf8');
           const cargoVersion = cargo.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
+          const cliVersion = readFileSync('bridge/Cargo.toml', 'utf8').match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
 
           if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requested)) {
             throw new Error(`Invalid release version: ${requested}`);
+          }
+          if (requested !== cliVersion) {
+            throw new Error(`bridge/Cargo.toml (vicuna CLI) is ${cliVersion}, expected ${requested} (run scripts/update-version.sh ${requested})`);
           }
           if (requested !== packageVersion || requested !== cargoVersion || requested !== conf.version) {
             throw new Error(
@@ -311,18 +315,106 @@ jobs:
           gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --title "Latest dev build" || true
           gh release upload latest --clobber src-tauri/target/release/bundle/appimage/*.AppImage src-tauri/target/release/bundle/deb/*.deb
 
+  # The `vicuna` CLI (`vicuna serve`, `vicuna open`): headless build of the
+  # bridge crate — no `desktop` feature, so the Linux binary links only libc
+  # (no WebKit/GTK) and uses rustls (no system OpenSSL). 22.04 = older glibc.
+  build-cli:
+    needs: validate
+    if: ${{ !cancelled() && needs.validate.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x86_64, os: ubuntu-22.04 }
+          - { target: linux-aarch64, os: ubuntu-22.04-arm }
+          - { target: macos-universal, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge -> target
+
+      # the -sys crates under tauri still run pkg-config at build time even
+      # though the headless binary never links them
+      - name: Install build dependencies (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential pkg-config libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
+      - name: Build vicuna
+        working-directory: bridge
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "macos-universal" ]; then
+            cargo build --release --bin vicuna --target aarch64-apple-darwin
+            cargo build --release --bin vicuna --target x86_64-apple-darwin
+            mkdir -p target/release
+            lipo -create -output target/release/vicuna \
+              target/aarch64-apple-darwin/release/vicuna target/x86_64-apple-darwin/release/vicuna
+          else
+            cargo build --release --bin vicuna
+            # the whole point of the headless build: refuse to ship GUI deps
+            if readelf -d target/release/vicuna | grep NEEDED | grep -Ei 'webkit|gtk|soup|ssl'; then
+              echo "::error::vicuna links GUI/OpenSSL libraries" >&2
+              exit 1
+            fi
+          fi
+          ./target/release/vicuna --version
+          mkdir -p ../dist
+          tar -C target/release -czf ../dist/vicuna-${{ matrix.target }}.tar.gz vicuna
+          cd ../dist
+          (command -v sha256sum >/dev/null && sha256sum vicuna-${{ matrix.target }}.tar.gz || shasum -a 256 vicuna-${{ matrix.target }}.tar.gz) > vicuna-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload CLI to rolling release
+        if: ${{ !inputs.version }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --title "Latest dev build" || true
+          gh release upload latest --clobber dist/* scripts/install-cli.sh
+
   # Versioned releases only: one GitHub release `v<version>` with every
   # installer, the updater bundles + signatures, and latest.json.
   publish:
-    needs: [validate, build-macos, build-windows, build-linux]
+    needs: [validate, build-macos, build-windows, build-linux, build-cli]
     if: ${{ inputs.version }}
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/install-cli.sh
+          sparse-checkout-cone-mode: false
+          path: src
+
       - uses: actions/download-artifact@v4
         with:
           pattern: desktop-*
           path: release
           merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: release
+          merge-multiple: true
+
+      - name: Add the CLI installer
+        run: cp src/scripts/install-cli.sh release/install-cli.sh
 
       # upload-artifact keeps each file's relative path, so bundles land in
       # nested dirs. Flatten everything to release/ so verification,
@@ -348,7 +440,11 @@ jobs:
             `Vicuna_${version}_x64-setup.exe.sig`,
             `Vicuna_${version}_amd64.AppImage`,
             `Vicuna_${version}_amd64.AppImage.sig`,
-            `Vicuna_${version}_amd64.deb`
+            `Vicuna_${version}_amd64.deb`,
+            'vicuna-linux-x86_64.tar.gz',
+            'vicuna-linux-aarch64.tar.gz',
+            'vicuna-macos-universal.tar.gz',
+            'install-cli.sh'
           ];
           const files = readdirSync('release', { withFileTypes: true })
             .filter((entry) => entry.isFile())
@@ -444,6 +540,16 @@ jobs:
             ```
 
             All builds talk to Ollama at `http://localhost:11434`: install Ollama and run `ollama serve` (or start it from Settings → Models).
+
+            ## Vicuna server (headless, for a VPS or another machine)
+
+            ```sh
+            curl -fsSL https://github.com/anslwy/vicuna/releases/download/v${{ inputs.version }}/install-cli.sh | VICUNA_VERSION=${{ inputs.version }} sh
+            vicuna serve --tailscale                # prints the URL + token to paste into the app
+            vicuna install-service --tailscale      # keep it running (systemd user unit / launchd)
+            ```
+
+            The same `vicuna` command opens folders in the desktop app: `vicuna open [path]`.
         run: |
           release_args=()
           if [[ "$TAG" == *-* ]]; then

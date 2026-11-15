@@ -20,6 +20,7 @@
     loadPrefs,
     savePrefs,
     readLocalPrefs,
+    readStartupPrefs,
     writePendingStream,
     readPendingStream,
     clearPendingStream,
@@ -35,13 +36,15 @@
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
-  import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
+  import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { invokeOrBridge } from "$lib/bridge";
+  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, type ServerInfo } from "$lib/bridge";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
+  import FolderPickerModal from "$lib/FolderPickerModal.svelte";
+  import { hideSplash } from "$lib/splash";
   import {
     APP_UPDATE_RELEASES_URL,
     createReleaseNotesPreview,
@@ -78,7 +81,11 @@
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
   let ready = $state(false);
-  const initialPrefs = typeof window !== "undefined" ? readLocalPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[], sessionFilter: "all" };
+  // fade out the launch splash (src/app.html) once real content can show
+  $effect(() => {
+    if (ready) hideSplash();
+  });
+  const initialPrefs = typeof window !== "undefined" ? readStartupPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[], sessionFilter: "all" };
   // the chat/Work transports read the key from the openrouter module
   setOpenRouterApiKey(initialPrefs.openrouterApiKey ?? "");
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
@@ -1247,7 +1254,8 @@
     lastTraySchedKey = schedKey;
     lastTrayRunning = running;
     lastTraySentAt = at;
-    void setTrayStatus(status, elapsed, schedLines, scheduled.length);
+    // the tray belongs to the main window: server windows would fight it
+    if (!isRemoteServer()) void setTrayStatus(status, elapsed, schedLines, scheduled.length);
   });
   /** Quit from the UI. With scheduled messages pending it asks first (they
    *  are only sent while Vicuna is open); `force` is the prompt's own
@@ -1293,7 +1301,7 @@
 
   function persistScheduled() {
     try {
-      localStorage.setItem(SCHEDULE_KEY, JSON.stringify(scheduled));
+      localStorage.setItem(scheduleStoreKey(), JSON.stringify(scheduled));
     } catch {
       error = "Could not save scheduled messages (storage is full). They will be lost when Vicuna closes.";
     }
@@ -1888,6 +1896,17 @@
   let gotoSel = $state(0);
   let settingsOpen = $state(false);
   let settingsTab = $state<"general" | "models" | "openrouter">("general");
+  const CLI_INSTALL_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh";
+  let cliCopied = $state(false);
+  async function copyCliInstall() {
+    try {
+      await navigator.clipboard.writeText(CLI_INSTALL_CMD);
+      cliCopied = true;
+      setTimeout(() => (cliCopied = false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
   /** Vicuna CLI launcher status (desktop only, loaded when Settings opens) */
   let cliState = $state<CliStatus | null>(null);
   let cliOp = $state<null | "load" | "install" | "uninstall">(null);
@@ -2404,6 +2423,117 @@
       catalogError = e?.message ?? String(e);
     } finally {
       fetching = null;
+    }
+  }
+
+  // ---- remote server (sidebar server menu; src/lib/bridge.ts + src-tauri/src/servers.rs) ----
+  // Picking a server reloads the window onto it: every backend call, the
+  // chat list and Work turns then live on that machine. Constant per load.
+  const onServer = isRemoteServer();
+  const activeServer = activeServerId();
+  let srvList = $state<ServerInfo[]>([]);
+  let srvMenuOpen = $state(false);
+  let srvDialogOpen = $state(false);
+  let srvUrlDraft = $state("");
+  let srvTokenDraft = $state("");
+  let srvBusy = $state(false);
+  let srvErr = $state<string | null>(null);
+  /** chats could not be loaded from the active server */
+  let srvLoadError = $state<string | null>(null);
+  let srvCopied = $state<string | null>(null);
+  const srvCurrent = $derived(srvList.find((x) => x.id === activeServer) ?? null);
+  const srvLabel = $derived(onServer ? (srvCurrent?.name ?? "Remote server") : "This computer");
+
+  /** scheduled sends target chat ids, which belong to one backend: keep a
+   *  separate list per server so nothing fires against the wrong machine */
+  function scheduleStoreKey(): string {
+    return activeServer ? `${SCHEDULE_KEY}:server:${activeServer}` : SCHEDULE_KEY;
+  }
+
+  async function refreshServers() {
+    try {
+      srvList = await listServers();
+    } catch {
+      srvList = [];
+    }
+  }
+
+  function toggleServerMenu() {
+    srvMenuOpen = !srvMenuOpen;
+    if (srvMenuOpen) void refreshServers();
+  }
+
+  function openServerDialog() {
+    srvMenuOpen = false;
+    srvErr = null;
+    srvUrlDraft = "";
+    srvTokenDraft = "";
+    srvDialogOpen = true;
+    void refreshServers();
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-url-input]")?.focus());
+  }
+
+  /** Open the server's own window (or focus it), or focus the main window
+   *  for This computer. This window keeps running whatever it shows. */
+  async function requestServerSwitch(id: string | null) {
+    srvMenuOpen = false;
+    if (id === activeServer) return;
+    try {
+      if (id) await touchServer(id).catch(() => {});
+      await switchServer(id, srvList.find((x) => x.id === id)?.name);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function submitServer() {
+    if (srvBusy || !srvUrlDraft.trim()) return;
+    srvBusy = true;
+    srvErr = null;
+    try {
+      const sv = await connectServer(srvUrlDraft.trim(), srvTokenDraft.trim());
+      srvDialogOpen = false;
+      await refreshServers();
+      await switchServer(sv.id, sv.name);
+    } catch (e) {
+      srvErr = e instanceof Error ? e.message : String(e);
+    } finally {
+      srvBusy = false;
+    }
+  }
+
+  async function forgetServer(id: string) {
+    await removeServer(id).catch(() => {});
+    await refreshServers();
+    // removed the server this window shows: back to the main window, close this one
+    if (id === activeServer) {
+      await switchServer(null).catch(() => {});
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      void getCurrentWindow().close();
+    }
+  }
+
+  const SERVER_SETUP_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh\nvicuna serve --tailscale";
+  let srvCmdCopied = $state(false);
+  async function copyServerSetup() {
+    try {
+      await navigator.clipboard.writeText(SERVER_SETUP_CMD);
+      srvCmdCopied = true;
+      setTimeout(() => (srvCmdCopied = false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+
+  async function copyServerUrl(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      srvCopied = url;
+      setTimeout(() => {
+        if (srvCopied === url) srvCopied = null;
+      }, 1500);
+    } catch {
+      /* clipboard unavailable */
     }
   }
 
@@ -2973,7 +3103,13 @@
   async function pickContinueWorkspace(e?: MouseEvent) {
     e?.stopPropagation();
     e?.preventDefault();
-    if (!isTauriRuntime()) {
+    // the native dialog browses THIS machine; a server's folders need the
+    // in-app picker (or, with no backend to list folders, a typed path)
+    if (!isTauriRuntime() || onServer) {
+      if (await canBrowseFolders()) {
+        openFolderPicker((defaultWorkspace || pendingWorkspace).trim(), "continue");
+        return;
+      }
       workspaceDraft = (defaultWorkspace || pendingWorkspace).trim();
       workspaceError = null;
       workspacePickerOpen = true;
@@ -3070,6 +3206,11 @@
   async function openWorkspacePath(raw: string) {
     const p = raw.trim();
     if (!p || !isTauriRuntime()) return;
+    if (onServer) {
+      // `vicuna <path>` names a folder on THIS computer
+      flashNotice(`Switch to This computer to open ${p}: Vicuna is connected to ${srvLabel}.`);
+      return;
+    }
     // links can arrive while hidden in the tray — come forward
     void focusAppWindow();
     let canon: string;
@@ -4679,7 +4820,7 @@
   /** click a file pill in a user bubble → reveal it in Finder/Explorer */
   async function onMessageClick(e: MouseEvent) {
     const el = (e.target as HTMLElement | null)?.closest?.("[data-reveal-path]") as HTMLElement | null;
-    if (!el || !isTauriRuntime()) return;
+    if (!el || !isTauriRuntime() || onServer) return;
     const path = el.getAttribute("data-reveal-path");
     if (!path) return;
     try {
@@ -5295,6 +5436,10 @@
 
   /** OS default app, sandboxed backend-side (work_open_path) */
   async function openPathExternal(path: string) {
+    if (onServer) {
+      flashExpNotice("That file is on the server; open it in the editor instead.");
+      return;
+    }
     if (!isTauriRuntime()) {
       flashExpNotice("Opening in the default app needs the desktop app.");
       return;
@@ -5310,6 +5455,10 @@
     const p = expCtx;
     closeExpCtx();
     if (!p || !isTauriRuntime()) return;
+    if (onServer) {
+      flashExpNotice("That file is on the server, not this computer.");
+      return;
+    }
     try {
       const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
       await revealItemInDir(absExpPath(p.path));
@@ -5362,6 +5511,10 @@
   let gitRefreshTick = $state(0);
 
   async function revealWorkPath(rel: string) {
+    if (onServer) {
+      flashExpNotice("That file is on the server, not this computer.");
+      return;
+    }
     if (!isTauriRuntime()) {
       flashExpNotice("Reveal needs the desktop app.");
       return;
@@ -6576,7 +6729,11 @@
    *  desktop; inline popup form in plain browsers (no FS access for a
    *  dialog, and no window.prompt — it auto-dismisses headlessly). */
   async function pickWorkspace() {
-    if (!isTauriRuntime()) {
+    if (!isTauriRuntime() || onServer) {
+      if (await canBrowseFolders()) {
+        openFolderPicker((composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim(), "composer");
+        return;
+      }
       const el = document.querySelector<HTMLInputElement>("[data-testid=workspace-input-active]");
       if (el) {
         el.focus();
@@ -6609,6 +6766,45 @@
     } catch (e: any) {
       workspaceError = typeof e === "string" ? e : (e?.message ?? String(e));
     }
+  }
+
+  // ---- in-app folder picker (FolderPickerModal): remote servers + bridged
+  // browsers, where the native dialog can't browse the backend's folders
+  let folderPicker = $state<{ start: string; target: "composer" | "continue" } | null>(null);
+  let folderPickError = $state<string | null>(null);
+
+  async function canBrowseFolders(): Promise<boolean> {
+    if (onServer) return true;
+    return !isTauriRuntime() && (await bridgeAvailable());
+  }
+
+  function openFolderPicker(start: string, target: "composer" | "continue") {
+    folderPickError = null;
+    workspaceError = null;
+    folderPicker = { start, target };
+  }
+
+  /** Same validate + assign flow as the typed-path popups; the modal stays
+   *  open with the error when the folder isn't a usable workspace. */
+  async function onFolderPicked(path: string) {
+    const target = folderPicker?.target;
+    // validate BEFORE assigning: the commit helpers set the pending
+    // workspace first, so a rejected pick (e.g. "/") would otherwise stick
+    // to the composer even after the modal is cancelled
+    const err = await validateWorkspace(path);
+    if (err) {
+      folderPickError = err;
+      return;
+    }
+    workspaceDraft = path;
+    if (target === "continue") await commitContinueWorkspace();
+    else await commitWorkspacePicker();
+    workspacePickerOpen = false;
+    if (workspaceError) {
+      folderPickError = workspaceError;
+      return;
+    }
+    folderPicker = null;
   }
 
   /** Discard the browser workspace-picker draft (Esc always cancels). */
@@ -7006,6 +7202,38 @@
           scrollIfOpen();
           saveSoon();
           break;
+        case "schedulewakeup": {
+          // vicuna-mcp schedule_wakeup: resolve in the user's timezone, add a
+          // Scheduled send for this session (same delivery, list, tray and
+          // cancel as one the user scheduled), answer the waiting tool call
+          const tid = workTurnIds.get(chat.id);
+          const r = resolveWakeTime({ at: ev.at, inMinutes: ev.in_minutes }, Date.now());
+          let reply: { ok: boolean; when?: string; error?: string };
+          if ("error" in r) {
+            reply = { ok: false, error: r.error };
+          } else {
+            const c = chats.find((x) => x.id === chat.id);
+            scheduled = [
+              ...scheduled,
+              {
+                id: crypto.randomUUID(),
+                chatId: chat.id,
+                title: c?.title ?? chat.title,
+                workspace,
+                text: wakeMessage(ev.message),
+                at: r.at,
+                createdAt: Date.now()
+              }
+            ];
+            persistScheduled();
+            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const abs = new Date(r.at).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+            const mins = Math.round((r.at - Date.now()) / 60000);
+            reply = { ok: true, when: `${abs} ${tz} (in ${mins >= 120 ? `${Math.round(mins / 60)} h` : `${mins} min`})` };
+          }
+          if (tid) void answerWorkAgentAsk(tid, ev.req_id, JSON.stringify(reply)).catch(() => {});
+          break;
+        }
         case "askrequest":
           // the agent is now blocked on the user: if the window is hidden or
           // in the background, chime + OS notification so they come back
@@ -7366,7 +7594,7 @@
     {
       let stored: string | null = null;
       try {
-        stored = localStorage.getItem(SCHEDULE_KEY);
+        stored = localStorage.getItem(scheduleStoreKey());
       } catch {}
       const loaded = markMissed(parseScheduled(stored), Date.now());
       if (loaded.length) {
@@ -7386,6 +7614,7 @@
       void import("@tauri-apps/api/event")
         .then(async ({ listen }) => {
           unlistenQuit = await listen("vicuna-quit-requested", () => {
+            if (isRemoteServer()) return; // the main window owns the quit prompt
             if (scheduled.length > 0) quitPromptOpen = true;
             else void quitVicuna(true);
           });
@@ -7406,15 +7635,17 @@
         .catch(() => {});
     }
     void initApp();
+    void refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
     initializeAppUpdatePreference();
-    const updateCheckTimer = isTauriRuntime()
+    const updateCheckTimer = isTauriRuntime() && !isRemoteServer()
       ? setTimeout(() => void triggerAutomaticAppUpdateCheck(), 2500)
       : null;
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
     let unlistenDeepLink: (() => void) | null = null;
-    if (isTauriRuntime()) {
+    // links name sessions/folders on THIS computer: the main window owns them
+    if (isTauriRuntime() && !isRemoteServer()) {
       void import("@tauri-apps/plugin-deep-link")
         .then(({ onOpenUrl, getCurrent }) => {
           getCurrent()
@@ -7480,7 +7711,13 @@
       sessionFilterRaw = prefs.sessionFilter ?? ALL_FILTER;
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
-      chats = await loadChats();
+      try {
+        chats = await loadChats();
+      } catch (e) {
+        if (!onServer) throw e;
+        chats = [];
+        srvLoadError = e instanceof Error ? e.message : String(e);
+      }
       // reopen where the user left off (saved on every navigation); the
       // draft below then restores their unsent text into the composer
       const savedActive = await loadActiveChat();
@@ -7862,6 +8099,33 @@
         {/if}
       </div>
       <div class="side-footer">
+        {#if isTauriRuntime()}
+          <div class="srv-pick">
+            {#if srvMenuOpen}
+              <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => (srvMenuOpen = false)}></button>
+              <div class="srv-menu" data-testid="server-menu" role="menu">
+                <div class="srv-menu-label">Recents</div>
+                <button class="srv-item" data-testid="server-item-local" role="menuitem" onclick={() => requestServerSwitch(null)}>
+                  <span class="srv-check">{#if !onServer}✓{/if}</span><span class="srv-item-name">This computer</span>
+                </button>
+                {#each srvList as sv (sv.id)}
+                  <button class="srv-item" data-testid="server-item" role="menuitem" title={sv.url} onclick={() => requestServerSwitch(sv.id)}>
+                    <span class="srv-check">{#if sv.id === activeServer}✓{/if}</span><span class="srv-item-name">{sv.name}</span>
+                  </button>
+                {/each}
+                <div class="srv-sep"></div>
+                <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
+                  <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
+                </button>
+              </div>
+            {/if}
+            <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+              <span class="srv-name">{srvLabel}</span>
+              <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
+            </button>
+          </div>
+        {/if}
         <button class="goto" data-testid="settings-btn" aria-label="Settings" title="Settings" onclick={openSettings}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
           <span>Settings</span>
@@ -7903,7 +8167,7 @@
               <span class="ctx-ws-name">{workspaceBase(defaultWorkspace || pendingWorkspace) || "Folder"}</span>
             </button>
           </div>
-          {#if workspacePickerOpen && !isTauriRuntime()}
+          {#if workspacePickerOpen && (!isTauriRuntime() || onServer)}
             <form
               class="ctx-ws-form"
               data-testid="continue-work-workspace-form"
@@ -7938,6 +8202,13 @@
   {/if}
 
   <main class="main">
+    {#if srvLoadError}
+      <div class="srv-strip" data-testid="server-load-error" role="alert">
+        <span>Can't load sessions from {srvLabel}: {srvLoadError}</span>
+        <button class="mini-btn" onclick={() => window.location.reload()}>Retry</button>
+        <button class="mini-btn" onclick={() => void switchServer(null)}>Use this computer</button>
+      </div>
+    {/if}
     {#if composerMode === "work"}
       <button
         class="icon-btn explorer-toggle-btn"
@@ -8659,7 +8930,7 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
               <span class="model-name">{wsName || "Workspace"}</span>
             </button>
-            {#if workspacePickerOpen && !isTauriRuntime() && !ctxMenu}
+            {#if workspacePickerOpen && (!isTauriRuntime() || onServer) && !ctxMenu}
               <span class="model-pill-wrap">
                 <button class="model-backdrop" data-testid="workspace-picker-backdrop" aria-label="Close workspace picker" onclick={dismissWorkspacePicker} tabindex="-1"></button>
                 <form
@@ -9425,10 +9696,13 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
               <span>Terminal</span>
             </button>
+            <!-- the Browser tab frames a daemon on THIS machine: hidden on a server -->
+            {#if !onServer}
             <button class="ctx-item" data-testid="new-tab-browser" onclick={openSideBrowser}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
               <span>Browser</span>
             </button>
+            {/if}
             <button class="ctx-item" data-testid="new-tab-git" onclick={openSideGit}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
               <span>Git Diff</span>
@@ -9676,6 +9950,54 @@
   >
     <img src={lightboxSrc} alt="" />
   </button>
+{/if}
+{#if folderPicker}
+  <FolderPickerModal
+    start={folderPicker.start}
+    where={onServer ? srvLabel : ""}
+    pickError={folderPickError}
+    onPick={onFolderPicked}
+    onClose={() => (folderPicker = null)}
+  />
+{/if}
+{#if srvDialogOpen}
+  <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
+  <div class="confirm-card srv-card" data-testid="server-dialog" role="dialog" aria-modal="true" aria-label="Connect to server">
+    <label class="srv-field-label" for="srv-url">Server URL</label>
+    <input id="srv-url" class="srv-input" data-testid="server-url-input" placeholder="https://my-vps.tailnet.ts.net:8443" autocomplete="off" spellcheck="false"
+      bind:value={srvUrlDraft} disabled={srvBusy}
+      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
+    <label class="srv-field-label" for="srv-token">Token</label>
+    <input id="srv-token" class="srv-input" data-testid="server-token-input" type="password" placeholder="printed by vicuna serve (kept for saved servers)" autocomplete="off"
+      bind:value={srvTokenDraft} disabled={srvBusy}
+      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
+    {#if srvErr}<p class="goto-error" data-testid="server-error">{srvErr}</p>{/if}
+    <button class="srv-connect-btn" data-testid="server-connect-btn" disabled={srvBusy || srvUrlDraft.trim() === ""} onclick={() => void submitServer()}>{srvBusy ? "Connecting…" : "Connect"}</button>
+    {#if srvList.length}
+      <div class="srv-recent-label">Recent servers</div>
+      {#each srvList as sv (sv.id)}
+        <div class="srv-recent-row" data-testid="server-recent">
+          <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => { srvUrlDraft = sv.url; srvTokenDraft = ""; }}>{sv.name}</button>
+          <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
+            {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
+          </button>
+          <button class="srv-recent-icon" data-testid="server-forget" aria-label="Remove {sv.name}" title="Remove" onclick={() => void forgetServer(sv.id)}>×</button>
+        </div>
+      {/each}
+    {/if}
+    <p class="srv-help">Set up a server: run this on that machine. It prints the URL and token to paste above.</p>
+    <div class="srv-cmd" data-testid="server-setup-cmd">
+      <pre>{SERVER_SETUP_CMD}</pre>
+      <button class="srv-cmd-copy" data-testid="server-setup-copy" aria-label="Copy commands" title={srvCmdCopied ? "Copied" : "Copy"} onclick={() => void copyServerSetup()}>
+        {#if srvCmdCopied}
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+        {:else}
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+        {/if}
+      </button>
+    </div>
+    <p class="srv-help">Work sessions, files and agents then run there; Chat mode keeps using this computer's Ollama.</p>
+  </div>
 {/if}
 {#if pendingDeleteId}
   <button
@@ -10186,23 +10508,18 @@
     {#if isTauriRuntime()}
       <div class="setting-stacked">
         <span class="setting-label">Vicuna CLI</span>
+        <!-- the `vicuna` binary (bridge/ crate) replaced the old launcher script:
+             one command for `vicuna open [path]` and `vicuna serve` (server) -->
         <div class="browse-actions">
-          {#if cliState?.found && cliState.managed}
-            <button class="mini-btn" data-testid="cli-reinstall-btn" disabled={cliOp !== null} onclick={installCliFlow}>{cliOp === "install" ? "…" : "Reinstall"}</button>
-            <button class="mini-btn" data-testid="cli-uninstall-btn" disabled={cliOp !== null} onclick={uninstallCliFlow}>{cliOp === "uninstall" ? "…" : "Uninstall"}</button>
-          {:else}
-            <button class="mini-btn primary" data-testid="cli-install-btn" disabled={cliOp !== null} onclick={installCliFlow}>{cliOp === "install" ? "…" : "Install"}</button>
-          {/if}
-          {#if cliOp === "load"}<span class="setting-note">Checking…</span>{/if}
+          <code class="cli-oneliner" data-testid="cli-oneliner">{CLI_INSTALL_CMD}</code>
+          <button class="mini-btn" data-testid="cli-copy-btn" onclick={() => void copyCliInstall()}>{cliCopied ? "Copied" : "Copy"}</button>
         </div>
-        {#if cliState}
+        {#if cliState?.found}
           <span class="setting-note" data-testid="cli-status">
-            {#if cliState.found && cliState.managed}Installed: {cliState.found}{cliState.on_path ? "" : " (not on PATH yet — open a new terminal)"}{:else if cliState.found}Another `{cliState.exe_name}` already exists at {cliState.found} — Install writes to {cliState.install_dir}.{:else}Not installed — Install writes to {cliState.install_dir}.{/if}
+            {#if cliState.managed}Found the old launcher at {cliState.found}: the command above replaces it.{:else}Found `{cliState.exe_name}` at {cliState.found}.{/if}
           </span>
         {/if}
-        {#if cliNote}<span class="setting-note" data-testid="cli-note">{cliNote}</span>{/if}
-        {#if cliError}<p class="goto-error" data-testid="cli-error">{cliError}</p>{/if}
-        <span class="setting-note">Run `{cliState?.exe_name ?? "vicuna"} [path]` in a terminal to open that folder in Vicuna (default: current directory).</span>
+        <span class="setting-note">Run it in a terminal (macOS/Linux, no sudo). Then <code>vicuna [path]</code> opens a folder here, and <code>vicuna serve --tailscale</code> turns any machine into a server for this app (sidebar server menu → Connect to new server…).</span>
       </div>
       <div class="setting-row quit-row">
         <span class="setting-label">Quit Vicuna</span>
@@ -10593,6 +10910,38 @@
   @keyframes stream-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
   .live-elapsed { flex-shrink: 0; margin-left: 8px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
   .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
+  .cli-oneliner { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; padding: 6px 8px; border: 1px solid var(--border-2); border-radius: 8px; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+  .srv-pick { position: relative; width: 100%; }
+  .srv-btn { width: 100%; box-sizing: border-box; }
+  .srv-btn .srv-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srv-btn .srv-chev { flex: none; opacity: .6; }
+  .srv-btn.remote { color: var(--accent); }
+  .srv-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; display: flex; flex-direction: column; min-width: 220px; }
+  .srv-menu-label { font-size: 12px; color: var(--muted); padding: 6px 10px 4px; }
+  .srv-item { display: flex; align-items: center; gap: 6px; border: none; background: transparent; text-align: left; font: inherit; font-size: 14px; padding: 8px 10px; border-radius: 10px; cursor: pointer; color: var(--text); }
+  .srv-item:hover { background: var(--hover-3); }
+  .srv-check { width: 16px; flex: none; color: var(--muted); text-align: center; }
+  .srv-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .srv-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+  .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+  .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .confirm-card.srv-card { width: min(460px, calc(100vw - 48px)); display: flex; flex-direction: column; gap: 6px; }
+  .srv-field-label { font-size: 13.5px; font-weight: 600; color: var(--text); margin-top: 4px; }
+  .srv-input { border: 1px solid var(--border-2); border-radius: 12px; padding: 10px 12px; font: inherit; font-size: 14.5px; background: transparent; color: var(--text); }
+  .srv-input:focus { outline: none; border-color: var(--accent); }
+  .srv-connect-btn { margin-top: 8px; border: 1px solid var(--border-2); border-radius: 12px; padding: 10px; font: inherit; font-size: 15px; font-weight: 600; background: transparent; color: var(--text); cursor: pointer; }
+  .srv-connect-btn:not(:disabled):hover { background: var(--hover-2); }
+  .srv-connect-btn:disabled { opacity: .55; cursor: default; }
+  .srv-recent-label { font-size: 13px; color: var(--muted); margin-top: 14px; }
+  .srv-recent-row { display: flex; gap: 6px; }
+  .srv-recent { flex: 1; min-width: 0; text-align: left; border: 1px solid var(--border-2); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srv-recent:hover, .srv-recent-icon:hover { background: var(--hover-2); }
+  .srv-recent-icon { flex: none; width: 40px; border: 1px solid var(--border-2); border-radius: 12px; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+  .srv-help { font-size: 12px; color: var(--muted); margin: 12px 0 0; line-height: 1.5; }
+  .srv-cmd { position: relative; margin-top: 6px; border: 1px solid var(--border-2); border-radius: 12px; background: var(--hover-2, rgba(0,0,0,.03)); }
+  .srv-cmd pre { margin: 0; padding: 10px 44px 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+  .srv-cmd-copy { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-2); border-radius: 8px; background: var(--card); color: var(--text-dim); cursor: pointer; }
+  .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }

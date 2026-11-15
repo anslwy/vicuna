@@ -18,6 +18,8 @@
 // root — this is how the bundled (no-PATH) path is verified headlessly
 // (see /tmp/vicuna-browser-bundled.sh).
 
+mod cli;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -46,6 +48,15 @@ pub struct BridgeState {
     pub undo: Arc<UndoState>,
     pub acp: Arc<AcpState>,
     pub events: EventQueues,
+    /// server mode (`serve`): bearer token every request must carry
+    pub token: Option<String>,
+    /// server mode: this machine's own vicuna.db (chats live on the server)
+    pub db: Option<vicuna_lib::server_store::Pool>,
+    /// terminal tabs (remote-server terminals): ptys + term id -> channel id
+    pub terms: Arc<vicuna_lib::TermState>,
+    pub term_channels: Arc<Mutex<HashMap<String, String>>>,
+    /// channel id -> last time a client polled it (orphan-terminal reaper)
+    pub last_poll: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl Default for BridgeState {
@@ -58,6 +69,11 @@ impl Default for BridgeState {
             browser: Arc::new(BrowserState::default()),
             undo: Arc::new(UndoState::default()),
             acp: Arc::new(AcpState::default()),
+            token: None,
+            db: None,
+            terms: Arc::new(vicuna_lib::TermState::default()),
+            term_channels: Arc::new(Mutex::new(HashMap::new())),
+            last_poll: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -84,12 +100,12 @@ fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
-fn channel_for(queues: &EventQueues, uuid: &str) -> Channel<WorkAgentEvent> {
+fn channel_for<T: tauri::ipc::IpcResponse>(queues: &EventQueues, uuid: &str) -> Channel<T> {
     // Real Tauri Channel wired into the poll queue: run_loop is unchanged,
     // its Token/Think/Tool/Done sends land here as JSON for GET /poll/<id>.
     let queues = queues.clone();
     let id = uuid.to_string();
-    Channel::<WorkAgentEvent>::new(move |body| {
+    Channel::<T>::new(move |body| {
         if let InvokeResponseBody::Json(s) = body {
             push_event(&queues, &id, &s);
         }
@@ -139,7 +155,7 @@ async fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing channel marker onEvent".to_string())?
                 .to_string();
-            let on_event = channel_for(&st.events, &uuid);
+            let on_event: Channel<WorkAgentEvent> = channel_for(&st.events, &uuid);
             let engine = vicuna_lib::work_engine::effective_engine(arg_opt_str(args, "engine").as_deref());
             if !engine.is_present() {
                 return Err(engine.missing_message());
@@ -345,6 +361,68 @@ async fn dispatch(
                 .await?;
             Ok(serde_json::Value::Null)
         }
+        // ----- folder picker (remote servers / browsers) -----
+        "fs_list_dirs" => vicuna_lib::fs_list_dirs_logic(
+            arg_opt_str(args, "path"),
+            args.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
+        // ----- terminal tabs (remote-server terminals) -----
+        "term_spawn" => {
+            let uuid = args
+                .get("onEvent")
+                .and_then(|v| v.get("__bridge_channel"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing channel marker onEvent".to_string())?
+                .to_string();
+            let cols = args.get("cols").and_then(|v| v.as_u64()).map(|n| n as u16);
+            let rows = args.get("rows").and_then(|v| v.as_u64()).map(|n| n as u16);
+            let ch: Channel<vicuna_lib::TermEvent> = channel_for(&st.events, &uuid);
+            let id = vicuna_lib::term_spawn_logic(&st.terms, &s("root")?, cols, rows, ch)?;
+            if let Ok(mut lp) = st.last_poll.lock() {
+                lp.insert(uuid.clone(), std::time::Instant::now());
+            }
+            if let Ok(mut tc) = st.term_channels.lock() {
+                tc.insert(id.clone(), uuid);
+            }
+            Ok(serde_json::json!(id))
+        }
+        "term_write" => {
+            vicuna_lib::term_write_logic(&st.terms, &s("id")?, &s("data")?)?;
+            Ok(serde_json::Value::Null)
+        }
+        "term_resize" => {
+            let cols = args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            let rows = args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+            vicuna_lib::term_resize_logic(&st.terms, &s("id")?, cols, rows)?;
+            Ok(serde_json::Value::Null)
+        }
+        "term_kill" => {
+            let id = s("id")?;
+            if let Ok(mut tc) = st.term_channels.lock() {
+                tc.remove(&id);
+            }
+            vicuna_lib::term_kill_logic(&st.terms, &id)?;
+            Ok(serde_json::Value::Null)
+        }
+        // ----- server mode (desktop "Connect to server") -----
+        "server_info" => Ok(serde_json::json!({
+            "app": "vicuna",
+            "name": server_name(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "home": std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default(),
+            "chats": st.db.is_some(),
+        })),
+        "chats_load" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
+            vicuna_lib::server_store::load_chats(db).await
+        }
+        "chats_merge" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
+            let chats = args.get("chats").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+            vicuna_lib::server_store::merge_json(db, &chats, arg_str_list(args, "deleted")).await?;
+            Ok(serde_json::Value::Null)
+        }
         "git_apply" => {
             let b = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
             vicuna_lib::git_panel::git_apply_logic(
@@ -495,7 +573,7 @@ fn json_resp(body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     tiny_http::Response::from_string(body)
         .with_header(h(b"Access-Control-Allow-Origin", b"*"))
         .with_header(h(b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"))
-        .with_header(h(b"Access-Control-Allow-Headers", b"Content-Type"))
+        .with_header(h(b"Access-Control-Allow-Headers", b"Content-Type, Authorization"))
         .with_header(h(b"Content-Type", b"application/json"))
 }
 
@@ -507,12 +585,49 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
         return;
     }
     if *req.method() == Get && path == "/health" {
-        let _ = req.respond(json_resp(r#"{"ok":true,"bridge":1}"#.to_string()));
+        let body = if st.token.is_some() { r#"{"ok":true,"bridge":1,"server":true}"# } else { r#"{"ok":true,"bridge":1}"# };
+        let _ = req.respond(json_resp(body.to_string()));
         return;
+    }
+    if let Some(want) = &st.token {
+        let given = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().trim().to_string())
+            .unwrap_or_default();
+        let given = given.strip_prefix("Bearer ").unwrap_or("").trim();
+        if !token_eq(given, want) {
+            let resp = json_resp(r#"{"ok":false,"error":"wrong or missing token"}"#.to_string()).with_status_code(401);
+            let _ = req.respond(resp);
+            return;
+        }
     }
     if *req.method() == Get && path.starts_with("/poll/") {
         let id = path.trim_start_matches("/poll/").to_string();
-        let events = drain_events(&st.events, &id);
+        // `?wait=<ms>` long-polls (remote clients): hold the request until
+        // events arrive or the wait runs out, so terminal echo and turn
+        // tokens arrive at once instead of on the next poll tick.
+        let wait_ms: u64 = req
+            .url()
+            .split_once('?')
+            .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("wait=")))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+            .min(25_000);
+        let touch = |st: &BridgeState| {
+            if let Ok(mut lp) = st.last_poll.lock() {
+                lp.insert(id.clone(), std::time::Instant::now());
+            }
+        };
+        touch(st);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let mut events = drain_events(&st.events, &id);
+        while events.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            events = drain_events(&st.events, &id);
+        }
+        touch(st);
         let body = serde_json::json!({"events": events}).to_string();
         let _ = req.respond(json_resp(body));
         return;
@@ -561,16 +676,132 @@ fn handle(rt: &tokio::runtime::Handle, st: &Arc<BridgeState>, mut req: tiny_http
     let _ = req.respond(json_resp(r#"{"ok":false,"error":"not found"}"#.to_string()));
 }
 
-/// Serve forever on 127.0.0.1:<port>. Called from `main` below.
-pub fn run(port: u16) {
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn server_name() -> String {
+    for k in ["VICUNA_SERVER_NAME", "HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+    }
+    std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "vicuna".into())
+}
+
+fn server_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join("vicuna").join("server")
+}
+
+/// `VICUNA_SERVER_TOKEN`, else `~/vicuna/server/token` (created 0600 with a
+/// fresh 128-bit token on first run).
+fn server_token() -> String {
+    if let Ok(t) = std::env::var("VICUNA_SERVER_TOKEN") {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    let p = server_dir().join("token");
+    if let Ok(t) = std::fs::read_to_string(&p) {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("os randomness");
+    let t: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let _ = std::fs::create_dir_all(server_dir());
+    std::fs::write(&p, &t).expect("write server token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    t
+}
+
+pub struct Config {
+    pub bind: String,
+    pub port: u16,
+    pub token: Option<String>,
+    pub db: Option<std::path::PathBuf>,
+    /// `--tailscale [--https-port N]`: expose over `tailscale serve` (HTTPS,
+    /// tailnet only) after binding, and print the URL to paste in the app
+    pub tailscale: bool,
+    pub https_port: Option<u16>,
+}
+
+/// Serve forever on <bind>:<port>. Called from `main` below.
+pub fn run(cfg: Config) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("bridge runtime");
-    let state = Arc::new(BridgeState::default());
-    let server =
-        tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("bridge bind 127.0.0.1");
-    println!("vicuna bridge on http://127.0.0.1:{port}");
+    let mut state = BridgeState::default();
+    if let Some(path) = &cfg.db {
+        let pool = rt.block_on(vicuna_lib::server_store::open(path)).expect("open server db");
+        vicuna_lib::vicuna_mcp::set_db_pool_override(pool.clone());
+        state.db = Some(pool);
+    }
+    state.token = cfg.token.clone();
+    let state = Arc::new(state);
+    // Terminals whose tab stopped polling (window closed, laptop asleep,
+    // client gone) would keep their shell alive forever on a server: reap
+    // any whose channel hasn't been polled for 90 s.
+    {
+        let st = state.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let stale: Vec<(String, String)> = {
+                let tc = st.term_channels.lock().map(|m| m.clone()).unwrap_or_default();
+                let lp = st.last_poll.lock().map(|m| m.clone()).unwrap_or_default();
+                tc.into_iter()
+                    .filter(|(_, ch)| lp.get(ch).is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(90)))
+                    .collect()
+            };
+            for (term, ch) in stale {
+                let _ = vicuna_lib::term_kill_logic(&st.terms, &term);
+                if let Ok(mut tc) = st.term_channels.lock() {
+                    tc.remove(&term);
+                }
+                if let Ok(mut lp) = st.last_poll.lock() {
+                    lp.remove(&ch);
+                }
+                if let Ok(mut q) = st.events.lock() {
+                    q.remove(&ch);
+                }
+            }
+        });
+    }
+    let addr = format!("{}:{}", cfg.bind, cfg.port);
+    let server = tiny_http::Server::http(&addr).unwrap_or_else(|e| panic!("bridge bind {addr}: {e}"));
+    match (&cfg.token, &cfg.db) {
+        (Some(t), Some(db)) => {
+            println!("vicuna server {} on http://{addr}", env!("CARGO_PKG_VERSION"));
+            println!("  chats: {}", db.display());
+            println!("  token: {t}");
+            if cfg.tailscale {
+                match cli::tailscale_expose(cfg.port, cfg.https_port) {
+                    Ok(url) => {
+                        println!("  tailnet URL: {url}");
+                        println!("In Vicuna: sidebar server menu → Connect to new server… → {url} + the token above.");
+                    }
+                    Err(e) => println!("  tailscale: {e}"),
+                }
+            } else {
+                println!("Expose it to your tailnet (HTTPS) with `vicuna serve --tailscale`, or by hand:");
+                println!("  tailscale serve --bg --https=8443 http://127.0.0.1:{}", cfg.port);
+            }
+            if cfg.bind != "127.0.0.1" && cfg.bind != "localhost" {
+                println!("WARNING: listening on {} over plain HTTP; prefer --bind 127.0.0.1 behind tailscale serve.", cfg.bind);
+            }
+        }
+        _ => println!("vicuna bridge on http://{addr}"),
+    }
     for req in server.incoming_requests() {
         let st = state.clone();
         let h = rt.handle().clone();
@@ -578,10 +809,109 @@ pub fn run(port: u16) {
     }
 }
 
+const USAGE: &str = "vicuna — Vicuna's command line
+
+usage:
+  vicuna serve [--port N] [--bind ADDR] [--db PATH] [--tailscale [--https-port N]]
+        Run a Vicuna server for the desktop app (token auth; chats in ~/vicuna/server).
+        --tailscale also exposes it over `tailscale serve` (HTTPS, tailnet only)
+        and prints the URL to paste into the app. Default 127.0.0.1:7421.
+  vicuna install-service [serve options]   run `vicuna serve` in the background
+        on login/boot (systemd user unit on Linux, launchd agent on macOS)
+  vicuna uninstall-service
+  vicuna token                             print the server token
+  vicuna open [path]                       open a folder in the Vicuna desktop app
+  vicuna [path]                            same as `vicuna open [path]`
+  vicuna bridge [port]                     dev bridge for browser testing (127.0.0.1, no auth, 1421)
+  vicuna --version";
+
+fn die(msg: &str) -> ! {
+    eprintln!("{msg}\n\n{USAGE}");
+    std::process::exit(2)
+}
+
+/// Parse `serve` options (shared by `serve` and `install-service`).
+fn parse_serve(args: &[String]) -> Config {
+    let mut cfg = Config { bind: "127.0.0.1".into(), port: 7421, token: None, db: None, tailscale: false, https_port: None };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().unwrap_or_else(|| die(&format!("{a} needs a value")));
+        match a.as_str() {
+            "--port" => cfg.port = val().parse().unwrap_or_else(|_| die("bad --port")),
+            "--bind" => cfg.bind = val(),
+            "--db" => cfg.db = Some(std::path::PathBuf::from(val())),
+            "--tailscale" => cfg.tailscale = true,
+            "--https-port" => cfg.https_port = Some(val().parse().unwrap_or_else(|_| die("bad --https-port"))),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0)
+            }
+            other => die(&format!("unknown option {other}")),
+        }
+    }
+    cfg
+}
+
 fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(1421);
-    run(port);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest = args.get(1..).unwrap_or(&[]).to_vec();
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            let mut cfg = parse_serve(&rest);
+            cfg.token = Some(server_token());
+            if cfg.db.is_none() {
+                cfg.db = Some(server_dir().join("vicuna.db"));
+            }
+            run(cfg);
+        }
+        Some("install-service") => {
+            let _ = parse_serve(&rest); // validate before writing anything
+            match cli::install_service(&rest) {
+                Ok(m) => {
+                    println!("{m}");
+                    println!("Token: {}", server_token());
+                }
+                Err(e) => {
+                    eprintln!("install-service failed: {e}");
+                    std::process::exit(1)
+                }
+            }
+        }
+        Some("uninstall-service") => match cli::uninstall_service() {
+            Ok(m) => println!("{m}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }
+        },
+        Some("token") => println!("{}", server_token()),
+        Some("open") => match cli::open_in_app(rest.first().map(String::as_str)) {
+            Ok(p) => println!("Opened {p} in Vicuna."),
+            Err(e) => {
+                eprintln!("vicuna open: {e}");
+                std::process::exit(1)
+            }
+        },
+        Some("bridge") => {
+            let port = rest.first().map(|p| p.parse().unwrap_or_else(|_| die("bad port"))).unwrap_or(1421);
+            run(Config { bind: "127.0.0.1".into(), port, token: None, db: None, tailscale: false, https_port: None });
+        }
+        Some("-h") | Some("--help") | Some("help") => println!("{USAGE}"),
+        Some("-V") | Some("--version") | Some("version") => println!("vicuna {}", env!("CARGO_PKG_VERSION")),
+        // `cargo run -- <port>` (the old bridge invocation) keeps working
+        Some(p) if p.parse::<u16>().is_ok() => {
+            run(Config { bind: "127.0.0.1".into(), port: p.parse().unwrap(), token: None, db: None, tailscale: false, https_port: None })
+        }
+        // `vicuna [path]` — the old desktop launcher's behavior
+        Some(p) if !p.starts_with('-') => match cli::open_in_app(Some(p)) {
+            Ok(p) => println!("Opened {p} in Vicuna."),
+            Err(e) => {
+                eprintln!("vicuna: {e}");
+                std::process::exit(1)
+            }
+        },
+        Some(other) => die(&format!("unknown option {other}")),
+        // no args: the dev bridge, as before (docs/scripts run `cargo run` here)
+        None => run(Config { bind: "127.0.0.1".into(), port: 1421, token: None, db: None, tailscale: false, https_port: None }),
+    }
 }

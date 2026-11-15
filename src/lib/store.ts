@@ -1,6 +1,7 @@
 import type { ChatMsg } from "./ollama";
 import { validateOverride, type CatalogOverride } from "./library";
 import { normalizeContinueMode, type ContinueMode, type PromptStyle } from "./continue";
+import { activeServerId, invokeOrBridge } from "./bridge";
 
 export interface Chat {
   id: string;
@@ -53,7 +54,11 @@ const HOME_DRAFT_KEY = "__home__";
 const LS_ACTIVE_CHAT = "vicuna-active-chat";
 
 function draftKey(id: string | null): string {
-  return id ?? HOME_DRAFT_KEY;
+  // server windows keep their own composer draft (several windows share
+  // this localStorage)
+  const base = id ?? HOME_DRAFT_KEY;
+  const server = activeServerId();
+  return server ? `${server}::${base}` : base;
 }
 
 export function readDrafts(): Record<string, string> {
@@ -287,6 +292,32 @@ function serializeImages(images: string[] | undefined): string | null {
   return images?.length ? JSON.stringify(images) : null;
 }
 
+/** exact payload shape for the Rust chats_save / server chats_merge commands (camelCase keys) */
+function toSavePayload(chats: Chat[]) {
+  return chats.map((c) => ({
+    id: c.id,
+    title: c.title,
+    createdAt: c.createdAt,
+    updatedAt: chatActivity(c),
+    forkedFrom: c.forkedFrom ? JSON.stringify(c.forkedFrom) : null,
+    forkFromIndex: c.forkFromIndex ?? null,
+    mode: c.mode ?? "chat",
+    workspace: c.workspace ?? null,
+    goal: c.goal ?? null,
+    messages: c.messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      thinking: m.thinking ?? "",
+      model: m.model ?? null,
+      images: m.images?.length ? m.images : null,
+      genMs: m.genMs ?? null,
+      genTps: m.genTps ?? null,
+      genCost: m.genCost ?? null,
+      summary: m.summary ? true : null
+    }))
+  }));
+}
+
 // ---- sqlite backend (Tauri desktop) ----
 
 async function createSqliteBackend(): Promise<Backend> {
@@ -411,32 +442,6 @@ async function createSqliteBackend(): Promise<Backend> {
     }
   }
 
-  /** exact payload shape for the Rust chats_save command (camelCase keys) */
-  function toSavePayload(chats: Chat[]) {
-    return chats.map((c) => ({
-      id: c.id,
-      title: c.title,
-      createdAt: c.createdAt,
-      updatedAt: chatActivity(c),
-      forkedFrom: c.forkedFrom ? JSON.stringify(c.forkedFrom) : null,
-      forkFromIndex: c.forkFromIndex ?? null,
-      mode: c.mode ?? "chat",
-      workspace: c.workspace ?? null,
-      goal: c.goal ?? null,
-      messages: c.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        thinking: m.thinking ?? "",
-        model: m.model ?? null,
-        images: m.images?.length ? m.images : null,
-        genMs: m.genMs ?? null,
-        genTps: m.genTps ?? null,
-        genCost: m.genCost ?? null,
-        summary: m.summary ? true : null
-      }))
-    }));
-  }
-
   return {
     async loadChats(): Promise<Chat[]> {      const rows = await db.select<
         { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null; updated_at: number | null }[]
@@ -541,6 +546,111 @@ async function createSqliteBackend(): Promise<Backend> {
   };
 }
 
+// ---- remote server backend (desktop connected to `vicuna serve`) ----
+// Chats live on the server, shared by every desktop that connects. Saves are
+// a merge, never a rewrite (a rewrite from one client would delete what
+// another created): only chats whose payload changed since the last save go
+// up, plus the ids THIS client deleted. Same coalescing single-writer as the
+// sqlite backend. Everything that isn't chats (model, catalog, active chat)
+// stays in localStorage, keyed per server.
+
+function serverKey(base: string, id: string): string {
+  return `${base}:server:${id}`;
+}
+
+function createServerBackend(serverId: string): Backend {
+  const sent = new Map<string, string>(); // chat id -> last payload JSON the server has
+  let saveActive = false;
+  let queued: Chat[] | null = null;
+
+  async function push(chats: Chat[]): Promise<void> {
+    const items = toSavePayload(chats);
+    const current = new Set(items.map((i) => i.id));
+    const changed: typeof items = [];
+    const json = new Map<string, string>();
+    for (const it of items) {
+      const j = JSON.stringify(it);
+      json.set(it.id, j);
+      if (sent.get(it.id) !== j) changed.push(it);
+    }
+    const deleted = [...sent.keys()].filter((id) => !current.has(id));
+    if (changed.length === 0 && deleted.length === 0) return;
+    await invokeOrBridge("chats_merge", { chats: changed, deleted });
+    for (const it of changed) sent.set(it.id, json.get(it.id)!);
+    for (const id of deleted) sent.delete(id);
+  }
+
+  const ls = (base: string) => serverKey(base, serverId);
+  return {
+    async loadChats(): Promise<Chat[]> {
+      const raw = await invokeOrBridge<any[]>("chats_load", {});
+      const chats: Chat[] = (Array.isArray(raw) ? raw : []).map((c: any) => ({
+        id: String(c.id),
+        title: typeof c.title === "string" ? c.title : "Untitled",
+        createdAt: typeof c.createdAt === "number" ? c.createdAt : 0,
+        updatedAt: typeof c.updatedAt === "number" ? c.updatedAt : c.createdAt ?? 0,
+        forkedFrom: c.forkedFrom && typeof c.forkedFrom.id === "string" ? c.forkedFrom : null,
+        forkFromIndex: typeof c.forkFromIndex === "number" ? c.forkFromIndex : null,
+        mode: c.mode === "work" ? "work" : "chat",
+        workspace: typeof c.workspace === "string" ? c.workspace : null,
+        goal: typeof c.goal === "string" ? c.goal : null,
+        messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
+          role: m.role as ChatMsg["role"],
+          content: typeof m.content === "string" ? m.content : "",
+          thinking: m.thinking || undefined,
+          model: m.model || undefined,
+          images: Array.isArray(m.images) && m.images.length ? m.images : undefined,
+          genMs: typeof m.genMs === "number" ? m.genMs : undefined,
+          genTps: typeof m.genTps === "number" ? m.genTps : undefined,
+          genCost: typeof m.genCost === "number" ? m.genCost : undefined,
+          summary: m.summary === true ? true : undefined
+        }))
+      }));
+      // what the server already has: the first save sends nothing unchanged
+      sent.clear();
+      for (const it of toSavePayload(chats)) sent.set(it.id, JSON.stringify(it));
+      return chats;
+    },
+    async saveChats(chats: Chat[]): Promise<void> {
+      queued = chats;
+      if (saveActive) return;
+      saveActive = true;
+      try {
+        while (queued) {
+          const next = queued;
+          queued = null;
+          try {
+            await push(next);
+          } catch (e) {
+            console.error("server saveChats failed:", e);
+          }
+        }
+      } finally {
+        saveActive = false;
+      }
+    },
+    async loadModel() {
+      return localStorage.getItem(ls(LS_MODEL));
+    },
+    async saveModel(m: string) {
+      localStorage.setItem(ls(LS_MODEL), m);
+    },
+    async loadCatalog() {
+      return localStorage.getItem(LS_CATALOG);
+    },
+    async saveCatalog(json: string) {
+      localStorage.setItem(LS_CATALOG, json);
+    },
+    async loadActiveChat() {
+      return localStorage.getItem(ls(LS_ACTIVE_CHAT));
+    },
+    async saveActiveChat(id: string | null) {
+      if (id) localStorage.setItem(ls(LS_ACTIVE_CHAT), id);
+      else localStorage.removeItem(ls(LS_ACTIVE_CHAT));
+    }
+  };
+}
+
 // ---- active backend ----
 
 let backend: Backend = lsBackend;
@@ -551,6 +661,14 @@ export function storageKind(): string {
 }
 
 export async function initStorage(): Promise<void> {
+  const server = activeServerId();
+  if (server) {
+    // no silent fallback: writing a server's chats into local storage (or
+    // showing local chats as the server's) would be worse than an error
+    backend = createServerBackend(server);
+    backendName = "server";
+    return;
+  }
   if (!isTauri()) {
     backend = lsBackend;
     backendName = "localStorage";
@@ -600,6 +718,10 @@ export async function loadActiveChat(): Promise<string | null> {
 }
 
 export function saveActiveChat(id: string | null): void {
+  if (activeServerId()) {
+    backend.saveActiveChat(id).catch(() => {});
+    return;
+  }
   try {
     if (id) localStorage.setItem(LS_ACTIVE_CHAT, id);
     else localStorage.removeItem(LS_ACTIVE_CHAT);
@@ -776,19 +898,59 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_session_filter', $1)", [p.sessionFilter ?? "all"]);
 }
 
+/** Prefs that name places on the backend machine: on a remote server they
+ *  are kept per server so a server path never becomes the local default. */
+interface ServerScopedPrefs {
+  defaultWorkspace: string;
+  sessionFilter: string;
+}
+
+function readServerPrefs(id: string): ServerScopedPrefs {
+  try {
+    const p = JSON.parse(localStorage.getItem(serverKey(LS_PREFS, id)) ?? "{}");
+    return {
+      defaultWorkspace: typeof p.defaultWorkspace === "string" ? p.defaultWorkspace : "",
+      sessionFilter: typeof p.sessionFilter === "string" ? p.sessionFilter : DEFAULT_PREFS.sessionFilter
+    };
+  } catch {
+    return { defaultWorkspace: "", sessionFilter: DEFAULT_PREFS.sessionFilter };
+  }
+}
+
+function withServerPrefs(p: Prefs): Prefs {
+  const id = activeServerId();
+  return id ? { ...p, ...readServerPrefs(id) } : p;
+}
+
+/** Synchronous startup read (before initApp): local prefs with the active
+ *  server's scoped values overlaid. */
+export function readStartupPrefs(): Prefs {
+  return withServerPrefs(readLocalPrefs());
+}
+
 export async function loadPrefs(): Promise<Prefs> {
   const local = readLocalPrefs();
   if (!isTauri()) return local;
   try {
     const remote = await readSqlitePrefs();
-    return { ...local, ...remote };
+    return withServerPrefs({ ...local, ...remote });
   } catch (e) {
     console.error("loadPrefs failed, using local:", e);
-    return local;
+    return withServerPrefs(local);
   }
 }
 
 export function savePrefs(p: Prefs): void {
+  const server = activeServerId();
+  if (server) {
+    try {
+      localStorage.setItem(serverKey(LS_PREFS, server), JSON.stringify({ defaultWorkspace: p.defaultWorkspace, sessionFilter: p.sessionFilter }));
+    } catch {
+      /* ignore */
+    }
+    const local = readLocalPrefs();
+    p = { ...p, defaultWorkspace: local.defaultWorkspace, sessionFilter: local.sessionFilter };
+  }
   try {
     localStorage.setItem(LS_PREFS, JSON.stringify(p));
   } catch {

@@ -5,7 +5,7 @@
 
 import type { ChatMsg } from "./ollama";
 import { isTauriRuntime } from "./ollama";
-import { invokeOrBridge, BridgeChannel, bridgeInvoke } from "./bridge";
+import { invokeOrBridge, BridgeChannel, bridgeInvoke, isRemoteServer, useLocalIpc } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
 export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac } from "./workGate";
@@ -61,6 +61,7 @@ export async function writeWorkFile(root: string, path: string, content: string)
 /** Open a workspace path with the OS default app (desktop only; sandboxed
  *  backend-side via work_join). */
 export async function openWorkPathExternal(root: string, path: string): Promise<void> {
+  if (isRemoteServer()) throw new Error("That file is on the server; open it in the in-app editor instead.");
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("work_open_path", { root, path });
 }
@@ -173,8 +174,16 @@ export interface TermStreamEvent {
   code?: number | null;
 }
 
-/** Spawn an interactive shell rooted at the workspace (desktop only).
- *  Output/exit stream through the callbacks; returns the terminal id. */
+/** Remote-server terminals: their poll channels (stopped on kill/exit) and
+ *  per-terminal write queues. Each keystroke is an HTTP request there, and
+ *  concurrent requests can land out of order, so writes are serialized and
+ *  keystrokes typed while one is in flight coalesce into the next send. */
+const remoteTermChannels = new Map<string, BridgeChannel>();
+const termWriteQueues = new Map<string, { pending: string; busy: boolean }>();
+
+/** Spawn an interactive shell rooted at the workspace (desktop only; on a
+ *  remote server the shell runs on the server). Output/exit stream through
+ *  the callbacks; returns the terminal id. */
 export async function spawnTerm(
   root: string,
   cols: number,
@@ -183,19 +192,55 @@ export async function spawnTerm(
   onExit: (code: number | null) => void
 ): Promise<string> {
   if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
-  const { invoke, Channel } = await import("@tauri-apps/api/core");
-  const ch = new Channel<TermStreamEvent>();
-  ch.onmessage = (ev) => {
+  const handle = (ev: TermStreamEvent) => {
     if (ev.type === "output") onOutput(ev.text ?? "");
     else if (ev.type === "exit") onExit(ev.code ?? null);
   };
+  if (isRemoteServer()) {
+    const ch = new BridgeChannel();
+    let id = "";
+    ch.onmessage = (ev) => {
+      handle(ev as TermStreamEvent);
+      if ((ev as TermStreamEvent).type === "exit") {
+        ch.stop();
+        if (id) remoteTermChannels.delete(id);
+      }
+    };
+    try {
+      id = await bridgeInvoke("term_spawn", { root, cols, rows, onEvent: ch.marker() });
+    } catch (e) {
+      ch.stop();
+      throw e;
+    }
+    remoteTermChannels.set(id, ch);
+    return id;
+  }
+  const { invoke, Channel } = await import("@tauri-apps/api/core");
+  const ch = new Channel<TermStreamEvent>();
+  ch.onmessage = handle;
   return await invoke<string>("term_spawn", { root, cols, rows, onEvent: ch });
 }
 
-/** Send keystrokes to a terminal (desktop only). */
+/** Send keystrokes to a terminal (desktop only). Serialized per terminal. */
 export async function writeTerm(id: string, data: string): Promise<void> {
   if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
-  await invokeCmd<void>("term_write", { id, data });
+  let q = termWriteQueues.get(id);
+  if (!q) {
+    q = { pending: "", busy: false };
+    termWriteQueues.set(id, q);
+  }
+  q.pending += data;
+  if (q.busy) return;
+  q.busy = true;
+  try {
+    while (q.pending) {
+      const chunk = q.pending;
+      q.pending = "";
+      await invokeCmd<void>("term_write", { id, data: chunk });
+    }
+  } finally {
+    q.busy = false;
+  }
 }
 
 /** Resize a terminal (desktop only). */
@@ -207,6 +252,9 @@ export async function resizeTerm(id: string, cols: number, rows: number): Promis
 /** Kill a terminal's shell (desktop only, best-effort). */
 export async function killTerm(id: string): Promise<void> {
   if (!isTauriRuntime()) return;
+  remoteTermChannels.get(id)?.stop();
+  remoteTermChannels.delete(id);
+  termWriteQueues.delete(id);
   try {
     await invokeCmd<void>("term_kill", { id });
   } catch {
@@ -473,6 +521,7 @@ export type WorkAgentEvent =
   | { type: "toolstart"; name: string; args: Record<string, any> }
   | { type: "toolend"; name: string; output: string }
   | { type: "askrequest"; ask_id: string; question: string; options: string[]; multi?: boolean }
+  | { type: "schedulewakeup"; req_id: string; message: string; at: string | null; in_minutes: number | null }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "runstarted"; job_id: string; command: string; started_ms?: number }
   | { type: "runended"; job_id: string }
@@ -547,7 +596,7 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     sessionId: p.sessionId ?? null,
     goalText: p.goalText ?? null
   };
-  if (isTauriRuntime()) {
+  if (useLocalIpc()) {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
     const ch = new Channel<WorkAgentEvent>();
     ch.onmessage = (ev) => p.onEvent(ev);
@@ -565,7 +614,7 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
 
 /** Interrupt a running turn (double-Esc, Stop, chat deleted). */
 export async function stopWorkAgentTurn(turnId: string): Promise<void> {
-  if (isTauriRuntime()) {
+  if (useLocalIpc()) {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("work_agent_stop", { turnId });
     return;
