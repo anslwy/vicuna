@@ -616,10 +616,10 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
  *  started it closed or reloaded). Only remote servers / bridged browsers keep
  *  turns across windows; local Tauri turns end with their window.
  *  Keyed by Vicuna session id. */
-export async function liveWorkTurns(): Promise<Record<string, { turnId: string; channel: string }>> {
+export async function liveWorkTurns(): Promise<Record<string, { turnId: string; channel: string; startedMs?: number }>> {
   if (useLocalIpc()) return {};
   try {
-    return ((await bridgeInvoke("work_agent_live", {})) ?? {}) as Record<string, { turnId: string; channel: string }>;
+    return ((await bridgeInvoke("work_agent_live", {})) ?? {}) as Record<string, { turnId: string; channel: string; startedMs?: number }>;
   } catch {
     return {}; // older server without the command, or bridge down
   }
@@ -679,6 +679,26 @@ export async function workRunStatus(id: string): Promise<BackgroundJobStatus> {
 }
 export async function workRunKill(id: string): Promise<BackgroundJobStatus> {
   return await invokeCmd<BackgroundJobStatus>("work_run_kill", { id });
+}
+
+/** Backgrounded jobs the backend still owes a finished message to: a window
+ *  that closed/reloaded rebuilds its chips from this. [] on older backends. */
+export async function workRunList(): Promise<Array<{ jobId: string; sessionId: string; command: string; startedMs: number; foreground?: boolean }>> {
+  try {
+    return (await invokeCmd<Array<{ jobId: string; sessionId: string; command: string; startedMs: number; foreground?: boolean }>>("work_run_list", {})) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Claim delivery of a finished job's message (false = another window has
+ *  it); `release` hands it back after a failed send. Older backends: true. */
+export async function workRunClaim(id: string, release = false): Promise<boolean> {
+  try {
+    return await invokeCmd<boolean>("work_run_claim", { id, release });
+  } catch {
+    return true;
+  }
 }
 
 export type UsageMeter = {

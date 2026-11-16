@@ -303,6 +303,19 @@ pub async fn work_run_kill(id: String) -> Result<crate::BgJobStatus, String> {
     crate::bg_kill(crate::vicuna_mcp::jobs(), &id)
 }
 
+/// Backgrounded `run` jobs not yet reported to their session (a reopened
+/// window rebuilds its chips from this).
+#[tauri::command]
+pub async fn work_run_list() -> Vec<crate::vicuna_mcp::BgRunRecord> {
+    crate::vicuna_mcp::bg_runs_pending()
+}
+
+/// One window delivers a finished job's message: true = this caller may.
+#[tauri::command]
+pub async fn work_run_claim(id: String, release: Option<bool>) -> bool {
+    crate::vicuna_mcp::bg_run_claim(&id, release.unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

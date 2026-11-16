@@ -61,7 +61,9 @@ pub struct BridgeState {
     /// window that closed/reloaded mid-turn reattaches (`work_agent_live`)
     /// instead of losing the stream or starting a second engine process on
     /// the same session.
-    pub session_turns: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// (turn id, channel id, start ms epoch: a reopened window's elapsed
+    /// clock must count from the turn's real start, not from the reopen)
+    pub session_turns: Arc<Mutex<HashMap<String, (String, String, u64)>>>,
 }
 
 impl Default for BridgeState {
@@ -205,7 +207,7 @@ async fn dispatch(
             let session_id = arg_opt_str(args, "sessionId");
             if let Some(sid) = &session_id {
                 let live = st.session_turns.lock().ok().and_then(|m| m.get(sid).cloned());
-                if let Some((tid, _)) = live {
+                if let Some((tid, _, _)) = live {
                     if st.agent.get_turn(&tid).is_some() {
                         return Err(format!(
                             "this session already has a Work turn running on the server ({tid}); reopen the session to follow it"
@@ -217,7 +219,11 @@ async fn dispatch(
             let mcp_snapshot =
                 vicuna_lib::acp::McpSnapshot::capture(&st.mcp, test_resource_dir().as_deref()).await;
             if let (Some(sid), Ok(mut m)) = (&session_id, st.session_turns.lock()) {
-                m.insert(sid.clone(), (turn_id.clone(), uuid.clone()));
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                m.insert(sid.clone(), (turn_id.clone(), uuid.clone(), started_ms));
             }
             let session_turns = st.session_turns.clone();
             let live_key = session_id.clone().map(|sid| (sid, turn_id.clone()));
@@ -228,7 +234,7 @@ async fn dispatch(
                 )
                 .await;
                 if let (Some((sid, tid)), Ok(mut m)) = (live_key, session_turns.lock()) {
-                    if m.get(&sid).is_some_and(|(t, _)| *t == tid) {
+                    if m.get(&sid).is_some_and(|(t, _, _)| *t == tid) {
                         m.remove(&sid);
                     }
                 }
@@ -273,9 +279,9 @@ async fn dispatch(
         "work_agent_live" => {
             let live = st.session_turns.lock().map(|m| m.clone()).unwrap_or_default();
             let mut out = serde_json::Map::new();
-            for (sid, (tid, ch)) in live {
+            for (sid, (tid, ch, started_ms)) in live {
                 if st.agent.get_turn(&tid).is_some() {
-                    out.insert(sid, serde_json::json!({ "turnId": tid, "channel": ch }));
+                    out.insert(sid, serde_json::json!({ "turnId": tid, "channel": ch, "startedMs": started_ms }));
                 }
             }
             Ok(serde_json::Value::Object(out))
@@ -310,6 +316,11 @@ async fn dispatch(
         }
         "work_run_status" => Ok(serde_json::json!(vicuna_lib::bg_snapshot(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
         "work_run_kill" => Ok(serde_json::json!(vicuna_lib::bg_kill(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
+        "work_run_list" => Ok(serde_json::json!(vicuna_lib::vicuna_mcp::bg_runs_pending())),
+        "work_run_claim" => Ok(serde_json::json!(vicuna_lib::vicuna_mcp::bg_run_claim(
+            &s("id")?,
+            args.get("release").and_then(|v| v.as_bool()).unwrap_or(false),
+        ))),
         // ----- workspace validation / tools -----
         "work_validate_root" => {
             Ok(serde_json::json!(vicuna_lib::work_validate_root_logic(s("path")?).await?))

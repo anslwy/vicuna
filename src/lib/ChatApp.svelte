@@ -37,7 +37,7 @@
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -1151,9 +1151,11 @@
     const { [id]: _, ...rest } = streamingStartedAt;
     streamingStartedAt = rest;
   }
-  function markWorkRunning(id: string) {
+  /** `startedAt`: the turn's real start when reattaching to one the server
+   *  kept running (the sidebar clock must not restart at the reopen) */
+  function markWorkRunning(id: string, startedAt?: number) {
     if (!workRunningIds.includes(id)) workRunningIds = [...workRunningIds, id];
-    workStartedAt = { ...workStartedAt, [id]: Date.now() };
+    workStartedAt = { ...workStartedAt, [id]: startedAt && startedAt <= Date.now() ? startedAt : Date.now() };
   }
   function unmarkWorkRunning(id: string) {
     if (!workRunningIds.includes(id)) return;
@@ -1532,9 +1534,17 @@
         if (!st || st.running) continue;
         if (!chats.some((c) => c.id === run.chatId)) {
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId); // session deleted
+          void workRunClaim(run.jobId);
+          continue;
+        }
+        // another window on the same backend may be watching this job too:
+        // only the one that claims it wakes the session
+        if (!(await workRunClaim(run.jobId))) {
+          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
           continue;
         }
         const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) });
+        if (!sent) void workRunClaim(run.jobId, true);
         if (sent) {
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
           const title = chats.find((c) => c.id === run.chatId)?.title ?? "the session";
@@ -1542,12 +1552,33 @@
         }
       } catch (e: any) {
         bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
+        void workRunClaim(run.jobId, true);
         error = `Background command finished, but its output could not be sent: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
       } finally {
         bgDelivering.delete(run.jobId);
       }
     }
   }
+  /** Rebuild background-job chips after the window closed or reloaded: the
+   *  jobs kept running on the backend, but `bgRuns` lived only in the old
+   *  window, so nothing watched them and the session was never woken. */
+  async function restoreBgRuns() {
+    const recs = await workRunList();
+    // foreground calls still waiting: their strip (with Background) sits on
+    // the live turn's trailing reply; `done` clears it as usual
+    const fg = recs
+      .filter((r) => r.foreground && !runningRuns.some((x) => x.jobId === r.jobId))
+      .flatMap((r) => {
+        const c = chats.find((x) => x.id === r.sessionId);
+        return c?.messages.length ? [{ chatId: c.id, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now(), index: c.messages.length - 1 }] : [];
+      });
+    if (fg.length) runningRuns = [...runningRuns, ...fg];
+    const add = recs
+      .filter((r) => !r.foreground && chats.some((c) => c.id === r.sessionId) && !bgRuns.some((b) => b.jobId === r.jobId))
+      .map((r) => ({ chatId: r.sessionId, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now() }));
+    if (add.length) bgRuns = [...bgRuns, ...add];
+  }
+
   $effect(() => {
     if (!bgRuns.length) return;
     const t = setInterval(() => void pollBgRuns(), 2000);
@@ -7044,7 +7075,7 @@
     }
   }
 
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string } } = {}) {
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string; startedMs?: number } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
     const turnEngine = engineId(workEngineInfo);
@@ -7070,7 +7101,7 @@
     // No Tauri gate here: plain browsers drive the same flow through the
     // loopback bridge (startWorkAgentTurn throws the desktop/bridge error
     // when neither is present, and the catch below surfaces it).
-    markWorkRunning(chat.id);
+    markWorkRunning(chat.id, opts.attach?.startedMs);
     workStopIds.delete(chat.id);
     // a new turn invalidates /redo (backend clears its stack in undo_begin_turn)
     if (!opts.attach) dropUndoStash(chat.id);
@@ -8034,7 +8065,8 @@
       clearPendingStream();
       pending = null;
     }
-    void reattachLiveWorkTurns();
+    // reattach first: a restored run strip needs the live turn's bubble
+    void reattachLiveWorkTurns().then(() => restoreBgRuns());
     if (pending && (!sessionId || sessionId === pending.chatId)) {
       const pc = chats.find((c) => c.id === pending!.chatId);
       const pm = pc?.messages[pending.index];
