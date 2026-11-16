@@ -38,6 +38,7 @@
   import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, type SessionRow } from "$lib/leadSessions";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
+  import { createTurnReplyRoute } from "$lib/turnReply";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -7486,6 +7487,16 @@
     const native: ChatMsg[] = [...seed, ...baseHistory];
     const think = effectiveThink();
 
+    // The channel can deliver before start returns its id. Keep its origin
+    // independent of the mutable per-chat map (settle/replacement clears it).
+    const replyRoute = createTurnReplyRoute();
+    const replyToTurn = (askId: string, answer: string) => {
+      void replyRoute.send(askId, answer, answerWorkAgentAsk).catch((e) => {
+        console.error("Work reply delivery failed", { chatId: chat.id, askId, error: e });
+        error = `Could not deliver the Work reply: ${String(e)}. The action may have run; check before retrying.`;
+      });
+    };
+
     async function settle(stopped: boolean) {
       if (flushTimer) {
         clearTimeout(flushTimer);
@@ -7721,7 +7732,6 @@
           // vicuna-mcp schedule_wakeup: resolve in the user's timezone, add a
           // Scheduled send for this session (same delivery, list, tray and
           // cancel as one the user scheduled), answer the waiting tool call
-          const tid = workTurnIds.get(chat.id);
           const r = resolveWakeTime({ at: ev.at, inMinutes: ev.in_minutes }, Date.now());
           let reply: { ok: boolean; when?: string; error?: string };
           if ("error" in r) {
@@ -7746,15 +7756,14 @@
             const mins = Math.round((r.at - Date.now()) / 60000);
             reply = { ok: true, when: `${abs} ${tz} (in ${mins >= 120 ? `${Math.round(mins / 60)} h` : `${mins} min`})` };
           }
-          if (tid) void answerWorkAgentAsk(tid, ev.req_id, JSON.stringify(reply)).catch(() => {});
+          replyToTurn(ev.req_id, JSON.stringify(reply));
           break;
         }
         case "sessioncontrol": {
-          const tid = workTurnIds.get(chat.id);
           void handleSessionControl(chat.id, workspace, ev.action, ev.args ?? {})
             .catch((e: any) => ({ ok: false, error: typeof e === "string" ? e : (e?.message ?? String(e)) }))
             .then((reply) => {
-              if (tid) void answerWorkAgentAsk(tid, ev.req_id, JSON.stringify(reply)).catch(() => {});
+              replyToTurn(ev.req_id, JSON.stringify(reply));
             });
           break;
         }
@@ -7783,8 +7792,7 @@
                 if (outcome === "cancel") return;
                 if (outcome === "later") {
                   // the card lives on in laterAsks; the tool call returns now
-                  const tid = workTurnIds.get(chat.id);
-                  if (tid) void answerWorkAgentAsk(tid, ev.ask_id, ASK_LATER).catch(() => {});
+                  replyToTurn(ev.ask_id, ASK_LATER);
                   return;
                 }
                 askOutcome = outcome;
@@ -7801,8 +7809,7 @@
                   chats = [...chats];
                   saveSoon();
                 }
-                const tid = workTurnIds.get(chat.id);
-                if (tid) void answerWorkAgentAsk(tid, ev.ask_id, answer).catch(() => {});
+                replyToTurn(ev.ask_id, answer);
                 scrollIfOpen();
               }
             }
@@ -7845,6 +7852,7 @@
     if (opts.attach) {
       // the server kept this turn running while no window followed it: keep
       // polling its channel (the queue held every event since then)
+      replyRoute.bind(opts.attach.turnId);
       attachWorkAgentTurn(opts.attach.channel, (ev) => handleEvent(ev));
       workTurnIds.set(chat.id, opts.attach.turnId);
       return;
@@ -7862,12 +7870,14 @@
         onEvent: (ev) => handleEvent(ev)
       });
     } catch (e: any) {
+      replyRoute.bind(null);
       if (!await warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false)) {
         error = typeof e === "string" ? e : (e?.message ?? String(e));
       }
       await settle(true);
       return;
     }
+    replyRoute.bind(agentTurn);
     if (isCurrentTurn()) {
       workTurnIds.set(chat.id, agentTurn);
     } else {

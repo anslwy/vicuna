@@ -472,19 +472,28 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     if let Ok(mut m) = turn.ask_pending.lock() {
         m.insert(req_id.clone(), tx);
     }
-    // delete waits on the user's confirm card, so it gets the ask budget
-    let wait = if action == "delete" { ASK_TIMEOUT_SECS } else { 60 };
-    emit_ev(&target.on_event, &turn.stop, WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: args.clone() });
+    // Cheap reads should fail promptly; engine startup can legitimately be slow.
+    // Delete waits for the user's confirmation card.
+    let wait = match action.as_str() {
+        "delete" => ASK_TIMEOUT_SECS,
+        "create" | "send" => 120,
+        _ => 15,
+    };
+    if target.on_event.send(WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: args.clone() }).is_err() {
+        turn.ask_pending.lock().ok().map(|mut m| m.remove(&req_id));
+        return text_result("The app event channel is unavailable; the action was not dispatched.", true);
+    }
     let reply = tokio::select! {
-        a = rx => a.ok(),
-        _ = client_gone => None,
-        _ = tokio::time::sleep(Duration::from_secs(wait)) => None,
+        a = rx => a.map_err(|_| "The reply channel closed"),
+        _ = client_gone => Err("The MCP client disconnected"),
+        _ = tokio::time::sleep(Duration::from_secs(wait)) => Err("Timed out waiting for the app reply"),
     };
     if let Ok(mut m) = turn.ask_pending.lock() {
         m.remove(&req_id);
     }
-    let Some(reply) = reply else {
-        return text_result("The Vicuna app did not answer (is its window still open?).", true);
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(reason) => return text_result(&format!("{reason}. The action may have run; check session state before retrying."), true),
     };
     let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -787,7 +796,7 @@ async fn schedule_wakeup(target: &Target, args: &Value, client_gone: impl std::f
         m.remove(&req_id);
     }
     let Some(reply) = reply else {
-        return text_result("The Vicuna app did not confirm the wake-up (is its window still open?). Nothing was scheduled.", true);
+        return text_result("The app did not confirm the wake-up. It may have been scheduled; check Scheduled sends before retrying.", true);
     };
     let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -2228,6 +2237,21 @@ mod tests {
         crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": "Created w-1" }).to_string()).unwrap();
         let r = pending.await.unwrap().1.unwrap();
         assert_eq!(result_text(&r), "Created w-1");
+    }
+
+    #[tokio::test]
+    async fn manage_sessions_disconnect_warns_about_side_effects_and_cleans_pending() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        turn.lead.store(true, Ordering::Relaxed);
+        let target = Target { seq: 0, workspace: ws(), session_id: Some("lead".into()), turn: turn.clone(), on_event: ch };
+        let result = manage_sessions(&target, &json!({ "action": "create" }), async {}).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("MCP client disconnected"));
+        assert!(text.contains("action may have run"));
+        assert!(seen.lock().unwrap().iter().any(|e| e["type"] == "sessioncontrol"));
+        assert!(turn.ask_pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
