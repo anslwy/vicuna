@@ -19,6 +19,10 @@
 // (see /tmp/vicuna-browser-bundled.sh).
 
 mod cli;
+#[cfg(unix)]
+mod server;
+#[cfg(unix)]
+mod upgrade;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -1102,6 +1106,18 @@ usage:
         on login/boot (systemd user unit on Linux, launchd agent on macOS)
   vicuna uninstall-service
   vicuna token                             print the server token
+  vicuna start [serve options]              start `vicuna serve` in the background
+        Uses the installed service (systemd user unit / launchd agent) when there
+        is one, else launches a detached `vicuna serve` (default `--tailscale`)
+        logging to ~/vicuna/server/serve.log, and writes a pidfile.
+  vicuna stop                               stop it (service manager, or SIGTERM)
+  vicuna restart [serve options]            restart it detached, so it also
+        completes from a session the server itself is hosting
+  vicuna status                             running / how it runs / pid / version / log
+  vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
+        Install the latest release (checksum-verified, atomic replace), back up
+        the server db to ~/vicuna/server/backups/<time>/ and restart a running
+        `vicuna serve` (systemd / launchd / plain process) on the new version.
   vicuna open [path]                       open a folder in the Vicuna desktop app
   vicuna [path]                            same as `vicuna open [path]`
   vicuna bridge [port]                     dev bridge for browser testing (127.0.0.1, no auth, 1421)
@@ -1110,6 +1126,15 @@ usage:
 fn die(msg: &str) -> ! {
     eprintln!("{msg}\n\n{USAGE}");
     std::process::exit(2)
+}
+
+/// `Ok(())` prints nothing extra; a failure is the command's error + exit 1.
+#[cfg(unix)]
+fn report(r: Result<(), String>) {
+    if let Err(e) = r {
+        eprintln!("vicuna: {e}");
+        std::process::exit(1)
+    }
 }
 
 /// Parse `serve` options (shared by `serve` and `install-service`).
@@ -1167,6 +1192,45 @@ fn main() {
             }
         },
         Some("token") => println!("{}", server_token()),
+        #[cfg(unix)]
+        Some("start") => {
+            let _ = parse_serve(&rest); // validate the serve options before spawning anything
+            report(server::start(&rest));
+        }
+        #[cfg(unix)]
+        Some("stop") => {
+            if !rest.is_empty() {
+                die("vicuna stop takes no options");
+            }
+            report(server::stop());
+        }
+        #[cfg(unix)]
+        Some("restart") => {
+            let _ = parse_serve(&rest);
+            report(server::restart(&rest));
+        }
+        #[cfg(unix)]
+        Some("status") => {
+            if !rest.is_empty() {
+                die("vicuna status takes no options");
+            }
+            match server::status() {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1), // scriptable, like `systemctl is-active`
+                Err(e) => {
+                    eprintln!("vicuna status: {e}");
+                    std::process::exit(2)
+                }
+            }
+        }
+        #[cfg(unix)]
+        Some("upgrade") => {
+            let opts = upgrade::parse_opts(&rest).unwrap_or_else(|e| die(&e));
+            if let Err(e) = upgrade::run(opts, &server_dir()) {
+                eprintln!("vicuna upgrade: {e}");
+                std::process::exit(1)
+            }
+        }
         Some("open") => match cli::open_in_app(rest.first().map(String::as_str)) {
             Ok(p) => println!("Opened {p} in Vicuna."),
             Err(e) => {
