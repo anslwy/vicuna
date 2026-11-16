@@ -1645,6 +1645,23 @@
         setArchived(c.id, on);
         return { ok: true, text: on ? `Archived "${c.title}"${isWorkRunning(c.id) ? " (its running turn keeps going)" : ""}. It stays fully intact; unarchive brings it back.` : `Unarchived "${c.title}".` };
       }
+      case "set_workspace": {
+        const raw = str("workspace");
+        if (!raw) throw new Error("`workspace` (an absolute folder) is required.");
+        const id = str("session_id") || leadId;
+        const c = chats.find((x) => x.id === id);
+        if (!c) throw new Error(`No session ${id}.`);
+        const own = id === leadId;
+        if (!own && isWorkRunning(c.id)) throw new Error(`"${c.title}" is running a turn; stop it or wait, then try again.`);
+        const ws = await canonicalWorkspace(raw);
+        const prev = c.workspace ?? null;
+        if (prev === ws) return { ok: true, text: `"${c.title}" is already in ${ws}.` };
+        c.workspace = ws;
+        c.mode = "work";
+        c.updatedAt = Date.now();
+        save();
+        return { ok: true, text: `Moved "${c.title}" from ${prev ?? "(none)"} to ${ws}.${own ? " This turn keeps running in the old folder; your next turn starts in the new one (with a fresh engine session, so use read_session if you need earlier context)." : ""}` };
+      }
       case "delete": {
         const c = target();
         if (c.role === "lead") throw new Error("Refusing to delete a lead session.");
