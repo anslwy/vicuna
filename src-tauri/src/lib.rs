@@ -2377,6 +2377,10 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
     }
     #[cfg(windows)]
     builder.creation_flags(CREATE_NO_WINDOW);
+    // own process group: a kill reaches the command's children too (killing
+    // only `sh` left e.g. `npm test`'s node running and holding the pipes)
+    #[cfg(unix)]
+    builder.process_group(0);
     let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -2450,13 +2454,29 @@ async fn bg_run_job(id: String, canon: std::path::PathBuf, cmd: String, rec: Arc
         }
     });
     let status = child.wait().await.ok();
-    let _ = tokio::join!(out_h, err_h);
+    // The pid is reaped now and may be reused by any new process: forget it
+    // at once, so a later kill can never hit an unrelated process.
+    if let Ok(mut g) = rec.lock() {
+        g.pid = None;
+    }
+    // A child the command left behind (`cmd &`, a daemon) inherits the pipes
+    // and keeps them open: the job finished when the shell did. Waiting for
+    // EOF made a 30 s job report "after 4h 49m" and let Stop "kill" a job that
+    // was already done, losing its exit status.
+    let _ = tokio::time::timeout(BG_PIPE_DRAIN, async { tokio::join!(out_h, err_h) }).await;
+    bg_finish(&rec, status.and_then(|s| s.code()));
+    let _ = id;
+}
+
+/// How long a finished job's pipes may keep draining before it is reported.
+const BG_PIPE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn bg_finish(rec: &Mutex<BgJobRecord>, exit_code: Option<i32>) {
     if let Ok(mut g) = rec.lock() {
         g.running = false;
         g.pid = None;
-        g.exit_code = status.and_then(|s| s.code());
+        g.exit_code = exit_code;
     }
-    let _ = id;
 }
 
 /// Plain (non-Tauri-State) start so unit tests can drive it directly.
@@ -2567,7 +2587,7 @@ pub fn bg_kill(state: &BgExecState, id: &str) -> Result<BgJobStatus, String> {
             .pid
     };
     match pid {
-        Some(p) => kill_pid(p),
+        Some(p) => kill_job(p),
         None => {
             // already finished (or spawn failed): nothing to kill, just report
         }
@@ -2582,7 +2602,7 @@ pub fn bg_kill_running(state: &BgExecState) {
             if let Ok(g) = rec.lock() {
                 if g.running {
                     if let Some(pid) = g.pid {
-                        kill_pid(pid);
+                        kill_job(pid);
                     }
                 }
             }
@@ -4373,6 +4393,22 @@ fn term_size(cols: Option<u16>, rows: Option<u16>) -> portable_pty::PtySize {
 }
 
 /// Kill by pid (unix kill -9 / windows taskkill). Best-effort.
+/// Kill a background job: its whole process group on Unix (bg jobs lead
+/// their own group), else just the pid.
+fn kill_job(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", "--"])
+            .arg(format!("-{pid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+    }
+    kill_pid(pid);
+}
+
 fn kill_pid(pid: u32) {
     #[cfg(not(windows))]
     let _ = Command::new("kill")
@@ -6312,6 +6348,29 @@ mod work_tests {
         assert_eq!(parse_show_context_length(&info), Some(131072));
         let empty = serde_json::json!({"general.architecture": "unknown"});
         assert_eq!(parse_show_context_length(&empty), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bg_job_finishes_when_the_shell_does_despite_a_lingering_child() {
+        let d = tmp_root("bglinger");
+        let state = BgExecState::default();
+        // the leftover sleep inherits stdout and keeps it open for 60 s
+        let id = bg_start(&state, d.to_string_lossy().to_string(), "sleep 60 & echo started; exit 3".into()).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let done = loop {
+            let s = bg_snapshot(&state, &id).unwrap();
+            if !s.running {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "job waited for the leftover child");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(done.exit_code, Some(3), "exit status kept");
+        assert!(done.stdout.contains("started"));
+        // killing a finished job is a no-op (the pid was released) and the
+        // reported status stays the real one
+        assert_eq!(bg_kill(&state, &id).unwrap().exit_code, Some(3));
     }
 
     #[tokio::test]

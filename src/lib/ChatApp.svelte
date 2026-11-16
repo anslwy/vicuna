@@ -5118,7 +5118,27 @@
     const q = queuedMsgs.find((x) => x.id === id);
     if (!q) return;
     const chatId = q.chatId;
-    if (!isWorkRunning(chatId)) return; // settle already picked it up
+    if (!isWorkRunning(chatId)) {
+      // the turn already ended but this chip stayed behind (a superseded or
+      // reattached turn's settle never took it): returning here made the
+      // button do nothing. Send it as a fresh turn instead.
+      queuedMsgs = queuedMsgs.filter((x) => x.id !== id);
+      void sendToWorkSession(chatId, q.msg)
+        .then((ok) => {
+          if (!ok) {
+            queuedMsgs = [...queuedMsgs, q];
+            error = "Couldn't send now: the session is busy or no longer a Work session.";
+          }
+        })
+        .catch((e: any) => {
+          queuedMsgs = [...queuedMsgs, q];
+          error = `Couldn't send now: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+        });
+      return;
+    }
+    if (sendNowIds.has(chatId)) return; // already interrupting
+    // stopping the engine can take a while (opencode's cancel grace): say so
+    flashNotice("Interrupting the agent to send this now…");
     // the urgent one goes first
     queuedMsgs = [q, ...queuedMsgs.filter((x) => x.id !== id)];
     const turnId = workTurnIds.get(chatId);
