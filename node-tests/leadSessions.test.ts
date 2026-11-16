@@ -23,7 +23,8 @@ test("list text tags the lead and its workers", () => {
   const txt = sessionListText(
     [
       { id: "L", title: "lead", status: "running", engine: "claude", model: null, workspace: "/w", role: "lead", updatedAt: 2 },
-      { id: "W", title: "w", status: "idle", engine: "codex", model: "m", workspace: "/w", role: "worker", updatedAt: 1 }
+      { id: "W", title: "w", status: "idle", engine: "codex", model: "m", workspace: "/w", role: "worker", updatedAt: 1 },
+      { id: "A", title: "old", status: "idle", engine: "claude", model: null, workspace: null, role: "other", updatedAt: 0, archived: true }
     ],
     ["claude", "codex"],
     "claude"
@@ -31,14 +32,17 @@ test("list text tags the lead and its workers", () => {
   assert.ok(txt.includes("Installed engines: claude, codex (default: claude)"));
   assert.ok(txt.includes('- L · "lead" [lead, you] · running · claude · /w'));
   assert.ok(txt.includes('- W · "w" [your worker] · idle · codex/m'));
+  assert.ok(txt.includes('- A · "old" [archived] · idle'));
   assert.ok(sessionListText([], [], "opencode").includes("No other Work sessions."));
 });
 
 test("extra column keeps only set fields and survives a round trip", () => {
   const base = { id: "1", title: "t", createdAt: 0, messages: [] };
   assert.equal(chatExtraJson(base), null);
-  const raw = chatExtraJson({ ...base, engine: "codex", workModel: "m", role: "lead", leadId: "L", pinned: true });
-  assert.deepEqual(parseChatExtra(raw), { engine: "codex", workModel: "m", role: "lead", leadId: "L", pinned: true });
+  const raw = chatExtraJson({ ...base, engine: "codex", workModel: "m", role: "lead", leadId: "L", pinned: true, archived: true });
+  assert.deepEqual(parseChatExtra(raw), { engine: "codex", workModel: "m", role: "lead", leadId: "L", pinned: true, archived: true });
+  assert.equal(chatExtraJson({ ...base, archived: false }), null);
+  assert.deepEqual(parseChatExtra({ archived: "yes" }), {});
   assert.deepEqual(parseChatExtra("not json"), {});
   assert.deepEqual(parseChatExtra({ role: "boss", pinned: "yes" }), {});
 });

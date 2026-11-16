@@ -34,6 +34,9 @@ export interface Chat {
   leadId?: string | null;
   /** shown in the sidebar's Pinned section regardless of scope */
   pinned?: boolean;
+  /** hidden from the sidebar unless "Show archived" is on; nothing else
+   *  changes (messages, engine sessions, jobs and turns are untouched) */
+  archived?: boolean;
 }
 
 export { chatExtraJson, parseChatExtra } from "./leadSessions";

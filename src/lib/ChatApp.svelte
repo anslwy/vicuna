@@ -64,7 +64,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey } from "$lib/sidebar";
+  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, visibleChats, isPinnedRow } from "$lib/sidebar";
   import {
     captureViewAnchor,
     followAfterScroll,
@@ -1558,7 +1558,8 @@
       model: c.engine ? (c.workModel ?? null) : workModel,
       workspace: c.workspace ?? null,
       role: c.id === leadId ? "lead" : c.leadId === leadId ? "worker" : "other",
-      updatedAt: chatActivity(c)
+      updatedAt: chatActivity(c),
+      archived: !!c.archived
     };
   }
 
@@ -1631,6 +1632,17 @@
         if (!isWorkRunning(c.id)) return { ok: true, text: `"${c.title}" was not running.` };
         stopSession(c.id);
         return { ok: true, text: `Stopped "${c.title}".` };
+      }
+      case "archive":
+      case "unarchive": {
+        // archiving only hides the session in the sidebar: a running turn
+        // keeps going and its messages/engine session/jobs stay intact
+        const c = target();
+        const on = action === "archive";
+        if (on && c.role === "lead") throw new Error("Refusing to archive a lead session.");
+        if (!!c.archived === on) return { ok: true, text: `"${c.title}" was already ${on ? "archived" : "not archived"}.` };
+        setArchived(c.id, on);
+        return { ok: true, text: on ? `Archived "${c.title}"${isWorkRunning(c.id) ? " (its running turn keeps going)" : ""}. It stays fully intact; unarchive brings it back.` : `Unarchived "${c.title}".` };
       }
       case "delete": {
         const c = target();
@@ -3866,10 +3878,35 @@
   const scopeTitle = $derived(folderRows.find((f) => f.key === sessionFilter)?.title ?? "");
   // pinned sessions sit above the date groups whatever the scope (the lead
   // stays in view); they are not repeated below
-  const pinnedChats = $derived(orderedChats.filter((c) => c.pinned && c.messages.length > 0));
-  const grouped = $derived(groupByDate(filterChats(orderedChats.filter((c) => !(c.pinned && c.messages.length > 0)), sessionFilter), Date.now()));
+  const SHOW_ARCHIVED_KEY = "vicuna-show-archived";
+  let showArchived = $state(typeof localStorage !== "undefined" && localStorage.getItem(SHOW_ARCHIVED_KEY) === "1");
+  // archived sessions leave Pinned (the pin flag is kept for unarchive) and
+  // are hidden unless "Show archived" is on — the open one always stays
+  const listedChats = $derived(visibleChats(orderedChats, showArchived, activeId));
+  const archivedCount = $derived(chats.filter((c) => c.archived && c.messages.length > 0).length);
+  const pinnedChats = $derived(listedChats.filter((c) => isPinnedRow(c)));
+  const grouped = $derived(groupByDate(filterChats(listedChats.filter((c) => !isPinnedRow(c)), sessionFilter), Date.now()));
 
   const ctxChat = $derived(ctxMenu ? chats.find((x) => x.id === ctxMenu!.chatId) : undefined);
+
+  function toggleShowArchived() {
+    showArchived = !showArchived;
+    try {
+      localStorage.setItem(SHOW_ARCHIVED_KEY, showArchived ? "1" : "0");
+    } catch {}
+  }
+
+  /** Archive hides a session from the sidebar; it does not stop its turn or
+   *  touch its messages, engine session or background jobs. */
+  function setArchived(id: string, on: boolean) {
+    const c = chats.find((x) => x.id === id);
+    ctxMenu = null;
+    if (!c) return;
+    c.archived = on;
+    chats = [...chats];
+    save();
+  }
+
   function togglePin(id: string) {
     const c = chats.find((x) => x.id === id);
     ctxMenu = null;
@@ -8513,6 +8550,16 @@
             <option value={f.key}>{f.label} · {f.count}</option>
           {/each}
         </select>
+        <button
+          class="archive-toggle {showArchived ? 'on' : ''}"
+          data-testid="show-archived-toggle"
+          aria-pressed={showArchived}
+          title={showArchived ? "Hide archived sessions" : "Show archived sessions"}
+          onclick={toggleShowArchived}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>
+          {#if archivedCount > 0}<span class="archive-count">{archivedCount}</span>{/if}
+        </button>
       </div>
 
       <div class="history">
@@ -8520,8 +8567,9 @@
           {#each items as c (c.id)}
             {@const live = isSessionStreaming(c.id)}
             <button
-              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''}"
+              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''} {c.archived ? 'archived' : ''}"
               data-testid="chat-item"
+              data-archived={c.archived ? "true" : null}
               data-streaming={live ? "true" : null}
               title={live ? liveTitle(c.id) : undefined}
               onclick={() => selectChat(c.id)}
@@ -8545,6 +8593,7 @@
                 <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
                 {@const liveMs = live ? liveElapsedMs(c.id) : null}
                 {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
+                {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
                 {#if c.role === "lead"}<span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>{/if}
                 {#if c.engine && c.mode === "work"}<span class="work-badge engine-tag" data-testid="session-engine" title={c.workModel ? `${c.engine}/${c.workModel}` : c.engine}>{c.engine}</span>{/if}
                 {#if c.mode === "work"}
@@ -8644,6 +8693,7 @@
           <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
           <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
           <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
+          <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
           {#if (ctxChat?.mode ?? "chat") === "work"}
             <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>{ctxChat?.role === "lead" ? "Remove lead" : "Make lead"}</button>
           {/if}
@@ -11452,6 +11502,11 @@
   .chat-item { display: flex; justify-content: space-between; align-items: center; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
   .chat-item:hover { background: var(--hover-3); }
   .chat-item.active { background: var(--active-item); }
+  .chat-item.archived .title { opacity: .55; }
+  .archived-badge { opacity: .75; }
+  .archive-toggle { flex: none; display: inline-flex; align-items: center; gap: 3px; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 7px; font-size: 11px; color: var(--muted); cursor: pointer; }
+  .archive-toggle:hover { background: var(--hover-2); }
+  .archive-toggle.on { color: var(--accent); border-color: var(--accent); }
   .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .chat-item.streaming { background: var(--hover-3); }
   .chat-item.streaming.active { background: var(--active-item); }

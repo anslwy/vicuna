@@ -362,6 +362,15 @@ mod tests {
         assert_eq!(a["mode"], "work");
         assert_eq!(a["workspace"], "/srv/p");
 
+        // archiving rides in `extra` and survives a merge untouched
+        let mut ar = row("a", "A2", &[("user", "hi"), ("assistant", "hello")]);
+        ar["extra"] = json!(r#"{"archived":true}"#);
+        merge_chats(&pool, parse_rows(&json!([ar])).unwrap(), vec![]).await.unwrap();
+        let all = load_chats(&pool).await.unwrap();
+        let a = all.as_array().unwrap().iter().find(|c| c["id"] == "a").unwrap();
+        assert!(a["extra"].as_str().unwrap_or("").contains("\"archived\":true"), "{a}");
+        assert_eq!(a["messages"].as_array().unwrap().len(), 2);
+
         // B deletes b; a stays
         merge_chats(&pool, vec![], vec!["b".into()]).await.unwrap();
         let all = load_chats(&pool).await.unwrap();

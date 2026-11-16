@@ -430,12 +430,12 @@ fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
         "title": "Manage worker sessions (lead only)",
-        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
+        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` tags archived sessions `[archived]`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "status"] },
-                "session_id": { "type": "string", "description": "Target session (send/stop/delete/status)." },
+                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status"] },
+                "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status)." },
                 "title": { "type": "string", "description": "create: sidebar title for the worker." },
                 "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's)." },
                 "engine": { "type": "string", "description": "create: harness, e.g. claude, codex, opencode, fx, agy, pi (default: the user's current pick). See `list` for installed ones." },
@@ -451,8 +451,8 @@ fn manage_sessions_schema() -> Value {
 /// Hand a session action to the window that runs this (lead) turn.
 async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !["list", "create", "send", "stop", "delete", "status"].contains(&action.as_str()) {
-        return text_result("`action` must be one of list, create, send, stop, delete, status.", true);
+    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status.", true);
     }
     let turn = &target.turn;
     if !turn.lead.load(Ordering::Relaxed) {
@@ -2222,6 +2222,28 @@ mod tests {
         crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": "Created w-1" }).to_string()).unwrap();
         let r = pending.await.unwrap().1.unwrap();
         assert_eq!(result_text(&r), "Created w-1");
+    }
+
+    #[tokio::test]
+    async fn manage_sessions_forwards_archive_without_a_long_wait() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        turn.lead.store(true, Ordering::Relaxed);
+        let reg = register(None, &ws(), Some("lead-1"), turn.clone(), ch).await.unwrap();
+        for action in ["archive", "unarchive"] {
+            let url = reg.url.clone();
+            let pending = tokio::spawn(async move { post(&url, sess_call(json!({ "action": action, "session_id": "w-1" }))).await });
+            let ev = loop {
+                if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == "sessioncontrol" && e["action"] == action).cloned() {
+                    break e;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(ev["args"]["session_id"], "w-1");
+            crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": format!("{action}d") }).to_string()).unwrap();
+            let r = pending.await.unwrap().1.unwrap();
+            assert_eq!(r["result"]["isError"], false);
+        }
     }
 
     #[tokio::test]
