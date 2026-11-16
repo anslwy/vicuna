@@ -304,6 +304,10 @@
   /** sessions the user asked to stop (Stop / double-Esc / chat deleted):
    *  per session so stopping one turn never aborts another */
   const workStopIds = new Set<string>();
+  /** sessions whose turn was interrupted by "Send now" (a queued chip or a
+   *  finished background job): settle restarts with the queue instead of
+   *  handing it back to the composer */
+  const sendNowIds = new Set<string>();
   // turn-finished OS notifications: chat turns the user stopped / that
   // errored, and a short debounce so a tool loop's back-to-back streams
   // notify once
@@ -1490,7 +1494,7 @@
    *  background job, a late ask answer): queued into its live turn, else a
    *  new background turn. Returns false while the session is busy with a
    *  compaction or plain stream (the caller retries) or gone. */
-  async function sendToWorkSession(chatId: string, msg: ChatMsg): Promise<boolean> {
+  async function sendToWorkSession(chatId: string, msg: ChatMsg, opts: { now?: boolean } = {}): Promise<boolean> {
     const chat = chats.find((x) => x.id === chatId);
     if (!chat || (chat.mode ?? "chat") !== "work" || !chat.workspace) return false;
     if (isCompacting(chat.id) || isChatStreaming(chat.id)) return false;
@@ -1498,7 +1502,8 @@
       const qid = crypto.randomUUID();
       queuedMsgs = [...queuedMsgs, { chatId: chat.id, id: qid, msg }];
       const turnId = workTurnIds.get(chat.id);
-      if (turnId) void queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
+      if (opts.now) sendQueuedNow(qid);
+      else if (turnId) void queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
       return true;
     }
     const gate = workSendGate(workEngineInfo);
@@ -1534,7 +1539,7 @@
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId); // session deleted
           continue;
         }
-        const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) });
+        const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) }, { now: true });
         if (sent) {
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
           const title = chats.find((c) => c.id === run.chatId)?.title ?? "the session";
@@ -4813,13 +4818,33 @@
     queuedMsgs = queuedMsgs.filter((q) => !gone.has(q.id));
   }
 
-  function unqueue(index: number) {
-    const removed = queuedMsgs.filter((_, i) => i === index);
-    queuedMsgs = queuedMsgs.filter((_, i) => i !== index);
+  function unqueue(id: string) {
+    const removed = queuedMsgs.filter((q) => q.id === id);
+    queuedMsgs = queuedMsgs.filter((q) => q.id !== id);
     for (const q of removed) {
       const turnId = workTurnIds.get(q.chatId);
       if (turnId) void removeWorkAgentMsg(turnId, q.id).catch(() => {});
     }
+  }
+
+  /** Interrupt the session's live turn and start a new one right away with
+   *  this message (plus anything else queued there, in order). The backend
+   *  never drains its queue after a stop, so settle's leftovers carry them. */
+  function sendQueuedNow(id: string) {
+    const q = queuedMsgs.find((x) => x.id === id);
+    if (!q) return;
+    const chatId = q.chatId;
+    if (!isWorkRunning(chatId)) return; // settle already picked it up
+    // the urgent one goes first
+    queuedMsgs = [q, ...queuedMsgs.filter((x) => x.id !== id)];
+    const turnId = workTurnIds.get(chatId);
+    for (const x of queuedMsgs) {
+      if (x.chatId === chatId && turnId) void removeWorkAgentMsg(turnId, x.id).catch(() => {});
+    }
+    sendNowIds.add(chatId);
+    workStopIds.add(chatId);
+    if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
+    cancelPendingAsk(chatId, "(interrupted by a message sent now)");
   }
 
   function formatSize(n: number): string {
@@ -7172,7 +7197,9 @@
       escArmed = false;
       // prompts that arrived after the last round: continue the agent with them
       // (an aborted turn returns them to the composer instead)
-      const aborted = workStopIds.has(chat.id) || stopped;
+      // "Send now" stops the turn too, but its queue must run, not return
+      const sendNow = sendNowIds.delete(chat.id);
+      const aborted = !sendNow && (workStopIds.has(chat.id) || stopped);
       const leftovers = isCurrentTurn() ? takeQueued(chat.id) : [];
       if (leftovers.length) {
         if (aborted) {
@@ -8874,15 +8901,14 @@
       {/if}
       {#if queuedForActive.length}
         <div class="queue-strip" data-testid="queue-strip">
-          {#each queuedMsgs as q, qi}
-            {#if q.chatId === activeId}
-              <div class="queue-chip">
+          {#each queuedForActive as q (q.id)}
+              <div class="queue-chip" data-testid="queue-chip">
                 <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : parseMcpWakeMessage(q.msg.content) ? `MCP server active: ${parseMcpWakeMessage(q.msg.content)?.summary}` : q.msg.content || "Image"}</span>
-                <button class="queue-x" aria-label="Remove queued message" title="Remove from queue" onclick={() => unqueue(qi)}>×</button>
+                <button class="queue-now" data-testid="queue-send-now" aria-label="Send this message now" title="Send now (interrupts the agent's current step)" onmousedown={(e) => e.preventDefault()} onclick={(e) => { e.stopPropagation(); sendQueuedNow(q.id); }}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+                <button class="queue-x" data-testid="queue-remove" aria-label="Remove queued message" title="Remove from queue" onmousedown={(e) => e.preventDefault()} onclick={(e) => { e.stopPropagation(); unqueue(q.id); }}>×</button>
               </div>
-            {/if}
           {/each}
-          <span class="queue-hint">queued · joins at the next tool call</span>
+          <span class="queue-hint">queued · joins when the agent finishes · ↑ sends now</span>
         </div>
       {/if}
       {#if bgRuns.some((r) => r.chatId === activeId)}
@@ -11213,6 +11239,8 @@
   .queue-text { max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .queue-x { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
   .queue-x:hover { color: var(--text); }
+  .queue-now { display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--muted); cursor: pointer; padding: 1px 2px; border-radius: 4px; }
+  .queue-now:hover { color: var(--accent); }
   .queue-hint { font-size: 11.5px; color: var(--faint); }
   .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
