@@ -759,6 +759,9 @@ async fn run_process(
     let mut aborted_at: Option<Instant> = None;
     let mut writer = Some(writer);
     let mut prompt_seq = 1u32;
+    // one interval for the whole loop: a fresh `sleep` per iteration never
+    // fires while the engine streams faster than it, so Stop went unseen
+    let mut stop_tick = crate::work_agent::stop_check_interval();
     let outcome: Result<(), RunError> = loop {
         tokio::select! {
             next = lines.next_segment() => {
@@ -845,7 +848,7 @@ async fn run_process(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+            _ = stop_tick.tick() => {
                 if stop.load(Ordering::Relaxed) && aborted_at.is_none() {
                     aborted_at = Some(Instant::now());
                     // open ask cards answer "cancelled" (Deny) as their senders drop

@@ -39,7 +39,8 @@
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -333,6 +334,10 @@
   /** backend turn id of each live Rust agent loop — needed for
    *  stop/steer/ask-answer routing while a turn runs */
   const workTurnIds = new Map<string, string>();
+  /** per session: settle its current Work turn as stopped, from outside the
+   *  turn's closure (the stop reconciliation below uses it when the
+   *  backend's `done` never arrived) */
+  const workForceSettle = new Map<string, () => void>();
   // ---- MCP servers (Work mode only) ----
   // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
   // file is the source of truth and the UI edits it via the backend.
@@ -6840,10 +6845,28 @@
   function stopSession(id: string) {
     if (isWorkRunning(id)) workStopIds.add(id);
     const turnId = workTurnIds.get(id);
-    if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
+    if (turnId) {
+      void stopWorkAgentTurn(turnId).catch(() => {});
+      reconcileStoppedTurn(id, turnId);
+    }
     cancelPendingAsk(id, "(the user interrupted before answering)");
     if (aborters.has(id)) chatStopIds.add(id);
     aborters.get(id)?.abort();
+  }
+
+  /** After a Stop, make the window agree with the backend: if the stopped
+   *  turn is over there but this window still shows it running (its `done`
+   *  event got lost), settle it here. Never touches a newer turn. */
+  function reconcileStoppedTurn(id: string, turnId: string, step = 0) {
+    const delay = STOP_RECONCILE_DELAYS_MS[step];
+    if (delay == null) return;
+    setTimeout(async () => {
+      if (!isWorkRunning(id) || workTurnIds.get(id) !== turnId) return;
+      const backendLive = await workTurnLive(turnId);
+      const action = stopReconcileAction({ running: isWorkRunning(id), currentTurnId: workTurnIds.get(id), stoppedTurnId: turnId, backendLive });
+      if (action === "clear") workForceSettle.get(id)?.();
+      else if (action === "retry") reconcileStoppedTurn(id, turnId, step + 1);
+    }, delay);
   }
 
   /** Terminal-style prompt history for the open session: the sent user
@@ -7554,6 +7577,7 @@
         workStopIds.delete(chat.id);
         workTurnSeqByChat.delete(chat.id);
         workTurnIds.delete(chat.id);
+        workForceSettle.delete(chat.id);
         reportToLead(chat.id, userStopped);
         const wakeServers = pendingMcpWakes.get(chat.id);
         pendingMcpWakes.delete(chat.id);
@@ -7565,6 +7589,13 @@
         }
       }
     }
+
+    // stop reconciliation: settles this turn when the backend says it is
+    // over but its `done` never arrived (a late `done` is then dropped by
+    // handleEvent's isCurrentTurn guard, so it can't settle twice)
+    workForceSettle.set(chat.id, () => {
+      if (isCurrentTurn()) void settle(true);
+    });
 
     function handleEvent(ev: WorkAgentEvent) {
       if (!isCurrentTurn()) return;

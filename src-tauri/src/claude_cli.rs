@@ -556,6 +556,9 @@ async fn run_process(
     let mut got_output = false;
     let mut interrupted_at: Option<Instant> = None;
     let mut writer = Some(writer);
+    // one interval for the whole loop: a fresh `sleep` per iteration never
+    // fires while the engine streams faster than it, so Stop went unseen
+    let mut stop_tick = crate::work_agent::stop_check_interval();
     let outcome: Result<(), RunError> = loop {
         tokio::select! {
             next = lines.next_line() => {
@@ -635,7 +638,7 @@ async fn run_process(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+            _ = stop_tick.tick() => {
                 if stop.load(Ordering::Relaxed) && interrupted_at.is_none() {
                     interrupted_at = Some(Instant::now());
                     if let Some(w) = &writer {

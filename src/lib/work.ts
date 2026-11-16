@@ -649,6 +649,21 @@ export async function stopWorkAgentTurn(turnId: string): Promise<void> {
   }
 }
 
+/** Is a backend turn still running? null when it can't be asked (an
+ *  older shell/server without `work_agent_turn_live`, bridge down) — the
+ *  caller must then not assume either way. */
+export async function workTurnLive(turnId: string): Promise<boolean | null> {
+  try {
+    if (useLocalIpc()) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return Boolean(await invoke("work_agent_turn_live", { turnId }));
+    }
+    return Boolean(await bridgeInvoke("work_agent_turn_live", { turnId }));
+  } catch {
+    return null;
+  }
+}
+
 /** Queue a steering prompt into a live turn (joins at the next round). */
 export async function queueWorkAgentMsg(turnId: string, id: string, message: ChatMsg): Promise<void> {
   await invokeCmd<void>("work_agent_queue", { turnId, id, message });

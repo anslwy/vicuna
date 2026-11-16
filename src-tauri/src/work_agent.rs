@@ -111,6 +111,35 @@ pub struct TurnState {
     pub run_pending: Mutex<HashMap<String, oneshot::Sender<()>>>,
     /// the session is the user's lead: vicuna-mcp `manage_sessions` works
     pub lead: AtomicBool,
+    /// the backend loop for this turn has returned (turns stay in the map
+    /// after finishing, so presence alone says nothing about liveness)
+    pub done: AtomicBool,
+}
+
+/// Marks a turn finished when dropped: held for the whole of
+/// `acp::run_turn`, so early returns and panics also count as finished.
+pub struct TurnDoneGuard(pub Arc<TurnState>);
+
+impl Drop for TurnDoneGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The engine loops' Stop poll. Must be created once outside the
+/// `select!` loop: a `sleep` arm rebuilt every iteration is reset by every
+/// engine message, so a steady token stream starved the stop check and the
+/// turn kept running (and showing as running) after Stop.
+pub fn stop_check_interval() -> tokio::time::Interval {
+    let mut i = tokio::time::interval(std::time::Duration::from_millis(120));
+    i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    i
+}
+
+/// Is this turn's backend loop still running? `false` for unknown (pruned)
+/// ids too: the window uses it to clear a stale "running" mark after Stop.
+pub fn turn_is_live(state: &WorkAgentState, turn_id: &str) -> bool {
+    state.get_turn(turn_id).is_some_and(|t| !t.done.load(Ordering::Relaxed))
 }
 
 impl TurnState {
@@ -122,6 +151,7 @@ impl TurnState {
             ask_seq: AtomicU64::new(1),
             run_pending: Mutex::new(HashMap::new()),
             lead: AtomicBool::new(false),
+            done: AtomicBool::new(false),
         }
     }
 }
@@ -257,6 +287,12 @@ pub async fn work_agent_stop(turn_id: String, agent_state: State<'_, WorkAgentSt
     Ok(())
 }
 
+/// Whether a turn is still running backend-side (see `turn_is_live`).
+#[tauri::command]
+pub async fn work_agent_turn_live(turn_id: String, agent_state: State<'_, WorkAgentState>) -> Result<bool, String> {
+    Ok(turn_is_live(&agent_state, &turn_id))
+}
+
 #[tauri::command]
 pub async fn work_agent_queue(
     turn_id: String,
@@ -332,6 +368,51 @@ mod tests {
 
     fn msg(text: &str) -> ChatMessage {
         serde_json::from_value(serde_json::json!({ "role": "user", "content": text })).unwrap()
+    }
+
+    #[test]
+    fn turn_live_tracks_the_done_guard_and_unknown_ids() {
+        let st = WorkAgentState::default();
+        let t = Arc::new(TurnState::new());
+        let id = st.next_turn(t.clone());
+        assert!(turn_is_live(&st, &id));
+        drop(TurnDoneGuard(t.clone()));
+        assert!(!turn_is_live(&st, &id), "finished turns stay in the map but are not live");
+        assert!(!turn_is_live(&st, "no-such-turn"));
+    }
+
+    /// The bug behind "Stop does nothing until reload": engine messages
+    /// faster than 120ms reset a per-iteration sleep forever.
+    #[tokio::test]
+    async fn stop_tick_fires_under_a_steady_message_stream() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                if tx.send(()).is_err() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let start = std::time::Instant::now();
+        // the old shape never reaches the sleep arm
+        let mut old_fired = false;
+        while start.elapsed() < std::time::Duration::from_millis(400) {
+            tokio::select! {
+                _ = rx.recv() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => { old_fired = true; break; }
+            }
+        }
+        assert!(!old_fired, "precondition: a rebuilt sleep is starved by the stream");
+        let mut tick = stop_check_interval();
+        tick.tick().await; // first tick is immediate
+        let start = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = rx.recv() => {}
+                _ = tick.tick() => break,
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "stop tick starved");
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]
