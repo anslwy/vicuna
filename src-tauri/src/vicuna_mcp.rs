@@ -373,6 +373,49 @@ fn target_for(registry: &SharedRegistry, token: &str) -> Option<Option<Target>> 
     r.tokens.values().any(|t| t == token).then_some(None)
 }
 
+/// Optional argument on every session-scoped vicuna-mcp tool: the Vicuna
+/// session the calling agent belongs to (it is in the workspace rules).
+pub(crate) const CALLER_ARG: &str = "caller_session_id";
+
+/// The calling session named in a `tools/call`, if the agent passed one.
+fn caller_session(msg: &Value) -> Option<&str> {
+    (msg.get("method").and_then(Value::as_str) == Some("tools/call"))
+        .then(|| msg.pointer(&format!("/params/arguments/{CALLER_ARG}")).and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Which turn a call belongs to. A per-workspace route (opencode/fx/agy) is
+/// shared by every session in that folder, so "the newest turn" answers a
+/// lead's call with a worker's turn (wrong session, or a turn that has since
+/// ended → "did not answer"), and a turn registered under a different spelling
+/// of the folder leaves the route empty ("No Vicuna Work turn is running").
+/// When the agent names its session, the live turn of that session wins: on
+/// this route first, else on any route.
+fn target_for_call(registry: &SharedRegistry, token: &str, default: Option<Target>, msg: &Value) -> Option<Target> {
+    let Some(sid) = caller_session(msg) else { return default };
+    let Ok(r) = registry.lock() else { return default };
+    let mine = |t: &&Target| t.session_id.as_deref() == Some(sid);
+    if let Some(t) = r.targets.get(token).and_then(|v| v.iter().rev().find(mine)) {
+        return Some(t.clone());
+    }
+    let mut any: Vec<&Target> = r.targets.values().flatten().filter(mine).collect();
+    any.sort_by_key(|t| t.seq);
+    any.last().map(|t| (*t).clone()).or(default)
+}
+
+/// Adds the optional `caller_session_id` argument to a tool schema.
+fn with_caller_arg(mut schema: Value) -> Value {
+    if let Some(props) = schema.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut) {
+        props.insert(
+            CALLER_ARG.to_string(),
+            json!({ "type": "string", "description": "Your own Vicuna session ID (from your instructions). Pass it on every call so Vicuna routes the call to your session when several sessions share a workspace." }),
+        );
+    }
+    schema
+}
+
 /// ACP-shaped MCP entry for the server (opencode's `mcpServers`; Claude's
 /// `--mcp-config` is converted from the same shape).
 pub fn server_entry(url: &str) -> Value {
@@ -892,6 +935,9 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     enum End {
         Done(crate::BgJobStatus),
         Background,
+        /// the engine dropped the call (its own timeout/abort, a dead
+        /// connection) while the turn goes on
+        ClientGone,
         Stopped,
     }
     let mut bg_open = true;
@@ -903,7 +949,7 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
                 }
                 bg_open = false; // sender dropped: never poll the receiver again
             }
-            _ = &mut client_gone => break End::Stopped,
+            _ = &mut client_gone => break if stop.load(Ordering::Relaxed) { End::Stopped } else { End::ClientGone },
             _ = tick.tick() => {
                 if stop.load(Ordering::Relaxed) {
                     break End::Stopped;
@@ -924,12 +970,28 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     }
     fg_run_ended(&job_id);
     emit_ev(on_event, stop, WorkAgentEvent::RunEnded { job_id: job_id.clone() });
+    // a job that already finished is reported as finished, never "killed"
+    let end = match end {
+        End::Stopped | End::ClientGone => match crate::bg_snapshot(jobs(), &job_id) {
+            Ok(st) if !st.running => End::Done(st),
+            _ => end,
+        },
+        e => e,
+    };
     match end {
         End::Done(st) => text_result(&job_output(&st, started.elapsed().as_secs()), false),
         End::Background => {
             remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
             emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
             text_result(&background_text(&job_id, true), false)
+        }
+        End::ClientGone => {
+            // Nobody reads this result any more. Killing the job here lost
+            // finished work and left the run card spinning; hand it to the
+            // background so its output reaches the session as a message.
+            remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
+            emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
+            text_result(&background_text(&job_id, false), false)
         }
         End::Stopped => {
             // a foreground command dies with its turn, like the engines' own shell
@@ -1693,14 +1755,14 @@ async fn handle_rpc(
         }
         "ping" => json!({}),
         "tools/list" => json!({ "tools": [
-            tool_schema(),
-            run_schema(),
-            get_session_schema(),
-            read_session_schema(),
+            with_caller_arg(tool_schema()),
+            with_caller_arg(run_schema()),
+            with_caller_arg(get_session_schema()),
+            with_caller_arg(read_session_schema()),
             list_sessions_schema(),
             manage_mcp_schema(),
-            schedule_schema(),
-            manage_sessions_schema(),
+            with_caller_arg(schedule_schema()),
+            with_caller_arg(manage_sessions_schema()),
         ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1890,6 +1952,7 @@ async fn handle_conn(mut stream: TcpStream, registry: SharedRegistry) -> std::io
     // heartbeats keep idle timers from firing, then the result.
     let is_call = msg.get("method").and_then(Value::as_str) == Some("tools/call")
         && msg.get("id").is_some_and(|i| !i.is_null());
+    let target = target_for_call(&registry, &token, target, &msg);
     if is_call && req.accept.contains("text/event-stream") {
         return stream_call(&msg, target.as_ref(), gone, &mut write_half).await;
     }
@@ -1995,6 +2058,33 @@ mod tests {
         assert_eq!(fg[0].session_id, "chat-b");
         fg_run_ended("bg-t3");
         assert!(mine(bg_runs_pending()).iter().all(|r| !r.foreground));
+    }
+
+    #[test]
+    fn calls_route_to_the_named_caller_session() {
+        let reg: SharedRegistry = Arc::default();
+        let (ch, _) = capture();
+        // lead then worker on the same per-workspace route: the worker is newest
+        let lead = register_on(&reg, 1, Some("opencode acp|/w"), "/w", Some("lead"), Arc::new(TurnState::new()), ch.clone());
+        let _worker = register_on(&reg, 1, Some("opencode acp|/w"), "/w", Some("worker"), Arc::new(TurnState::new()), ch.clone());
+        // another spelling of the folder: a route with no live turn
+        let other = register_on(&reg, 1, Some("opencode acp|/w/"), "/w/", Some("x"), Arc::new(TurnState::new()), ch.clone());
+        let other_token = other.token.clone();
+        drop(other);
+        let call = |sid: Option<&str>| {
+            let mut args = json!({});
+            if let Some(s) = sid { args[CALLER_ARG] = json!(s); }
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": SCHEDULE_TOOL, "arguments": args } })
+        };
+        let pick = |token: &str, sid| {
+            let def = target_for(&reg, token).flatten();
+            target_for_call(&reg, token, def, &call(sid)).and_then(|t| t.session_id)
+        };
+        assert_eq!(pick(&lead.token, None).as_deref(), Some("worker"), "old behaviour without the arg");
+        assert_eq!(pick(&lead.token, Some("lead")).as_deref(), Some("lead"));
+        assert_eq!(pick(&other_token, Some("lead")).as_deref(), Some("lead"), "found on another route");
+        assert_eq!(pick(&other_token, None), None);
+        assert_eq!(pick(&lead.token, Some("gone")).as_deref(), Some("worker"));
     }
 
     fn capture() -> (Channel<WorkAgentEvent>, Arc<Mutex<Vec<Value>>>) {

@@ -631,12 +631,18 @@ struct AcpClient {
 struct RouteGuard {
     routes: Routes,
     session: String,
+    /// this turn's sender: a newer turn on the same ACP session replaces the
+    /// route, and the older turn's guard must not unregister that one (the
+    /// newer turn then received nothing and hung until its prompt returned)
+    tx: mpsc::UnboundedSender<Value>,
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         if let Ok(mut r) = self.routes.lock() {
-            r.remove(&self.session);
+            if r.get(&self.session).is_some_and(|cur| cur.same_channel(&self.tx)) {
+                r.remove(&self.session);
+            }
         }
     }
 }
@@ -695,13 +701,14 @@ impl AcpClient {
     fn route(&self, session: &str) -> (mpsc::UnboundedReceiver<Value>, RouteGuard) {
         let (tx, rx) = mpsc::unbounded_channel();
         if let Ok(mut r) = self.routes.lock() {
-            r.insert(session.to_string(), tx);
+            r.insert(session.to_string(), tx.clone());
         }
         (
             rx,
             RouteGuard {
                 routes: self.routes.clone(),
                 session: session.to_string(),
+                tx,
             },
         )
     }
@@ -755,9 +762,25 @@ fn spawn_acp(
     let (pending_r, routes_r, write_r, closed_r, always_r) =
         (pending.clone(), routes.clone(), write_tx.clone(), closed.clone(), always.clone());
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+        let mut reader = BufReader::new(stdout);
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            // Byte lines, not `lines()`: one non-UTF-8 byte in an agent's
+            // output (a tool printing binary/Latin-1, a split multibyte char)
+            // made `next_line` return Err, which ended this loop as if the
+            // process had died: every live turn then failed with "exited
+            // unexpectedly" while the agent was still running.
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{label}: stdout read failed: {e}");
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let Ok(msg) = serde_json::from_str::<Value>(line.trim_end()) else {
                 continue;
             };
             let id = msg.get("id").cloned().filter(|v| !v.is_null());
@@ -815,6 +838,7 @@ fn spawn_acp(
         }
         // EOF: the process is gone. Unblock every waiter and every turn; the
         // next turn respawns.
+        eprintln!("{label}: stdout closed; the next turn starts a new process");
         closed_r.store(true, Ordering::Relaxed);
         if let Ok(mut m) = pending_r.lock() {
             for (_, tx) in m.drain() {
@@ -1384,7 +1408,7 @@ pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Opt
     let session_info = session_id
         .map(|id| {
             format!(
-                "- Session context: your Vicuna session ID is `{id}` (call `get_session_id` on vicuna-mcp anytime to check it). If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
+                "- Session context: your Vicuna session ID is `{id}`; pass `caller_session_id: \"{id}\"` on every vicuna-mcp call (ask_user, run, schedule_wakeup, manage_sessions, read_session, get_session_id) so it reaches this session even when other sessions share the workspace. If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
 Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."
             )
         })
@@ -1792,10 +1816,16 @@ async fn run_turn_inner(
                                 handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
                             }
                         }
+                        // the guard holds a sender, so this is not normally
+                        // reached: at EOF the reader fails the pending
+                        // prompt instead (next branch)
                         None => break Err(client.dead_error()),
                     }
                 }
-                result = &mut rx => break result.map_err(|_| "acp: response channel dropped".to_string()).and_then(|r| r),
+                result = &mut rx => break result
+                    .map_err(|_| "acp: response channel dropped".to_string())
+                    .and_then(|r| r)
+                    .map_err(|e| if client.closed.load(Ordering::Relaxed) { client.dead_error() } else { e }),
                 _ = tokio::time::sleep(Duration::from_millis(120)) => {
                     if stop.load(Ordering::Relaxed) && !cancelled {
                         cancelled = true;
@@ -1945,9 +1975,39 @@ mod tests {
     #[test]
     fn route_guard_unregisters() {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
-        routes.lock().unwrap().insert("a".into(), mpsc::unbounded_channel().0);
-        drop(RouteGuard { routes: routes.clone(), session: "a".into() });
+        let tx = mpsc::unbounded_channel().0;
+        routes.lock().unwrap().insert("a".into(), tx.clone());
+        drop(RouteGuard { routes: routes.clone(), session: "a".into(), tx });
         assert!(routes.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_output_does_not_kill_the_client() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(r#"printf '\377\376 binary\n'; read l; echo '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'; sleep 5"#)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let (client, _child) = spawn_acp(cmd, "test acp", Path::new("sh")).unwrap();
+        let r = client.call("ping", json!({}), Duration::from_secs(5)).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(!client.closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn older_route_guard_keeps_a_newer_turns_route() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let old = mpsc::unbounded_channel().0;
+        routes.lock().unwrap().insert("a".into(), old.clone());
+        let old_guard = RouteGuard { routes: routes.clone(), session: "a".into(), tx: old };
+        // a newer turn on the same ACP session takes the route over
+        let (new, mut new_rx) = mpsc::unbounded_channel();
+        routes.lock().unwrap().insert("a".into(), new.clone());
+        drop(old_guard);
+        forward(&routes, &json!({ "sessionId": "a" }), json!(7));
+        assert_eq!(new_rx.try_recv().unwrap(), json!(7));
     }
 
     #[test]
