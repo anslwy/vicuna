@@ -816,6 +816,9 @@ async fn run_turns(
     let mut last_goal: Option<(String, String)> = None;
     let mut started = Instant::now();
     let mut interrupted_at: Option<Instant> = None;
+    // one interval for the whole loop: a fresh `sleep` per iteration never
+    // fires while the engine streams faster than it, so Stop went unseen
+    let mut stop_tick = crate::work_agent::stop_check_interval();
     loop {
         tokio::select! {
             r = async { start_rx.as_mut().unwrap().await }, if start_rx.is_some() => {
@@ -915,7 +918,7 @@ async fn run_turns(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+            _ = stop_tick.tick() => {
                 if stop.load(Ordering::Relaxed) {
                     if interrupted_at.is_none() {
                         if let Some(t) = &turn_id {

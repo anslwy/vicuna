@@ -5640,6 +5640,7 @@ pub fn run() {
             browser_mcp_command,
             work_agent::work_agent_start,
             work_agent::work_agent_stop,
+            work_agent::work_agent_turn_live,
             work_agent::work_agent_queue,
             work_agent::work_agent_remove,
             work_agent::work_agent_answer,
