@@ -42,6 +42,7 @@
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
@@ -3479,32 +3480,69 @@
   let pendingDeepLinkPath: string | null = null;
   /** a session handed to this (already loaded) window by the search palette */
   let pendingOpenChatId: string | null = null;
-  function extractSessionId(urls: string[]): string | null {
-    for (const u of urls) {
-      const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-      const m = path.match(/^\/?s\/([A-Za-z0-9-]+)\/?$/);
-      if (m) return m[1];
-    }
-    return null;
-  }
   function handleDeepLinkUrls(urls: string[] | null) {
     if (!urls?.length) return;
     const id = extractSessionId(urls);
     if (id) {
-      if (ready && chats.some((c) => c.id === id)) {
-        activeId = id;
-        isPinned = true;
-        void goto(`/s/${id}`);
-      } else {
-        // initApp flushes this after load; unknown ids are dropped there
-        pendingDeepLinkId = id;
-      }
+      // decided only once chats have loaded (flushPendingDeepLinks)
+      if (!ready) pendingDeepLinkId = id;
+      else void openSessionLink(id);
       return;
     }
     const path = extractOpenPath(urls);
     if (!path) return;
     if (ready) void openWorkspacePath(path);
     else pendingDeepLinkPath = path;
+  }
+
+  /** Open a `vicuna://s/<id>` session: this computer's list first, then
+   *  every connected server (the session may live on a remote host, whose
+   *  window is raised on it). */
+  async function openSessionLink(id: string) {
+    if (srvList.length === 0) await refreshServers();
+    const action = sessionLinkAction(id, {
+      ready,
+      localIds: chats.map((c) => c.id),
+      serverCount: remoteTargets.length
+    });
+    if (action.kind === "stash") {
+      pendingDeepLinkId = id;
+      return;
+    }
+    if (action.kind === "open-local") {
+      // navigate and let the route effect activate it (#29)
+      isPinned = true;
+      void goto(`/s/${id}`);
+      return;
+    }
+    if (action.kind === "search-remote") {
+      for (const sv of remoteTargets) {
+        try {
+          const { hits } = await searchServerChats(sv.id, "", [id], 1);
+          if (hits.some((h) => h.id === id)) {
+            await openChatInWindow(sv.id, id);
+            return;
+          }
+        } catch {
+          // unreachable server: try the next one
+        }
+      }
+    }
+    flashNotice("That session isn't on this computer or any connected server.");
+  }
+
+  /** Run links stashed before chats loaded (cold start, slow server). */
+  function flushPendingDeepLinks() {
+    if (pendingDeepLinkId) {
+      const id = pendingDeepLinkId;
+      pendingDeepLinkId = null;
+      void openSessionLink(id);
+    }
+    if (pendingDeepLinkPath) {
+      const p = pendingDeepLinkPath;
+      pendingDeepLinkPath = null;
+      void openWorkspacePath(p);
+    }
   }
 
   /** Open a folder from the `vicuna` CLI (`vicuna://open?path=…`): validate
@@ -8211,22 +8249,6 @@
         // home: no active session
         activeId = null;
       }
-      // app launched via a vicuna:// link: the listener stashed it above
-      if (pendingDeepLinkId) {
-        const id = pendingDeepLinkId;
-        pendingDeepLinkId = null;
-        if (chats.some((c) => c.id === id)) {
-          activeId = id;
-          isPinned = true;
-          void goto(`/s/${id}`);
-        }
-      }
-      // app launched via `vicuna [path]`: raise a work session there
-      if (pendingDeepLinkPath) {
-        const p = pendingDeepLinkPath;
-        pendingDeepLinkPath = null;
-        await openWorkspacePath(p);
-      }
       // the palette handed this window a session before chats finished loading
       if (pendingOpenChatId) {
         const id = pendingOpenChatId;
@@ -8253,6 +8275,9 @@
     } finally {
       ready = true;
     }
+    // vicuna:// links that arrived before chats loaded (cold start: the
+    // getCurrent() answer can land at any point during initApp)
+    flushPendingDeepLinks();
     refreshModels();
     void refreshWorkEngine();
     // resume a stream interrupted by a refresh: the partial tokens persisted
