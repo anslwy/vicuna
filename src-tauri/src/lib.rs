@@ -98,6 +98,8 @@ struct ChatSaveRow {
     mode: Option<String>,
     workspace: Option<String>,
     goal: Option<String>,
+    /// per-session agent fields (engine/model/lead/pin) as JSON
+    extra: Option<String>,
     messages: Vec<MsgSaveRow>,
 }
 
@@ -127,7 +129,7 @@ async fn chats_save(
         .map_err(|e| format!("chats_save: {e}"))?;
     for chat in chats {
         sqlx::query(
-            "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(chat.id.clone())
         .bind(chat.title.clone())
@@ -138,6 +140,7 @@ async fn chats_save(
         .bind(chat.workspace)
         .bind(chat.goal)
         .bind(chat.updated_at.unwrap_or(chat.created_at))
+        .bind(chat.extra)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("chats_save: {e}"))?;

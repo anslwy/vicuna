@@ -95,7 +95,10 @@ async function serverInvoke(cmd: string, args: Record<string, any>): Promise<any
 
 function bridgePort(): number {
   try {
-    const q = new URLSearchParams(window.location.search).get("bridge");
+    // in-app navigation drops the query, so remember ?bridge= per tab
+    const fromUrl = new URLSearchParams(window.location.search).get("bridge");
+    if (fromUrl) sessionStorage.setItem("vicuna-bridge-port", fromUrl);
+    const q = fromUrl ?? sessionStorage.getItem("vicuna-bridge-port");
     const n = q ? parseInt(q, 10) : NaN;
     if (Number.isFinite(n) && n > 0 && n < 65536) return n;
   } catch {

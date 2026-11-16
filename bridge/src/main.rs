@@ -196,6 +196,7 @@ async fn dispatch(
                 return Err(engine.missing_message());
             }
             let turn = Arc::new(TurnState::new());
+            turn.lead.store(args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
             let turn_id = st.agent.next_turn(turn.clone());
             let acp = st.acp.clone();
             let model = arg_opt_str(args, "model");

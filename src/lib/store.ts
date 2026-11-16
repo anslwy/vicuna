@@ -23,7 +23,21 @@ export interface Chat {
    *  { text, paused, startedAt, pausedAt } — the turn loop keeps running
    *  until an unpaused goal reads as met. */
   goal?: string | null;
+  /** Work harness this session runs on ("claude" | "codex" | …); null = the
+   *  global pick in Settings. */
+  engine?: string | null;
+  /** that harness's model id; null = the engine's saved/default model */
+  workModel?: string | null;
+  /** "lead" = may create/start/stop/remove other sessions (vicuna-mcp
+   *  `manage_sessions`); a worker remembers its lead in `leadId`. */
+  role?: "lead" | null;
+  leadId?: string | null;
+  /** shown in the sidebar's Pinned section regardless of scope */
+  pinned?: boolean;
 }
+
+export { chatExtraJson, parseChatExtra } from "./leadSessions";
+import { chatExtraJson, parseChatExtra } from "./leadSessions";
 
 /** effective sidebar time: last user message, falling back to creation
  *  for sessions that predate updatedAt. */
@@ -307,6 +321,7 @@ function toSavePayload(chats: Chat[]) {
     mode: c.mode ?? "chat",
     workspace: c.workspace ?? null,
     goal: c.goal ?? null,
+    extra: chatExtraJson(c),
     messages: c.messages.map((m) => ({
       role: m.role,
       content: m.content,
@@ -336,7 +351,7 @@ async function createSqliteBackend(): Promise<Backend> {
       fork_from_index INTEGER
     )`);
   // migrations for databases created before fork attribution existed
-  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER"]) {
+  for (const col of ["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER", "extra TEXT"]) {
     try {
       await db.execute(`ALTER TABLE chats ADD COLUMN ${col}`);
     } catch {
@@ -432,8 +447,8 @@ async function createSqliteBackend(): Promise<Backend> {
     await db.execute("DELETE FROM chats");
     for (const c of chats) {
       await db.execute(
-        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null, c.goal ?? null, chatActivity(c)]
+        "INSERT INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        [c.id, c.title, c.createdAt, c.forkedFrom ? JSON.stringify(c.forkedFrom) : null, c.forkFromIndex ?? null, c.mode ?? "chat", c.workspace ?? null, c.goal ?? null, chatActivity(c), chatExtraJson(c)]
       );
       let i = 0;
       for (const m of c.messages) {
@@ -447,8 +462,8 @@ async function createSqliteBackend(): Promise<Backend> {
 
   return {
     async loadChats(): Promise<Chat[]> {      const rows = await db.select<
-        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null; updated_at: number | null }[]
-      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at FROM chats ORDER BY COALESCE(updated_at, created_at) DESC");
+        { id: string; title: string; created_at: number; forked_from: string | null; fork_from_index: number | null; mode: string | null; workspace: string | null; goal: string | null; updated_at: number | null; extra: string | null }[]
+      >("SELECT id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at, extra FROM chats ORDER BY COALESCE(updated_at, created_at) DESC");
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
@@ -467,6 +482,7 @@ async function createSqliteBackend(): Promise<Backend> {
           mode: r.mode === "work" ? "work" : "chat",
           workspace: r.workspace ?? null,
           goal: r.goal ?? null,
+          ...parseChatExtra(r.extra),
           messages: msgs.map((m) => ({
             role: m.role as ChatMsg["role"],
             content: m.content,
@@ -597,6 +613,7 @@ function createServerBackend(serverId: string): Backend {
         mode: c.mode === "work" ? "work" : "chat",
         workspace: typeof c.workspace === "string" ? c.workspace : null,
         goal: typeof c.goal === "string" ? c.goal : null,
+        ...parseChatExtra(c.extra),
         messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
           role: m.role as ChatMsg["role"],
           content: typeof m.content === "string" ? m.content : "",

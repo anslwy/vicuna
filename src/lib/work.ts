@@ -522,6 +522,7 @@ export type WorkAgentEvent =
   | { type: "toolend"; name: string; output: string }
   | { type: "askrequest"; ask_id: string; question: string; options: string[]; multi?: boolean }
   | { type: "schedulewakeup"; req_id: string; message: string; at: string | null; in_minutes: number | null }
+  | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "runstarted"; job_id: string; command: string; started_ms?: number }
   | { type: "runended"; job_id: string }
@@ -580,6 +581,8 @@ export interface WorkTurnParams {
   messages: ChatMsg[];
   sessionId?: string;
   goalText?: string | null;
+  /** the user's lead session: vicuna-mcp manage_sessions is allowed */
+  lead?: boolean;
   onEvent: (ev: WorkAgentEvent) => void;
 }
 
@@ -594,7 +597,8 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     workspace: p.workspace,
     messages: p.messages,
     sessionId: p.sessionId ?? null,
-    goalText: p.goalText ?? null
+    goalText: p.goalText ?? null,
+    lead: p.lead ?? false
   };
   if (useLocalIpc()) {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
