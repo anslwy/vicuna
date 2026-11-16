@@ -1479,6 +1479,7 @@ pub async fn run_turn(
     mcp_snapshot: McpSnapshot,
     engine: Engine,
 ) {
+    let _done = crate::work_agent::TurnDoneGuard(turn.clone());
     // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
     // keeps MCP servers per workspace folder, so its route is the workspace;
     // each claude process and each codex app-server gets its own.
@@ -1805,6 +1806,9 @@ async fn run_turn_inner(
         // a tool call was still running when Stop was pressed
         let mut tool_running_at_stop = false;
         let mut cancel_at: Option<Instant> = None;
+        // one interval for the whole loop: a fresh `sleep` per iteration never
+        // fires while the engine streams faster than it, so Stop went unseen
+        let mut stop_tick = crate::work_agent::stop_check_interval();
         let outcome: Result<Value, String> = loop {
             tokio::select! {
                 update = updates.recv() => {
@@ -1826,7 +1830,7 @@ async fn run_turn_inner(
                     .map_err(|_| "acp: response channel dropped".to_string())
                     .and_then(|r| r)
                     .map_err(|e| if client.closed.load(Ordering::Relaxed) { client.dead_error() } else { e }),
-                _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                _ = stop_tick.tick() => {
                     if stop.load(Ordering::Relaxed) && !cancelled {
                         cancelled = true;
                         tool_running_at_stop = tools.values().any(|t| t.started && !t.ended);

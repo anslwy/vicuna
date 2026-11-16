@@ -291,6 +291,7 @@ async fn dispatch(
             }
             Ok(serde_json::Value::Object(out))
         }
+        "work_agent_turn_live" => Ok(serde_json::json!(vicuna_lib::work_agent::turn_is_live(&st.agent, &s("turnId")?))),
         "work_agent_stop" => {
             let turn = st.agent.get_turn(&s("turnId")?).ok_or("unknown turn")?;
             agent_stop(&turn);
