@@ -522,6 +522,7 @@ export type WorkAgentEvent =
   | { type: "toolend"; name: string; output: string }
   | { type: "askrequest"; ask_id: string; question: string; options: string[]; multi?: boolean }
   | { type: "schedulewakeup"; req_id: string; message: string; at: string | null; in_minutes: number | null }
+  | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "runstarted"; job_id: string; command: string; started_ms?: number }
   | { type: "runended"; job_id: string }
@@ -580,6 +581,8 @@ export interface WorkTurnParams {
   messages: ChatMsg[];
   sessionId?: string;
   goalText?: string | null;
+  /** the user's lead session: vicuna-mcp manage_sessions is allowed */
+  lead?: boolean;
   onEvent: (ev: WorkAgentEvent) => void;
 }
 
@@ -594,7 +597,8 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     workspace: p.workspace,
     messages: p.messages,
     sessionId: p.sessionId ?? null,
-    goalText: p.goalText ?? null
+    goalText: p.goalText ?? null,
+    lead: p.lead ?? false
   };
   if (useLocalIpc()) {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
@@ -610,6 +614,25 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     ch.stop();
     throw e;
   }
+}
+
+/** A Work turn the server is still running for this session (the window that
+ *  started it closed or reloaded). Only remote servers / bridged browsers keep
+ *  turns across windows; local Tauri turns end with their window.
+ *  Keyed by Vicuna session id. */
+export async function liveWorkTurns(): Promise<Record<string, { turnId: string; channel: string }>> {
+  if (useLocalIpc()) return {};
+  try {
+    return ((await bridgeInvoke("work_agent_live", {})) ?? {}) as Record<string, { turnId: string; channel: string }>;
+  } catch {
+    return {}; // older server without the command, or bridge down
+  }
+}
+
+/** Follow an already-running turn's event stream (see liveWorkTurns). */
+export function attachWorkAgentTurn(channel: string, onEvent: (ev: WorkAgentEvent) => void): void {
+  const ch = new BridgeChannel(channel);
+  ch.onmessage = (ev) => onEvent(ev as WorkAgentEvent);
 }
 
 /** Interrupt a running turn (double-Esc, Stop, chat deleted). */
