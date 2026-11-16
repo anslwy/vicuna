@@ -26,7 +26,7 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, idx)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ];
-const CHAT_MIGRATIONS: &[&str] = &["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER"];
+const CHAT_MIGRATIONS: &[&str] = &["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER", "extra TEXT"];
 const MSG_MIGRATIONS: &[&str] = &["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL"];
 
 /// Open (creating if needed) a server database at `path`.
@@ -61,7 +61,7 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<(), String> {
     Ok(())
 }
 
-const CHAT_COLS: &str = "id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at";
+const CHAT_COLS: &str = "id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at, extra";
 
 fn chat_json(r: &sqlx::sqlite::SqliteRow, messages: Vec<Value>) -> Value {
     let created: i64 = r.try_get("created_at").unwrap_or(0);
@@ -76,6 +76,7 @@ fn chat_json(r: &sqlx::sqlite::SqliteRow, messages: Vec<Value>) -> Value {
         "mode": if r.try_get::<Option<String>, _>("mode").ok().flatten().as_deref() == Some("work") { "work" } else { "chat" },
         "workspace": r.try_get::<Option<String>, _>("workspace").ok().flatten(),
         "goal": r.try_get::<Option<String>, _>("goal").ok().flatten(),
+        "extra": r.try_get::<Option<String>, _>("extra").ok().flatten(),
         "messages": messages,
     })
 }
@@ -150,7 +151,7 @@ pub(crate) async fn merge_chats(pool: &SqlitePool, chats: Vec<crate::ChatSaveRow
         }
         sqlx::query("DELETE FROM messages WHERE chat_id = $1").bind(&chat.id).execute(&mut *tx).await.map_err(err)?;
         sqlx::query(
-            "INSERT OR REPLACE INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT OR REPLACE INTO chats (id, title, created_at, forked_from, fork_from_index, mode, workspace, goal, updated_at, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&chat.id)
         .bind(&chat.title)
@@ -161,6 +162,7 @@ pub(crate) async fn merge_chats(pool: &SqlitePool, chats: Vec<crate::ChatSaveRow
         .bind(&chat.workspace)
         .bind(&chat.goal)
         .bind(chat.updated_at.unwrap_or(chat.created_at))
+        .bind(&chat.extra)
         .execute(&mut *tx)
         .await
         .map_err(err)?;

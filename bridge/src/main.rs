@@ -57,6 +57,13 @@ pub struct BridgeState {
     pub term_channels: Arc<Mutex<HashMap<String, String>>>,
     /// channel id -> last time a client polled it (orphan-terminal reaper)
     pub last_poll: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Vicuna session id -> (turn id, channel id) of its live Work turn, so a
+    /// window that closed/reloaded mid-turn reattaches (`work_agent_live`)
+    /// instead of losing the stream or starting a second engine process on
+    /// the same session.
+    /// (turn id, channel id, start ms epoch: a reopened window's elapsed
+    /// clock must count from the turn's real start, not from the reopen)
+    pub session_turns: Arc<Mutex<HashMap<String, (String, String, u64)>>>,
 }
 
 impl Default for BridgeState {
@@ -74,6 +81,7 @@ impl Default for BridgeState {
             terms: Arc::new(vicuna_lib::TermState::default()),
             term_channels: Arc::new(Mutex::new(HashMap::new())),
             last_poll: Arc::new(Mutex::new(HashMap::new())),
+            session_turns: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -84,10 +92,37 @@ fn push_event(queues: &EventQueues, id: &str, raw: &str) {
         serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
     if let Ok(mut map) = queues.lock() {
         let q = map.entry(id.to_string()).or_default();
+        // merge adjacent token/think chunks: nobody may poll for hours (window
+        // closed mid-turn), and the cap below must not drop streamed text
+        if let Some(prev) = q.back_mut() {
+            if merge_text_event(prev, &v) {
+                return;
+            }
+        }
         q.push_back(v);
         while q.len() > EVENT_CAP {
             q.pop_front();
         }
+    }
+}
+
+/// Append `next`'s text onto `prev` when both are the same token/think event.
+fn merge_text_event(prev: &mut serde_json::Value, next: &serde_json::Value) -> bool {
+    let kind = next.get("type").and_then(|t| t.as_str());
+    if !matches!(kind, Some("token" | "think")) || prev.get("type").and_then(|t| t.as_str()) != kind {
+        return false;
+    }
+    let (Some(p), Some(n)) = (prev.as_object_mut(), next.as_object()) else { return false };
+    if p.len() != 2 || n.len() != 2 {
+        return false;
+    }
+    let add = n.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    match p.get_mut("text") {
+        Some(serde_json::Value::String(s)) => {
+            s.push_str(&add);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -161,6 +196,7 @@ async fn dispatch(
                 return Err(engine.missing_message());
             }
             let turn = Arc::new(TurnState::new());
+            turn.lead.store(args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
             let turn_id = st.agent.next_turn(turn.clone());
             let acp = st.acp.clone();
             let model = arg_opt_str(args, "model");
@@ -170,15 +206,39 @@ async fn dispatch(
                 serde_json::from_value(args.get("messages").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad messages: {e}"))?;
             let session_id = arg_opt_str(args, "sessionId");
+            if let Some(sid) = &session_id {
+                let live = st.session_turns.lock().ok().and_then(|m| m.get(sid).cloned());
+                if let Some((tid, _, _)) = live {
+                    if st.agent.get_turn(&tid).is_some() {
+                        return Err(format!(
+                            "this session already has a Work turn running on the server ({tid}); reopen the session to follow it"
+                        ));
+                    }
+                }
+            }
             let goal_text = arg_opt_str(args, "goalText");
             let mcp_snapshot =
                 vicuna_lib::acp::McpSnapshot::capture(&st.mcp, test_resource_dir().as_deref()).await;
+            if let (Some(sid), Ok(mut m)) = (&session_id, st.session_turns.lock()) {
+                let started_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                m.insert(sid.clone(), (turn_id.clone(), uuid.clone(), started_ms));
+            }
+            let session_turns = st.session_turns.clone();
+            let live_key = session_id.clone().map(|sid| (sid, turn_id.clone()));
             tokio::spawn(async move {
                 vicuna_lib::acp::run_turn(
                     turn, model, workspace, messages, session_id, goal_text, fresh_session, on_event, &acp,
                     mcp_snapshot, engine,
                 )
                 .await;
+                if let (Some((sid, tid)), Ok(mut m)) = (live_key, session_turns.lock()) {
+                    if m.get(&sid).is_some_and(|(t, _, _)| *t == tid) {
+                        m.remove(&sid);
+                    }
+                }
             });
             Ok(serde_json::json!(turn_id))
         }
@@ -214,6 +274,19 @@ async fn dispatch(
             vicuna_lib::opencode::save_model(arg_opt_str(args, "model").as_deref())?;
             Ok(serde_json::Value::Null)
         }
+        // A window (re)opening a session asks whether its Work turn is still
+        // running here; it then keeps polling the same channel, whose queue
+        // held every event since the previous window went away.
+        "work_agent_live" => {
+            let live = st.session_turns.lock().map(|m| m.clone()).unwrap_or_default();
+            let mut out = serde_json::Map::new();
+            for (sid, (tid, ch, started_ms)) in live {
+                if st.agent.get_turn(&tid).is_some() {
+                    out.insert(sid, serde_json::json!({ "turnId": tid, "channel": ch, "startedMs": started_ms }));
+                }
+            }
+            Ok(serde_json::Value::Object(out))
+        }
         "work_agent_stop" => {
             let turn = st.agent.get_turn(&s("turnId")?).ok_or("unknown turn")?;
             agent_stop(&turn);
@@ -244,6 +317,11 @@ async fn dispatch(
         }
         "work_run_status" => Ok(serde_json::json!(vicuna_lib::bg_snapshot(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
         "work_run_kill" => Ok(serde_json::json!(vicuna_lib::bg_kill(vicuna_lib::vicuna_mcp::jobs(), &s("id")?)?)),
+        "work_run_list" => Ok(serde_json::json!(vicuna_lib::vicuna_mcp::bg_runs_pending())),
+        "work_run_claim" => Ok(serde_json::json!(vicuna_lib::vicuna_mcp::bg_run_claim(
+            &s("id")?,
+            args.get("release").and_then(|v| v.as_bool()).unwrap_or(false),
+        ))),
         // ----- workspace validation / tools -----
         "work_validate_root" => {
             Ok(serde_json::json!(vicuna_lib::work_validate_root_logic(s("path")?).await?))
@@ -1117,5 +1195,28 @@ fn main() {
         Some(other) => die(&format!("unknown option {other}")),
         // no args: the dev bridge, as before (docs/scripts run `cargo run` here)
         None => run(Config { bind: "127.0.0.1".into(), port: 1421, token: None, db: None, tailscale: false, https_port: None }),
+    }
+}
+
+#[cfg(test)]
+mod event_queue_tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_text_events_merge_without_loss() {
+        let q: EventQueues = Default::default();
+        for i in 0..5000 {
+            push_event(&q, "c", &format!(r#"{{"type":"token","text":"{}"}}"#, i % 10));
+        }
+        push_event(&q, "c", r#"{"type":"think","text":"a"}"#);
+        push_event(&q, "c", r#"{"type":"think","text":"b"}"#);
+        push_event(&q, "c", r#"{"type":"toolstart","name":"x","args":{}}"#);
+        push_event(&q, "c", r#"{"type":"token","text":"z"}"#);
+        let ev = drain_events(&q, "c");
+        assert_eq!(ev.len(), 4);
+        assert_eq!(ev[0]["text"].as_str().unwrap().len(), 5000);
+        assert_eq!(ev[1]["text"], "ab");
+        assert_eq!(ev[2]["type"], "toolstart");
+        assert_eq!(ev[3]["text"], "z");
     }
 }

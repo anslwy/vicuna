@@ -54,6 +54,11 @@ pub enum WorkAgentEvent {
     /// `req_id` (via work_agent_answer) with `{ok, when}` or `{ok:false, error}`.
     #[serde(rename = "schedulewakeup")]
     ScheduleWakeup { req_id: String, message: String, at: Option<String>, in_minutes: Option<f64> },
+    /// vicuna-mcp `manage_sessions` (lead sessions only): the window owns the
+    /// sessions, so it performs `action` and answers `req_id` with
+    /// `{ok, text}` or `{ok:false, error}`.
+    #[serde(rename = "sessioncontrol")]
+    SessionControl { req_id: String, action: String, args: serde_json::Value },
     Done { stopped: bool },
     Error { message: String },
 }
@@ -104,6 +109,8 @@ pub struct TurnState {
     /// vicuna-mcp `run` calls waiting on their job, by job id: sending moves
     /// the job to the background and returns the tool call at once
     pub run_pending: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// the session is the user's lead: vicuna-mcp `manage_sessions` works
+    pub lead: AtomicBool,
 }
 
 impl TurnState {
@@ -114,6 +121,7 @@ impl TurnState {
             ask_pending: Mutex::new(HashMap::new()),
             ask_seq: AtomicU64::new(1),
             run_pending: Mutex::new(HashMap::new()),
+            lead: AtomicBool::new(false),
         }
     }
 }
@@ -204,6 +212,7 @@ pub async fn work_agent_start(
     goal_text: Option<String>,
     fresh_session: Option<bool>,
     engine: Option<String>,
+    lead: Option<bool>,
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
 ) -> Result<String, String> {
@@ -213,6 +222,7 @@ pub async fn work_agent_start(
     }
     crate::vicuna_mcp::set_app_handle(app.clone());
     let turn = Arc::new(TurnState::new());
+    turn.lead.store(lead.unwrap_or(false), Ordering::Relaxed);
     let turn_id = agent_state.next_turn(turn.clone());
     // the MCP dialog's servers (+ built-in browser) go to opencode
     let mcp_snapshot = crate::acp::McpSnapshot::capture(
@@ -301,6 +311,19 @@ pub async fn work_run_status(id: String) -> Result<crate::BgJobStatus, String> {
 #[tauri::command]
 pub async fn work_run_kill(id: String) -> Result<crate::BgJobStatus, String> {
     crate::bg_kill(crate::vicuna_mcp::jobs(), &id)
+}
+
+/// Backgrounded `run` jobs not yet reported to their session (a reopened
+/// window rebuilds its chips from this).
+#[tauri::command]
+pub async fn work_run_list() -> Vec<crate::vicuna_mcp::BgRunRecord> {
+    crate::vicuna_mcp::bg_runs_pending()
+}
+
+/// One window delivers a finished job's message: true = this caller may.
+#[tauri::command]
+pub async fn work_run_claim(id: String, release: Option<bool>) -> bool {
+    crate::vicuna_mcp::bg_run_claim(&id, release.unwrap_or(false))
 }
 
 #[cfg(test)]

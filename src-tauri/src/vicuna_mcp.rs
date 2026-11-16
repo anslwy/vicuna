@@ -43,8 +43,10 @@ pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
 /// The agent schedules a message to itself (a wake-up) in its own session.
 pub const SCHEDULE_TOOL: &str = "schedule_wakeup";
+/// Lead sessions create/start/stop/remove other sessions (refused elsewhere).
+pub const MANAGE_SESSIONS_TOOL: &str = "manage_sessions";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 7;
+pub const TOOL_COUNT: usize = 8;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, `run`
 /// raises Vicuna's own Allow card in ask mode, and session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -54,6 +56,7 @@ pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
 pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
 pub const CLAUDE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__schedule_wakeup";
+pub const CLAUDE_MANAGE_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_sessions";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -65,6 +68,91 @@ static JOBS: std::sync::LazyLock<crate::BgExecState> = std::sync::LazyLock::new(
 
 pub fn jobs() -> &'static crate::BgExecState {
     &JOBS
+}
+
+/// A `run` job that went to the background, remembered here (not only in the
+/// window that saw the `RunBackground` event): a window that closed or
+/// reloaded rebuilds its chips from `bg_runs_pending`, and exactly one window
+/// delivers the finished-job message (`bg_run_claim`).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgRunRecord {
+    pub job_id: String,
+    pub session_id: String,
+    pub command: String,
+    pub started_ms: u64,
+    /// still a foreground call (its turn is waiting; the window shows the
+    /// run strip with Background), not yet a background job
+    pub foreground: bool,
+    #[serde(skip)]
+    claimed: bool,
+}
+
+/// Foreground `run` calls in flight, so a reopened window can show their
+/// strip again (the `RunStarted` event went to the window that closed).
+static FG_RUNS: std::sync::LazyLock<Mutex<Vec<BgRunRecord>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn fg_run_started(job_id: &str, session_id: Option<&str>, command: &str, started_ms: u64) {
+    let Some(sid) = session_id else { return };
+    if let Ok(mut v) = FG_RUNS.lock() {
+        v.push(BgRunRecord { job_id: job_id.into(), session_id: sid.into(), command: command.into(), started_ms, foreground: true, claimed: false });
+    }
+}
+
+fn fg_run_ended(job_id: &str) {
+    if let Ok(mut v) = FG_RUNS.lock() {
+        v.retain(|r| r.job_id != job_id);
+    }
+}
+
+static BG_RUNS: std::sync::LazyLock<Mutex<Vec<BgRunRecord>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn remember_bg_run(job_id: &str, session_id: Option<&str>, command: &str, started_ms: u64) {
+    let Some(sid) = session_id else { return };
+    if let Ok(mut v) = BG_RUNS.lock() {
+        if v.iter().any(|r| r.job_id == job_id) {
+            return;
+        }
+        v.push(BgRunRecord { job_id: job_id.into(), session_id: sid.into(), command: command.into(), started_ms, foreground: false, claimed: false });
+        // keep every unreported job; drop the oldest delivered ones
+        while v.len() > 200 {
+            match v.iter().position(|r| r.claimed) {
+                Some(i) => {
+                    v.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Backgrounded jobs whose finished-job message has not been delivered yet,
+/// then foreground `run` calls still waiting (`foreground: true`).
+pub fn bg_runs_pending() -> Vec<BgRunRecord> {
+    let mut out: Vec<BgRunRecord> = BG_RUNS.lock().map(|v| v.iter().filter(|r| !r.claimed).cloned().collect()).unwrap_or_default();
+    if let Ok(v) = FG_RUNS.lock() {
+        out.extend(v.iter().cloned());
+    }
+    out
+}
+
+/// Claim the right to deliver a job's finished message (true = go ahead).
+/// `release` hands it back after a failed send. Unknown ids (jobs started by
+/// an older build) are always deliverable.
+pub fn bg_run_claim(job_id: &str, release: bool) -> bool {
+    let Ok(mut v) = BG_RUNS.lock() else { return true };
+    match v.iter_mut().find(|r| r.job_id == job_id) {
+        Some(r) if release => {
+            r.claimed = false;
+            true
+        }
+        Some(r) if r.claimed => false,
+        Some(r) => {
+            r.claimed = true;
+            true
+        }
+        None => true,
+    }
 }
 
 const MAX_HEADER: usize = 64 * 1024;
@@ -89,7 +177,9 @@ their output reaches you as a message when they finish. Use `get_session_id`, `r
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
 custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedule_wakeup` to have Vicuna send you a \
-message in this session later (check back on slow work, follow up at a time the user names).";
+message in this session later (check back on slow work, follow up at a time the user names). In the user's lead session, \
+`manage_sessions` creates, messages, stops and removes worker sessions (each on its own harness/model); a worker's reply \
+reaches the lead as a message when its turn ends.";
 
 #[cfg(feature = "desktop")]
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
@@ -334,6 +424,68 @@ fn schedule_schema() -> Value {
             "required": ["message"]
         }
     })
+}
+
+fn manage_sessions_schema() -> Value {
+    json!({
+        "name": MANAGE_SESSIONS_TOOL,
+        "title": "Manage worker sessions (lead only)",
+        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "status"] },
+                "session_id": { "type": "string", "description": "Target session (send/stop/delete/status)." },
+                "title": { "type": "string", "description": "create: sidebar title for the worker." },
+                "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's)." },
+                "engine": { "type": "string", "description": "create: harness, e.g. claude, codex, opencode, fx, agy, pi (default: the user's current pick). See `list` for installed ones." },
+                "model": { "type": "string", "description": "create: that engine's model id (default: the engine's default)." },
+                "message": { "type": "string", "description": "create/send: the prompt for the worker." },
+                "report": { "type": "boolean", "description": "create/send: send the worker's reply back to you when its turn ends (default true)." }
+            },
+            "required": ["action"]
+        }
+    })
+}
+
+/// Hand a session action to the window that runs this (lead) turn.
+async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if !["list", "create", "send", "stop", "delete", "status"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, send, stop, delete, status.", true);
+    }
+    let turn = &target.turn;
+    if !turn.lead.load(Ordering::Relaxed) {
+        return text_result("manage_sessions only works in the user's lead session. The user can make a session the lead from its sidebar menu (Make lead).", true);
+    }
+    if turn.stop.load(Ordering::Relaxed) {
+        return text_result("The user stopped the turn; nothing was done.", true);
+    }
+    let req_id = format!("sess-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = oneshot::channel::<String>();
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.insert(req_id.clone(), tx);
+    }
+    // delete waits on the user's confirm card, so it gets the ask budget
+    let wait = if action == "delete" { ASK_TIMEOUT_SECS } else { 60 };
+    emit_ev(&target.on_event, &turn.stop, WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: args.clone() });
+    let reply = tokio::select! {
+        a = rx => a.ok(),
+        _ = client_gone => None,
+        _ = tokio::time::sleep(Duration::from_secs(wait)) => None,
+    };
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.remove(&req_id);
+    }
+    let Some(reply) = reply else {
+        return text_result("The Vicuna app did not answer (is its window still open?).", true);
+    };
+    let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        text_result(v.get("text").and_then(Value::as_str).unwrap_or("Done."), false)
+    } else {
+        text_result(v.get("error").and_then(Value::as_str).unwrap_or("the app refused the action"), true)
+    }
 }
 
 fn run_schema() -> Value {
@@ -709,6 +861,7 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
         Err(e) => return text_result(&format!("Cannot run the command: {e}"), true),
     };
     if background {
+        remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
         emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
         return text_result(&background_text(&job_id, false), false);
     }
@@ -716,6 +869,7 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     if let Ok(mut m) = turn.run_pending.lock() {
         m.insert(job_id.clone(), tx);
     }
+    fg_run_started(&job_id, target.session_id.as_deref(), &command, started_ms);
     emit_ev(on_event, stop, WorkAgentEvent::RunStarted { job_id: job_id.clone(), command: command.clone(), started_ms });
     let started = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -741,7 +895,10 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
                 match crate::bg_snapshot(jobs(), &job_id) {
                     Ok(st) if !st.running => break End::Done(st),
                     Ok(_) => {}
-                    Err(e) => return text_result(&format!("Lost track of the command: {e}"), true),
+                    Err(e) => {
+                        fg_run_ended(&job_id);
+                        return text_result(&format!("Lost track of the command: {e}"), true);
+                    }
                 }
             }
         }
@@ -749,10 +906,12 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     if let Ok(mut m) = turn.run_pending.lock() {
         m.remove(&job_id);
     }
+    fg_run_ended(&job_id);
     emit_ev(on_event, stop, WorkAgentEvent::RunEnded { job_id: job_id.clone() });
     match end {
         End::Done(st) => text_result(&job_output(&st, started.elapsed().as_secs()), false),
         End::Background => {
+            remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
             emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
             text_result(&background_text(&job_id, true), false)
         }
@@ -1525,6 +1684,7 @@ async fn handle_rpc(
             list_sessions_schema(),
             manage_mcp_schema(),
             schedule_schema(),
+            manage_sessions_schema(),
         ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1535,11 +1695,12 @@ async fn handle_rpc(
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
                 (Some(t), READ_SESSION_TOOL) => read_session(t, &args).await,
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
+                (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, RUN_TOOL) => text_result("No Vicuna Work turn is running for this chat; use your own shell tool.", true),
-                (None, GET_SESSION_TOOL | READ_SESSION_TOOL | SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                (None, GET_SESSION_TOOL | READ_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
@@ -1796,6 +1957,30 @@ mod tests {
     use super::*;
     use tauri::ipc::InvokeResponseBody;
 
+    #[test]
+    fn bg_runs_survive_for_a_reopened_window_and_deliver_once() {
+        remember_bg_run("bg-t1", Some("chat-a"), "sleep 60", 5);
+        remember_bg_run("bg-t1", Some("chat-a"), "sleep 60", 5); // both emit sites: one record
+        remember_bg_run("bg-t2", None, "x", 6); // no session: nothing to wake
+        let mine = |v: Vec<BgRunRecord>| v.into_iter().filter(|r| r.job_id.starts_with("bg-t")).collect::<Vec<_>>();
+        let p = mine(bg_runs_pending());
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].session_id.as_str(), p[0].command.as_str(), p[0].started_ms), ("chat-a", "sleep 60", 5));
+        assert!(bg_run_claim("bg-t1", false));
+        assert!(!bg_run_claim("bg-t1", false), "a second window must not deliver it again");
+        assert!(mine(bg_runs_pending()).is_empty());
+        bg_run_claim("bg-t1", true); // send failed: hand it back
+        assert_eq!(mine(bg_runs_pending()).len(), 1);
+        assert!(bg_run_claim("bg-t1", false));
+        assert!(bg_run_claim("bg-unknown", false), "untracked jobs stay deliverable");
+        fg_run_started("bg-t3", Some("chat-b"), "make", 7);
+        let fg: Vec<_> = mine(bg_runs_pending()).into_iter().filter(|r| r.foreground).collect();
+        assert_eq!(fg.len(), 1);
+        assert_eq!(fg[0].session_id, "chat-b");
+        fg_run_ended("bg-t3");
+        assert!(mine(bg_runs_pending()).iter().all(|r| !r.foreground));
+    }
+
     fn capture() -> (Channel<WorkAgentEvent>, Arc<Mutex<Vec<Value>>>) {
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
         let s = seen.clone();
@@ -2003,6 +2188,40 @@ mod tests {
         let reg = register(None, &ws(), None, Arc::new(TurnState::new()), ch).await.unwrap();
         let r = post(&reg.url, wake_call(json!({ "message": "x", "in_minutes": 5 }))).await.1.unwrap();
         assert!(result_text(&r).contains("no Vicuna session"), "{}", result_text(&r));
+    }
+
+    fn sess_call(args: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": { "name": "manage_sessions", "arguments": args } })
+    }
+
+    #[tokio::test]
+    async fn manage_sessions_is_lead_only_and_asks_the_window() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), Some("lead-1"), turn.clone(), ch).await.unwrap();
+        // not the lead: refused without bothering the window
+        let r = post(&reg.url, sess_call(json!({ "action": "list" }))).await.1.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("lead session"), "{}", result_text(&r));
+        assert!(!seen.lock().unwrap().iter().any(|e| e["type"] == "sessioncontrol"));
+        // bad action
+        turn.lead.store(true, Ordering::Relaxed);
+        let r = post(&reg.url, sess_call(json!({ "action": "explode" }))).await.1.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        // lead: the window performs it and its text is the result
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, sess_call(json!({ "action": "create", "engine": "codex", "message": "hi" }))).await });
+        let ev = loop {
+            if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == "sessioncontrol").cloned() {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(ev["action"], "create");
+        assert_eq!(ev["args"]["engine"], "codex");
+        crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": "Created w-1" }).to_string()).unwrap();
+        let r = pending.await.unwrap().1.unwrap();
+        assert_eq!(result_text(&r), "Created w-1");
     }
 
     #[tokio::test]

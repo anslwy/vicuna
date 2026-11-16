@@ -35,9 +35,10 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
+  import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, type SessionRow } from "$lib/leadSessions";
   import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -1155,9 +1156,11 @@
     const { [id]: _, ...rest } = streamingStartedAt;
     streamingStartedAt = rest;
   }
-  function markWorkRunning(id: string) {
+  /** `startedAt`: the turn's real start when reattaching to one the server
+   *  kept running (the sidebar clock must not restart at the reopen) */
+  function markWorkRunning(id: string, startedAt?: number) {
     if (!workRunningIds.includes(id)) workRunningIds = [...workRunningIds, id];
-    workStartedAt = { ...workStartedAt, [id]: Date.now() };
+    workStartedAt = { ...workStartedAt, [id]: startedAt && startedAt <= Date.now() ? startedAt : Date.now() };
   }
   function unmarkWorkRunning(id: string) {
     if (!workRunningIds.includes(id)) return;
@@ -1507,7 +1510,7 @@
       return true;
     }
     const gate = workSendGate(workEngineInfo);
-    if (gate.blocked) throw new Error(gate.reason ?? "The Work engine is not available.");
+    if (gate.blocked && !chat.engine) throw new Error(gate.reason ?? "The Work engine is not available.");
     const ws = await canonicalWorkspace(chat.workspace);
     // the await may have outlived the session or its idle state
     if (!chats.some((x) => x.id === chatId) || isWorkRunning(chatId) || isCompacting(chatId) || isChatStreaming(chatId)) return false;
@@ -1524,6 +1527,131 @@
     return true;
   }
 
+  // ---- lead sessions (vicuna-mcp manage_sessions) ----
+  /** workers whose next turn end goes back to their lead */
+  const reportIds = new Set<string>();
+
+  function reportToLead(chatId: string, stopped: boolean) {
+    if (!reportIds.has(chatId)) return;
+    reportIds.delete(chatId);
+    const w = chats.find((x) => x.id === chatId);
+    const lead = w?.leadId ? chats.find((x) => x.id === w.leadId) : undefined;
+    if (!w || !lead) return;
+    const msg: ChatMsg = { role: "user", content: workerDoneMessage({ id: w.id, title: w.title, engine: w.engine || engineId(workEngineInfo), model: w.engine ? (w.workModel ?? null) : workModel }, lastReply(chatId) ?? "", stopped) };
+    const trySend = (n: number) =>
+      void sendToWorkSession(lead.id, msg)
+        .then((ok) => {
+          if (!ok && n < 30) setTimeout(() => trySend(n + 1), 2000);
+        })
+        .catch((e: any) => {
+          error = `Worker report not sent to the lead: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+        });
+    trySend(0);
+  }
+
+  function sessionRow(c: Chat, leadId: string): SessionRow {
+    return {
+      id: c.id,
+      title: c.title,
+      status: isWorkRunning(c.id) ? "running" : isCompacting(c.id) ? "compacting" : "idle",
+      engine: c.engine || engineId(workEngineInfo),
+      model: c.engine ? (c.workModel ?? null) : workModel,
+      workspace: c.workspace ?? null,
+      role: c.id === leadId ? "lead" : c.leadId === leadId ? "worker" : "other",
+      updatedAt: chatActivity(c)
+    };
+  }
+
+  /** a lead asking to delete a session waits on this confirm card */
+  let leadDeleteAsk = $state<{ title: string; leadTitle: string; resolve: (yes: boolean) => void } | null>(null);
+
+  /** perform a lead's manage_sessions call; the reply is the tool result */
+  async function handleSessionControl(leadId: string, leadWs: string, action: string, args: Record<string, any>): Promise<{ ok: boolean; text?: string; error?: string }> {
+    const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
+    const report = args.report !== false;
+    const target = () => {
+      const id = str("session_id");
+      if (!id) throw new Error("`session_id` is required (see `list`).");
+      if (id === leadId) throw new Error("That is your own session.");
+      const c = chats.find((x) => x.id === id);
+      if (!c) throw new Error(`No session ${id}.`);
+      return c;
+    };
+    const engines = workEngineChoices(workEngineInfo).map((e) => e.id);
+    switch (action) {
+      case "list": {
+        const rows = chats.filter((c) => (c.mode ?? "chat") === "work" && c.messages.length > 0).slice(0, 40).map((c) => sessionRow(c, leadId));
+        return { ok: true, text: sessionListText(rows, engines, engineId(workEngineInfo)) };
+      }
+      case "status": {
+        const c = target();
+        const tail = tailText(lastReply(c.id) ?? "", 3000);
+        return { ok: true, text: `${sessionListText([sessionRow(c, leadId)], engines, engineId(workEngineInfo)).split("\n").slice(-1)[0]}\nLast reply (tail):\n${tail || "(none yet)"}` };
+      }
+      case "create": {
+        const engine = str("engine");
+        if (engine && engines.length && !engines.includes(engine)) throw new Error(`Engine "${engine}" is not installed. Installed: ${engines.join(", ")}.`);
+        const ws = await canonicalWorkspace(str("workspace") || leadWs);
+        const message = str("message");
+        const title = (str("title") || message || "Worker").slice(0, 40);
+        const msgs: ChatMsg[] = message ? [{ role: "user", content: message }, { role: "assistant", content: "", thinking: "", model: selectedModel }] : [];
+        // complete before it enters reactive state (see send())
+        const c: Chat = {
+          id: crypto.randomUUID(),
+          title,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          messages: msgs,
+          mode: "work",
+          workspace: ws,
+          engine: engine || engineId(workEngineInfo),
+          workModel: str("model") || null,
+          leadId
+        };
+        chats = [c, ...chats];
+        save();
+        if (message) {
+          if (report) reportIds.add(c.id);
+          void runWorkTurn(c, c.messages.length - 1, ws);
+        }
+        return { ok: true, text: `Created "${c.title}" (session_id=${c.id}, engine=${c.engine}, model=${c.workModel ?? "default"}, workspace=${ws})${message ? "; its turn has started" + (report ? " and its reply will reach you when it ends" : "") : ""}.` };
+      }
+      case "send": {
+        const c = target();
+        const message = str("message");
+        if (!message) throw new Error("`message` is required.");
+        const running = isWorkRunning(c.id);
+        const ok = await sendToWorkSession(c.id, { role: "user", content: message });
+        if (!ok) throw new Error(`"${c.title}" is busy (compacting or streaming) or has no workspace; try again shortly.`);
+        if (report) reportIds.add(c.id);
+        return { ok: true, text: running ? `Queued into the running turn of "${c.title}".` : `Started a turn in "${c.title}".` };
+      }
+      case "stop": {
+        const c = target();
+        if (!isWorkRunning(c.id)) return { ok: true, text: `"${c.title}" was not running.` };
+        stopSession(c.id);
+        return { ok: true, text: `Stopped "${c.title}".` };
+      }
+      case "delete": {
+        const c = target();
+        if (c.role === "lead") throw new Error("Refusing to delete a lead session.");
+        const lead = chats.find((x) => x.id === leadId);
+        const yes = await new Promise<boolean>((resolve) => {
+          leadDeleteAsk?.resolve(false);
+          leadDeleteAsk = { title: c.title, leadTitle: lead?.title ?? "The lead", resolve };
+        });
+        leadDeleteAsk = null;
+        if (!yes) return { ok: false, error: `The user declined deleting "${c.title}". Do not retry unless they ask.` };
+        if (!chats.some((x) => x.id === c.id)) return { ok: true, text: `"${c.title}" was already gone.` };
+        if (isWorkRunning(c.id)) stopSession(c.id);
+        reportIds.delete(c.id);
+        deleteChat(c.id);
+        return { ok: true, text: `Deleted "${c.title}".` };
+      }
+    }
+    throw new Error(`Unknown action ${action}.`);
+  }
+
   // watch backgrounded `run` jobs; a finished one wakes its session with
   // the output (the "callback")
   const pendingMcpWakes = new Map<string, Array<{ name: string; tools: number | null }>>();
@@ -1537,9 +1665,17 @@
         if (!st || st.running) continue;
         if (!chats.some((c) => c.id === run.chatId)) {
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId); // session deleted
+          void workRunClaim(run.jobId);
+          continue;
+        }
+        // another window on the same backend may be watching this job too:
+        // only the one that claims it wakes the session
+        if (!(await workRunClaim(run.jobId))) {
+          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
           continue;
         }
         const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) }, { now: true });
+        if (!sent) void workRunClaim(run.jobId, true);
         if (sent) {
           bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
           const title = chats.find((c) => c.id === run.chatId)?.title ?? "the session";
@@ -1547,12 +1683,33 @@
         }
       } catch (e: any) {
         bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
+        void workRunClaim(run.jobId, true);
         error = `Background command finished, but its output could not be sent: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
       } finally {
         bgDelivering.delete(run.jobId);
       }
     }
   }
+  /** Rebuild background-job chips after the window closed or reloaded: the
+   *  jobs kept running on the backend, but `bgRuns` lived only in the old
+   *  window, so nothing watched them and the session was never woken. */
+  async function restoreBgRuns() {
+    const recs = await workRunList();
+    // foreground calls still waiting: their strip (with Background) sits on
+    // the live turn's trailing reply; `done` clears it as usual
+    const fg = recs
+      .filter((r) => r.foreground && !runningRuns.some((x) => x.jobId === r.jobId))
+      .flatMap((r) => {
+        const c = chats.find((x) => x.id === r.sessionId);
+        return c?.messages.length ? [{ chatId: c.id, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now(), index: c.messages.length - 1 }] : [];
+      });
+    if (fg.length) runningRuns = [...runningRuns, ...fg];
+    const add = recs
+      .filter((r) => !r.foreground && chats.some((c) => c.id === r.sessionId) && !bgRuns.some((b) => b.jobId === r.jobId))
+      .map((r) => ({ chatId: r.sessionId, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now() }));
+    if (add.length) bgRuns = [...bgRuns, ...add];
+  }
+
   $effect(() => {
     if (!bgRuns.length) return;
     const t = setInterval(() => void pollBgRuns(), 2000);
@@ -3707,7 +3864,36 @@
   // full path of the chosen scope: a native <select> can only tooltip the
   // control, not each option, so the closed state carries the path instead
   const scopeTitle = $derived(folderRows.find((f) => f.key === sessionFilter)?.title ?? "");
-  const grouped = $derived(groupByDate(filterChats(orderedChats, sessionFilter), Date.now()));
+  // pinned sessions sit above the date groups whatever the scope (the lead
+  // stays in view); they are not repeated below
+  const pinnedChats = $derived(orderedChats.filter((c) => c.pinned && c.messages.length > 0));
+  const grouped = $derived(groupByDate(filterChats(orderedChats.filter((c) => !(c.pinned && c.messages.length > 0)), sessionFilter), Date.now()));
+
+  const ctxChat = $derived(ctxMenu ? chats.find((x) => x.id === ctxMenu!.chatId) : undefined);
+  function togglePin(id: string) {
+    const c = chats.find((x) => x.id === id);
+    ctxMenu = null;
+    if (!c) return;
+    c.pinned = !c.pinned;
+    chats = [...chats];
+    save();
+  }
+
+  /** the lead may manage other sessions; making one the lead also pins it */
+  function toggleLead(id: string) {
+    const c = chats.find((x) => x.id === id);
+    ctxMenu = null;
+    if (!c) return;
+    if (c.role === "lead") {
+      c.role = null;
+    } else {
+      c.role = "lead";
+      c.pinned = true;
+    }
+    chats = [...chats];
+    save();
+    flashNotice(c.role === "lead" ? `"${c.title}" is now a lead: from its next turn it can create, message, stop and remove sessions.` : `"${c.title}" is no longer a lead.`);
+  }
 
   /** Choose the sidebar scope. Picking a workspace also makes it where New
    *  starts: the last-used work folder and the composer's pending workspace
@@ -6554,6 +6740,11 @@
     // settle, so park focus first or Safari jumps to the top on Stop too
     parkComposerFocus();
     if (id == null) return;
+    stopSession(id);
+  }
+
+  /** stop one session's live turn (Stop button, or a lead's manage_sessions) */
+  function stopSession(id: string) {
     if (isWorkRunning(id)) workStopIds.add(id);
     const turnId = workTurnIds.get(id);
     if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
@@ -7047,11 +7238,37 @@
    *  markdown results for persistence, ask cards, steering bubbles) exactly
    *  like the old in-thread loop did. Settle paths (leftovers, follow-up
    *  turns, goal retirement, stats) are unchanged. */
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean } = {}) {
+  /** Follow Work turns the server is still running for sessions this window
+   *  shows (the window that started them closed or reloaded). Without this
+   *  the turn ran on unseen, its output was never saved, and the next send
+   *  started a second engine process on the same session. */
+  async function reattachLiveWorkTurns() {
+    const live = await liveWorkTurns();
+    for (const [id, t] of Object.entries(live)) {
+      const c = chats.find((x) => x.id === id);
+      if (!c || c.mode !== "work" || workTurnIds.has(id) || workRunningIds.includes(id)) continue;
+      // its live bubble is the trailing assistant message; a user message
+      // last means the placeholder never got saved, so add it back
+      let idx = c.messages.length - 1;
+      if (idx < 0) continue;
+      if (c.messages[idx].role !== "assistant") {
+        c.messages = [...c.messages, { role: "assistant", content: "" }];
+        idx = c.messages.length - 1;
+        chats = [...chats];
+      }
+      void runWorkTurn(c, idx, c.workspace ?? "", [], { attach: t });
+    }
+  }
+
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string; startedMs?: number } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
-    const turnEngine = engineId(workEngineInfo);
-    let turnModel = workReplyModel(null, workModel, turnEngine);
+    // a session pinned to its own harness (lead-created workers) runs on it;
+    // otherwise the global pick
+    const own = chats.find((x) => x.id === chat.id) ?? chat;
+    const turnEngine = own.engine || engineId(workEngineInfo);
+    const turnPick: string | null = own.engine ? (own.workModel ?? null) : workModel;
+    let turnModel = workReplyModel(null, turnPick, turnEngine);
     {
       const c0 = chats.find((x) => x.id === chat.id);
       const m0 = c0?.messages[index];
@@ -7073,10 +7290,10 @@
     // No Tauri gate here: plain browsers drive the same flow through the
     // loopback bridge (startWorkAgentTurn throws the desktop/bridge error
     // when neither is present, and the catch below surfaces it).
-    markWorkRunning(chat.id);
+    markWorkRunning(chat.id, opts.attach?.startedMs);
     workStopIds.delete(chat.id);
     // a new turn invalidates /redo (backend clears its stack in undo_begin_turn)
-    dropUndoStash(chat.id);
+    if (!opts.attach) dropUndoStash(chat.id);
     let curIndex = index;
     // in-flight tool head (for say/ask/done display) + the ask answer the
     // frontend itself sent (the record mirrors it once the result lands)
@@ -7234,6 +7451,7 @@
         workStopIds.delete(chat.id);
         workTurnSeqByChat.delete(chat.id);
         workTurnIds.delete(chat.id);
+        reportToLead(chat.id, userStopped);
         const wakeServers = pendingMcpWakes.get(chat.id);
         pendingMcpWakes.delete(chat.id);
         if (wakeServers?.length && !userStopped) {
@@ -7267,12 +7485,14 @@
         case "roundstart":
           // a generation round is in flight: persist the resume marker (same
           // shape the old per-round streamInto wrote) so a refresh resumes it
-          writePendingStream({ chatId: chat.id, index: curIndex, mode: ev.mode as "fresh" | "continue", model: selectedModel, think });
+          // `work` keeps initApp from "resuming" it through the tool-less Chat
+          // path with the Chat model (that once replaced opus's real reply)
+          writePendingStream({ chatId: chat.id, index: curIndex, mode: ev.mode as "fresh" | "continue", model: selectedModel, think, work: true });
           save();
           armStall();
           break;
         case "model": {
-          turnModel = workReplyModel(ev.model, workModel, turnEngine);
+          turnModel = workReplyModel(ev.model, turnPick, turnEngine);
           const t = live();
           const m = t?.messages[curIndex];
           if (t && m && m.role === "assistant" && m.model !== turnModel) {
@@ -7437,6 +7657,15 @@
           if (tid) void answerWorkAgentAsk(tid, ev.req_id, JSON.stringify(reply)).catch(() => {});
           break;
         }
+        case "sessioncontrol": {
+          const tid = workTurnIds.get(chat.id);
+          void handleSessionControl(chat.id, workspace, ev.action, ev.args ?? {})
+            .catch((e: any) => ({ ok: false, error: typeof e === "string" ? e : (e?.message ?? String(e)) }))
+            .then((reply) => {
+              if (tid) void answerWorkAgentAsk(tid, ev.req_id, JSON.stringify(reply)).catch(() => {});
+            });
+          break;
+        }
         case "askrequest":
           // the agent is now blocked on the user: if the window is hidden or
           // in the background, chime + OS notification so they come back
@@ -7521,10 +7750,18 @@
     }
 
     let agentTurn: string;
+    if (opts.attach) {
+      // the server kept this turn running while no window followed it: keep
+      // polling its channel (the queue held every event since then)
+      attachWorkAgentTurn(opts.attach.channel, (ev) => handleEvent(ev));
+      workTurnIds.set(chat.id, opts.attach.turnId);
+      return;
+    }
     try {
       agentTurn = await startWorkAgentTurn({
         engine: turnEngine,
-        model: workModel ?? "",
+        model: turnPick ?? "",
+        lead: own.role === "lead",
         freshSession: opts.freshSession ?? false,
         workspace,
         messages: native,
@@ -8021,9 +8258,19 @@
     // resume a stream interrupted by a refresh: the partial tokens persisted
     // via the regular save, the pending marker tells us how to continue it
     // (user-stopped streams clear the marker, so they never resume here)
-    const pending = readPendingStream();
+    let pending = readPendingStream();
+    if (pending && (pending.work || chats.find((c) => c.id === pending!.chatId)?.mode === "work")) {
+      // a Work turn's marker: the Chat resume below would wipe the agent's
+      // partial reply and regenerate it with the Chat model and no tools.
+      // Work turns live on the backend; a still-running one is reattached
+      // just below, a finished one keeps whatever was saved.
+      clearPendingStream();
+      pending = null;
+    }
+    // reattach first: a restored run strip needs the live turn's bubble
+    void reattachLiveWorkTurns().then(() => restoreBgRuns());
     if (pending && (!sessionId || sessionId === pending.chatId)) {
-      const pc = chats.find((c) => c.id === pending.chatId);
+      const pc = chats.find((c) => c.id === pending!.chatId);
       const pm = pc?.messages[pending.index];
       if (pc && pm && pm.role === "assistant") {
         activeId = pc.id;
@@ -8298,6 +8545,8 @@
                 <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
                 {@const liveMs = live ? liveElapsedMs(c.id) : null}
                 {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
+                {#if c.role === "lead"}<span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>{/if}
+                {#if c.engine && c.mode === "work"}<span class="work-badge engine-tag" data-testid="session-engine" title={c.workModel ? `${c.engine}/${c.workModel}` : c.engine}>{c.engine}</span>{/if}
                 {#if c.mode === "work"}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
@@ -8313,6 +8562,10 @@
             </button>
           {/each}
         {/snippet}
+        {#if pinnedChats.length > 0}
+          <div class="group-label" data-testid="pinned-label">Pinned</div>
+          <div data-testid="pinned-list">{@render chatList(pinnedChats)}</div>
+        {/if}
         {#if grouped.today.length > 0}
           <div class="group-label">Today</div>
           {@render chatList(grouped.today)}
@@ -8329,7 +8582,7 @@
           <div class="group-label">Older</div>
           {@render chatList(grouped.older)}
         {/if}
-        {#if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0}
+        {#if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
           <div class="group-label">{sessionFilter === ALL_FILTER ? "Today" : "No matches"}</div>
           <div class="empty-hint">{sessionFilter === ALL_FILTER ? "No chats yet" : "No sessions in this scope yet"}</div>
         {/if}
@@ -8390,6 +8643,10 @@
         >
           <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
           <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
+          <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
+          {#if (ctxChat?.mode ?? "chat") === "work"}
+            <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>{ctxChat?.role === "lead" ? "Remove lead" : "Make lead"}</button>
+          {/if}
           <div class="ctx-continue-row">
             <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
             <button
@@ -8632,7 +8889,24 @@
           {@const copyKey = `${activeId}:${i}`}
           {@const bgDone = m.role === "user" && editingIndex !== i ? parseBgDoneMessage(m.content) : null}
           {@const mcpWake = !bgDone && m.role === "user" && editingIndex !== i ? parseMcpWakeMessage(m.content) : null}
-          {#if bgDone}
+          {@const workerDone = !bgDone && !mcpWake && m.role === "user" && editingIndex !== i ? parseWorkerDone(m.content) : null}
+          {#if workerDone}
+            <!-- a worker's turn ended: its report wakes the lead -->
+            <div class="row asst-row bg-done-row" data-msg-index={i}><div class="col">
+              <details class="bg-done" data-testid="worker-done">
+                <summary>
+                  <span class="bg-done-mark" class:bad={m.content.includes(") stopped.")} aria-hidden="true">{m.content.includes(") stopped.") ? "■" : "✓"}</span>
+                  <span class="bg-done-title">Worker report</span>
+                  {#if chats.some((c) => c.id === workerDone.id)}
+                    <button class="fork-link" onclick={(e) => { e.preventDefault(); selectChat(workerDone.id); }}>{workerDone.title}</button>
+                  {:else}
+                    <span class="bg-done-meta">{workerDone.title}</span>
+                  {/if}
+                </summary>
+                <pre class="bg-done-out">{m.content}</pre>
+              </details>
+            </div></div>
+          {:else if bgDone}
             <!-- a finished background job wakes the agent with a user message;
                  show it as the tool result it is, on the agent's side -->
             <div class="row asst-row bg-done-row" data-msg-index={i}><div class="col">
@@ -8903,7 +9177,7 @@
         <div class="queue-strip" data-testid="queue-strip">
           {#each queuedForActive as q (q.id)}
               <div class="queue-chip" data-testid="queue-chip">
-                <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : parseMcpWakeMessage(q.msg.content) ? `MCP server active: ${parseMcpWakeMessage(q.msg.content)?.summary}` : q.msg.content || "Image"}</span>
+                <span class="queue-text">{parseBgDoneMessage(q.msg.content) ? `Background command finished: ${parseBgDoneMessage(q.msg.content)?.command}` : parseMcpWakeMessage(q.msg.content) ? `MCP server active: ${parseMcpWakeMessage(q.msg.content)?.summary}` : parseWorkerDone(q.msg.content) ? `Worker report: ${parseWorkerDone(q.msg.content)?.title}` : q.msg.content || "Image"}</span>
                 <button class="queue-now" data-testid="queue-send-now" aria-label="Send this message now" title="Send now (interrupts the agent's current step)" onmousedown={(e) => e.preventDefault()} onclick={(e) => { e.stopPropagation(); sendQueuedNow(q.id); }}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
                 <button class="queue-x" data-testid="queue-remove" aria-label="Remove queued message" title="Remove from queue" onmousedown={(e) => e.preventDefault()} onclick={(e) => { e.stopPropagation(); unqueue(q.id); }}>×</button>
               </div>
@@ -10235,6 +10509,16 @@
     <p class="srv-help">Work sessions, files and agents then run there; Chat mode keeps using this computer's Ollama.</p>
   </div>
 {/if}
+{#if leadDeleteAsk}
+  <button class="confirm-backdrop" aria-label="Cancel" tabindex="-1" onclick={() => leadDeleteAsk?.resolve(false)}></button>
+  <div class="confirm-card" data-testid="lead-delete-confirm" role="alertdialog" aria-modal="true" aria-label="Confirm lead delete">
+    <p class="confirm-text">"{leadDeleteAsk.leadTitle}" wants to delete the session "{leadDeleteAsk.title}". Allow it?</p>
+    <div class="confirm-actions">
+      <button class="confirm-cancel" data-testid="lead-delete-deny" onclick={() => leadDeleteAsk?.resolve(false)}>Deny</button>
+      <button class="confirm-ok" data-testid="lead-delete-allow" onclick={() => leadDeleteAsk?.resolve(true)}>Delete</button>
+    </div>
+  </div>
+{/if}
 {#if pendingDeleteId}
   <button
     class="confirm-backdrop"
@@ -11208,6 +11492,8 @@
   .srv-cmd-copy { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-2); border-radius: 8px; background: var(--card); color: var(--text-dim); cursor: pointer; }
   .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
+  .lead-badge { background: var(--text); color: var(--bg); }
+  .engine-tag { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 600; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
