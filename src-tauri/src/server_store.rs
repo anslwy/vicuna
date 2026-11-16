@@ -48,6 +48,29 @@ pub async fn open(path: &Path) -> Result<SqlitePool, String> {
     Ok(pool)
 }
 
+/// Consistent snapshot of a (possibly live, WAL-mode) server database into
+/// `dest` via `VACUUM INTO`: SQLite reads it inside one transaction, so the
+/// copy includes committed WAL pages and is never torn — unlike copying
+/// `vicuna.db` + `-wal` + `-shm` by hand. Opens read-only; never migrates.
+pub async fn backup_to(src: &Path, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        return Err(format!("{} already exists", dest.display()));
+    }
+    let opts = SqliteConnectOptions::new().filename(src).read_only(true).create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .map_err(|e| format!("open {}: {e}", src.display()))?;
+    let r = sqlx::query("VACUUM INTO ?")
+        .bind(dest.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("backup to {}: {e}", dest.display()));
+    pool.close().await;
+    r.map(|_| ())
+}
+
 pub async fn init_schema(pool: &SqlitePool) -> Result<(), String> {
     for q in SCHEMA {
         sqlx::query(q).execute(pool).await.map_err(|e| format!("schema: {e}"))?;
@@ -375,6 +398,24 @@ mod tests {
         merge_chats(&pool, vec![], vec!["b".into()]).await.unwrap();
         let all = load_chats(&pool).await.unwrap();
         assert_eq!(all.as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backup_snapshots_a_live_wal_db() {
+        let dir = std::env::temp_dir().join(format!("vicuna-server-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = open(&dir.join("vicuna.db")).await.unwrap();
+        merge_chats(&pool, parse_rows(&json!([row("a", "A", &[("user", "hi")])])).unwrap(), vec![]).await.unwrap();
+        // pool stays open: the row may still live only in the -wal file
+        let dest = dir.join("bk/vicuna.db");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        backup_to(&dir.join("vicuna.db"), &dest).await.unwrap();
+        assert!(backup_to(&dir.join("vicuna.db"), &dest).await.is_err(), "never overwrites");
+        let copy = open(&dest).await.unwrap();
+        let all = load_chats(&copy).await.unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 1);
+        assert_eq!(all[0]["messages"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

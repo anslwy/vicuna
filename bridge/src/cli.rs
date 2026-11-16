@@ -45,7 +45,7 @@ const TAILSCALE_SOCKETS: &[&str] = &["/run/tailscale/tailscaled.sock", "/var/run
 /// distrobox/toolbox container the host's tailscale isn't on the container's
 /// filesystem, but the host root is mounted there (SteamOS + distrobox, hit
 /// live). `exists` is injected for tests.
-fn find_tailscale(path_env: Option<&std::ffi::OsStr>, exists: impl Fn(&Path) -> bool) -> Option<(PathBuf, Option<PathBuf>)> {
+pub(crate) fn find_tailscale(path_env: Option<&std::ffi::OsStr>, exists: impl Fn(&Path) -> bool) -> Option<(PathBuf, Option<PathBuf>)> {
     let on_path = path_env.into_iter().flat_map(std::env::split_paths).map(|d| d.join("tailscale"));
     let spots = TAILSCALE_SPOTS.iter().map(PathBuf::from);
     let host = TAILSCALE_SPOTS.iter().map(|s| Path::new(HOST_ROOT).join(s.trim_start_matches('/')));

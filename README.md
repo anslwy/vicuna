@@ -25,6 +25,52 @@ curl -fsSL https://raw.githubusercontent.com/anslwy/vicuna/main/install.sh | sh
 irm https://raw.githubusercontent.com/anslwy/vicuna/main/install.ps1 | iex
 ```
 
+## Headless server (`vicuna` CLI)
+
+The `vicuna` binary is Vicuna's headless server + CLI (one-line install, no
+sudo; Linux and macOS):
+
+```sh
+curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh
+vicuna serve --tailscale
+```
+
+Then paste the printed URL + token into the app: sidebar server menu →
+Connect to new server…
+
+```sh
+vicuna serve [--port N] [--bind ADDR] [--db PATH] [--tailscale [--https-port N]]
+                                        run a server in the foreground
+vicuna install-service [serve options]  keep it running on login/boot
+vicuna uninstall-service
+vicuna start [serve options]            start it in the background
+vicuna stop                             stop it
+vicuna restart [serve options]          restart it (detached)
+vicuna status                           running / how it runs / pid / version / log
+vicuna token                            print the server token
+vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
+                                        install the newest release
+vicuna open [path] / vicuna [path]      open a folder in the desktop app
+```
+
+`start`, `stop`, `restart` and `status` share one detection layer: the
+systemd user unit or launchd agent installed by `install-service` when there
+is one, otherwise a bare `vicuna serve` process. Inside a distrobox/toolbox
+container a unit on the host's user manager is reached through
+`distrobox-host-exec`. `start` no-ops when a server is already running (and
+`stop` when none is), logs to `~/vicuna/server/serve.log` and writes
+`~/vicuna/server/vicuna.pid`. `restart` runs detached, so it also completes
+when the shell you ran it from is hosted by that very server.
+
+`upgrade` downloads the latest release with the installer's checksum +
+atomic replace (a running binary keeps its old inode, so no
+"text file busy"), snapshots the live server database to
+`~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db` (a `VACUUM INTO`
+copy, safe on an open WAL database), and restarts a running server once the
+new binary is in place. With no server running it installs and stops there.
+`--check` only reports, `--dry-run` prints every step without touching
+anything, `--no-restart` leaves the running server on the old binary.
+
 ## Prerequisites
 
 - [Ollama](https://ollama.com) installed and serving: `ollama serve`
