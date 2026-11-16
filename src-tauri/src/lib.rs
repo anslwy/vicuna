@@ -5643,6 +5643,8 @@ pub fn run() {
             work_agent::work_agent_background,
             work_agent::work_run_status,
             work_agent::work_run_kill,
+            work_agent::work_run_list,
+            work_agent::work_run_claim,
             work_engine_info,
             opencode::opencode_models,
             opencode::opencode_set_model,

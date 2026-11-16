@@ -67,6 +67,91 @@ pub fn jobs() -> &'static crate::BgExecState {
     &JOBS
 }
 
+/// A `run` job that went to the background, remembered here (not only in the
+/// window that saw the `RunBackground` event): a window that closed or
+/// reloaded rebuilds its chips from `bg_runs_pending`, and exactly one window
+/// delivers the finished-job message (`bg_run_claim`).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgRunRecord {
+    pub job_id: String,
+    pub session_id: String,
+    pub command: String,
+    pub started_ms: u64,
+    /// still a foreground call (its turn is waiting; the window shows the
+    /// run strip with Background), not yet a background job
+    pub foreground: bool,
+    #[serde(skip)]
+    claimed: bool,
+}
+
+/// Foreground `run` calls in flight, so a reopened window can show their
+/// strip again (the `RunStarted` event went to the window that closed).
+static FG_RUNS: std::sync::LazyLock<Mutex<Vec<BgRunRecord>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn fg_run_started(job_id: &str, session_id: Option<&str>, command: &str, started_ms: u64) {
+    let Some(sid) = session_id else { return };
+    if let Ok(mut v) = FG_RUNS.lock() {
+        v.push(BgRunRecord { job_id: job_id.into(), session_id: sid.into(), command: command.into(), started_ms, foreground: true, claimed: false });
+    }
+}
+
+fn fg_run_ended(job_id: &str) {
+    if let Ok(mut v) = FG_RUNS.lock() {
+        v.retain(|r| r.job_id != job_id);
+    }
+}
+
+static BG_RUNS: std::sync::LazyLock<Mutex<Vec<BgRunRecord>>> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn remember_bg_run(job_id: &str, session_id: Option<&str>, command: &str, started_ms: u64) {
+    let Some(sid) = session_id else { return };
+    if let Ok(mut v) = BG_RUNS.lock() {
+        if v.iter().any(|r| r.job_id == job_id) {
+            return;
+        }
+        v.push(BgRunRecord { job_id: job_id.into(), session_id: sid.into(), command: command.into(), started_ms, foreground: false, claimed: false });
+        // keep every unreported job; drop the oldest delivered ones
+        while v.len() > 200 {
+            match v.iter().position(|r| r.claimed) {
+                Some(i) => {
+                    v.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Backgrounded jobs whose finished-job message has not been delivered yet,
+/// then foreground `run` calls still waiting (`foreground: true`).
+pub fn bg_runs_pending() -> Vec<BgRunRecord> {
+    let mut out: Vec<BgRunRecord> = BG_RUNS.lock().map(|v| v.iter().filter(|r| !r.claimed).cloned().collect()).unwrap_or_default();
+    if let Ok(v) = FG_RUNS.lock() {
+        out.extend(v.iter().cloned());
+    }
+    out
+}
+
+/// Claim the right to deliver a job's finished message (true = go ahead).
+/// `release` hands it back after a failed send. Unknown ids (jobs started by
+/// an older build) are always deliverable.
+pub fn bg_run_claim(job_id: &str, release: bool) -> bool {
+    let Ok(mut v) = BG_RUNS.lock() else { return true };
+    match v.iter_mut().find(|r| r.job_id == job_id) {
+        Some(r) if release => {
+            r.claimed = false;
+            true
+        }
+        Some(r) if r.claimed => false,
+        Some(r) => {
+            r.claimed = true;
+            true
+        }
+        None => true,
+    }
+}
+
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -709,6 +794,7 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
         Err(e) => return text_result(&format!("Cannot run the command: {e}"), true),
     };
     if background {
+        remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
         emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
         return text_result(&background_text(&job_id, false), false);
     }
@@ -716,6 +802,7 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     if let Ok(mut m) = turn.run_pending.lock() {
         m.insert(job_id.clone(), tx);
     }
+    fg_run_started(&job_id, target.session_id.as_deref(), &command, started_ms);
     emit_ev(on_event, stop, WorkAgentEvent::RunStarted { job_id: job_id.clone(), command: command.clone(), started_ms });
     let started = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -741,7 +828,10 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
                 match crate::bg_snapshot(jobs(), &job_id) {
                     Ok(st) if !st.running => break End::Done(st),
                     Ok(_) => {}
-                    Err(e) => return text_result(&format!("Lost track of the command: {e}"), true),
+                    Err(e) => {
+                        fg_run_ended(&job_id);
+                        return text_result(&format!("Lost track of the command: {e}"), true);
+                    }
                 }
             }
         }
@@ -749,10 +839,12 @@ async fn run(target: &Target, args: &Value, client_gone: impl std::future::Futur
     if let Ok(mut m) = turn.run_pending.lock() {
         m.remove(&job_id);
     }
+    fg_run_ended(&job_id);
     emit_ev(on_event, stop, WorkAgentEvent::RunEnded { job_id: job_id.clone() });
     match end {
         End::Done(st) => text_result(&job_output(&st, started.elapsed().as_secs()), false),
         End::Background => {
+            remember_bg_run(&job_id, target.session_id.as_deref(), &command, started_ms);
             emit_ev(on_event, stop, WorkAgentEvent::RunBackground { job_id: job_id.clone(), command, started_ms });
             text_result(&background_text(&job_id, true), false)
         }
@@ -1795,6 +1887,30 @@ async fn stream_call(
 mod tests {
     use super::*;
     use tauri::ipc::InvokeResponseBody;
+
+    #[test]
+    fn bg_runs_survive_for_a_reopened_window_and_deliver_once() {
+        remember_bg_run("bg-t1", Some("chat-a"), "sleep 60", 5);
+        remember_bg_run("bg-t1", Some("chat-a"), "sleep 60", 5); // both emit sites: one record
+        remember_bg_run("bg-t2", None, "x", 6); // no session: nothing to wake
+        let mine = |v: Vec<BgRunRecord>| v.into_iter().filter(|r| r.job_id.starts_with("bg-t")).collect::<Vec<_>>();
+        let p = mine(bg_runs_pending());
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].session_id.as_str(), p[0].command.as_str(), p[0].started_ms), ("chat-a", "sleep 60", 5));
+        assert!(bg_run_claim("bg-t1", false));
+        assert!(!bg_run_claim("bg-t1", false), "a second window must not deliver it again");
+        assert!(mine(bg_runs_pending()).is_empty());
+        bg_run_claim("bg-t1", true); // send failed: hand it back
+        assert_eq!(mine(bg_runs_pending()).len(), 1);
+        assert!(bg_run_claim("bg-t1", false));
+        assert!(bg_run_claim("bg-unknown", false), "untracked jobs stay deliverable");
+        fg_run_started("bg-t3", Some("chat-b"), "make", 7);
+        let fg: Vec<_> = mine(bg_runs_pending()).into_iter().filter(|r| r.foreground).collect();
+        assert_eq!(fg.len(), 1);
+        assert_eq!(fg[0].session_id, "chat-b");
+        fg_run_ended("bg-t3");
+        assert!(mine(bg_runs_pending()).iter().all(|r| !r.foreground));
+    }
 
     fn capture() -> (Channel<WorkAgentEvent>, Arc<Mutex<Vec<Value>>>) {
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
