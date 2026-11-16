@@ -429,15 +429,15 @@ fn schedule_schema() -> Value {
 fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
-        "title": "Manage worker sessions (lead only)",
-        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` tags archived sessions `[archived]`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
+        "title": "Manage worker sessions (lead only; set_workspace on your own session works anywhere)",
+        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` tags archived sessions `[archived]`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status"] },
-                "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status)." },
+                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace"] },
+                "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status/set_workspace; set_workspace defaults to your own)." },
                 "title": { "type": "string", "description": "create: sidebar title for the worker." },
-                "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's)." },
+                "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's). set_workspace: the new folder (required)." },
                 "engine": { "type": "string", "description": "create: harness, e.g. claude, codex, opencode, fx, agy, pi (default: the user's current pick). See `list` for installed ones." },
                 "model": { "type": "string", "description": "create: that engine's model id (default: the engine's default)." },
                 "message": { "type": "string", "description": "create/send: the prompt for the worker." },
@@ -451,11 +451,17 @@ fn manage_sessions_schema() -> Value {
 /// Hand a session action to the window that runs this (lead) turn.
 async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status"].contains(&action.as_str()) {
-        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status.", true);
+    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status, set_workspace.", true);
     }
     let turn = &target.turn;
-    if !turn.lead.load(Ordering::Relaxed) {
+    // moving your own session's folder needs no lead role
+    let sid = args.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    let own = action == "set_workspace" && (sid.is_empty() || Some(sid) == target.session_id.as_deref());
+    if own && target.session_id.is_none() {
+        return text_result("This turn has no Vicuna session, so there is nothing to move.", true);
+    }
+    if !own && !turn.lead.load(Ordering::Relaxed) {
         return text_result("manage_sessions only works in the user's lead session. The user can make a session the lead from its sidebar menu (Make lead).", true);
     }
     if turn.stop.load(Ordering::Relaxed) {
@@ -2244,6 +2250,29 @@ mod tests {
             let r = pending.await.unwrap().1.unwrap();
             assert_eq!(r["result"]["isError"], false);
         }
+    }
+
+    #[tokio::test]
+    async fn set_workspace_on_own_session_needs_no_lead() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        let reg = register(None, &ws(), Some("s-1"), turn.clone(), ch).await.unwrap();
+        // another session still needs the lead role
+        let r = post(&reg.url, sess_call(json!({ "action": "set_workspace", "session_id": "other", "workspace": "/tmp" }))).await.1.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("lead session"), "{}", result_text(&r));
+        // own session: forwarded to the window
+        let url = reg.url.clone();
+        let pending = tokio::spawn(async move { post(&url, sess_call(json!({ "action": "set_workspace", "workspace": "/tmp" }))).await });
+        let ev = loop {
+            if let Some(e) = seen.lock().unwrap().iter().find(|e| e["type"] == "sessioncontrol").cloned() {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(ev["action"], "set_workspace");
+        crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": "Moved" }).to_string()).unwrap();
+        assert_eq!(result_text(&pending.await.unwrap().1.unwrap()), "Moved");
     }
 
     #[tokio::test]
