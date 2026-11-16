@@ -187,6 +187,20 @@ export function filterChats(chats: Chat[], filter: string): Chat[] {
   return chats.filter((c) => matchesFilter(c, f));
 }
 
+/** Archive visibility: hidden archived sessions drop out of the list, except
+ *  the one being viewed (`keepId`) so it doesn't vanish under the user. */
+export function visibleChats<T extends { id: string; archived?: boolean }>(chats: T[], showArchived: boolean, keepId: string | null = null): T[] {
+  if (showArchived) return chats;
+  return chats.filter((c) => !c.archived || c.id === keepId);
+}
+
+/** Pinned section: pinned sessions that are not archived. Archiving keeps
+ *  the pin flag, so unarchiving puts the session back in Pinned; while
+ *  archived it lists in the date groups like any other session. */
+export function isPinnedRow(c: { pinned?: boolean; archived?: boolean; messages: unknown[] }): boolean {
+  return !!c.pinned && !c.archived && c.messages.length > 0;
+}
+
 export interface SessionGroups {
   today: Chat[];
   yesterday: Chat[];

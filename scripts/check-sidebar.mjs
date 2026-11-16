@@ -12,7 +12,9 @@ import {
   resolveSessionFilter,
   filterChats,
   groupByDate,
-  workspaceBase
+  workspaceBase,
+  visibleChats,
+  isPinnedRow
 } from "../src/lib/sidebar.ts";
 
 let failures = 0;
@@ -184,6 +186,15 @@ const ordered = groupByDate([
   chat("c", { now, age: 2 * HOUR })
 ], now);
 eq(ordered.today.map((c) => c.id), ["b", "c", "a"], "newest first inside a bucket");
+
+// ---- archive ----
+const arch = [{ id: "a", archived: true }, { id: "b" }, { id: "c", archived: true }];
+eq(visibleChats(arch, true).map((c) => c.id), ["a", "b", "c"], "show archived lists everything");
+eq(visibleChats(arch, false).map((c) => c.id), ["b"], "hide archived drops archived sessions");
+eq(visibleChats(arch, false, "c").map((c) => c.id), ["b", "c"], "the open session stays listed while hidden");
+eq(isPinnedRow({ pinned: true, messages: [1] }), true, "pinned row");
+eq(isPinnedRow({ pinned: true, archived: true, messages: [1] }), false, "archived leaves Pinned");
+eq(isPinnedRow({ pinned: true, messages: [] }), false, "empty never pinned");
 
 if (failures > 0) {
   console.error(`\n${failures} sidebar check(s) failed`);

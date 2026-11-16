@@ -11,6 +11,7 @@ export interface SessionRow {
   workspace: string | null;
   role: "lead" | "worker" | "other";
   updatedAt: number;
+  archived?: boolean;
 }
 
 /** first line of a worker's finished-turn message; keep in sync with parseWorkerDone */
@@ -52,7 +53,8 @@ export function sessionListText(rows: SessionRow[], engines: string[], defaultEn
   for (const r of rows) {
     const tag = r.role === "lead" ? " [lead, you]" : r.role === "worker" ? " [your worker]" : "";
     const model = r.model ? `${r.engine}/${r.model}` : r.engine;
-    lines.push(`- ${r.id} · "${r.title}"${tag} · ${r.status} · ${model}${r.workspace ? ` · ${r.workspace}` : ""}`);
+    const arch = r.archived ? " [archived]" : "";
+    lines.push(`- ${r.id} · "${r.title}"${tag}${arch} · ${r.status} · ${model}${r.workspace ? ` · ${r.workspace}` : ""}`);
   }
   return lines.join("\n");
 }
@@ -63,6 +65,7 @@ export interface ChatExtra {
   role?: "lead" | null;
   leadId?: string | null;
   pinned?: boolean;
+  archived?: boolean;
 }
 
 /** persisted `extra` JSON column: per-session engine/model/lead/pin */
@@ -73,6 +76,7 @@ export function chatExtraJson(c: ChatExtra): string | null {
   if (c.role === "lead") o.role = "lead";
   if (c.leadId) o.leadId = c.leadId;
   if (c.pinned) o.pinned = true;
+  if (c.archived) o.archived = true;
   return Object.keys(o).length ? JSON.stringify(o) : null;
 }
 
@@ -92,5 +96,6 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (o.role === "lead") out.role = "lead";
   if (typeof o.leadId === "string" && o.leadId) out.leadId = o.leadId;
   if (o.pinned === true) out.pinned = true;
+  if (o.archived === true) out.archived = true;
   return out;
 }
