@@ -119,7 +119,7 @@ impl AcpState {
                 let bin = find_opencode().ok_or_else(not_found_message)?;
                 let mut cmd = super::opencode::command(&bin);
                 cmd.arg("acp");
-                (bin, cmd, String::new())
+                (bin, cmd, process_workspace(engine, workspace).to_string())
             }
             Engine::Agy => {
                 if let Some(e) = super::agy::workspace_error(Path::new(workspace)) {
@@ -127,13 +127,13 @@ impl AcpState {
                 }
                 let bin = super::agy::find_agy().ok_or_else(super::agy::missing_message)?;
                 let cmd = super::agy::command(&bin, ask_now, Path::new(workspace));
-                (bin, cmd, workspace.to_string())
+                (bin, cmd, process_workspace(engine, workspace).to_string())
             }
             Engine::Fx => {
                 let bin = super::fx::find_fx().ok_or_else(super::fx::missing_message)?;
                 let mut cmd = super::fx::command(&bin, ask_now);
                 cmd.arg("acp");
-                (bin, cmd, String::new())
+                (bin, cmd, process_workspace(engine, workspace).to_string())
             }
             _ => return Err(format!("{} does not run over ACP", engine.label())),
         };
@@ -162,7 +162,7 @@ impl AcpState {
     /// Drop a warm process (e.g. it failed to start a session) so the next
     /// call respawns it.
     async fn discard(&self, engine: Engine, workspace: &str) {
-        let ws = if engine == Engine::Agy { workspace.to_string() } else { String::new() };
+        let ws = process_workspace(engine, workspace).to_string();
         self.procs.lock().await.remove(&(engine, ws));
     }
 
@@ -170,7 +170,7 @@ impl AcpState {
     /// cancelled call started running), so nothing outlives the turn. The
     /// next turn respawns agy and resumes the saved session.
     async fn kill_tree(&self, engine: Engine, workspace: &str) {
-        let ws = if engine == Engine::Agy { workspace.to_string() } else { String::new() };
+        let ws = process_workspace(engine, workspace).to_string();
         if let Some(p) = self.procs.lock().await.remove(&(engine, ws)) {
             super::agy::kill_group(p.pid);
             // dropping `p` kills agy itself (kill_on_drop)
@@ -181,11 +181,19 @@ impl AcpState {
     /// (app startup). Silent when it is missing; the UI shows that state.
     pub async fn prewarm(&self) {
         let engine = super::work_engine::current_engine();
-        // only the ACP engines keep a warm process; claude/codex start per turn
-        if matches!(engine, Engine::Opencode | Engine::Fx) && engine.is_present() {
+        // Only opencode is workspace-independent; fx/agy start once a workspace
+        // is known so cached MCP connections cannot point at a different route.
+        if engine == Engine::Opencode && engine.is_present() {
             let _ = self.client(engine, "").await;
         }
     }
+}
+
+// fx retains process-wide MCP connections. Its process scope must match the
+// per-workspace MCP route; otherwise a second workspace calls the first one's
+// now-idle route. Agy also runs tools in its process cwd.
+fn process_workspace(engine: Engine, workspace: &str) -> &str {
+    if matches!(engine, Engine::Agy | Engine::Fx) { workspace } else { "" }
 }
 
 /// Spawn an ACP agent and run `initialize`.
@@ -1873,6 +1881,15 @@ async fn run_turn_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_mcp_processes_are_scoped_to_their_workspace_routes() {
+        for engine in [Engine::Fx, Engine::Agy] {
+            assert_ne!(process_workspace(engine, "/lead"), process_workspace(engine, "/worker"));
+            assert_eq!(process_workspace(engine, "/lead"), "/lead");
+        }
+        assert_eq!(process_workspace(Engine::Opencode, "/lead"), "");
+    }
 
     #[test]
     fn tool_mapping_reads_like_native_names() {

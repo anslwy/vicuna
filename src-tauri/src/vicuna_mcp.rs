@@ -477,9 +477,10 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     let wait = match action.as_str() {
         "delete" => ASK_TIMEOUT_SECS,
         "create" | "send" => 120,
-        _ => 15,
+        _ => 60,
     };
     if target.on_event.send(WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: args.clone() }).is_err() {
+        turn.stop.store(true, Ordering::Relaxed);
         turn.ask_pending.lock().ok().map(|mut m| m.remove(&req_id));
         return text_result("The app event channel is unavailable; the action was not dispatched.", true);
     }
@@ -2237,6 +2238,18 @@ mod tests {
         crate::work_agent::agent_answer(&turn, ev["req_id"].as_str().unwrap(), json!({ "ok": true, "text": "Created w-1" }).to_string()).unwrap();
         let r = pending.await.unwrap().1.unwrap();
         assert_eq!(result_text(&r), "Created w-1");
+    }
+
+    #[tokio::test]
+    async fn manage_sessions_dead_channel_stops_the_turn_without_dispatch() {
+        let ch = Channel::<WorkAgentEvent>::new(|_| Err(tauri::Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))));
+        let turn = Arc::new(TurnState::new());
+        turn.lead.store(true, Ordering::Relaxed);
+        let target = Target { seq: 0, workspace: ws(), session_id: Some("lead".into()), turn: turn.clone(), on_event: ch };
+        let result = manage_sessions(&target, &json!({ "action": "list" }), std::future::pending()).await;
+        assert!(turn.stop.load(Ordering::Relaxed));
+        assert!(turn.ask_pending.lock().unwrap().is_empty());
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("not dispatched"));
     }
 
     #[tokio::test]
