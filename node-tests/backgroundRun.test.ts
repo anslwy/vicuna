@@ -1,16 +1,14 @@
-// Backgrounded vicuna-mcp `run` jobs + late ask answers (run: `npm test`).
+// Legacy `run` wake-up parsing, MCP wake-ups + late ask answers (run: `npm test`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bgDoneMessage, formatRunElapsed, isBgDoneMessage, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "../src/lib/backgroundRun.ts";
+import { isBgDoneMessage, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "../src/lib/backgroundRun.ts";
 
-test("finished-job messages parse back for the tool-result display", () => {
-  const msg = bgDoneMessage(
-    { chatId: "c", jobId: "bg-1", command: 'for i in 1 2; do echo "t $i"; done', startedAt: 0 },
-    { running: false, exit_code: 0, stdout: "t 1\nt 2\n", stderr: "warn ```x```\n", truncated: true },
-    101_000
-  );
-  assert.ok(isBgDoneMessage(msg));
-  assert.deepEqual(parseBgDoneMessage(msg), {
+// Literal message as the removed `run` tool stored it in old chats.
+const LEGACY = 'Background command finished (exit 0, after 1m 41s, job bg-1):\n\n```\nfor i in 1 2; do echo "t $i"; done\n```\n\nOutput:\n```\nt 1\nt 2\n```\n\nStderr:\n````\nwarn ```x```\n````\n\n(output was truncated at 32KB per stream)\n\nContinue from here.';
+
+test("legacy finished-job messages still parse for the tool-result display", () => {
+  assert.ok(isBgDoneMessage(LEGACY));
+  assert.deepEqual(parseBgDoneMessage(LEGACY), {
     status: "exit 0",
     ok: true,
     elapsed: "1m 41s",
@@ -20,7 +18,7 @@ test("finished-job messages parse back for the tool-result display", () => {
     stderr: "warn ```x```",
     truncated: true
   });
-  const killed = parseBgDoneMessage(bgDoneMessage({ chatId: "c", jobId: "bg-2", command: "sleep 99", startedAt: 0 }, { running: false, exit_code: null, stdout: "", stderr: "", truncated: false }, 5000))!;
+  const killed = parseBgDoneMessage("Background command finished (killed, after 5s, job bg-2):\n\n```\nsleep 99\n```\n\n(no output)\n\nContinue from here.")!;
   assert.equal(killed.status, "killed");
   assert.equal(killed.ok, false);
   assert.equal(killed.output, "");
@@ -44,33 +42,6 @@ test("mcp wake-up message formats and parses back for card display", () => {
   assert.equal(parseMcpWakeMessage("hello"), null);
 });
 import { laterAnswerMessage } from "../src/lib/askCard.ts";
-
-const run = { chatId: "c", jobId: "bg-3", command: "npm test", startedAt: 0 };
-
-test("elapsed labels", () => {
-  assert.equal(formatRunElapsed(45_000), "45s");
-  assert.equal(formatRunElapsed(133_000), "2m 13s");
-  assert.equal(formatRunElapsed(3_840_000), "1h 4m");
-  assert.equal(formatRunElapsed(-5), "0s");
-});
-
-test("finished job message carries command, exit, output and stderr", () => {
-  const msg = bgDoneMessage(run, { running: false, exit_code: 1, stdout: "ok 1\nnot ok 2\n", stderr: "boom\n", truncated: false }, 133_000);
-  assert.ok(msg.startsWith("Background command finished (exit 1, after 2m 13s, job bg-3):"), msg);
-  assert.ok(msg.includes("```\nnpm test\n```"));
-  assert.ok(msg.includes("Output:\n```\nok 1\nnot ok 2\n```"));
-  assert.ok(msg.includes("Stderr:\n```\nboom\n```"));
-  assert.ok(msg.trimEnd().endsWith("Continue from here."));
-});
-
-test("killed / silent / truncated jobs say so, and fences can't be broken", () => {
-  const msg = bgDoneMessage(run, { running: false, exit_code: null, stdout: "a ``` b", stderr: "", truncated: true }, 1000);
-  assert.ok(msg.includes("(killed, after 1s"));
-  assert.ok(msg.includes("````\na ``` b\n````"));
-  assert.ok(msg.includes("truncated"));
-  const silent = bgDoneMessage(run, { running: false, exit_code: 0, stdout: "", stderr: "  ", truncated: false }, 0);
-  assert.ok(silent.includes("(no output)"));
-});
 
 test("late answers quote the question and keep images", () => {
   assert.deepEqual(laterAnswerMessage("Which  db?", { text: " Postgres ", images: [], multi: false, picked: [] }), {

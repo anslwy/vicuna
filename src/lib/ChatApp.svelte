@@ -36,11 +36,11 @@
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, type SessionRow } from "$lib/leadSessions";
-  import { bgDoneMessage, formatRunElapsed, mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage, type BgRun } from "$lib/backgroundRun";
+  import { mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, backgroundWorkRun, workRunStatus, workRunKill, workRunList, workRunClaim, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -166,11 +166,6 @@
     images: string[];
   }
   let laterAsks = $state<LaterAsk[]>([]);
-  /** vicuna-mcp `run` calls still waiting on their command (Background-able) */
-  let runningRuns = $state<(BgRun & { index: number })[]>([]);
-  /** `run` jobs moved to the background, watched until they finish; their
-   *  output then goes to the session as a message */
-  let bgRuns = $state<BgRun[]>([]);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
   let explorerEntries = $state<WorkTreeEntry[]>([]);
@@ -1223,7 +1218,7 @@
   // advance the live clock while a turn runs (or a browser start is in
   // flight) so elapsed tooltips/labels stay current
   $effect(() => {
-    if (!streaming && !workRunning && !browserStarting && !bgRuns.length) return;
+    if (!streaming && !workRunning && !browserStarting) return;
     const t = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -1688,87 +1683,7 @@
     throw new Error(`Unknown action ${action}.`);
   }
 
-  // watch backgrounded `run` jobs; a finished one wakes its session with
-  // the output (the "callback")
   const pendingMcpWakes = new Map<string, Array<{ name: string; tools: number | null }>>();
-  const bgDelivering = new Set<string>();
-  async function pollBgRuns() {
-    for (const run of bgRuns) {
-      if (bgDelivering.has(run.jobId)) continue;
-      bgDelivering.add(run.jobId);
-      try {
-        const st = await workRunStatus(run.jobId).catch(() => null);
-        if (!st || st.running) continue;
-        if (!chats.some((c) => c.id === run.chatId)) {
-          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId); // session deleted
-          void workRunClaim(run.jobId);
-          continue;
-        }
-        // another window on the same backend may be watching this job too:
-        // only the one that claims it wakes the session
-        if (!(await workRunClaim(run.jobId))) {
-          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
-          continue;
-        }
-        const sent = await sendToWorkSession(run.chatId, { role: "user", content: bgDoneMessage(run, st, Date.now()) }, { now: true });
-        if (!sent) void workRunClaim(run.jobId, true);
-        if (sent) {
-          bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
-          const title = chats.find((c) => c.id === run.chatId)?.title ?? "the session";
-          if (run.chatId !== activeId) flashNotice(`Background command finished in "${title}".`);
-        }
-      } catch (e: any) {
-        bgRuns = bgRuns.filter((r) => r.jobId !== run.jobId);
-        void workRunClaim(run.jobId, true);
-        error = `Background command finished, but its output could not be sent: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
-      } finally {
-        bgDelivering.delete(run.jobId);
-      }
-    }
-  }
-  /** Rebuild background-job chips after the window closed or reloaded: the
-   *  jobs kept running on the backend, but `bgRuns` lived only in the old
-   *  window, so nothing watched them and the session was never woken. */
-  async function restoreBgRuns() {
-    const recs = await workRunList();
-    // foreground calls still waiting: their strip (with Background) sits on
-    // the live turn's trailing reply; `done` clears it as usual
-    const fg = recs
-      .filter((r) => r.foreground && !runningRuns.some((x) => x.jobId === r.jobId))
-      .flatMap((r) => {
-        const c = chats.find((x) => x.id === r.sessionId);
-        return c?.messages.length ? [{ chatId: c.id, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now(), index: c.messages.length - 1 }] : [];
-      });
-    if (fg.length) runningRuns = [...runningRuns, ...fg];
-    const add = recs
-      .filter((r) => !r.foreground && chats.some((c) => c.id === r.sessionId) && !bgRuns.some((b) => b.jobId === r.jobId))
-      .map((r) => ({ chatId: r.sessionId, jobId: r.jobId, command: r.command, startedAt: r.startedMs || Date.now() }));
-    if (add.length) bgRuns = [...bgRuns, ...add];
-  }
-
-  $effect(() => {
-    if (!bgRuns.length) return;
-    const t = setInterval(() => void pollBgRuns(), 2000);
-    return () => clearInterval(t);
-  });
-
-  /** Background button on a waiting `run` call */
-  async function moveRunToBackground(chatId: string, jobId: string) {
-    const turnId = workTurnIds.get(chatId);
-    if (!turnId) return;
-    try {
-      await backgroundWorkRun(turnId, jobId);
-    } catch (e: any) {
-      // it finished in the meantime: nothing to move
-      flashNotice(typeof e === "string" ? e : (e?.message ?? "That command already finished."));
-    }
-  }
-
-  /** Stop a backgrounded job (its output still arrives, marked killed) */
-  async function stopBgRun(jobId: string) {
-    await workRunKill(jobId).catch(() => {});
-  }
-
   /** send a question answered after "Answer later" */
   async function sendLaterAsk(id: string) {
     const a = laterAsks.find((x) => x.id === id);
@@ -2053,9 +1968,7 @@
   function deleteChat(id: string) {
     // stop only THIS session's live turn — other sessions keep running
     if (pendingAsks[id]) cancelPendingAsk(id, "(the chat was deleted before answering)");
-    // its background commands and put-off questions go with it
-    for (const r of bgRuns) if (r.chatId === id) void workRunKill(r.jobId).catch(() => {});
-    bgRuns = bgRuns.filter((r) => r.chatId !== id);
+    // its put-off questions go with it
     laterAsks = laterAsks.filter((a) => a.chatId !== id);
     const turnId = workTurnIds.get(id);
     if (turnId) {
@@ -7867,24 +7780,7 @@
           };
           requestAnimationFrame(() => scrollIfOpen());
           break;
-        case "runstarted":
-          runningRuns = [...runningRuns, { chatId: chat.id, jobId: ev.job_id, command: ev.command, startedAt: ev.started_ms || Date.now(), index: curIndex }];
-          requestAnimationFrame(() => scrollIfOpen());
-          break;
-        case "runended":
-          runningRuns = runningRuns.filter((r) => r.jobId !== ev.job_id);
-          break;
-        case "runbackground": {
-          // started_ms is the job's real start (runended already dropped the
-          // strip, so the frontend's own copy is gone by now)
-          runningRuns = runningRuns.filter((r) => r.jobId !== ev.job_id);
-          if (!bgRuns.some((r) => r.jobId === ev.job_id)) {
-            bgRuns = [...bgRuns, { chatId: chat.id, jobId: ev.job_id, command: ev.command, startedAt: ev.started_ms || Date.now() }];
-          }
-          break;
-        }
         case "done":
-          runningRuns = runningRuns.filter((r) => r.chatId !== chat.id);
           setToolStatus(chat.id, null);
           void settle(ev.stopped);
           break;
@@ -7892,7 +7788,6 @@
           void warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false).then((warned) => {
             if (!warned) error = ev.message;
           });
-          runningRuns = runningRuns.filter((r) => r.chatId !== chat.id);
           setToolStatus(chat.id, null);
           void settle(false);
           break;
@@ -8408,7 +8303,7 @@
       pending = null;
     }
     // reattach first: a restored run strip needs the live turn's bubble
-    void reattachLiveWorkTurns().then(() => restoreBgRuns());
+    void reattachLiveWorkTurns();
     if (pending && (!sessionId || sessionId === pending.chatId)) {
       const pc = chats.find((c) => c.id === pending!.chatId);
       const pm = pc?.messages[pending.index];
@@ -9192,21 +9087,6 @@
                 </div>
               {/if}
               <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
-              {#each runningRuns.filter((r) => r.chatId === activeId && r.index === i) as run (run.jobId)}
-                <div class="run-strip" data-testid="run-strip">
-                  <span class="run-spin" aria-hidden="true"></span>
-                  <code class="run-cmd" title={run.command}>{run.command}</code>
-                  <span class="run-elapsed">{formatRunElapsed(now - run.startedAt)}</span>
-                  {#if now - run.startedAt >= 1000}
-                    <button
-                      class="run-bg-btn"
-                      data-testid="run-background"
-                      title="Let the agent continue; you'll get the output as a message when it finishes"
-                      onclick={() => moveRunToBackground(run.chatId, run.jobId)}
-                    >Background</button>
-                  {/if}
-                </div>
-              {/each}
               {#if pendingAsk && pendingAsk.index === i && activeId != null}
                 {@const askCard = pendingAsks[activeId]}
                 {#if askCard}
@@ -9336,19 +9216,6 @@
               </div>
           {/each}
           <span class="queue-hint">queued · joins when the agent finishes · ↑ sends now</span>
-        </div>
-      {/if}
-      {#if bgRuns.some((r) => r.chatId === activeId)}
-        <div class="queue-strip bg-strip" data-testid="bg-strip">
-          {#each bgRuns.filter((r) => r.chatId === activeId) as r (r.jobId)}
-            <div class="queue-chip bg-chip" data-testid="bg-chip">
-              <span class="run-spin" aria-hidden="true"></span>
-              <span class="queue-text" title={r.command}>{r.command}</span>
-              <span class="run-elapsed">{formatRunElapsed(now - r.startedAt)}</span>
-              <button class="queue-x" data-testid="bg-stop" aria-label="Stop background command" title="Stop it (the agent still gets the output so far)" onclick={() => void stopBgRun(r.jobId)}>×</button>
-            </div>
-          {/each}
-          <span class="queue-hint">in background · the agent gets the output when it finishes</span>
         </div>
       {/if}
       {#if busy}
@@ -11750,16 +11617,6 @@
   .bg-done-out { margin: 0; border-radius: 0; border-top: 1px solid var(--border-2); background: transparent; padding: 10px 12px; font-size: 12.5px; max-height: 360px; overflow: auto; user-select: text; white-space: pre-wrap; }
   .bg-done-err { color: var(--danger, #e03131); }
   .bg-done-label { border-top: 1px solid var(--border-2); padding: 6px 12px; font-size: 11.5px; color: var(--muted-2); }
-  /* a vicuna-mcp `run` call waiting on its command */
-  .run-strip { display: flex; align-items: center; gap: 8px; margin: 10px 0 2px; max-width: 560px; border: 1px solid var(--border-2); border-radius: 10px; background: var(--card); padding: 6px 8px 6px 10px; font-size: 12.5px; color: var(--muted); }
-  .run-cmd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-  .run-elapsed { font-variant-numeric: tabular-nums; color: var(--muted-2); white-space: nowrap; }
-  .run-spin { width: 10px; height: 10px; flex: none; border-radius: 50%; border: 2px solid var(--border-3); border-top-color: var(--accent); animation: run-spin 0.9s linear infinite; }
-  @keyframes run-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .run-spin { animation: none; } }
-  .run-bg-btn { border: 1px solid var(--border-2); background: var(--bg); color: var(--text); border-radius: 8px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
-  .run-bg-btn:hover { border-color: var(--accent); background: var(--hover-3); }
-  .bg-chip .queue-text { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, ui-monospace, monospace); }
   .ask-send { border: none; border-radius: 10px; background: var(--accent); color: var(--accent-fg); padding: 0 13px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
   .ask-send:disabled { opacity: .45; cursor: default; }
   .col { display: flex; flex-direction: column; }

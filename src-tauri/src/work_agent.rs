@@ -40,14 +40,6 @@ pub enum WorkAgentEvent {
         multi: bool,
     },
     BgCompleted { job_id: String, command: String, output: String },
-    /// vicuna-mcp `run` started a Vicuna-owned job and the tool call is
-    /// waiting on it (the chat shows it with a Background button).
-    RunStarted { job_id: String, command: String, started_ms: u64 },
-    /// that waiting `run` call returned (finished, stopped or backgrounded)
-    RunEnded { job_id: String },
-    /// the job keeps running detached from the turn; the frontend watches it
-    /// and sends its output to the session as a message when it finishes
-    RunBackground { job_id: String, command: String, started_ms: u64 },
     ContextCompacted { note: String },
     /// vicuna-mcp `schedule_wakeup`: the chat window resolves the time in the
     /// user's timezone, adds a Scheduled send for this session, and answers
@@ -106,9 +98,6 @@ pub struct TurnState {
     pub queue: Mutex<Vec<(String, ChatMessage)>>,
     pub ask_pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     pub ask_seq: AtomicU64,
-    /// vicuna-mcp `run` calls waiting on their job, by job id: sending moves
-    /// the job to the background and returns the tool call at once
-    pub run_pending: Mutex<HashMap<String, oneshot::Sender<()>>>,
     /// the session is the user's lead: vicuna-mcp `manage_sessions` works
     pub lead: AtomicBool,
     /// the backend loop for this turn has returned (turns stay in the map
@@ -149,7 +138,6 @@ impl TurnState {
             queue: Mutex::new(Vec::new()),
             ask_pending: Mutex::new(HashMap::new()),
             ask_seq: AtomicU64::new(1),
-            run_pending: Mutex::new(HashMap::new()),
             lead: AtomicBool::new(false),
             done: AtomicBool::new(false),
         }
@@ -188,21 +176,6 @@ pub fn agent_remove_msg(turn: &Arc<TurnState>, id: &str) -> Result<(), String> {
         .map_err(|_| "agent state poisoned".to_string())
 }
 
-/// The user's Background button on a waiting vicuna-mcp `run` call.
-pub fn agent_background(turn: &Arc<TurnState>, job_id: &str) -> Result<(), String> {
-    let tx = turn
-        .run_pending
-        .lock()
-        .map_err(|_| "agent state poisoned".to_string())?
-        .remove(job_id);
-    match tx {
-        Some(tx) => {
-            let _ = tx.send(());
-            Ok(())
-        }
-        None => Err("that command is no longer waiting".to_string()),
-    }
-}
 
 pub fn agent_answer(turn: &Arc<TurnState>, ask_id: &str, answer: String) -> Result<(), String> {
     let tx = turn
@@ -325,41 +298,6 @@ pub async fn work_agent_answer(
 ) -> Result<(), String> {
     let turn = get_turn(&agent_state, &turn_id)?;
     agent_answer(&turn, &ask_id, answer)
-}
-
-#[tauri::command]
-pub async fn work_agent_background(
-    turn_id: String,
-    job_id: String,
-    agent_state: State<'_, WorkAgentState>,
-) -> Result<(), String> {
-    let turn = get_turn(&agent_state, &turn_id)?;
-    agent_background(&turn, &job_id)
-}
-
-/// Poll a vicuna-mcp `run` job (also after its turn ended: the frontend
-/// watches backgrounded jobs to send their output as a message).
-#[tauri::command]
-pub async fn work_run_status(id: String) -> Result<crate::BgJobStatus, String> {
-    crate::bg_snapshot(crate::vicuna_mcp::jobs(), &id)
-}
-
-#[tauri::command]
-pub async fn work_run_kill(id: String) -> Result<crate::BgJobStatus, String> {
-    crate::bg_kill(crate::vicuna_mcp::jobs(), &id)
-}
-
-/// Backgrounded `run` jobs not yet reported to their session (a reopened
-/// window rebuilds its chips from this).
-#[tauri::command]
-pub async fn work_run_list() -> Vec<crate::vicuna_mcp::BgRunRecord> {
-    crate::vicuna_mcp::bg_runs_pending()
-}
-
-/// One window delivers a finished job's message: true = this caller may.
-#[tauri::command]
-pub async fn work_run_claim(id: String, release: Option<bool>) -> bool {
-    crate::vicuna_mcp::bg_run_claim(&id, release.unwrap_or(false))
 }
 
 #[cfg(test)]

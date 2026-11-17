@@ -5155,8 +5155,6 @@ fn shutdown_children(app: &AppHandle) {
     if let Some(s) = app.try_state::<BgExecState>() {
         bg_kill_running(&s);
     }
-    // vicuna-mcp `run` jobs (foreground and backgrounded) die with the app
-    bg_kill_running(vicuna_mcp::jobs());
     if let Some(s) = app.try_state::<AgentShellState>() {
         kill_agent_shells(&s);
     }
@@ -5680,11 +5678,6 @@ pub fn run() {
             work_agent::work_agent_queue,
             work_agent::work_agent_remove,
             work_agent::work_agent_answer,
-            work_agent::work_agent_background,
-            work_agent::work_run_status,
-            work_agent::work_run_kill,
-            work_agent::work_run_list,
-            work_agent::work_run_claim,
             work_engine_info,
             opencode::opencode_models,
             opencode::opencode_set_model,

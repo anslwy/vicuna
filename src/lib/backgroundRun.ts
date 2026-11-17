@@ -1,43 +1,10 @@
-// Backgrounded vicuna-mcp `run` jobs (pure, node-tested in
-// node-tests/backgroundRun.test.ts).
+// Session wake-up messages that render as tool-style cards (pure,
+// node-tested in node-tests/backgroundRun.test.ts).
 //
-// A Work agent runs long commands through vicuna-mcp's `run` tool; the user
-// (or the agent itself) can move one to the background. The tool call then
-// returns at once, the job keeps running in Vicuna, and when it finishes its
-// output goes back to the session as a user message — queued into the live
-// turn, or starting a new one when the session is idle.
-
-export interface BgRun {
-  chatId: string;
-  jobId: string;
-  command: string;
-  /** ms epoch the job was started (for the elapsed label) */
-  startedAt: number;
-}
-
-export interface BgRunStatus {
-  running: boolean;
-  exit_code: number | null;
-  stdout: string;
-  stderr: string;
-  truncated: boolean;
-}
-
-/** "45s", "2m 13s", "1h 4m" */
-export function formatRunElapsed(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
-}
-
-/** Fence that can't be closed by the output itself. */
-function fence(body: string): string {
-  let f = "```";
-  while (body.includes(f)) f += "`";
-  return `${f}\n${body}\n${f}`;
-}
+// "Background command finished (…)" messages were produced by the removed
+// vicuna-mcp `run` tool. Nothing creates them any more, but chats saved before
+// the removal still hold them, so the parser stays to render them as a
+// collapsed tool result instead of a raw user bubble.
 
 const BG_DONE_HEAD = /^Background command finished \(((?:exit -?\d+)|killed), after ([^,]+), job ([^)]+)\):\n/;
 
@@ -82,24 +49,6 @@ export function parseBgDoneMessage(content: string): BgDoneParts | null {
     stderr: fencedAfter(rest, "Stderr:") ?? "",
     truncated: rest.includes("(output was truncated")
   };
-}
-
-/** The user message that wakes the agent when a background job finishes. */
-export function bgDoneMessage(run: BgRun, st: BgRunStatus, now: number): string {
-  const exit = st.exit_code == null ? "killed" : `exit ${st.exit_code}`;
-  const lines = [
-    `Background command finished (${exit}, after ${formatRunElapsed(now - run.startedAt)}, job ${run.jobId}):`,
-    "",
-    fence(run.command)
-  ];
-  const out = st.stdout.trimEnd();
-  const err = st.stderr.trimEnd();
-  if (out) lines.push("", "Output:", fence(out));
-  if (err) lines.push("", "Stderr:", fence(err));
-  if (!out && !err) lines.push("", "(no output)");
-  if (st.truncated) lines.push("", "(output was truncated at 32KB per stream)");
-  lines.push("", "Continue from here.");
-  return lines.join("\n");
 }
 
 const MCP_WAKE_RE = /^MCP server\(s\) now active: (.+?)\. You can call their tools now\.$/;
