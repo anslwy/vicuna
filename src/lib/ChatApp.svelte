@@ -11,6 +11,11 @@
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
   import {
     initStorage,
+    serverSync,
+    adoptServerChat,
+    normalizeServerChat,
+    serverSaveRow,
+    serverSavesIdle,
     loadChats,
     saveChats,
     loadModel,
@@ -37,10 +42,10 @@
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
   import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, type SessionRow } from "$lib/leadSessions";
   import { mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "$lib/backgroundRun";
-  import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
+  import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, serverRecordsTurns, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -329,6 +334,11 @@
   /** backend turn id of each live Rust agent loop — needed for
    *  stop/steer/ask-answer routing while a turn runs */
   const workTurnIds = new Map<string, string>();
+  /** this window's server records Work turns itself (server_turns.rs): it
+   *  writes their transcript, runs follow-ups and sends scheduled messages,
+   *  so the window skips saving live turns and adopts the server's copy */
+  let serverPersist = $state(false);
+  const scheduleNote = $derived(serverPersist ? SCHEDULE_SERVER_NOTE : SCHEDULE_OPEN_NOTE);
   /** per session: settle its current Work turn as stopped, from outside the
    *  turn's closure (the stop reconciliation below uses it when the
    *  backend's `done` never arrived) */
@@ -1315,7 +1325,26 @@
   /** ids being sent right now (a slow workspace check must not double-send) */
   const scheduleSending = new Set<string>();
 
+  /** server mode: id → JSON of each scheduled item the server has */
+  const schedSent = new Map<string, string>();
+  let schedSync: Promise<void> = Promise.resolve();
   function persistScheduled() {
+    if (serverPersist) {
+      // the server owns the list (and sends the messages): push the diff
+      const { put, remove } = scheduleDiff(schedSent, scheduled);
+      for (const it of put) schedSent.set(it.id, JSON.stringify(it));
+      for (const id of remove) schedSent.delete(id);
+      if (!put.length && !remove.length) return;
+      schedSync = schedSync.then(async () => {
+        try {
+          if (put.length) await invokeOrBridge("schedule_put", { items: put, tzOffsetMin: -new Date().getTimezoneOffset() });
+          if (remove.length) await invokeOrBridge("schedule_remove", { ids: remove });
+        } catch (e: any) {
+          error = `Could not save scheduled messages on the server: ${typeof e === "string" ? e : (e?.message ?? String(e))}`;
+        }
+      });
+      return;
+    }
     try {
       localStorage.setItem(scheduleStoreKey(), JSON.stringify(scheduled));
     } catch {
@@ -1418,16 +1447,41 @@
     clearDraft(null);
     attachImages = [];
     error = null;
-    flashNotice(`Scheduled for ${formatWhen(at, Date.now())}. ${SCHEDULE_OPEN_NOTE}`, 7000);
+    flashNotice(`Scheduled for ${formatWhen(at, Date.now())}. ${scheduleNote}`, 7000);
   }
 
   /** Send a scheduled message: into its session's running turn (queued, like
    *  typing while it runs), as a new turn of that session, or as a new
    *  session when the target is gone. A failure keeps the message in the
    *  list (flagged) so nothing is lost. */
+  /** server mode: reload the server's Scheduled list (it delivers them) */
+  async function refreshServerSchedule() {
+    await schedSync;
+    try {
+      const list = await invokeOrBridge<ScheduledItem[]>("schedule_list", {});
+      if (!Array.isArray(list)) return;
+      schedSent.clear();
+      for (const it of list) schedSent.set(it.id, JSON.stringify(it));
+      if (JSON.stringify(list) !== JSON.stringify(scheduled)) scheduled = list;
+    } catch {
+      /* server unreachable: keep the list shown */
+    }
+  }
+
   async function deliverScheduled(id: string) {
     const item = scheduled.find((x) => x.id === id);
     if (!item || scheduleSending.has(id)) return;
+    if (serverPersist) {
+      // Send now: due immediately, the server's timer sends it within seconds
+      scheduled = scheduled.map((x) => {
+        if (x.id !== id) return x;
+        const { missed: _m, error: _e, ...rest } = x;
+        return { ...rest, at: Date.now() };
+      });
+      persistScheduled();
+      flashNotice("Sending on the server…");
+      return;
+    }
     scheduleSending.add(id);
     try {
       const find = () => {
@@ -1705,6 +1759,13 @@
 
   function scheduleTick() {
     if (!ready) return;
+    if (serverPersist) {
+      // the server sends scheduled messages and may start turns on its own
+      // (follow-ups, worker reports, wake-ups): follow them and its list
+      void reattachLiveWorkTurns();
+      void refreshServerSchedule();
+      return;
+    }
     const at = Date.now();
     // keep Today/Tomorrow labels and the tray rows honest across midnight
     if (scheduled.length && Math.floor(at / 60000) !== Math.floor(scheduleNow / 60000)) scheduleNow = at;
@@ -7291,7 +7352,19 @@
    *  shows (the window that started them closed or reloaded). Without this
    *  the turn ran on unseen, its output was never saved, and the next send
    *  started a second engine process on the same session. */
+  let reattaching = false;
   async function reattachLiveWorkTurns() {
+    if (serverPersist) {
+      // one pass at a time (the 5 s tick also calls this)
+      if (reattaching) return;
+      reattaching = true;
+      try {
+        await reattachRecordedTurns();
+      } finally {
+        reattaching = false;
+      }
+      return;
+    }
     const live = await liveWorkTurns();
     for (const [id, t] of Object.entries(live)) {
       const c = chats.find((x) => x.id === id);
@@ -7309,7 +7382,56 @@
     }
   }
 
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string; startedMs?: number } } = {}) {
+  /** Server mode: follow every turn the server is running for this
+   *  window's sessions, from the server's own recording (the transcript in
+   *  the snapshot already holds every event up to now, so nothing doubles).
+   *  Sessions the server created on its own (a scheduled send into a new
+   *  session) are fetched first. */
+  async function reattachRecordedTurns() {
+    await serverSavesIdle();
+    const rows = await invokeOrBridge<any[]>("chats_load", {}).catch(() => []);
+    for (const raw of rows) {
+      const local = chats.find((c) => c.id === raw.id);
+      if (workRunningIds.includes(raw.id)) continue;
+      const base = local ? serverSaveRow(local)?.baseRev : null;
+      if (!local || (typeof raw.rev === "number" && typeof base === "number" && raw.rev > base)) {
+        const fresh = adoptServerChat(raw);
+        chats = local ? chats.map((c) => c.id === fresh.id ? fresh : c) : [fresh, ...chats];
+      }
+    }
+    const live = await liveWorkTurns();
+    for (const id of Object.keys(live)) {
+      if (workTurnIds.has(id) || workRunningIds.includes(id)) continue;
+      if (!chats.some((x) => x.id === id)) {
+        const raw = await invokeOrBridge<any>("chats_get", { id }).catch(() => null);
+        if (!raw || chats.some((x) => x.id === id)) continue;
+        chats = [adoptServerChat(raw), ...chats];
+      }
+      const snap = await attachWorkAgentSnapshot(id);
+      const c = chats.find((x) => x.id === id);
+      if (!snap?.snapshot || !c || c.mode !== "work" || workTurnIds.has(id) || workRunningIds.includes(id)) continue;
+      c.messages = normalizeServerChat({ id, messages: snap.snapshot.messages }).messages;
+      chats = [...chats];
+      void runWorkTurn(c, snap.snapshot.index, c.workspace ?? "", [], { attach: snap });
+    }
+  }
+
+  /** Server mode: take the server's transcript of a session (after its turn
+   *  ended, or when a save was refused). Local metadata (title, pins) stays;
+   *  if it differs, the next save sends it on top of the adopted revision. */
+  async function refreshServerChat(id: string) {
+    const raw = await invokeOrBridge<any>("chats_get", { id }).catch(() => null);
+    if (!raw) return;
+    const local = chats.find((x) => x.id === id);
+    const fresh = adoptServerChat(raw);
+    if (!local) return;
+    local.messages = fresh.messages;
+    if ((fresh.updatedAt ?? 0) > (local.updatedAt ?? 0)) local.updatedAt = fresh.updatedAt;
+    chats = [...chats];
+    save();
+  }
+
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string; startedMs?: number; snapshot?: { messages: any[]; index: number; pendingHead: { name: string; args: Record<string, any> } | null; pendingAsk: WorkAgentEvent | null } } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
     // a session pinned to its own harness (lead-created workers) runs on it;
@@ -7321,7 +7443,8 @@
     {
       const c0 = chats.find((x) => x.id === chat.id);
       const m0 = c0?.messages[index];
-      if (c0 && m0 && m0.role === "assistant") {
+      // a server snapshot already carries the label the server recorded
+      if (c0 && m0 && m0.role === "assistant" && !opts.attach?.snapshot) {
         c0.messages[index] = { ...m0, model: turnModel };
         chats = [...chats];
       }
@@ -7446,8 +7569,8 @@
     // The channel can deliver before start returns its id. Keep its origin
     // independent of the mutable per-chat map (settle/replacement clears it).
     const replyRoute = createTurnReplyRoute();
-    const replyToTurn = (askId: string, answer: string) => {
-      void replyRoute.send(askId, answer, answerWorkAgentAsk).catch((e) => {
+    const replyToTurn = (askId: string, answer: string, record?: { display: string; dismissed: boolean }) => {
+      void replyRoute.send(askId, answer, answerWorkAgentAsk, record).catch((e) => {
         console.error("Work reply delivery failed", { chatId: chat.id, askId, error: e });
         error = `Could not deliver the Work reply: ${String(e)}. The action may have run; check before retrying.`;
       });
@@ -7465,6 +7588,9 @@
       // no longer be answered
       if (isCurrentTurn() && pendingAsks[chat.id]) cancelPendingAsk(chat.id, "(the turn ended before an answer)");
       if (!unloading) clearPendingStreamFor(chat.id);
+      // server mode: the server wrote the whole turn (and its final copy is
+      // in before this terminal event was released); adopt it
+      if (serverPersist && !unloading) await refreshServerChat(chat.id);
       save();
       if (escTimer) {
         clearTimeout(escTimer);
@@ -7477,7 +7603,11 @@
       const sendNow = sendNowIds.delete(chat.id);
       const aborted = !sendNow && (workStopIds.has(chat.id) || stopped);
       const leftovers = isCurrentTurn() ? takeQueued(chat.id) : [];
-      if (leftovers.length) {
+      if (leftovers.length && serverPersist && !aborted && !sendNow) {
+        // the server already started the next turn with them (it holds the
+        // same queue); follow it instead of starting a second one
+        setTimeout(() => void reattachLiveWorkTurns(), 300);
+      } else if (leftovers.length) {
         if (aborted) {
           if (activeId === chat.id) {
             input = [input.trim(), ...leftovers.map((q) => q.content.trim())].filter(Boolean).join("\n\n");
@@ -7507,6 +7637,9 @@
         const userStopped = workStopIds.has(chat.id);
         void notifyTurnEnd({ title: live()?.title, mode: "work", end: "done", reply: lastReply(chat.id), userStopped });
         unmarkWorkRunning(chat.id);
+        // server mode: no longer server-owned, so local edits made during the
+        // turn (an auto-title) can go up on top of the adopted revision
+        if (serverPersist) save();
         workStopIds.delete(chat.id);
         workTurnSeqByChat.delete(chat.id);
         workTurnIds.delete(chat.id);
@@ -7773,7 +7906,8 @@
                   chats = [...chats];
                   saveSoon();
                 }
-                replyToTurn(ev.ask_id, answer);
+                // a server recording the turn writes the same record
+                replyToTurn(ev.ask_id, answer, isAgentQuestion(ev.ask_id) ? { display: display ?? answer, dismissed: outcome === "dismiss" } : undefined);
                 scrollIfOpen();
               }
             }
@@ -7797,14 +7931,39 @@
     let agentTurn: string;
     if (opts.attach) {
       // the server kept this turn running while no window followed it: keep
-      // polling its channel (the queue held every event since then)
+      // polling its channel (the queue held every event since then — or, from
+      // a server snapshot, every event the snapshot doesn't already hold)
+      const snap = opts.attach.snapshot;
+      if (snap) {
+        curIndex = snap.index;
+        pendingHead = snap.pendingHead;
+      }
       replyRoute.bind(opts.attach.turnId);
       attachWorkAgentTurn(opts.attach.channel, (ev) => handleEvent(ev));
       workTurnIds.set(chat.id, opts.attach.turnId);
+      // the agent was already waiting on an ask card when this window came
+      if (snap?.pendingAsk) handleEvent(snap.pendingAsk);
       return;
+    }
+    // server mode: hand the server the session as it stands now (it writes it
+    // and records the turn) — after queued saves land, so its revision is
+    // current. A worker report owed to a lead becomes the server's job too.
+    let persist: { chat: Record<string, unknown>; index: number } | null = null;
+    let reportTo: string | null = null;
+    if (serverPersist) {
+      await serverSavesIdle();
+      const row = serverSaveRow(live() ?? chat);
+      if (row) persist = { chat: row, index: curIndex };
+      const lead = live()?.leadId;
+      if (reportIds.has(chat.id) && lead) {
+        reportIds.delete(chat.id);
+        reportTo = lead;
+      }
     }
     try {
       agentTurn = await startWorkAgentTurn({
+        persist,
+        reportTo,
         engine: turnEngine,
         model: turnPick ?? "",
         lead: own.role === "lead",
@@ -7820,6 +7979,7 @@
       if (!await warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false)) {
         error = typeof e === "string" ? e : (e?.message ?? String(e));
       }
+      if (reportTo) reportIds.add(chat.id);
       await settle(true);
       return;
     }
@@ -8191,6 +8351,32 @@
     for (const c of aborters.values()) c.abort();
   });
 
+  /** Server mode with a recording server: wire the store's save hooks and
+   *  move the Scheduled list onto the server. */
+  async function installServerSync() {
+    // a live server turn is written by the server alone
+    serverSync.skip = (id) => serverPersist && workRunningIds.includes(id);
+    // a refused save: the server has a newer copy (it recorded a turn while
+    // this window slept, or another window saved) — show that one
+    serverSync.onConflict = (fresh) => {
+      const byId = new Map(fresh.filter((c) => !isSessionBusy(c.id)).map((c) => [c.id, c]));
+      if (!byId.size) return;
+      chats = chats.map((c) => byId.get(c.id) ?? c);
+      flashNotice("A session changed on the server; showing its latest version.");
+    };
+    // scheduled sends kept in this window's storage by older builds go up once
+    try {
+      const local = parseScheduled(localStorage.getItem(scheduleStoreKey()));
+      if (local.length) {
+        await invokeOrBridge("schedule_put", { items: local, tzOffsetMin: -new Date().getTimezoneOffset() });
+        localStorage.removeItem(scheduleStoreKey());
+      }
+    } catch {
+      /* keep them local; the server list below still loads */
+    }
+    await refreshServerSchedule();
+  }
+
   async function initApp() {
     try {
       await initStorage();
@@ -8228,6 +8414,10 @@
         if (!onServer) throw e;
         chats = [];
         srvLoadError = e instanceof Error ? e.message : String(e);
+      }
+      if (onServer && !srvLoadError) {
+        serverPersist = await serverRecordsTurns();
+        if (serverPersist) await installServerSync();
       }
       // reopen where the user left off (saved on every navigation); the
       // draft below then restores their unsent text into the composer
@@ -8451,7 +8641,7 @@
       {/each}
       <div class="sched-menu-sep"></div>
       <button class="ctx-item sched-opt" role="menuitem" data-testid="schedule-custom" onclick={() => openScheduleCustom()}>Custom time</button>
-      <div class="sched-menu-note">{SCHEDULE_OPEN_NOTE}</div>
+      <div class="sched-menu-note">{scheduleNote}</div>
     </div>
   {/if}
 {/snippet}
@@ -10707,7 +10897,7 @@
   <div class="confirm-card sched-card" data-testid="scheduled-dialog" role="dialog" aria-modal="true" aria-label="Scheduled messages">
     <button class="modal-x" data-testid="scheduled-close" aria-label="Close" onclick={() => (scheduleListOpen = false)}>×</button>
     <p class="confirm-text sched-title">Scheduled messages</p>
-    <p class="sched-note" data-testid="scheduled-note">{SCHEDULE_OPEN_NOTE} Closing the window keeps it running in the tray; quitting does not.</p>
+    <p class="sched-note" data-testid="scheduled-note">{scheduleNote}{serverPersist ? "" : " Closing the window keeps it running in the tray; quitting does not."}</p>
     {#if scheduled.some((x) => x.missed)}
       <p class="sched-warn" data-testid="scheduled-missed-note">Some messages were not sent at their time. Send them now, pick a new time, or delete them.</p>
     {/if}
@@ -10742,7 +10932,7 @@
       <input type="time" class="sched-input" data-testid="schedule-time" aria-label="Time" value={sc.time} oninput={(e) => (scheduleCustom = { ...sc, time: e.currentTarget.value, error: null })} onkeydown={(e) => { if (e.key === "Enter") void confirmScheduleCustom(); }} />
     </div>
     {#if sc.error}<p class="sched-row-err" data-testid="schedule-custom-error">{sc.error}</p>{/if}
-    <p class="sched-note">{SCHEDULE_OPEN_NOTE}</p>
+    <p class="sched-note">{scheduleNote}</p>
     <div class="confirm-actions sched-actions">
       <button class="confirm-cancel" data-testid="schedule-custom-cancel" onclick={() => (scheduleCustom = null)}>Cancel</button>
       <button class="confirm-ok" data-testid="schedule-custom-confirm" onclick={() => void confirmScheduleCustom()}>{sc.rescheduleId ? "Reschedule" : "Schedule message"}</button>

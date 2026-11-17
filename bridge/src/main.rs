@@ -23,6 +23,8 @@ mod cli;
 mod server;
 #[cfg(unix)]
 mod upgrade;
+mod persist;
+mod server_turns;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -32,11 +34,13 @@ use vicuna_lib::acp::AcpState;
 use vicuna_lib::browser::BrowserState;
 use vicuna_lib::mcp::McpManager;
 use vicuna_lib::work_agent::{
-    agent_answer, agent_queue_msg, agent_remove_msg, agent_stop, TurnState, WorkAgentState, WorkAgentEvent,
+    agent_queue_msg, agent_remove_msg, agent_stop, WorkAgentState,
 };
 use vicuna_lib::{AgentShellState, BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
 
 const EVENT_CAP: usize = 2000;
+/// Error prefix of a refused turn start (the window reloads the session).
+const SESSION_CHANGED: &str = "SESSION_CHANGED";
 const BODY_CAP: u64 = 32 * 1024 * 1024;
 
 type EventQueues = Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>;
@@ -68,6 +72,20 @@ pub struct BridgeState {
     /// (turn id, channel id, start ms epoch: a reopened window's elapsed
     /// clock must count from the turn's real start, not from the reopen)
     pub session_turns: Arc<Mutex<HashMap<String, (String, String, u64)>>>,
+    /// server mode: each recorded Work turn (event channel -> transcript
+    /// being written to the db), see server_turns.rs
+    pub recorders: server_turns::Recorders,
+    /// session -> MCP servers added mid-turn that wake it when the turn ends
+    pub mcp_wakes: Arc<Mutex<HashMap<String, Vec<(String, Option<usize>)>>>>,
+    /// the user's UTC offset (minutes), as last reported by a window; the
+    /// server resolves `schedule_wakeup` local times with it
+    pub tz_offset_min: std::sync::atomic::AtomicI64,
+    /// serializes read-modify-write of the stored Scheduled list
+    pub sched_lock: tokio::sync::Mutex<()>,
+    /// Serialize turn handoffs, recorder writes and client merges. Take this
+    /// before reading a recorder snapshot so a delayed write cannot roll back
+    /// a final write or the next turn's user message.
+    pub chat_lock: tokio::sync::Mutex<()>,
 }
 
 impl Default for BridgeState {
@@ -86,12 +104,17 @@ impl Default for BridgeState {
             term_channels: Arc::new(Mutex::new(HashMap::new())),
             last_poll: Arc::new(Mutex::new(HashMap::new())),
             session_turns: Arc::new(Mutex::new(HashMap::new())),
+            recorders: Arc::new(Mutex::new(HashMap::new())),
+            mcp_wakes: Arc::new(Mutex::new(HashMap::new())),
+            tz_offset_min: std::sync::atomic::AtomicI64::new(0),
+            sched_lock: tokio::sync::Mutex::new(()),
+            chat_lock: tokio::sync::Mutex::new(()),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-fn push_event(queues: &EventQueues, id: &str, raw: &str) {
+pub(crate) fn push_event(queues: &EventQueues, id: &str, raw: &str) {
     let v: serde_json::Value =
         serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
     if let Ok(mut map) = queues.lock() {
@@ -171,7 +194,7 @@ fn arg_str_list(args: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 /// Test-only resource root for browser_* (see header comment).
-fn test_resource_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn test_resource_dir() -> Option<std::path::PathBuf> {
     std::env::var("VICUNA_TEST_RESOURCE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -180,7 +203,7 @@ fn test_resource_dir() -> Option<std::path::PathBuf> {
 
 #[allow(clippy::too_many_lines)]
 async fn dispatch(
-    st: &BridgeState,
+    st: &Arc<BridgeState>,
     cmd: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -188,64 +211,73 @@ async fn dispatch(
     match cmd {
         // ----- work agent turn -----
         "work_agent_start" => {
+            let _write = st.chat_lock.lock().await;
             let uuid = args
                 .get("onEvent")
                 .and_then(|v| v.get("__bridge_channel"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing channel marker onEvent".to_string())?
                 .to_string();
-            let on_event: Channel<WorkAgentEvent> = channel_for(&st.events, &uuid);
             let engine = vicuna_lib::work_engine::effective_engine(arg_opt_str(args, "engine").as_deref());
             if !engine.is_present() {
                 return Err(engine.missing_message());
             }
-            let turn = Arc::new(TurnState::new());
-            turn.lead.store(args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
-            let turn_id = st.agent.next_turn(turn.clone());
-            let acp = st.acp.clone();
             let model = arg_opt_str(args, "model");
-            let fresh_session = args.get("freshSession").and_then(|v| v.as_bool()).unwrap_or(false);
-            let workspace = s("workspace")?;
             let messages: Vec<ChatMessage> =
                 serde_json::from_value(args.get("messages").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad messages: {e}"))?;
             let session_id = arg_opt_str(args, "sessionId");
-            if let Some(sid) = &session_id {
-                let live = st.session_turns.lock().ok().and_then(|m| m.get(sid).cloned());
-                if let Some((tid, _, _)) = live {
-                    if st.agent.get_turn(&tid).is_some() {
-                        return Err(format!(
-                            "this session already has a Work turn running on the server ({tid}); reopen the session to follow it"
-                        ));
-                    }
+            if let Some(off) = args.get("tzOffsetMin").and_then(|v| v.as_i64()) {
+                st.tz_offset_min.store(off, std::sync::atomic::Ordering::Relaxed);
+            }
+            // server mode: the window hands over the session as it stands at
+            // turn start (user message + placeholder); the server writes it now
+            // and records the rest of the turn itself
+            let mut rec = None;
+            if let (Some(db), Some(sid), Some(row)) = (&st.db, &session_id, args.get("persistChat").filter(|v| v.is_object())) {
+                if let Some((tid, _)) = server_turns::live_turn(st, sid) {
+                    return Err(format!(
+                        "this session already has a Work turn running on the server ({tid}); reopen the session to follow it"
+                    ));
                 }
-            }
-            let goal_text = arg_opt_str(args, "goalText");
-            let mcp_snapshot =
-                vicuna_lib::acp::McpSnapshot::capture(&st.mcp, test_resource_dir().as_deref()).await;
-            if let (Some(sid), Ok(mut m)) = (&session_id, st.session_turns.lock()) {
-                let started_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                m.insert(sid.clone(), (turn_id.clone(), uuid.clone(), started_ms));
-            }
-            let session_turns = st.session_turns.clone();
-            let live_key = session_id.clone().map(|sid| (sid, turn_id.clone()));
-            tokio::spawn(async move {
-                vicuna_lib::acp::run_turn(
-                    turn, model, workspace, messages, session_id, goal_text, fresh_session, on_event, &acp,
-                    mcp_snapshot, engine,
+                let out = vicuna_lib::server_store::merge_json(
+                    db,
+                    &serde_json::Value::Array(vec![row.clone()]),
+                    vec![],
+                    &server_turns::live_sessions(st),
                 )
-                .await;
-                if let (Some((sid, tid)), Ok(mut m)) = (live_key, session_turns.lock()) {
-                    if m.get(&sid).is_some_and(|(t, _, _)| *t == tid) {
-                        m.remove(&sid);
-                    }
+                .await?;
+                if !out.conflicts.is_empty() {
+                    return Err(format!("{SESSION_CHANGED}: this session changed on the server since this window loaded it. Vicuna reloaded it; send again."));
                 }
-            });
+                let msgs: Vec<serde_json::Value> = row.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+                let idx = args.get("persistIndex").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(msgs.len().saturating_sub(1));
+                if idx < msgs.len() {
+                    rec = Some(persist::Recorder::new(sid, msgs, idx, model.clone().filter(|m| !m.is_empty()), engine.id()));
+                }
+            }
+            let turn_id = server_turns::launch(
+                st,
+                server_turns::LaunchParams {
+                    uuid,
+                    engine,
+                    model,
+                    workspace: s("workspace")?,
+                    messages,
+                    session_id,
+                    goal_text: arg_opt_str(args, "goalText"),
+                    fresh_session: args.get("freshSession").and_then(|v| v.as_bool()).unwrap_or(false),
+                    lead: args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false),
+                    report_to: rec.as_ref().and(arg_opt_str(args, "reportTo")),
+                    rec,
+                },
+            )
+            .await?;
             Ok(serde_json::json!(turn_id))
         }
+        // a window reopening a session with a live server turn: the recorded
+        // transcript so far + the channel to keep following
+        "work_agent_attach" => Ok(server_turns::attach(st, &s("sessionId")?)),
         "work_engine_info" => Ok(serde_json::to_value(vicuna_lib::work_engine::engines_info().await)
             .map_err(|e| e.to_string())?),
         "work_engine_select" => Ok(serde_json::to_value(
@@ -312,7 +344,19 @@ async fn dispatch(
         }
         "work_agent_answer" => {
             let turn = st.agent.get_turn(&s("turnId")?).ok_or("unknown turn")?;
-            agent_answer(&turn, &s("askId")?, s("answer")?)?;
+            let ask_id = s("askId")?;
+            // the Q/A record the window writes into its own copy (agent
+            // questions only); the recorder writes the same into the db
+            let record = args.get("record");
+            server_turns::record_answer(
+                st,
+                &turn,
+                &s("turnId")?,
+                &ask_id,
+                s("answer")?,
+                record.and_then(|r| r.get("display")).and_then(|v| v.as_str()),
+                record.and_then(|r| r.get("dismissed")).and_then(|v| v.as_bool()).unwrap_or(false),
+            )?;
             Ok(serde_json::Value::Null)
         }
         // ----- workspace validation / tools -----
@@ -488,17 +532,33 @@ async fn dispatch(
             "os": std::env::consts::OS,
             "home": std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default(),
             "chats": st.db.is_some(),
+            // records Work turns itself + per-chat revisions (server_turns.rs)
+            "persist": st.db.is_some(),
         })),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
             vicuna_lib::server_store::load_chats(db).await
         }
         "chats_merge" => {
+            let _write = st.chat_lock.lock().await;
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
             let chats = args.get("chats").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-            vicuna_lib::server_store::merge_json(db, &chats, arg_str_list(args, "deleted")).await?;
-            Ok(serde_json::Value::Null)
+            let out = vicuna_lib::server_store::merge_json(db, &chats, arg_str_list(args, "deleted"), &server_turns::live_sessions(st)).await?;
+            Ok(out.to_json())
         }
+        "chats_get" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
+            Ok(vicuna_lib::server_store::load_chat(db, &s("id")?).await?.unwrap_or(serde_json::Value::Null))
+        }
+        "schedule_list" => server_turns::schedule_list(st).await,
+        "schedule_put" => {
+            if let Some(off) = args.get("tzOffsetMin").and_then(|v| v.as_i64()) {
+                st.tz_offset_min.store(off, std::sync::atomic::Ordering::Relaxed);
+            }
+            let items = args.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            server_turns::schedule_put(st, items).await
+        }
+        "schedule_remove" => server_turns::schedule_remove(st, arg_str_list(args, "ids")).await,
         // cross-host Cmd+P: another window searches this server's sessions
         "server_search_chats" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
@@ -1008,6 +1068,20 @@ pub fn run(cfg: Config) {
     }
     state.token = cfg.token.clone();
     let state = Arc::new(state);
+    if state.db.is_some() {
+        // server mode: scheduled sends and MCP wake-ups run with no window
+        let st = state.clone();
+        rt.spawn(async move { server_turns::spawn_scheduler(st) });
+        let wakes = state.mcp_wakes.clone();
+        vicuna_lib::vicuna_mcp::set_mcp_wake_hook(move |sid, name, tools| {
+            if let Ok(mut m) = wakes.lock() {
+                let list = m.entry(sid.to_string()).or_default();
+                if !list.iter().any(|(n, _)| n == name) {
+                    list.push((name.to_string(), tools));
+                }
+            }
+        });
+    }
     // Terminals whose tab stopped polling (window closed, laptop asleep,
     // client gone) would keep their shell alive forever on a server: reap
     // any whose channel hasn't been polled for 90 s.

@@ -8,6 +8,8 @@ import { isTauriRuntime } from "./ollama";
 import { invokeOrBridge, BridgeChannel, bridgeInvoke, isRemoteServer, useLocalIpc } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
+// pure formatters live in toolFormat.ts (node-testable; the server ports them)
+export { toolLabel, formatAskRecord, formatToolCallHead, formatToolCallTail, formatToolResult } from "./toolFormat";
 export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac } from "./workGate";
 export type { WorkEngineInfo, OpencodeModel, OpencodeModels, EngineSummary } from "./workGate";
 
@@ -380,49 +382,6 @@ export function extractViewedImages(text: string): { clean: string; images: stri
   return { clean, images };
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-/** One-line label for a tool call, shared by the result header and the
- *  running indicator. */
-export function toolLabel(name: string, args: Record<string, any>): string {
-  const argSummary = name === "exec" ? String(args.command ?? "") :
-    name === "exec_input" ? String(args.text ?? "") :
-    name === "exec_status" ? String(args.id ?? "(shell)") :
-    name === "exec_kill" ? String(args.id ?? "(shell)") :
-    name === "read" || name === "write" || name === "list" || name === "view_image" ? String(args.path ?? ".") :
-    name === "grep" ? String(args.pattern ?? "") :
-    name === "sessions" ? String(args.query ?? "") :
-    name === "read_session" ? String(args.id ?? "") :
-    name === "read_upload" ? String(args.name ?? "") :
-    name === "fetch_url" ? String(args.url ?? "") :
-    // MCP management shows the name only — args may carry API keys in
-    // headers/env, and the label lands in the visible transcript
-    name === "mcp_add" || name === "mcp_remove" || name === "mcp_enable" || name === "mcp_disable" ? String(args.name ?? "") :
-    name === "mcp_list" ? "" :
-    name === "say" ? String(args.text ?? "") :
-    name === "ask" ? String(args.question ?? "") : JSON.stringify(args);
-  return `${name} — ${argSummary.slice(0, 120)}`;
-}
-
-/** Visible record of an answered or dismissed `ask` card. Emitted as harness
- *  HTML (not markdown prose) so the transcript reads as tool output — the old
- *  `> Question/Answer` blockquote taught the model to imitate the format and
- *  fabricate answers instead of calling the tool. */
-export function formatAskRecord(question: string, answer: string, dismissed: boolean): string {
-  const one = (s: string) => s.replace(/\s+/g, " ").trim();
-  const q = escapeHtml(one(question));
-  const a = dismissed
-    ? `<span class="ask-log-dismissed">Dismissed</span>`
-    : `<strong>Answer:</strong> ${escapeHtml(one(answer))}`;
-  return `\n\n<div class="ask-log"><div class="ask-log-q">${q}</div><div class="ask-log-a">${a}</div></div>\n\n`;
-}
-
 /** One-line activity note for a tool call, shown as normal assistant prose
  *  when the round had no narration of its own. Models that emit tool calls
  *  with no text would otherwise leave a bare chain of collapsed tags, so the
@@ -480,24 +439,6 @@ export function formatToolActivity(name: string, args: Record<string, any>): str
   }
 }
 
-/** Head of a tool-result block, appended as soon as the call is known so the
- *  tag is visible while a slow tool runs; `formatToolCallTail` closes it. */
-export function formatToolCallHead(name: string, args: Record<string, any>): string {
-  const head = toolLabel(name, args);
-  return `\n\n<details class="tool-result"><summary>${escapeHtml(head)}</summary><pre><code>`;
-}
-
-export function formatToolCallTail(output: string): string {
-  return `${escapeHtml(output.slice(0, 6000))}</code></pre></details>`;
-}
-
-/** Tool results render as collapsed <details> (closed by default): the head
- *  line stays visible, output expands on click. Raw HTML rather than a fence
- *  — marked leaves block HTML untouched, and DOMPurify allows details/summary.
- *  Summary is plain text (no markdown inside <summary> renders). */
-export function formatToolResult(name: string, args: Record<string, any>, output: string): string {
-  return formatToolCallHead(name, args) + formatToolCallTail(output);
-}
 
 // ---------- Rust work-agent turn client (src-tauri/src/work_agent.rs) ----------
 //
@@ -580,6 +521,11 @@ export interface WorkTurnParams {
   goalText?: string | null;
   /** the user's lead session: vicuna-mcp manage_sessions is allowed */
   lead?: boolean;
+  /** server mode: the session as it stands at turn start (save row with its
+   *  revision) and the live bubble's index; the server records the turn */
+  persist?: { chat: Record<string, unknown>; index: number } | null;
+  /** server mode: lead session the server reports to when this turn ends */
+  reportTo?: string | null;
   onEvent: (ev: WorkAgentEvent) => void;
 }
 
@@ -595,7 +541,10 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     messages: p.messages,
     sessionId: p.sessionId ?? null,
     goalText: p.goalText ?? null,
-    lead: p.lead ?? false
+    lead: p.lead ?? false,
+    // server mode (ignored elsewhere): see WorkTurnParams.persist
+    ...(p.persist ? { persistChat: p.persist.chat, persistIndex: p.persist.index, reportTo: p.reportTo ?? null } : {}),
+    tzOffsetMin: -new Date().getTimezoneOffset()
   };
   if (useLocalIpc()) {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
@@ -624,6 +573,44 @@ export async function liveWorkTurns(): Promise<Record<string, { turnId: string; 
   } catch {
     return {}; // older server without the command, or bridge down
   }
+}
+
+/** Server-side recording of a live turn (server mode): the transcript so far,
+ *  the live bubble index, the in-flight tool call and an unanswered ask card.
+ *  Taking it drops the already-recorded events from the channel. */
+export type WorkTurnSnapshot = {
+  turnId: string;
+  channel: string;
+  startedMs?: number;
+  snapshot?: {
+    messages: any[];
+    index: number;
+    pendingHead: { name: string; args: Record<string, any> } | null;
+    pendingAsk: WorkAgentEvent | null;
+  };
+};
+
+export async function attachWorkAgentSnapshot(sessionId: string): Promise<WorkTurnSnapshot | null> {
+  try {
+    return ((await bridgeInvoke("work_agent_attach", { sessionId })) ?? null) as WorkTurnSnapshot | null;
+  } catch {
+    return null; // older server without the command
+  }
+}
+
+let serverPersistCache: Promise<boolean> | null = null;
+
+/** Does this window's server record Work turns itself (and check chat
+ *  revisions)? False for This computer, the dev bridge and older servers. */
+export function serverRecordsTurns(): Promise<boolean> {
+  if (!isRemoteServer()) return Promise.resolve(false);
+  serverPersistCache ??= bridgeInvoke("server_info", {})
+    .then((i: any) => i?.persist === true)
+    .catch(() => {
+      serverPersistCache = null;
+      return false;
+    });
+  return serverPersistCache;
 }
 
 /** Follow an already-running turn's event stream (see liveWorkTurns). */
@@ -676,8 +663,15 @@ export async function removeWorkAgentMsg(turnId: string, id: string): Promise<vo
 }
 
 /** Answer a live `ask` card (answer or dismissal text). */
-export async function answerWorkAgentAsk(turnId: string, askId: string, answer: string): Promise<void> {
-  await invokeCmd<void>("work_agent_answer", { turnId, askId, answer });
+export async function answerWorkAgentAsk(
+  turnId: string,
+  askId: string,
+  answer: string,
+  record?: { display: string; dismissed: boolean }
+): Promise<void> {
+  // `record`: the Q/A record this window writes into its copy; a server
+  // recording the turn writes the same into its db
+  await invokeCmd<void>("work_agent_answer", { turnId, askId, answer, ...(record ? { record } : {}) });
 }
 
 /** The ask card's "Answer later": vicuna-mcp returns the waiting ask_user

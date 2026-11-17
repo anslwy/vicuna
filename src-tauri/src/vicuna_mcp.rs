@@ -732,8 +732,14 @@ async fn schedule_wakeup(target: &Target, args: &Value, client_gone: impl std::f
     let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
         let when = v.get("when").and_then(Value::as_str).unwrap_or("the requested time");
+        // a headless server stores and delivers it itself (no window needed)
+        let delivery = if v.get("server").and_then(Value::as_bool) == Some(true) {
+            "The Vicuna server delivers it even when no app window is open"
+        } else {
+            "It is delivered while the user's Vicuna app is open"
+        };
         text_result(
-            &format!("Scheduled: Vicuna will send your message into this session at {when}. It is delivered while the user's Vicuna app is open, and the user can see or cancel it under Scheduled. End your turn now unless there is other work to do."),
+            &format!("Scheduled: Vicuna will send your message into this session at {when}. {delivery}, and the user can see or cancel it under Scheduled. End your turn now unless there is other work to do."),
             false,
         )
     } else {
@@ -1433,12 +1439,30 @@ async fn manage_mcp_in(
     }
 }
 
+/// Headless server: called with (session id, server name, tool count) when
+/// `manage_mcp` adds/enables a server that should wake the session after the
+/// turn (the desktop emits `vicuna-mcp-wake` to its window instead). The
+/// bridge sets it so the follow-up turn runs with no window open.
+type McpWakeHook = Box<dyn Fn(&str, &str, Option<usize>) + Send + Sync>;
+static MCP_WAKE_HOOK: std::sync::OnceLock<McpWakeHook> = std::sync::OnceLock::new();
+
+pub fn set_mcp_wake_hook(f: impl Fn(&str, &str, Option<usize>) + Send + Sync + 'static) {
+    let _ = MCP_WAKE_HOOK.set(Box::new(f));
+}
+
 #[cfg(not(feature = "desktop"))]
-async fn manage_mcp(_target: Option<&Target>, args: &Value) -> Value {
+async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
     // headless server: the config file is the source of truth; the desktop
     // app reconciles its MCP list from it (no live manager / window events)
     match manage_mcp_in(None, args, None).await {
-        Ok(out) => text_result(&out.value.to_string(), false),
+        Ok(out) => {
+            if let (Some((name, tools)), Some(session_id), Some(hook)) =
+                (out.wake_server, target.and_then(|t| t.session_id.as_deref()), MCP_WAKE_HOOK.get())
+            {
+                hook(session_id, &name, tools);
+            }
+            text_result(&out.value.to_string(), false)
+        }
         Err(e) => text_result(&e, true),
     }
 }
