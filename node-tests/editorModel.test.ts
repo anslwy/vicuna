@@ -7,6 +7,7 @@ import {
   escapeAction,
   fileBase,
   isDirty,
+  isMarkdownPath,
   readOnlyReason,
   readVimPref,
   saveAction,
@@ -67,4 +68,12 @@ test("fileBase handles both separators", () => {
   assert.equal(fileBase("src/lib/a.ts"), "a.ts");
   assert.equal(fileBase("src\\lib\\b.rs"), "b.rs");
   assert.equal(fileBase("c.md"), "c.md");
+});
+
+test("isMarkdownPath matches .md/.markdown only", () => {
+  assert.equal(isMarkdownPath("README.md"), true);
+  assert.equal(isMarkdownPath("docs\\Guide.MARKDOWN"), true);
+  assert.equal(isMarkdownPath("src/a.ts"), false);
+  assert.equal(isMarkdownPath("notes.md.bak"), false);
+  assert.equal(isMarkdownPath("md"), false);
 });

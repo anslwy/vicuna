@@ -14,7 +14,8 @@
   import { tags as t } from "@lezer/highlight";
   import { vim, Vim } from "@replit/codemirror-vim";
   import { readWorkFile, writeWorkFile } from "./work";
-  import { escapeAction, fileBase, isDirty, readOnlyReason, readVimPref, saveAction, writeVimPref } from "./editorModel";
+  import { renderMarkdown } from "./markdown";
+  import { escapeAction, fileBase, isDirty, isMarkdownPath, readOnlyReason, readVimPref, saveAction, writeVimPref } from "./editorModel";
 
   // Vim ex commands are global to the library; route them to whichever editor
   // instance issued them (cm.cm6 is that instance's EditorView).
@@ -63,6 +64,58 @@
     writeVimPref(vimStore, vimOn);
     view?.dispatch({ effects: vimConf.reconfigure(vimOn ? vim({ status: true }) : []) });
     view?.focus();
+  }
+
+  // Markdown preview: the editor stays mounted (hidden) so cursor/undo survive;
+  // the preview renders the live buffer through the chat's sanitized renderer.
+  const isMd = $derived(isMarkdownPath(path));
+  let previewOn = $state(false);
+  let previewHtml = $state("");
+  function togglePreview() {
+    previewOn = !previewOn;
+    if (previewOn) previewHtml = renderMarkdown(docText());
+    else tick().then(() => view?.focus());
+  }
+
+  const CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  async function copyText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+  }
+  // same copy button markup as chat code blocks (markdown.ts); chat's click
+  // delegate only covers the message list, so the preview handles its own
+  function onPreviewClick(e: MouseEvent) {
+    const btn = (e.target as HTMLElement | null)?.closest?.("[data-copy-code]") as HTMLElement | null;
+    if (!btn) return;
+    e.preventDefault();
+    const txt = btn.closest(".codeblock")?.querySelector("code")?.textContent ?? "";
+    if (!txt) return;
+    void copyText(txt).then((ok) => {
+      if (!ok || btn.classList.contains("ok")) return;
+      const orig = btn.innerHTML;
+      btn.innerHTML = CHECK_SVG;
+      btn.classList.add("ok");
+      setTimeout(() => {
+        btn.innerHTML = orig;
+        btn.classList.remove("ok");
+      }, 1200);
+    });
   }
 
   let loading = $state(true);
@@ -317,6 +370,16 @@
           title={vimOn ? "Vim keybindings on (:w save, :q close)" : "Turn on Vim keybindings"}
           onclick={toggleVim}
         >Vim</button>
+        {#if isMd}
+          <button
+            class="ed-toggle"
+            class:on={previewOn}
+            data-testid="editor-preview-toggle"
+            aria-pressed={previewOn}
+            title={previewOn ? "Back to editing" : "Preview rendered Markdown"}
+            onclick={togglePreview}
+          >{previewOn ? "Edit" : "Preview"}</button>
+        {/if}
       {/if}
       {#if onopenexternal}
         <button class="ed-btn ghost" data-testid="editor-open-external" onclick={() => onopenexternal?.(path)}>Open in default app</button>
@@ -355,7 +418,13 @@
           {#if onopenexternal}<button class="ed-btn" onclick={() => onopenexternal?.(path)}>Open in default app</button>{/if}
         </div>
       {/if}
-      <div class="ed-cm" bind:this={host} class:hidden={loading || !!loadError}></div>
+      <div class="ed-cm" bind:this={host} class:hidden={loading || !!loadError || previewOn}></div>
+      {#if previewOn && !loading && !loadError}
+        <!-- renderMarkdown sanitizes with DOMPurify. The click is delegated to the
+             copy <button>s inside, which are keyboard-accessible themselves. -->
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+        <div class="ed-preview" data-testid="editor-preview" tabindex="-1" onclick={onPreviewClick}>{@html previewHtml}</div>
+      {/if}
     </div>
     {#if !loading && !loadError}
       <div class="ed-foot">
@@ -429,6 +498,24 @@
   .ed-body { position: relative; flex: 1; min-height: 0; }
   .ed-cm { position: absolute; inset: 0; -webkit-user-select: text; user-select: text; }
   .ed-cm.hidden { visibility: hidden; }
+  .ed-preview { position: absolute; inset: 0; overflow: auto; padding: 20px 28px; font-size: 14px; line-height: 1.6; -webkit-user-select: text; user-select: text; }
+  .ed-preview :global(h1), .ed-preview :global(h2), .ed-preview :global(h3) { margin: 1.1em 0 0.5em; line-height: 1.3; }
+  .ed-preview :global(h1:first-child), .ed-preview :global(h2:first-child), .ed-preview :global(h3:first-child) { margin-top: 0; }
+  .ed-preview :global(p) { margin: 0 0 12px; }
+  .ed-preview :global(ul), .ed-preview :global(ol) { margin: 0 0 12px; padding-left: 24px; }
+  .ed-preview :global(a) { color: var(--link); }
+  .ed-preview :global(code) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
+  .ed-preview :global(pre) { background: var(--item-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; }
+  .ed-preview :global(pre code) { background: transparent; padding: 0; }
+  .ed-preview :global(.codeblock) { position: relative; margin-bottom: 12px; }
+  .ed-preview :global(.codeblock pre) { margin: 0; }
+  .ed-preview :global(.codecopy) { position: absolute; top: 8px; right: 8px; background: var(--card); border: 1px solid var(--border-2); border-radius: 8px; cursor: pointer; color: var(--icon-dim); width: 24px; height: 24px; padding: 0; display: flex; align-items: center; justify-content: center; }
+  .ed-preview :global(.codecopy:hover) { background: var(--hover); color: var(--text); }
+  .ed-preview :global(.codecopy.ok) { color: var(--ok); }
+  .ed-preview :global(blockquote) { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid var(--border-2); color: var(--muted); }
+  .ed-preview :global(table) { border-collapse: collapse; margin-bottom: 12px; }
+  .ed-preview :global(th), .ed-preview :global(td) { border: 1px solid var(--border); padding: 4px 10px; }
+  .ed-preview :global(img) { max-width: 100%; }
   .ed-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 13px; }
   .ed-msg p { margin: 0; }
   .ed-foot { display: flex; gap: 16px; padding: 5px 16px; font-size: 11.5px; color: var(--muted); border-top: 1px solid var(--border); }

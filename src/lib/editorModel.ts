@@ -66,3 +66,8 @@ export function fileBase(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
+
+/** Markdown files get a Preview toggle in the editor header. */
+export function isMarkdownPath(path: string): boolean {
+  return /\.(md|markdown)$/i.test(fileBase(path));
+}
