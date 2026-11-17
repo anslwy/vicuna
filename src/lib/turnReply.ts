@@ -6,10 +6,11 @@ export function createTurnReplyRoute() {
   const origin = new Promise<string | null>((resolve) => { bind = resolve; });
   return {
     bind,
-    async send(askId: string, answer: string, deliver: (turnId: string, askId: string, answer: string) => Promise<void>) {
+    async send<R>(askId: string, answer: string, deliver: (turnId: string, askId: string, answer: string, record?: R) => Promise<void>, record?: R) {
       const turnId = await origin;
       if (!turnId) throw new Error("The originating Work turn failed to start");
-      await deliver(turnId, askId, answer);
+      if (record === undefined) await deliver(turnId, askId, answer);
+      else await deliver(turnId, askId, answer, record);
     }
   };
 }

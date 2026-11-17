@@ -101,6 +101,9 @@ struct ChatSaveRow {
     /// per-session agent fields (engine/model/lead/pin) as JSON
     extra: Option<String>,
     messages: Vec<MsgSaveRow>,
+    /// server merges only: the chat revision this client last saw. Older
+    /// clients without a revision cannot overwrite server-recorded turns.
+    base_rev: Option<i64>,
 }
 
 #[cfg(feature = "desktop")]
@@ -3979,8 +3982,8 @@ async fn cli_shell_path_dirs() -> Vec<std::path::PathBuf> {
 
 /// Effective search path: process dirs first, then login-shell extras.
 fn cli_all_path_dirs(shell_dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
-    let mut out = cli_path_dirs();
-    for d in shell_dirs {
+    let mut out = Vec::new();
+    for d in cli_path_dirs().iter().chain(shell_dirs) {
         if !out.iter().any(|e| e == d) {
             out.push(d.clone());
         }

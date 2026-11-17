@@ -238,3 +238,19 @@ export function resolveWakeTime(
 export function wakeMessage(message: string): string {
   return `Scheduled wake-up (you asked Vicuna to wake you now): ${message.trim()}`;
 }
+
+/** shown instead of SCHEDULE_OPEN_NOTE in a window on a server that sends
+ *  scheduled messages itself */
+export const SCHEDULE_SERVER_NOTE = "This server sends scheduled messages itself, even with Vicuna closed.";
+
+/** Server mode: what changed in the Scheduled list since `sent` (id → JSON
+ *  the server has). Only explicit removals of ids this window knew go up, so
+ *  an item the server added meanwhile (an agent wake-up) is never deleted by
+ *  a window that hasn't seen it yet. */
+export function scheduleDiff(sent: Map<string, string>, items: ScheduledItem[]): { put: ScheduledItem[]; remove: string[] } {
+  const ids = new Set(items.map((x) => x.id));
+  return {
+    put: items.filter((x) => sent.get(x.id) !== JSON.stringify(x)),
+    remove: [...sent.keys()].filter((id) => !ids.has(id))
+  };
+}

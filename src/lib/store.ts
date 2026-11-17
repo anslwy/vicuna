@@ -580,10 +580,76 @@ function serverKey(base: string, id: string): string {
   return `${base}:server:${id}`;
 }
 
+/** Hooks ChatApp installs for the server backend (see createServerBackend). */
+export const serverSync: {
+  /** chats the server is recording right now (a live Work turn): never sent */
+  skip: (id: string) => boolean;
+  /** the server refused these (it has a newer copy): adopt them */
+  onConflict: (chats: Chat[]) => void;
+} = { skip: () => false, onConflict: () => {} };
+
+/** Raw server chat JSON (chats_load / chats_get / a conflict) → Chat. */
+export function normalizeServerChat(c: any): Chat {
+  return {
+    id: String(c.id),
+    title: typeof c.title === "string" ? c.title : "Untitled",
+    createdAt: typeof c.createdAt === "number" ? c.createdAt : 0,
+    updatedAt: typeof c.updatedAt === "number" ? c.updatedAt : c.createdAt ?? 0,
+    forkedFrom: c.forkedFrom && typeof c.forkedFrom.id === "string" ? c.forkedFrom : null,
+    forkFromIndex: typeof c.forkFromIndex === "number" ? c.forkFromIndex : null,
+    mode: c.mode === "work" ? "work" : "chat",
+    workspace: typeof c.workspace === "string" ? c.workspace : null,
+    goal: typeof c.goal === "string" ? c.goal : null,
+    ...parseChatExtra(c.extra),
+    messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
+      role: m.role as ChatMsg["role"],
+      content: typeof m.content === "string" ? m.content : "",
+      thinking: m.thinking || undefined,
+      model: m.model || undefined,
+      images: Array.isArray(m.images) && m.images.length ? m.images : undefined,
+      genMs: typeof m.genMs === "number" ? m.genMs : undefined,
+      genTps: typeof m.genTps === "number" ? m.genTps : undefined,
+      genCost: typeof m.genCost === "number" ? m.genCost : undefined,
+      summary: m.summary === true ? true : undefined
+    }))
+  };
+}
+
+let serverBackendApi: {
+  adopt(raw: any): Chat;
+  saveRow(chat: Chat): Record<string, unknown>;
+  idle(): Promise<void>;
+} | null = null;
+
+/** Server mode: take the server's copy of a chat as the new baseline (its
+ *  revision, and "already saved" for the change detection). */
+export function adoptServerChat(raw: any): Chat {
+  return serverBackendApi ? serverBackendApi.adopt(raw) : normalizeServerChat(raw);
+}
+
+/** Server mode: a chat's save row carrying the revision this window has. */
+export function serverSaveRow(chat: Chat): Record<string, unknown> | null {
+  return serverBackendApi ? serverBackendApi.saveRow(chat) : null;
+}
+
+/** Server mode: resolves once queued chat saves have landed. */
+export function serverSavesIdle(): Promise<void> {
+  return serverBackendApi ? serverBackendApi.idle() : Promise.resolve();
+}
+
 function createServerBackend(serverId: string): Backend {
   const sent = new Map<string, string>(); // chat id -> last payload JSON the server has
+  // chat id -> server revision this window last saw. Sent as baseRev: the
+  // server refuses a save whose base moved on (it recorded a Work turn while
+  // this window slept, or another window saved) and returns its copy instead,
+  // so an outdated window can never overwrite newer rows.
+  const revs = new Map<string, number>();
   let saveActive = false;
   let queued: Chat[] | null = null;
+  let idleWaiters: Array<() => void> = [];
+
+  const withRev = (it: ReturnType<typeof toSavePayload>[number]) =>
+    revs.has(it.id) ? { ...it, baseRev: revs.get(it.id) } : it;
 
   async function push(chats: Chat[]): Promise<void> {
     const items = toSavePayload(chats);
@@ -593,45 +659,56 @@ function createServerBackend(serverId: string): Backend {
     for (const it of items) {
       const j = JSON.stringify(it);
       json.set(it.id, j);
-      if (sent.get(it.id) !== j) changed.push(it);
+      // a live server-recorded turn: the server is its only writer
+      if (sent.get(it.id) !== j && !serverSync.skip(it.id)) changed.push(it);
     }
     const deleted = [...sent.keys()].filter((id) => !current.has(id));
     if (changed.length === 0 && deleted.length === 0) return;
-    await invokeOrBridge("chats_merge", { chats: changed, deleted });
-    for (const it of changed) sent.set(it.id, json.get(it.id)!);
-    for (const id of deleted) sent.delete(id);
+    const out = await invokeOrBridge<any>("chats_merge", { chats: changed.map(withRev), deleted });
+    const written: Record<string, number> = out && typeof out === "object" && out.revs ? out.revs : {};
+    const hasRevs = !!(out && typeof out === "object" && out.revs);
+    for (const it of changed) {
+      // older servers answer null (everything written, no revisions)
+      if (!hasRevs || it.id in written) {
+        sent.set(it.id, json.get(it.id)!);
+        if (hasRevs) revs.set(it.id, written[it.id]);
+      }
+    }
+    for (const id of deleted) {
+      sent.delete(id);
+      revs.delete(id);
+    }
+    const conflicts: Chat[] = (Array.isArray(out?.conflicts) ? out.conflicts : []).map((raw: any) => adopt(raw));
+    if (conflicts.length) {
+      // A save requested during this request may still hold the rejected
+      // objects. Never rebase that stale transcript onto the adopted revision.
+      const fresh = new Map(conflicts.map((c) => [c.id, c]));
+      if (queued) queued = queued.map((c) => fresh.get(c.id) ?? c);
+      serverSync.onConflict(conflicts);
+    }
   }
+
+  function adopt(raw: any): Chat {
+    const chat = normalizeServerChat(raw);
+    if (typeof raw?.rev === "number") revs.set(chat.id, raw.rev);
+    sent.set(chat.id, JSON.stringify(toSavePayload([chat])[0]));
+    return chat;
+  }
+
+  serverBackendApi = {
+    adopt,
+    saveRow: (chat) => withRev(toSavePayload([chat])[0]),
+    idle: () => (saveActive ? new Promise((r) => idleWaiters.push(r)) : Promise.resolve())
+  };
 
   const ls = (base: string) => serverKey(base, serverId);
   return {
     async loadChats(): Promise<Chat[]> {
       const raw = await invokeOrBridge<any[]>("chats_load", {});
-      const chats: Chat[] = (Array.isArray(raw) ? raw : []).map((c: any) => ({
-        id: String(c.id),
-        title: typeof c.title === "string" ? c.title : "Untitled",
-        createdAt: typeof c.createdAt === "number" ? c.createdAt : 0,
-        updatedAt: typeof c.updatedAt === "number" ? c.updatedAt : c.createdAt ?? 0,
-        forkedFrom: c.forkedFrom && typeof c.forkedFrom.id === "string" ? c.forkedFrom : null,
-        forkFromIndex: typeof c.forkFromIndex === "number" ? c.forkFromIndex : null,
-        mode: c.mode === "work" ? "work" : "chat",
-        workspace: typeof c.workspace === "string" ? c.workspace : null,
-        goal: typeof c.goal === "string" ? c.goal : null,
-        ...parseChatExtra(c.extra),
-        messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
-          role: m.role as ChatMsg["role"],
-          content: typeof m.content === "string" ? m.content : "",
-          thinking: m.thinking || undefined,
-          model: m.model || undefined,
-          images: Array.isArray(m.images) && m.images.length ? m.images : undefined,
-          genMs: typeof m.genMs === "number" ? m.genMs : undefined,
-          genTps: typeof m.genTps === "number" ? m.genTps : undefined,
-          genCost: typeof m.genCost === "number" ? m.genCost : undefined,
-          summary: m.summary === true ? true : undefined
-        }))
-      }));
       // what the server already has: the first save sends nothing unchanged
       sent.clear();
-      for (const it of toSavePayload(chats)) sent.set(it.id, JSON.stringify(it));
+      revs.clear();
+      const chats: Chat[] = (Array.isArray(raw) ? raw : []).map((c: any) => adopt(c));
       return chats;
     },
     async saveChats(chats: Chat[]): Promise<void> {
@@ -650,6 +727,9 @@ function createServerBackend(serverId: string): Backend {
         }
       } finally {
         saveActive = false;
+        const w = idleWaiters;
+        idleWaiters = [];
+        for (const f of w) f();
       }
     },
     async loadModel() {

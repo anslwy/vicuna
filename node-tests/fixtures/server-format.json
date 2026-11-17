@@ -1,0 +1,183 @@
+[
+  {
+    "fn": "formatToolCallHead",
+    "args": [
+      "bash",
+      {
+        "command": "ls -la",
+        "description": "List <files> & \"more\""
+      }
+    ],
+    "expected": "\n\n<details class=\"tool-result\"><summary>bash — {&quot;command&quot;:&quot;ls -la&quot;,&quot;description&quot;:&quot;List &lt;files&gt; &amp; \\&quot;more\\&quot;&quot;}</summary><pre><code>"
+  },
+  {
+    "fn": "formatToolCallHead",
+    "args": [
+      "exec",
+      {
+        "command": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    ],
+    "expected": "\n\n<details class=\"tool-result\"><summary>exec — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</summary><pre><code>"
+  },
+  {
+    "fn": "formatToolCallHead",
+    "args": [
+      "read",
+      {}
+    ],
+    "expected": "\n\n<details class=\"tool-result\"><summary>read — .</summary><pre><code>"
+  },
+  {
+    "fn": "formatToolCallHead",
+    "args": [
+      "mcp__vicuna-mcp__ask_user",
+      {
+        "question": "Fruit?",
+        "choices": [
+          "Kiwi",
+          "Mango"
+        ]
+      }
+    ],
+    "expected": "\n\n<details class=\"tool-result\"><summary>mcp__vicuna-mcp__ask_user — {&quot;question&quot;:&quot;Fruit?&quot;,&quot;choices&quot;:[&quot;Kiwi&quot;,&quot;Mango&quot;]}</summary><pre><code>"
+  },
+  {
+    "fn": "formatToolCallHead",
+    "args": [
+      "exec",
+      {
+        "command": "echo 😀 ünïcode"
+      }
+    ],
+    "expected": "\n\n<details class=\"tool-result\"><summary>exec — echo 😀 ünïcode</summary><pre><code>"
+  },
+  {
+    "fn": "formatToolCallTail",
+    "args": [
+      "a.txt & <b> \"q\" 'single'"
+    ],
+    "expected": "a.txt &amp; &lt;b&gt; &quot;q&quot; 'single'</code></pre></details>"
+  },
+  {
+    "fn": "formatToolCallTail",
+    "args": [
+      "é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀"
+    ],
+    "expected": "é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀é😀</code></pre></details>"
+  },
+  {
+    "fn": "formatAskRecord",
+    "args": [
+      "Which   fruit?\nPick one",
+      "Kiwi <3",
+      false
+    ],
+    "expected": "\n\n<div class=\"ask-log\"><div class=\"ask-log-q\">Which fruit? Pick one</div><div class=\"ask-log-a\"><strong>Answer:</strong> Kiwi &lt;3</div></div>\n\n"
+  },
+  {
+    "fn": "formatAskRecord",
+    "args": [
+      "Which fruit?",
+      "",
+      true
+    ],
+    "expected": "\n\n<div class=\"ask-log\"><div class=\"ask-log-q\">Which fruit?</div><div class=\"ask-log-a\"><span class=\"ask-log-dismissed\">Dismissed</span></div></div>\n\n"
+  },
+  {
+    "fn": "workReplyModel",
+    "args": [
+      null,
+      "opus",
+      "claude"
+    ],
+    "expected": "claude/opus"
+  },
+  {
+    "fn": "workReplyModel",
+    "args": [
+      "opencode/deepseek",
+      null,
+      "opencode"
+    ],
+    "expected": "opencode/deepseek"
+  },
+  {
+    "fn": "workReplyModel",
+    "args": [
+      null,
+      null,
+      "codex"
+    ],
+    "expected": "codex"
+  },
+  {
+    "fn": "workerDoneMessage",
+    "args": [
+      {
+        "id": "w1",
+        "title": "Build",
+        "engine": "claude",
+        "model": "opus"
+      },
+      "  done  ",
+      false
+    ],
+    "expected": "Worker session finished: \"Build\" (w1, claude/opus) finished its turn.\nIts last reply:\n\ndone\n\nUse manage_sessions (send/stop/delete) or read_session for more."
+  },
+  {
+    "fn": "workerDoneMessage",
+    "args": [
+      {
+        "id": "w2",
+        "title": "T",
+        "engine": "opencode",
+        "model": null
+      },
+      "",
+      true
+    ],
+    "expected": "Worker session finished: \"T\" (w2, opencode) stopped.\nIts last reply:\n\n(no reply text)\n\nUse manage_sessions (send/stop/delete) or read_session for more."
+  },
+  {
+    "fn": "workerDoneMessage",
+    "args": [
+      {
+        "id": "w3",
+        "title": "Long",
+        "engine": "codex",
+        "model": null
+      },
+      "line\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\n",
+      false
+    ],
+    "expected": "Worker session finished: \"Long\" (w3, codex) finished its turn.\nIts last reply:\n\n…line\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\n\nUse manage_sessions (send/stop/delete) or read_session for more."
+  },
+  {
+    "fn": "mcpWakeMessage",
+    "args": [
+      [
+        {
+          "name": "gh",
+          "tools": 1
+        },
+        {
+          "name": "x",
+          "tools": null
+        },
+        {
+          "name": "y",
+          "tools": 5
+        }
+      ]
+    ],
+    "expected": "MCP server(s) now active: `gh` (1 tool), `x`, `y` (5 tools). You can call their tools now."
+  },
+  {
+    "fn": "wakeMessage",
+    "args": [
+      "  check CI  "
+    ],
+    "expected": "Scheduled wake-up (you asked Vicuna to wake you now): check CI"
+  }
+]
