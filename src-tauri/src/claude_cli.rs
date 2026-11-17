@@ -741,6 +741,7 @@ mod tests {
                 "mcp__vicuna-mcp__list_sessions",
                 "mcp__vicuna-mcp__manage_mcp",
                 "mcp__vicuna-mcp__schedule_wakeup",
+                "mcp__vicuna-mcp__manage_sessions",
             ]
         );
         let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();

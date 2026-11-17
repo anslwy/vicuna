@@ -2138,6 +2138,12 @@ mod tests {
         assert_eq!(tools.as_array().unwrap().len(), TOOL_COUNT);
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL]);
+        assert!(!names.contains(&"run"), "the run tool was removed");
+        // a stale client calling it gets a protocol error, not a crash
+        let (_, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run", "arguments": { "command": "true" } } })).await;
+        assert!(r.unwrap()["error"]["message"].as_str().unwrap().contains("unknown tool: run"));
     }
 
     #[tokio::test]
