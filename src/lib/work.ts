@@ -524,9 +524,6 @@ export type WorkAgentEvent =
   | { type: "schedulewakeup"; req_id: string; message: string; at: string | null; in_minutes: number | null }
   | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
-  | { type: "runstarted"; job_id: string; command: string; started_ms?: number }
-  | { type: "runended"; job_id: string }
-  | { type: "runbackground"; job_id: string; command: string; started_ms?: number }
   | { type: "contextcompacted"; note: string }
   | { type: "done"; stopped: boolean }
   | { type: "error"; message: string };
@@ -686,39 +683,6 @@ export async function answerWorkAgentAsk(turnId: string, askId: string, answer: 
 /** The ask card's "Answer later": vicuna-mcp returns the waiting ask_user
  *  call at once (must match `vicuna_mcp::ASK_LATER`). */
 export const ASK_LATER = '{"vicunaAskLater":true}';
-
-/** Background button on a waiting vicuna-mcp `run` call. */
-export async function backgroundWorkRun(turnId: string, jobId: string): Promise<void> {
-  await invokeCmd<void>("work_agent_background", { turnId, jobId });
-}
-
-/** Poll / stop a vicuna-mcp `run` job (works after its turn ended). */
-export async function workRunStatus(id: string): Promise<BackgroundJobStatus> {
-  return await invokeCmd<BackgroundJobStatus>("work_run_status", { id });
-}
-export async function workRunKill(id: string): Promise<BackgroundJobStatus> {
-  return await invokeCmd<BackgroundJobStatus>("work_run_kill", { id });
-}
-
-/** Backgrounded jobs the backend still owes a finished message to: a window
- *  that closed/reloaded rebuilds its chips from this. [] on older backends. */
-export async function workRunList(): Promise<Array<{ jobId: string; sessionId: string; command: string; startedMs: number; foreground?: boolean }>> {
-  try {
-    return (await invokeCmd<Array<{ jobId: string; sessionId: string; command: string; startedMs: number; foreground?: boolean }>>("work_run_list", {})) ?? [];
-  } catch {
-    return [];
-  }
-}
-
-/** Claim delivery of a finished job's message (false = another window has
- *  it); `release` hands it back after a failed send. Older backends: true. */
-export async function workRunClaim(id: string, release = false): Promise<boolean> {
-  try {
-    return await invokeCmd<boolean>("work_run_claim", { id, release });
-  } catch {
-    return true;
-  }
-}
 
 export type UsageMeter = {
   label: string;

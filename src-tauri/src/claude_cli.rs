@@ -217,8 +217,6 @@ pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
     if mcp.iter().any(|e| e.get("name").and_then(|n| n.as_str()) == Some(crate::vicuna_mcp::SERVER_NAME)) {
         args.push("--allowedTools".to_string());
         args.push(crate::vicuna_mcp::CLAUDE_TOOL_ID.to_string());
-        // vicuna-mcp gates `run` itself in ask mode (no double prompt)
-        args.push(crate::vicuna_mcp::CLAUDE_RUN_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_GET_SESSION_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_READ_SESSION_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_LIST_SESSIONS_TOOL_ID.to_string());
@@ -738,12 +736,12 @@ mod tests {
                 "AskUserQuestion",
                 "--allowedTools",
                 "mcp__vicuna-mcp__ask_user",
-                "mcp__vicuna-mcp__run",
                 "mcp__vicuna-mcp__get_session_id",
                 "mcp__vicuna-mcp__read_session",
                 "mcp__vicuna-mcp__list_sessions",
                 "mcp__vicuna-mcp__manage_mcp",
                 "mcp__vicuna-mcp__schedule_wakeup",
+                "mcp__vicuna-mcp__manage_sessions",
             ]
         );
         let cfg: Value = serde_json::from_str(&mcp_config(&mcp).unwrap()).unwrap();

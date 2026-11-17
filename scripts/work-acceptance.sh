@@ -13,7 +13,6 @@
 #   scripts/work-acceptance.sh stopq <model> [engine]    # a message queued mid-turn runs next; Stop interrupts a long reply
 #   scripts/work-acceptance.sh ask <model> [engine]      # agent question (vicuna-mcp ask_user): card, answer continues, Stop cancels
 #                                                        #   ASK_ANSWER_DELAY=<s> answers late (must not time out)
-#   scripts/work-acceptance.sh background <model> [engine]  # vicuna-mcp run: Background returns the call, job finishes later
 #   scripts/work-acceptance.sh always <model> [engine]   # 'ask' mode: "Always allow" on the first shell command approves the second
 #   scripts/work-acceptance.sh stoptool <model> [engine] # Stop during a long shell command ends the turn AND the command; missing workspace errors
 #   scripts/work-acceptance.sh plan <model> codex       # Codex goal/plan updates show as a transcript note (1 turn)
@@ -622,67 +621,6 @@ assert done and done[-1]["stopped"] is True, done
 print("PASS Stop while a question was pending ended the turn cleanly (done stopped=true, no error)")
 PY
     ;;
-  background)
-    [ -n "$model" ] || { echo "usage: $0 background <model> [engine]"; exit 2; }
-    # The agent runs a slow command through vicuna-mcp's `run`; pressing
-    # Background returns the tool call at once (the turn goes on and ends)
-    # while the job keeps running in Vicuna and finishes with its output.
-    start_bridge
-    marker="BGDONE-$$"
-    prompt="Use the run tool (vicuna-mcp server) to run exactly this command: sleep 15 && echo $marker. Do not use any other tool. If it goes to the background, reply exactly WAITING and end your turn."
-    start="$(invoke work_agent_start "$(turn_args "bg-$$" true "$prompt")")"
-    echo "work_agent_start: $start"
-    turn_id="$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"], r; print(r["data"])' "$start")"
-    : >"$work/events.jsonl"
-    job="" pressed="" t0=$(date +%s)
-    for _ in $(seq 1 400); do
-      curl -sS "$base/poll/bg-$$" | python3 -c '
-import json, sys
-for ev in json.load(sys.stdin).get("events", []):
-    print(json.dumps(ev))' >>"$work/events.jsonl"
-      if [ -z "$job" ]; then
-        job="$(python3 -c '
-import json, sys
-for l in open(sys.argv[1]):
-    e = json.loads(l)
-    if e.get("type") == "runstarted": print(e["job_id"]); break' "$work/events.jsonl")"
-      fi
-      if [ -n "$job" ] && [ -z "$pressed" ]; then
-        sleep 2
-        echo "run started ($job); pressing Background"
-        r="$(invoke work_agent_background "{\"turnId\":\"$turn_id\",\"jobId\":\"$job\"}")"
-        echo "  work_agent_background: $r"
-        pressed=1
-      fi
-      if grep -qE '"type": "(done|error)"' "$work/events.jsonl"; then break; fi
-      sleep 0.5
-    done
-    turn_secs=$(( $(date +%s) - t0 ))
-    [ -n "$job" ] || { echo "FAIL the agent never called run"; tail -20 "$work/events.jsonl"; exit 1; }
-    st="$(invoke work_run_status "{\"id\":\"$job\"}")"
-    python3 - "$work/events.jsonl" "$st" "$turn_secs" <<'PY'
-import json, sys
-evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-st = json.loads(sys.argv[2])
-assert not [e for e in evs if e.get("type") == "error"], evs[-3:]
-assert [e for e in evs if e.get("type") == "runbackground"], "no runbackground event"
-done = [e for e in evs if e.get("type") == "done"]
-assert done and done[-1]["stopped"] is False, done
-assert st["ok"] and st["data"]["running"], f"job should still be running when the turn ended: {st}"
-print(f"PASS Background returned the call; the turn ended in {sys.argv[3]}s while the job kept running")
-PY
-    for _ in $(seq 1 60); do
-      st="$(invoke work_run_status "{\"id\":\"$job\"}")"
-      python3 -c 'import json,sys; sys.exit(0 if not json.loads(sys.argv[1])["data"]["running"] else 1)' "$st" && break
-      sleep 1
-    done
-    python3 - "$st" "$marker" <<'PY'
-import json, sys
-d = json.loads(sys.argv[1])["data"]
-assert not d["running"] and d["exit_code"] == 0 and sys.argv[2] in d["stdout"], d
-print("PASS the backgrounded job finished later with its output (the frontend sends it to the session)")
-PY
-    ;;
   plan)
     [ -n "$model" ] || { echo "usage: $0 plan <model> codex"; exit 2; }
     # Codex 0.16x offers goal tools (create_goal/update_goal) instead of
@@ -991,5 +929,5 @@ print("PASS its model-menu error is clean and starts with the upgrade hint:", er
 PY
     ;;
   *)
-    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | combo <model> [engine] | stopq <model> [engine] | ask <model> [engine] | background <model> [engine] | finder | finder-codex   (engine: opencode|claude|codex|fx)"; exit 2 ;;
+    echo "usage: $0 missing [engine] | present <model> [engine] | mcp <model> [engine] | approve <model> [engine] | toolcap <model> [engine] | combo <model> [engine] | stopq <model> [engine] | ask <model> [engine] | finder | finder-codex   (engine: opencode|claude|codex|fx)"; exit 2 ;;
 esac
