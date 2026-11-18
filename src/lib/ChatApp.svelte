@@ -648,8 +648,7 @@
     await connectMcpServer(id);
   }
 
-  /** Browser sign-in for an OAuth-protected server (e.g. higgsfield).
-   *  Opens the system browser; the backend resolves once login completes.
+  /** OAuth sign-in uses the side-panel browser in a remote window.
    *  A server that turns out to need no auth falls back to plain connect. */
   async function signInMcpServer(id: string) {
     const cfg = findMcpServer(id);
@@ -658,7 +657,13 @@
     mcpAuthWait = id;
     mcpLive[id] = { connected: false, tools: [], error: null };
     try {
-      const info = await signInMcpBackend(cfg);
+      if (onServer) {
+        mcpOpen = false;
+        explorerOpen = true;
+        openSideBrowser();
+        await ensureBrowserDaemon();
+      }
+      const info = await signInMcpBackend(cfg, onServer);
       mcpLive[id] = { connected: true, tools: info.tools, error: null };
       // an explicit sign-in implies the user wants the server: enable it
       if (!findMcpServer(id)?.enabled) {
@@ -677,9 +682,11 @@
         return;
       }
       mcpLive[id] = { connected: false, tools: [], error: msg };
+      if (onServer) flashExpNotice(msg);
       // github only: no open registration means the browser flow can never
       // start — prompt for a personal access token instead of dead-ending
       if (msg.includes("no open client registration") && /github/i.test(cfg?.name ?? "")) {
+        mcpOpen = true;
         mcpPatFor = id;
         mcpPatToken = "";
         mcpPatError = null;

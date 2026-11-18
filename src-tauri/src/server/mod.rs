@@ -677,16 +677,21 @@ async fn dispatch(
                 .unwrap_or(id);
             Ok(serde_json::json!(crate::mcp::auth_present(&name)))
         }
-        // embedded in the desktop app: the app registered a browser opener,
-        // so OAuth runs here (tokens land in the shared auth.json); a
-        // headless `vicuna serve` has no browser to open
         "mcp_signin" => {
-            let Some(open) = URL_OPENER.get() else {
-                return Err("browser sign-in needs the Vicuna desktop app".to_string());
-            };
             let cfg: crate::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default()).map_err(|e| format!("bad config: {e}"))?;
-            crate::mcp::oauth_login(&cfg, |url| open(url)).await?;
+            if args.get("sidePanelBrowser").and_then(|v| v.as_bool()) == Some(true) {
+                crate::mcp::oauth_login(&cfg, |url| async move {
+                    let resources = test_resource_dir();
+                    crate::browser::open_sign_in_tab(resources.as_deref(), &url).await
+                })
+                .await?;
+            } else {
+                let open = URL_OPENER
+                    .get()
+                    .ok_or_else(|| "browser sign-in needs the Vicuna desktop app".to_string())?;
+                crate::mcp::oauth_login(&cfg, |url| std::future::ready(open(&url))).await?;
+            }
             Ok(serde_json::json!(st.mcp.connect(&cfg).await?))
         }
         // ----- in-app updates -----
