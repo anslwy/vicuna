@@ -114,7 +114,7 @@ async fn commit(st: &BridgeState, chat: &mut Value) -> Result<Value, String> {
     as_save_row(chat);
     let out = crate::server_store::merge_json(db, &json!([chat]), vec![], &live_sessions(st)).await?;
     if !out.conflicts.is_empty() {
-        return Err("the session is busy (a Work turn is recording it); try again when it settles".into());
+        return Err("the session is busy (the server is recording a turn); try again when it settles".into());
     }
     crate::server_store::load_chat(db, &id).await?.ok_or_else(|| "session vanished".into())
 }
@@ -127,10 +127,39 @@ async fn load(st: &BridgeState, id: &str) -> Result<Value, String> {
 /// Message edits/deletes are refused while the session's turn runs (the
 /// window gated them on `busy`; the server is now the authority).
 fn idle(st: &BridgeState, id: &str) -> Result<(), String> {
-    if live_turn(st, id).is_some() {
+    if live_turn(st, id).is_some() || super::chat::is_running(st, id) {
         return Err("the session is running; wait for it or stop it first".into());
     }
     Ok(())
+}
+
+pub(super) fn fork_row(src: &Value, id: &str, at: usize, fork_id: &str, msgs: Vec<Value>) -> Value {
+    let title = src["title"].as_str().unwrap_or("Untitled").to_string();
+    // forks are plain sessions: no lead role, pin, archive or goal;
+    // the harness/model/MCP pick carries over
+    let mut extra = extra_of(src);
+    if let Some(o) = extra.as_object_mut() {
+        for k in ["role", "pinned", "archived", "leadId"] {
+            o.remove(k);
+        }
+    }
+    let now = now_ms();
+    let mut fork = json!({
+        "id": fork_id,
+        "title": format!("{title} (fork)"),
+        "createdAt": now,
+        "updatedAt": now,
+        "messages": msgs,
+        // save rows carry it as JSON text (loads parse it back)
+        "forkedFrom": json!({ "id": id, "title": title }).to_string(),
+        "forkFromIndex": at,
+        "mode": src["mode"].as_str().unwrap_or("chat"),
+        "workspace": src["workspace"].clone(),
+    });
+    if extra.as_object().is_some_and(|o| !o.is_empty()) {
+        fork["extra"] = json!(extra.to_string());
+    }
+    fork
 }
 
 pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Value, String> {
@@ -162,6 +191,13 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                 }
             }
             chat["extra"] = json!(extra.to_string());
+            if super::chat::is_running(st, &id) {
+                // The live recorder owns messages. Sidebar changes touch only
+                // metadata, and the recorder's next checkpoint preserves them.
+                let db = st.db.as_ref().ok_or("this bridge stores no sessions")?;
+                crate::server_store::write_title_and_extra(db, &id, &chat).await?;
+                return load(st, &id).await;
+            }
             commit(st, &mut chat).await
         }
         "session_delete" => {
@@ -177,32 +213,8 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
             if at >= msgs.len() {
                 return Err(format!("no message {at}"));
             }
-            let title = src["title"].as_str().unwrap_or("Untitled").to_string();
-            // forks are plain sessions: no lead role, pin, archive or goal;
-            // the harness/model/MCP pick carries over
-            let mut extra = extra_of(&src);
-            if let Some(o) = extra.as_object_mut() {
-                for k in ["role", "pinned", "archived", "leadId"] {
-                    o.remove(k);
-                }
-            }
-            let now = now_ms();
             let fork_id = uuid();
-            let mut fork = json!({
-                "id": fork_id,
-                "title": format!("{title} (fork)"),
-                "createdAt": now,
-                "updatedAt": now,
-                "messages": msgs[..=at].to_vec(),
-                // save rows carry it as JSON text (loads parse it back)
-                "forkedFrom": json!({ "id": id, "title": title }).to_string(),
-                "forkFromIndex": at,
-                "mode": src["mode"].as_str().unwrap_or("chat"),
-                "workspace": src["workspace"].clone(),
-            });
-            if extra.as_object().is_some_and(|o| !o.is_empty()) {
-                fork["extra"] = json!(extra.to_string());
-            }
+            let fork = fork_row(&src, &id, at, &fork_id, msgs[..=at].to_vec());
             let _w = st.chat_lock.lock().await;
             crate::server_store::create_chat(db, &fork).await?;
             crate::server_store::load_chat(db, &fork_id).await?.ok_or_else(|| "fork vanished".into())
@@ -211,8 +223,8 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
             let id = arg_str(args, "id")?;
             let index = arg_index(args, "index")?;
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-            idle(st, &id)?;
             let _w = st.chat_lock.lock().await;
+            idle(st, &id)?;
             let mut chat = load(st, &id).await?;
             let mut msgs = chat["messages"].as_array().cloned().unwrap_or_default();
             let truncate = args.get("truncate").and_then(Value::as_bool).unwrap_or(false);
@@ -229,8 +241,8 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
         "message_delete" => {
             let id = arg_str(args, "id")?;
             let index = arg_index(args, "index")?;
-            idle(st, &id)?;
             let _w = st.chat_lock.lock().await;
+            idle(st, &id)?;
             let mut chat = load(st, &id).await?;
             let mut msgs = chat["messages"].as_array().cloned().unwrap_or_default();
             let (from, count) = delete_span(&msgs, index)?;

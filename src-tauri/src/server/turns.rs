@@ -74,6 +74,7 @@ pub fn live_sessions(st: &BridgeState) -> HashSet<String> {
             let ended = st.agent.get_turn(&g.turn_id).map_or(true, |t| t.done.load(Ordering::Relaxed));
             (g.finishing || !ended).then(|| g.rec.chat_id.clone())
         })
+        .chain(super::chat::running_ids(st))
         .collect()
 }
 
@@ -555,7 +556,7 @@ fn session_row(st: &BridgeState, c: &Value) -> Value {
         "lead": x.get("role").and_then(Value::as_str) == Some("lead"),
         "updatedAt": c["updatedAt"],
         "createdAt": c["createdAt"],
-        "running": live.is_some(),
+        "running": live.is_some() || super::chat::is_running(st, id),
         "turnId": live.as_ref().map(|l| json!(l.0)).unwrap_or(Value::Null),
         "channel": live.as_ref().map(|l| json!(l.1)).unwrap_or(Value::Null),
         "startedMs": live.as_ref().map(|l| json!(l.2)).unwrap_or(Value::Null),
@@ -665,7 +666,8 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
             if let Some((_, turn)) = &running {
                 crate::work_agent::agent_stop(turn);
             }
-            Ok(json!({ "id": id, "stopped": running.is_some() }))
+            let stopped = super::chat::stop(st, &id, None) || running.is_some();
+            Ok(json!({ "id": id, "stopped": stopped }))
         }
         "delete" => {
             if let Some((_, turn)) = live_turn(st, &id) {
@@ -679,6 +681,7 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
                 }
             }
             let _write = st.chat_lock.lock().await;
+            super::chat::stop(st, &id, None);
             crate::server_store::merge_json(db, &json!([]), vec![id.clone()], &Default::default()).await?;
             schedule_drop_for(st, &id).await;
             Ok(json!({ "id": id, "deleted": true }))

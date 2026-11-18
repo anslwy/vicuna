@@ -15,8 +15,14 @@
 //     (`cargo run` in bridge/), so live-browser drives the real backend.
 // When none is present the call fails with the usual desktop error.
 
-import { isTauriRuntime } from "./ollama";
 import { searchLoadedChats, type LoadedChat } from "./serverSearch";
+
+export function isTauriRuntime(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)
+  );
+}
 
 // ---- remote server selection (desktop only) ----
 
@@ -106,8 +112,7 @@ export async function switchServer(id: string | null, title?: string): Promise<v
 }
 
 /** The ONLY commands that run in the desktop shell instead of the API: what
- *  is about this app/machine/window itself, plus Chat mode's Ollama calls
- *  until they move server-side. Everything else — anything that touches the
+ *  is about this app/machine/window itself. Everything that touches the
  *  database — is a server action (`vicuna api list`), so the CLI, headless
  *  tests and future mobile apps reach exactly what the GUI does. No silent
  *  fallback: a command missing from the server fails loudly instead of
@@ -138,16 +143,9 @@ export const DESKTOP_CMDS = new Set([
   "server_call",
   "server_download_file",
   "server_lb_proxy_url",
-  // Chat mode (Ollama) — moves to the server in phase 3
-  "ollama_list_models",
-  "ollama_list_running",
-  "ollama_warm_model",
+  // Local Ollama process controls and legacy frontend-owned streams
   "ollama_chat_stream",
   "ollama_generate_stream",
-  "ollama_model_show",
-  "ollama_pull_model",
-  "ollama_delete_model",
-  "ollama_server_version",
   "ollama_start_server",
   "ollama_stop_server"
 ]);

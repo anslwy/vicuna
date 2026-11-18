@@ -24,6 +24,7 @@
 
 
 pub mod actions;
+mod chat;
 pub mod embedded;
 pub mod persist;
 pub mod turns;
@@ -78,6 +79,7 @@ pub struct BridgeState {
     /// server mode: each recorded Work turn (event channel -> transcript
     /// being written to the db), see server_turns.rs
     pub recorders: turns::Recorders,
+    chat_turns: chat::ChatTurns,
     /// session -> MCP servers added mid-turn that wake it when the turn ends
     pub mcp_wakes: Arc<Mutex<HashMap<String, Vec<(String, Option<usize>)>>>>,
     /// the user's UTC offset (minutes), as last reported by a window; the
@@ -110,6 +112,7 @@ impl Default for BridgeState {
             last_poll: Arc::new(Mutex::new(HashMap::new())),
             session_turns: Arc::new(Mutex::new(HashMap::new())),
             recorders: Arc::new(Mutex::new(HashMap::new())),
+            chat_turns: Mutex::new(HashMap::new()),
             mcp_wakes: Arc::new(Mutex::new(HashMap::new())),
             tz_offset_min: std::sync::atomic::AtomicI64::new(0),
             sched_lock: tokio::sync::Mutex::new(()),
@@ -218,6 +221,37 @@ async fn dispatch(
 ) -> Result<serde_json::Value, String> {
     let s = |k: &str| arg_str(args, k);
     match cmd {
+        "chat_turn_start" => chat::start(st, args).await,
+        "chat_turn_attach" => chat::attach(st, args).await,
+        "chat_turn_live" => Ok(serde_json::json!(chat::live_turns(st))),
+        "chat_turn_stop" => Ok(serde_json::json!(chat::stop(st, &s("id")?, args["turnId"].as_str()))),
+        "ollama_list_models" => crate::ollama_list_models().await,
+        "ollama_list_running" => crate::ollama_list_running().await,
+        "ollama_model_show" => Ok(serde_json::json!(crate::ollama_model_show(s("model")?).await?)),
+        "ollama_server_version" => Ok(serde_json::json!(crate::ollama_server_version().await?)),
+        "ollama_warm_model" => {
+            crate::ollama_warm_model(s("model")?, s("keepAlive")?).await?;
+            Ok(serde_json::Value::Null)
+        }
+        "ollama_delete_model" => {
+            crate::ollama_delete_model(s("model")?).await?;
+            Ok(serde_json::Value::Null)
+        }
+        "ollama_pull_model" => {
+            let id = args["onEvent"]["__bridge_channel"].as_str().ok_or("missing onEvent channel")?.to_string();
+            let model = s("model")?;
+            let events = st.events.clone();
+            tokio::spawn(async move {
+                let channel = channel_for(&events, &id);
+                let result = crate::ollama_pull_model(model, channel).await;
+                let event = match result {
+                    Ok(()) => serde_json::json!({"type": "done"}),
+                    Err(message) => serde_json::json!({"type": "error", "message": message}),
+                };
+                push_event(&events, &id, &event.to_string());
+            });
+            Ok(serde_json::Value::Null)
+        }
         // ----- work agent turn -----
         "work_agent_start" => {
             let _write = st.chat_lock.lock().await;
@@ -544,6 +578,7 @@ async fn dispatch(
             "chats": st.db.is_some(),
             // records Work turns itself + per-chat revisions (server_turns.rs)
             "persist": st.db.is_some(),
+            "chatTurns": st.db.is_some(),
         })),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
@@ -1187,6 +1222,10 @@ pub const API_ACTIONS: &[&str] = &[
     "browser_status",
     "browser_stop",
     "browser_takeover",
+    "chat_turn_attach",
+    "chat_turn_live",
+    "chat_turn_start",
+    "chat_turn_stop",
     "chats_get",
     "chats_load",
     "chats_merge",
@@ -1210,7 +1249,14 @@ pub const API_ACTIONS: &[&str] = &[
     "mcp_save_server",
     "mcp_signin",
     "mcp_signout",
+    "ollama_delete_model",
     "ollama_fetch_text",
+    "ollama_list_models",
+    "ollama_list_running",
+    "ollama_model_show",
+    "ollama_pull_model",
+    "ollama_server_version",
+    "ollama_warm_model",
     "opencode_models",
     "opencode_set_model",
     "schedule_list",

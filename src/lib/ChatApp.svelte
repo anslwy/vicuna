@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, setServerOllama, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { shouldWarnOllamaUnavailable } from "$lib/ollamaWarning";
   import { notifyTurnEnd, notifyAgentAsk, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
@@ -45,10 +45,10 @@
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, serverRecordsTurns, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { BridgeChannel, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -361,6 +361,7 @@
    *  writes their transcript, runs follow-ups and sends scheduled messages,
    *  so the window skips saving live turns and adopts the server's copy */
   let serverPersist = $state(false);
+  let serverChatTurns = $state(false);
   const scheduleNote = $derived(serverPersist ? SCHEDULE_SERVER_NOTE : SCHEDULE_OPEN_NOTE);
   /** per session: settle its current Work turn as stopped, from outside the
    *  turn's closure (the stop reconciliation below uses it when the
@@ -2071,6 +2072,7 @@
     workTurnSeqByChat.delete(id);
     aborters.get(id)?.abort();
     aborters.delete(id);
+    serverChatFeeds.get(id)?.close();
     // drop any prompts queued for the deleted session (backend-confirmed or
     // not — their turn is gone)
     if (queuedMsgs.some((q) => q.chatId === id)) {
@@ -3792,6 +3794,7 @@
 
   // keep capabilities in step with the selected model
   $effect(() => {
+    if (!ready) return;
     selectedModel;
     thinkLevels = [];
     thinkDefault = null;
@@ -3986,6 +3989,10 @@
       const raw = await invokeOrBridge<any>(action, args);
       if (!raw || typeof raw.id !== "string") return null;
       const fresh = adoptServerChat(raw);
+      if (action === "session_update" && serverChatFeeds.has(fresh.id)) {
+        const live = chats.find((c) => c.id === fresh.id);
+        if (live) fresh.messages = live.messages;
+      }
       chats = chats.some((x) => x.id === fresh.id) ? chats.map((x) => (x.id === fresh.id ? fresh : x)) : [fresh, ...chats];
       // hand back the REACTIVE copy: writes through the raw object would be
       // invisible to the UI (#16) — a regenerate placeholder once was
@@ -4061,7 +4068,9 @@
     persistPrefs();
   }
 
-  const ollamaUnavailableMessage = () => `Ollama isn't reachable at ${activeOllamaBase()}. Start Ollama to use this model.`;
+  const ollamaUnavailableMessage = () => serverChatTurns
+    ? "Ollama isn't reachable on the Vicuna server. Start Ollama there to use this model."
+    : `Ollama isn't reachable at ${activeOllamaBase()}. Start Ollama to use this model.`;
 
   async function warnIfOllamaUnavailable(isOllamaModel: boolean): Promise<boolean> {
     if (!isOllamaModel) return false;
@@ -4446,10 +4455,22 @@
   }
   async function forkAndSave() {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || editingIndex == null || activeStreaming) return;
+    if (!chat || editingIndex == null || busy) return;
     const i = editingIndex;
     const draft = editDraft;
     const imgs = [...editImages];
+    if (serverChatTurns && chat.mode !== "work" && chat.messages[i]?.role === "user") {
+      const forkId = crypto.randomUUID();
+      await startServerChat(chat.id, { operation: "fork_edit", index: i, content: draft, images: imgs, forkId }, forkId, () => {
+        cancelEdit();
+        if (activeId === chat.id) {
+          activeId = forkId;
+          pendingMode = "chat";
+          void goto(`/s/${forkId}`);
+        }
+      });
+      return;
+    }
     if (!(await forkAt(i))) return;
     // forkAt clears the edit state; restore the pending edits onto the fork
     editingIndex = i;
@@ -4520,6 +4541,10 @@
     // replies keep the exact text: trailing whitespace is meaningful when
     // continuing ("Yo! How's " must not collapse into "Yo! How's")
     const text = target.role === "assistant" ? editDraft : trimmed;
+    if (serverChatTurns && chat.mode !== "work" && target.role === "user") {
+      await startServerChat(chat.id, { operation: "edit", index: editingIndex, content: text, images }, chat.id, cancelEdit);
+      return;
+    }
     const edited = await serverAction("message_edit", { id: chat.id, index: editingIndex, content: text, images: images ?? null, truncate: true });
     if (edited === null) return;
     if (edited) {
@@ -4624,6 +4649,213 @@
     if (!made) save();
     void goto(`/s/${fork.id}`);
     return true;
+  }
+
+  type ChatTurnSnapshot = {
+    id: string;
+    turnId: string;
+    chat: unknown;
+    startedMs: number;
+    index: number;
+    continuing: boolean;
+    imagesStripped: boolean;
+  };
+  type ChatTurnEvent =
+    | { type: "token" | "think" | "replace"; text: string }
+    | { type: "done" | "images_stripped" }
+    | { type: "error"; message: string };
+  type ChatTurnOperation =
+    | { operation: "send"; content: string; images?: string[]; titleSource: string }
+    | { operation: "continue" | "regenerate"; index: number }
+    | { operation: "edit"; index: number; content: string; images?: string[] }
+    | { operation: "fork_edit"; index: number; content: string; images: string[]; forkId: string };
+
+  const serverChatFeeds = new Map<string, { stop(): void; close(): void; reconcile(turnId: string | undefined): void }>();
+  let startingChatFromHome: string | null = null;
+
+  function adoptChatTurn(raw: unknown) {
+    const fresh = adoptServerChat(raw);
+    chats = chats.some((c) => c.id === fresh.id)
+      ? chats.map((c) => c.id === fresh.id ? fresh : c)
+      : [fresh, ...chats];
+  }
+
+  async function startServerChat(
+    source: string,
+    operation: ChatTurnOperation,
+    id = source,
+    onStarted?: () => void,
+    options: { model: string; think?: boolean | string; continueMode: ContinueMode; stop: string[] } = {
+      model: selectedModel, think: effectiveThink(), continueMode, stop: stopWords
+    }
+  ) {
+    if (serverChatFeeds.has(id)) return;
+    error = null;
+    const chat = chats.find((c) => c.id === source);
+    const baseRev = chat ? serverSaveRow(chat)?.baseRev : undefined;
+    await followServerChat(id, async (onEvent) => {
+      await serverSavesIdle();
+      return await invokeOrBridge<ChatTurnSnapshot>("chat_turn_start", {
+        id: source,
+        baseRev: operation.operation === "send" && chat ? serverSaveRow(chat)?.baseRev : baseRev,
+        ...operation,
+        ...options,
+        ...(isOpenRouterSelection(options.model) ? { openRouterApiKey: openrouterKey } : {}),
+        onEvent
+      });
+    }, onStarted ?? (() => {}), !isOpenRouterSelection(options.model));
+  }
+
+  async function followServerChat(
+    id: string,
+    subscribe: (onEvent: ReturnType<BridgeChannel["marker"]>) => Promise<ChatTurnSnapshot | null>,
+    onStarted?: () => void,
+    isOllama = false
+  ) {
+    if (serverChatFeeds.has(id)) return;
+    const channel = new BridgeChannel();
+    let snapshot: ChatTurnSnapshot | null = null;
+    let stopped = false;
+    let closed = false;
+    let pendingText = "";
+    let pendingThinking = "";
+    let replacement: string | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let earlyEvents: ChatTurnEvent[] = [];
+    let finish!: (event: ChatTurnEvent) => void;
+    const settled = new Promise<ChatTurnEvent>((resolve) => { finish = resolve; });
+
+    const stop = () => {
+      stopped = true;
+      if (snapshot) {
+        void invokeOrBridge("chat_turn_stop", { id, turnId: snapshot.turnId }).catch((e: Error) => {
+          if (activeId === id) error = e.message;
+        });
+      }
+    };
+    const close = () => {
+      closed = true;
+      channel.stop();
+      clearTimeout(timer);
+      finish({ type: "done" });
+    };
+    let missing = false;
+    function reconcile(turnId: string | undefined) {
+      if (!snapshot || closed) return;
+      if (turnId === snapshot.turnId) {
+        missing = false;
+      } else if (missing) {
+        // The window can sleep longer than the server keeps terminal events.
+        // Give a normal Done/Error time to arrive before fetching the transcript.
+        receive({ type: "done" });
+      } else {
+        missing = true;
+      }
+    }
+    serverChatFeeds.set(id, { stop, close, reconcile });
+
+    function flush() {
+      clearTimeout(timer);
+      timer = undefined;
+      if (closed || !snapshot || (!pendingText && !pendingThinking && replacement === undefined)) return;
+      const { index } = snapshot;
+      const c = chats.find((chat) => chat.id === id);
+      const msg = c?.messages[index];
+      if (!c || !msg) return;
+      const isOpen = activeId === id;
+      const keep = isOpen ? captureStreamSel(index) : null;
+      const held = isOpen && holdReaderPlace();
+      c.messages[index] = {
+        ...msg,
+        content: (replacement ?? msg.content) + pendingText,
+        thinking: (msg.thinking ?? "") + pendingThinking
+      };
+      pendingText = "";
+      pendingThinking = "";
+      replacement = undefined;
+      if (keep) void tick().then(() => restoreStreamSel(index, keep));
+      if (isOpen) scrollBottom();
+      if (held) void releaseReaderPlace();
+    }
+    function receive(event: ChatTurnEvent) {
+      if (event.type === "done" || event.type === "error") {
+        flush();
+        channel.stop();
+        finish(event);
+        return;
+      }
+      if (event.type === "images_stripped") {
+        if (activeId === id) noteImagesStripped();
+        return;
+      }
+      if (event.type === "replace") {
+        replacement = event.text;
+        pendingText = "";
+      } else if (event.type === "think") {
+        pendingThinking += event.text;
+      } else if (event.type === "token") {
+        pendingText += event.text;
+      }
+      timer ??= setTimeout(flush, 120);
+    }
+    channel.onmessage = (event: ChatTurnEvent) => {
+      if (snapshot) receive(event);
+      else earlyEvents.push(event);
+    };
+    let started = false;
+    try {
+      snapshot = await subscribe(channel.marker());
+      if (closed || !snapshot) return;
+      started = true;
+      adoptChatTurn(snapshot.chat);
+      markStreaming(id);
+      streamingStartedAt = { ...streamingStartedAt, [id]: snapshot.startedMs };
+      if (snapshot.continuing) continuingIds = [...continuingIds, id];
+      onStarted?.();
+      if (activeId === id) {
+        if (onStarted) isPinned = true;
+        if (snapshot.imagesStripped) noteImagesStripped();
+        scrollBottom();
+      }
+      if (stopped) stop();
+      for (const event of earlyEvents) receive(event);
+      earlyEvents = [];
+      const end = await settled;
+      if (closed) return;
+      await reloadServerChatTurn(id);
+      if (end.type === "error") throw new Error(end.message);
+    } catch (e) {
+      if (closed) return;
+      if (started) chatErrorIds.add(id);
+      const message = e instanceof Error ? e.message : String(e);
+      if (message.includes("SESSION_CHANGED")) await reloadServerChatTurn(id);
+      if (activeId === id || !started) {
+        if (!started || !await warnIfOllamaUnavailable(isOllama)) error = message;
+      }
+    } finally {
+      close();
+      if (serverChatFeeds.get(id)?.close === close) serverChatFeeds.delete(id);
+      continuingIds = continuingIds.filter((x) => x !== id);
+      if (started) unmarkStreaming(id);
+    }
+  }
+
+  async function reloadServerChatTurn(id: string) {
+    const raw = await invokeOrBridge<unknown>("chats_get", { id }).catch(() => null);
+    if (raw && chats.some((c) => c.id === id) && !unloading) adoptChatTurn(raw);
+  }
+
+  async function reattachServerChatTurns() {
+    const live = await invokeOrBridge<Record<string, string>>("chat_turn_live", {}).catch(() => null);
+    if (!live) return;
+    for (const [id, feed] of serverChatFeeds) feed.reconcile(live[id]);
+    for (const id of Object.keys(live)) {
+      void followServerChat(id, async (onEvent) => {
+        const snapshot = await invokeOrBridge<ChatTurnSnapshot | null>("chat_turn_attach", { id, onEvent });
+        if (!snapshot) await reloadServerChatTurn(id);
+        return snapshot;
+      });
+    }
   }
 
   async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; rawStyle?: PromptStyle; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
@@ -4837,7 +5069,7 @@
 
   async function continueFrom(i: number) {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || busy) return;
+    if (!chat || busy || serverChatFeeds.has(chat.id)) return;
     if (i !== chat.messages.length - 1) return;
     const target = chat.messages[i];
     if (!target || target.role !== "assistant") return;
@@ -4847,6 +5079,10 @@
     // OpenRouter selections have no /api/generate path either — chat and Work
     // are the supported transports there.
     if (isCloudModel(selectedModel) || isOpenRouterSelection(selectedModel)) return;
+    if (serverChatTurns && chat.mode !== "work") {
+      await startServerChat(chat.id, { operation: "continue", index: i });
+      return;
+    }
     error = null;
     const history: ChatMsg[] = compactedHistory(chat.messages.slice(0, i + 1));
     // Two ways to extend a reply. Native /api/chat resends the partial as
@@ -4886,12 +5122,16 @@
 
   async function regenerate(i: number) {
     const chat = chats.find((c) => c.id === activeId);
-    if (!chat || busy) return;
+    if (!chat || busy || serverChatFeeds.has(chat.id)) return;
     if (i !== chat.messages.length - 1) return;
     const target = chat.messages[i];
     if (!target || target.role !== "assistant") return;
     error = null;
     cancelEdit();
+    if (serverChatTurns && chat.mode !== "work") {
+      await startServerChat(chat.id, { operation: "regenerate", index: i });
+      return;
+    }
     // drop the old reply and generate fresh with the currently selected model
     chat.messages = [...chat.messages.slice(0, i)];
     const freshHistory: ChatMsg[] = compactedHistory(chat.messages);
@@ -4994,7 +5234,7 @@
     // only THIS session's own live turn blocks its composer: a turn running
     // in another session never stops this one from sending (each session runs
     // its own stream/work turn concurrently)
-    if (isCompacting(activeId ?? "")) return;
+    if (isCompacting(activeId ?? "") || (activeId === null && startingChatFromHome)) return;
     // Work mode needs the opencode CLI (no fallback engine); a live turn can
     // still take queued messages
     if (composerMode === "work" && workGate.blocked && !activeWorkRunning) return;
@@ -5054,6 +5294,28 @@
     const effectiveMode: "chat" | "work" = chat
       ? (chat.mode ?? (chat.messages.length === 0 ? pendingMode : "chat"))
       : pendingMode;
+    if (serverChatTurns && effectiveMode === "chat") {
+      const fromHome = !chat;
+      if (fromHome && startingChatFromHome) return;
+      if (fromHome) startingChatFromHome = stagedId;
+      try {
+        const titleSource = text || (images ? "Image" : (firstUploadName ?? "New session"));
+        await startServerChat(stagedId, { operation: "send", content: fullText, images, titleSource }, stagedId, () => {
+          if (startingChatFromHome === stagedId) startingChatFromHome = null;
+          if (input.trim() === text && activeId === sentFromId) clearSentComposer();
+          if (fromHome && activeId === sentFromId) {
+            activeId = stagedId;
+            void saveActiveChat(stagedId);
+            void goto(`/s/${stagedId}`);
+          }
+          const sent = chats.find((c) => c.id === stagedId);
+          if (sent) chats = [sent, ...chats.filter((c) => c.id !== stagedId)];
+        });
+      } finally {
+        if (startingChatFromHome === stagedId) startingChatFromHome = null;
+      }
+      return;
+    }
     let workRoot: string | null = null;
     if (effectiveMode === "work") {
       // workspace required before the session begins. Always canonicalized
@@ -5124,14 +5386,7 @@
       // most-recently-active first, so the just-messaged session jumps to top
       chats = [chat, ...chats.filter((x) => x.id !== chat!.id)];
     }
-    input = "";
-    // a send ends any history walk: the next ArrowUp starts from the newest
-    historyIndex = null;
-    historyDraft = "";
-    mention = null;
-    clearDraft(null);
-    attachImages = [];
-    attachFiles = [];
+    clearSentComposer();
     error = null;
 
     if ((chat.mode ?? "chat") === "work" && chat.workspace) {
@@ -5145,6 +5400,17 @@
       // user stayed put: now reflect the session in the URL
       void goto(`/s/${chat.id}`);
     }
+  }
+
+  function clearSentComposer() {
+    input = "";
+    // a send ends any history walk: the next ArrowUp starts from the newest
+    historyIndex = null;
+    historyDraft = "";
+    mention = null;
+    clearDraft(null);
+    attachImages = [];
+    attachFiles = [];
   }
 
   function queuePrompt(text: string, images?: string[]) {
@@ -5892,6 +6158,7 @@
     if (len) ctxWindow = len;
   }
   $effect(() => {
+    if (!ready) return;
     selectedModel;
     openrouterModels;
     void refreshCtxWindow();
@@ -6944,6 +7211,12 @@
 
   /** stop one session's live turn (Stop button, or a lead's manage_sessions) */
   function stopSession(id: string) {
+    const chatFeed = serverChatFeeds.get(id);
+    if (chatFeed) {
+      chatStopIds.add(id);
+      chatFeed.stop();
+      return;
+    }
     if (isWorkRunning(id)) workStopIds.add(id);
     const turnId = workTurnIds.get(id);
     if (turnId) {
@@ -7499,13 +7772,14 @@
     const rows = await invokeOrBridge<any[]>("chats_load", {}).catch(() => []);
     for (const raw of rows) {
       const local = chats.find((c) => c.id === raw.id);
-      if (workRunningIds.includes(raw.id)) continue;
+      if (workRunningIds.includes(raw.id) || serverChatFeeds.has(raw.id)) continue;
       const base = local ? serverSaveRow(local)?.baseRev : null;
       if (!local || (typeof raw.rev === "number" && typeof base === "number" && raw.rev > base)) {
         const fresh = adoptServerChat(raw);
         chats = local ? chats.map((c) => c.id === fresh.id ? fresh : c) : [fresh, ...chats];
       }
     }
+    if (serverChatTurns) await reattachServerChatTurns();
     const live = await liveWorkTurns();
     for (const id of Object.keys(live)) {
       if (workTurnIds.has(id) || workRunningIds.includes(id)) continue;
@@ -8475,13 +8749,14 @@
   onDestroy(() => {
     if (scrollFrame) cancelAnimationFrame(scrollFrame);
     for (const c of aborters.values()) c.abort();
+    for (const feed of serverChatFeeds.values()) feed.close();
   });
 
   /** Server mode with a recording server: wire the store's save hooks and
    *  move the Scheduled list onto the server. */
   async function installServerSync() {
     // a live server turn is written by the server alone
-    serverSync.skip = (id) => serverPersist && workRunningIds.includes(id);
+    serverSync.skip = (id) => serverPersist && (workRunningIds.includes(id) || serverChatFeeds.has(id));
     // a refused save: the server has a newer copy (it recorded a turn while
     // this window slept, or another window saved) — show that one
     serverSync.onConflict = (fresh) => {
@@ -8550,7 +8825,10 @@
         chatsLoaded = true;
       }
       if (isServerBacked() && !srvLoadError) {
-        serverPersist = await serverRecordsTurns();
+        const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean }>("server_info", {}).catch(() => null);
+        serverPersist = info?.persist === true;
+        serverChatTurns = info?.chatTurns === true;
+        setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
       // reopen where the user left off (saved on every navigation); the
@@ -8638,6 +8916,19 @@
           void saveModel(pending.model);
         }
         error = null;
+        if (serverChatTurns && pc.mode !== "work") {
+          clearPendingStreamFor(pc.id);
+          await startServerChat(pc.id, {
+            operation: pending.mode === "continue" ? "continue" : "regenerate",
+            index: pending.index
+          }, pc.id, () => {}, {
+            model: pending.model || selectedModel,
+            think: pending.think,
+            continueMode: pending.rawStyle ? "raw" : "native",
+            stop: pending.stop ?? []
+          });
+          return;
+        }
         if (pending.mode === "fresh") {
           // fresh generations restart from scratch (history excludes the
           // placeholder): drop the stale partial first, or the resumed run
@@ -11230,17 +11521,22 @@
       </div>
     </div>
     <div class="setting-stacked">
-      <span class="setting-label">Ollama host <span class="setting-hint">· browser mode only</span></span>
-      <input
-        class="pull-input"
-        data-testid="ollama-host-input"
-        placeholder="http://localhost:11434"
-        bind:value={ollamaBase}
-        onblur={() => setOllamaHost(ollamaBase)}
-        onkeydown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-        spellcheck={false}
-      />
-      <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. For remote access use the https tailscale URL. The Tauri shell always uses its local Ollama.</span>
+      {#if serverChatTurns}
+        <span class="setting-label">Ollama host</span>
+        <span class="setting-note">Vicuna uses Ollama at http://localhost:11434 on the connected server.</span>
+      {:else}
+        <span class="setting-label">Ollama host <span class="setting-hint">· browser mode only</span></span>
+        <input
+          class="pull-input"
+          data-testid="ollama-host-input"
+          placeholder="http://localhost:11434"
+          bind:value={ollamaBase}
+          onblur={() => setOllamaHost(ollamaBase)}
+          onkeydown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+          spellcheck={false}
+        />
+        <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. For remote access use the https tailscale URL. The Tauri shell always uses its local Ollama.</span>
+      {/if}
     </div>
     <div class="setting-stacked">
       <span class="setting-label">Work engine</span>
@@ -11433,7 +11729,7 @@
           </span>
         </div>
         <div class="model-manage-actions">
-          {#if isTauriRuntime()}
+          {#if isTauriRuntime() && !(serverChatTurns && isRemoteServer())}
             {#if ollamaVersion}
               <button class="mini-btn" data-testid="stop-server-btn" disabled={serverOp !== null} onclick={stopServerFlow}>{serverOp === "stop" ? "…" : "Stop"}</button>
             {:else}
