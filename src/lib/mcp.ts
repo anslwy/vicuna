@@ -134,12 +134,10 @@ export function isAuthError(msg: string | null | undefined): boolean {
   return !!msg && /401|403|unauthorized|sign.?in|forbidden/i.test(msg);
 }
 
-/** Browser sign-in for an OAuth-protected remote server. Opens the system
- *  browser (desktop only — the bridge has no window to open); resolves with
- *  the connected server info once login completes (rejects on
- *  timeout/denial, or when the server needs no sign-in). */
-export async function signInServer(c: McpServerConfig): Promise<McpServerInfo> {
+/** Resolve with the connected server once OAuth and the loopback callback finish. */
+export async function signInServer(c: McpServerConfig, sidePanelBrowser: boolean): Promise<McpServerInfo> {
   return await invokeOrBridge<McpServerInfo>("mcp_signin", {
+    sidePanelBrowser,
     config: {
       id: c.id,
       name: c.name,

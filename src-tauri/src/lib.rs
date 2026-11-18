@@ -5453,7 +5453,7 @@ async fn mcp_signin(
     state: State<'_, mcp::McpManager>,
 ) -> Result<mcp::McpServerInfo, String> {
     use tauri_plugin_opener::OpenerExt;
-    mcp::oauth_login(&config, |url| {
+    mcp::oauth_login(&config, |url| async move {
         app.opener()
             .open_url(url, None::<&str>)
             .map_err(|e| format!("mcp: cannot open browser for sign-in: {e}"))

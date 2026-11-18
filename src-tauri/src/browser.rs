@@ -1401,6 +1401,29 @@ async fn force_stop_port_lb(resource_dir: Option<&Path>) {
     graceful_stop(&bin).await;
 }
 
+/// Open the OAuth page in the browser on the same host as the loopback callback.
+pub(crate) async fn open_sign_in_tab(resource_dir: Option<&Path>, url: &str) -> Result<(), String> {
+    let (bin, _) = resolve_lb_bin(resource_dir)
+        .ok_or_else(|| "no `lb` browser engine found".to_string())?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["--server", &lb_server_url(), "open", "--new-tab", "--", url])
+        .env_remove("LB_TAB")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let status = tokio::time::timeout(Duration::from_secs(30), cmd.status())
+        .await
+        .map_err(|_| "mcp: opening the browser tab timed out".to_string())?
+        .map_err(|e| format!("mcp: could not open the browser tab: {e}"))?;
+    if !status.success() {
+        return Err(format!("mcp: could not open the browser tab ({status})"));
+    }
+    Ok(())
+}
+
 /// Absolute `lb mcp` argv for the default `browser` MCP server entry.
 /// Absolute paths pass `McpManager`'s resolver straight through, which is
 /// what makes the bundled (non-PATH) binary work as an MCP command.

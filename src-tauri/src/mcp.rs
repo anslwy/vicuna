@@ -735,7 +735,7 @@ fn is_auth_failure(err: &str) -> bool {
 // Flow (MCP auth spec / OAuth 2.1, same shape as opencode's browser login):
 // probe `initialize` → on 401 discover the protected-resource metadata →
 // authorization-server metadata → dynamic client registration → PKCE
-// authorize URL in the system browser → loopback redirect captures the code
+// authorize URL in a browser on this host → loopback redirect captures the code
 // → token exchange. Tokens live in ~/vicuna/config/auth.json (0600),
 // keyed by server name; vicuna.json keeps only the server config.
 
@@ -1083,22 +1083,22 @@ async fn fetch_json(url: &str, what: &str) -> Result<serde_json::Value, String> 
 }
 
 /// Full browser sign-in for a remote server. `open_browser` opens the
-/// authorize URL (system browser in production; a test hook in tests).
+/// authorize URL on the same host as the loopback listener.
 /// Persists tokens to auth.json; the caller connects afterwards, which
 /// picks them up. Errors when the server needs no auth so the caller can
 /// fall back to a plain connect.
-pub async fn oauth_login(
+pub async fn oauth_login<F: std::future::Future<Output = Result<(), String>>>(
     cfg: &McpServerConfig,
-    open_browser: impl FnOnce(&str) -> Result<(), String>,
+    open_browser: impl FnOnce(String) -> F,
 ) -> Result<(), String> {
     let path = auth_config_path()?;
     oauth_login_in(cfg, &path, open_browser).await
 }
 
-async fn oauth_login_in(
+async fn oauth_login_in<F: std::future::Future<Output = Result<(), String>>>(
     cfg: &McpServerConfig,
     auth_path: &Path,
-    open_browser: impl FnOnce(&str) -> Result<(), String>,
+    open_browser: impl FnOnce(String) -> F,
 ) -> Result<(), String> {
     let url = cfg.url.clone().unwrap_or_default();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -1119,12 +1119,12 @@ async fn oauth_login_in(
     }
 }
 
-async fn oauth_protected(
+async fn oauth_protected<F: std::future::Future<Output = Result<(), String>>>(
     cfg: &McpServerConfig,
     auth_path: &Path,
     url: &str,
     resource_metadata: Option<String>,
-    open_browser: impl FnOnce(&str) -> Result<(), String>,
+    open_browser: impl FnOnce(String) -> F,
 ) -> Result<(), String> {
     // 2. protected-resource metadata: header first, well-known fallback
     let prm_url = resource_metadata.or_else(|| well_known(url, "oauth-protected-resource"));
@@ -1207,7 +1207,7 @@ async fn oauth_protected(
             (client_id, client_secret)
         }
     };
-    // 5. PKCE + loopback redirect, then open the system browser
+    // 5. PKCE + loopback redirect, then open the browser
     let verifier = random_b64url(32)?;
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_b64url(16)?;
@@ -1228,21 +1228,14 @@ async fn oauth_protected(
     if !prm.scopes_supported.is_empty() {
         auth_url.push_str(&format!("&scope={}", percent_encode(&prm.scopes_supported.join(" "))));
     }
-    // 6. wait for the redirect with the code. The accept task starts BEFORE
-    //    opening the browser: the browser (or a script driving the URL)
-    //    may hit the loopback before open_browser returns.
-    let accept_task = tokio::spawn(wait_for_callback(listener));
-    open_browser(&auth_url)?;
-    let (code, returned_state) = match timeout(
+    // Accept the redirect while opening the browser so even an immediate
+    // callback can complete before the browser opener returns.
+    let ((code, returned_state), ()) = timeout(
         OAUTH_CALLBACK_TIMEOUT + Duration::from_secs(30),
-        accept_task,
+        async { tokio::try_join!(wait_for_callback(listener), open_browser(auth_url)) },
     )
     .await
-    {
-        Err(_) => return Err("mcp: login timed out waiting for the browser (try again)".to_string()),
-        Ok(Err(e)) => return Err(format!("mcp: login callback failed: {e}")),
-        Ok(Ok(inner)) => inner?,
-    };
+    .map_err(|_| "mcp: login timed out waiting for the browser (try again)".to_string())??;
     if returned_state != state {
         return Err("mcp: login callback state mismatch (possible CSRF — aborted)".to_string());
     }
@@ -1997,27 +1990,18 @@ mod oauth_tests {
         text("404 Not Found", "nope")
     }
 
-    /// "Browser" hook for tests: GET the authorize URL with redirects followed,
-    /// which lands on the loopback callback the login flow is listening on.
-    /// The accept task is already running (spawned before open), so this can
-    /// block for the full fetch.
-    fn visit_in_thread(url: &str) -> Result<(), String> {
-        let url = url.to_string();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
-                let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
-                let _ = client.get(&url).send().await;
-            });
-        })
-        .join()
-        .map_err(|_| "mcp: test browser thread panicked".to_string())
+    /// Follow the authorize redirect to the loopback callback.
+    async fn visit_authorize_url(url: String) -> Result<(), String> {
+        reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
-    // NOTE: multi_thread — the "browser" hook below blocks its thread in
-    // join() while the loopback accept task needs executor polling. A
-    // single-thread runtime would starve it (production uses Tauri's
-    // multi-thread runtime, so this is test-only).
     /// Fake OAuth + MCP server on a loopback port. `with_registration`
     /// controls whether the AS metadata advertises DCR (and whether
     /// /register succeeds) — false simulates github-style servers.
@@ -2093,7 +2077,7 @@ mod oauth_tests {
             Probe::Open => panic!("fake should demand auth"),
         }
         // full dance through the fake browser
-        oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap();
+        oauth_login_in(&cfg, &auth_path, visit_authorize_url).await.unwrap();
         let map = read_auth_map_in(&auth_path);
         let entry = map.get("fake").expect("token stored");
         assert_eq!(entry.client_id, "test-client");
@@ -2156,7 +2140,7 @@ mod oauth_tests {
         });
         let auth_path = tmp_auth("open");
         let cfg = test_cfg(format!("{base}/mcp"));
-        let err = oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap_err();
+        let err = oauth_login_in(&cfg, &auth_path, visit_authorize_url).await.unwrap_err();
         assert!(err.contains("does not require sign-in"), "{err}");
         std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
     }
@@ -2168,7 +2152,7 @@ mod oauth_tests {
         let base = spawn_fake(false).await;
         let auth_path = tmp_auth("nodcr");
         let cfg = test_cfg(format!("{base}/mcp"));
-        let err = oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap_err();
+        let err = oauth_login_in(&cfg, &auth_path, visit_authorize_url).await.unwrap_err();
         assert!(err.contains("no open client registration"), "{err}");
         assert!(err.contains("Custom \u{2192} Edit"), "{err}");
         std::fs::remove_dir_all(auth_path.parent().unwrap()).ok();
@@ -2186,7 +2170,7 @@ mod oauth_tests {
             client_id: "static-client".to_string(),
             client_secret: None,
         });
-        oauth_login_in(&cfg, &auth_path, visit_in_thread).await.unwrap();
+        oauth_login_in(&cfg, &auth_path, visit_authorize_url).await.unwrap();
         let map = read_auth_map_in(&auth_path);
         let entry = map.get("fake").expect("token stored");
         assert_eq!(entry.client_id, "static-client");

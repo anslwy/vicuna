@@ -161,7 +161,9 @@ export async function serverLbProxyUrl(id: string): Promise<string> {
 /** One call to the active server: `{ok, data | error}` unwrapped. */
 async function serverInvoke(cmd: string, args: Record<string, any>): Promise<any> {
   const { invoke } = await import("@tauri-apps/api/core");
-  const r = await invoke<any>("server_call", { id: TRANSPORT, path: "/invoke", body: { cmd, args } });
+  // Sign-in holds the request until the user finishes the OAuth flow.
+  const timeoutMs = cmd === "mcp_signin" ? 6 * 60_000 : undefined;
+  const r = await invoke<any>("server_call", { id: TRANSPORT, path: "/invoke", body: { cmd, args }, timeoutMs });
   if (!r?.ok) throw new Error(r?.error ?? `${cmd} failed on the server`);
   return r.data ?? null;
 }
