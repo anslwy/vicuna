@@ -90,11 +90,34 @@
 
   let chats = $state<Chat[]>([]);
   let activeId = $state<string | null>(null);
+  /** chats loaded: every effect/gate that reads the session list waits on it */
   let ready = $state(false);
+  /** the window shell can draw (prefs applied). Set before the session list
+   *  arrives: a remote server's full history can take a minute on a slow
+   *  link, and the window used to stay blank (white once the splash's 15 s
+   *  backstop removed it) until it landed. */
+  let uiReady = $state(false);
+  /** the session list arrived (or failed): hides the sidebar loading row */
+  let chatsLoaded = $state(false);
   // fade out the launch splash (src/app.html) once real content can show
   $effect(() => {
-    if (ready) hideSplash();
+    if (uiReady || ready) hideSplash();
   });
+  /** shown while the session list is still loading (seconds, ticks) */
+  let loadingSince = $state(0);
+  let loadingTick = $state(0);
+  $effect(() => {
+    if (chatsLoaded || !uiReady) return;
+    const t = setInterval(() => (loadingTick = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
+  const loadingSecs = $derived(loadingSince ? Math.max(0, Math.floor(((loadingTick || loadingSince) - loadingSince) / 1000)) : 0);
+  /** sends would race the incoming list (it replaces `chats` wholesale) */
+  function blockedWhileLoading(): boolean {
+    if (ready) return false;
+    flashNotice("Sessions are still loading. Try again in a moment.");
+    return true;
+  }
   const initialPrefs = typeof window !== "undefined" ? readStartupPrefs() : { theme: "light" as const, accent: "orange", fontSize: 14.5, sidebarOpen: true, stopWords: [...DEFAULT_STOP_WORDS], ollamaBase: "", zoom: 1, defaultWorkspace: "", thinkLevel: "auto", continueMode: "raw" as const, openrouterApiKey: "", openrouterAdded: [] as string[], sessionFilter: "all" };
   // the chat/Work transports read the key from the openrouter module
   setOpenRouterApiKey(initialPrefs.openrouterApiKey ?? "");
@@ -1395,6 +1418,7 @@
   /** Schedule the composer's message for `at` instead of sending it now. */
   async function scheduleSend(at: number) {
     scheduleMenuOpen = false;
+    if (blockedWhileLoading()) return;
     const text = input.trim();
     const images = attachImages.length ? [...attachImages] : undefined;
     if (!text && !images) return;
@@ -4957,6 +4981,7 @@
   }
 
   async function send() {
+    if (blockedWhileLoading()) return;
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
     // only THIS session's own live turn blocks its composer: a turn running
@@ -5801,6 +5826,10 @@
 
   /** run the highlighted slash command, then clear the composer */
   function runSlash() {
+    if (blockedWhileLoading()) {
+      slash = null;
+      return;
+    }
     const item = slash?.items[slash.index];
     const cmd = item?.name;
     slash = null;
@@ -8498,12 +8527,20 @@
       sessionFilterRaw = prefs.sessionFilter ?? ALL_FILTER;
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
+      // restore the unsent composer text (one global box, not per session;
+      // local storage) before drawing, so typing while sessions load is kept
+      input = readDraft(null);
+      // draw the window now; the session list follows
+      loadingSince = Date.now();
+      uiReady = true;
       try {
         chats = await loadChats();
       } catch (e) {
         if (!isServerBacked()) throw e;
         chats = [];
         srvLoadError = e instanceof Error ? e.message : String(e);
+      } finally {
+        chatsLoaded = true;
       }
       if (isServerBacked() && !srvLoadError) {
         serverPersist = await serverRecordsTurns();
@@ -8545,8 +8582,6 @@
         pendingOpenChatId = null;
         if (chats.some((c) => c.id === id)) void goto(`/s/${id}`);
       }
-      // restore the unsent composer text (one global box, not per session)
-      input = readDraft(null);
       const savedCatalog = await loadCatalog();
       if (savedCatalog) {
         catalog = savedCatalog.entries;
@@ -8563,6 +8598,8 @@
     } catch (e) {
       console.error("storage load failed:", e);
     } finally {
+      uiReady = true;
+      chatsLoaded = true;
       ready = true;
     }
     // vicuna:// links that arrived before chats loaded (cold start: the
@@ -8635,7 +8672,7 @@
   }
 </script>
 
-{#if ready}
+{#if uiReady}
 <!-- agent question body (vicuna-mcp ask_user): choices prefill the answer
      box (never answer directly), the box takes pasted images; shared by the
      live card and the put-off "Answer later" cards -->
@@ -8909,7 +8946,11 @@
           <div class="group-label">Older</div>
           {@render chatList(grouped.older)}
         {/if}
-        {#if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
+        {#if !chatsLoaded}
+          <div class="empty-hint loading-sessions" data-testid="sessions-loading" role="status">
+            <span class="shimmer">Loading sessions{onServer ? ` from ${srvLabel}` : ""}…</span>{#if loadingSecs >= 3}{" "}{loadingSecs}s{/if}
+          </div>
+        {:else if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
           <div class="group-label">{sessionFilter === ALL_FILTER ? "Today" : "No matches"}</div>
           <div class="empty-hint">{sessionFilter === ALL_FILTER ? "No chats yet" : "No sessions in this scope yet"}</div>
         {/if}

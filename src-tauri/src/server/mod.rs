@@ -928,7 +928,71 @@ async fn proxy_lb(req: hyper::Request<hyper::body::Incoming>) -> hyper::Response
     builder.body(full_body(bytes)).unwrap_or_else(|_| json_resp(502, ""))
 }
 
+/// Responses smaller than this go out as-is (gzip would barely pay off).
+const GZIP_MIN: usize = 1024;
+
+fn accepts_gzip(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|e| {
+            let mut parts = e.split(';');
+            let name = parts.next().unwrap_or("").trim();
+            let q_zero = parts.any(|p| matches!(p.trim().replace(' ', "").as_str(), "q=0" | "q=0.0" | "q=0.00" | "q=0.000"));
+            (name.eq_ignore_ascii_case("gzip") || name == "*") && !q_zero
+        })
+}
+
+fn gzip_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    // fast level: the server may be a Steam Deck, and the win is the wire
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 4), flate2::Compression::fast());
+    enc.write_all(data).ok()?;
+    enc.finish().ok()
+}
+
+/// gzip a JSON response for a client that accepts it. Chat history is text
+/// heavy and a remote `chats_load` is megabytes: over a slow link the window
+/// waited a minute or more for it before drawing (measured 6 MB in 85 s).
+/// Only our own JSON responses: the live-browser proxy keeps its encoding and
+/// streams untouched.
+async fn maybe_gzip(resp: hyper::Response<BoxBody>) -> hyper::Response<BoxBody> {
+    use http_body_util::BodyExt;
+    let is_json = resp
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes() == b"application/json");
+    if !is_json || resp.headers().contains_key(hyper::header::CONTENT_ENCODING) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let data = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => match e {},
+    };
+    if data.len() < GZIP_MIN {
+        return hyper::Response::from_parts(parts, full_body(data));
+    }
+    match gzip_bytes(&data) {
+        Some(z) => {
+            parts.headers.insert(hyper::header::CONTENT_ENCODING, hyper::header::HeaderValue::from_static("gzip"));
+            parts.headers.insert(hyper::header::VARY, hyper::header::HeaderValue::from_static("Accept-Encoding"));
+            parts.headers.remove(hyper::header::CONTENT_LENGTH);
+            hyper::Response::from_parts(parts, full_body(z))
+        }
+        None => hyper::Response::from_parts(parts, full_body(data)),
+    }
+}
+
 async fn handle(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
+    let gzip = accepts_gzip(req.headers()) && !req.uri().path().starts_with("/lb");
+    let resp = handle_inner(st, req).await;
+    if gzip { maybe_gzip(resp).await } else { resp }
+}
+
+async fn handle_inner(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
     use http_body_util::BodyExt;
     use hyper::Method;
     let path = req.uri().path().to_string();
@@ -1343,3 +1407,48 @@ mod event_queue_tests {
     }
 }
 
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::*;
+
+    fn hdr(v: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::ACCEPT_ENCODING, hyper::header::HeaderValue::from_str(v).unwrap());
+        h
+    }
+
+    #[test]
+    fn accept_encoding_parsing() {
+        assert!(accepts_gzip(&hdr("gzip")));
+        assert!(accepts_gzip(&hdr("br, gzip, deflate")));
+        assert!(accepts_gzip(&hdr("gzip;q=0.5")));
+        assert!(accepts_gzip(&hdr("*")));
+        assert!(!accepts_gzip(&hdr("gzip;q=0")));
+        assert!(!accepts_gzip(&hdr("br, deflate")));
+        assert!(!accepts_gzip(&hyper::HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn large_json_is_gzipped_small_and_foreign_are_not() {
+        use http_body_util::BodyExt;
+        use std::io::Read;
+        let big = serde_json::json!({"ok": true, "data": "hello world ".repeat(2000)}).to_string();
+        let resp = maybe_gzip(json_resp(200, big.clone())).await;
+        assert_eq!(resp.headers().get(hyper::header::CONTENT_ENCODING).unwrap(), "gzip");
+        let z = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(z.len() < big.len() / 10);
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(&z[..]).read_to_string(&mut out).unwrap();
+        assert_eq!(out, big);
+
+        let small = maybe_gzip(json_resp(200, r#"{"ok":true}"#)).await;
+        assert!(small.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+
+        let html = hyper::Response::builder()
+            .header("Content-Type", "text/html")
+            .body(full_body("x".repeat(5000)))
+            .unwrap();
+        assert!(maybe_gzip(html).await.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+    }
+}

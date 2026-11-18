@@ -1,6 +1,6 @@
 [package]
 name = "vicuna"
-version = "0.0.24"
+version = "0.0.25"
 description = "Vicuna — minimal desktop chat client for Ollama"
 authors = ["you"]
 edition = "2024"
@@ -66,7 +66,8 @@ base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.3"
 tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt", "rt-multi-thread", "macros", "fs", "net"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "gzip"] }
+flate2 = "1"
 futures-util = "0.3"
 portable-pty = "0.9.0"
 hyper = { version = "1", features = ["http1", "server"] }
