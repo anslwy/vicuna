@@ -1,6 +1,6 @@
 [package]
 name = "vicuna"
-version = "0.0.22"
+version = "0.0.23"
 description = "Vicuna — minimal desktop chat client for Ollama"
 authors = ["you"]
 edition = "2024"
@@ -40,10 +40,6 @@ desktop = [
     "dep:tauri-plugin-single-instance",
     "reqwest/default-tls",
     "reqwest/macos-system-configuration",
-    "dep:hyper",
-    "dep:hyper-util",
-    "dep:http-body-util",
-    "dep:bytes",
     "dep:tokio-native-tls",
 ]
 # server builds: Rust-native TLS, so no system OpenSSL is needed either
@@ -73,10 +69,10 @@ tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt",
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2"] }
 futures-util = "0.3"
 portable-pty = "0.9.0"
-hyper = { version = "1", features = ["http1", "server"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-http-body-util = { version = "0.1", optional = true }
-bytes = { version = "1", optional = true }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = { version = "0.1" }
+bytes = { version = "1" }
 tokio-native-tls = { version = "0.3", optional = true }
 
 # A second launch on Windows/Linux (Start menu, taskbar, launcher, deep link)

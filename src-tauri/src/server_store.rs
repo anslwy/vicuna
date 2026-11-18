@@ -226,7 +226,10 @@ pub(crate) async fn merge_chats(
     let err = |e: sqlx::Error| format!("save chats: {e}");
     let mut out = MergeOutcome::default();
     let mut refused: Vec<String> = Vec::new();
-    let mut tx = pool.begin().await.map_err(err)?;
+    // IMMEDIATE: a deferred read-then-write transaction fails at once with
+    // SQLITE_BUSY ("database is locked") when another writer got there first
+    // (busy_timeout can't help an upgrade); IMMEDIATE waits its turn instead
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
     for id in &deleted {
         sqlx::query("DELETE FROM messages WHERE chat_id = $1").bind(id).execute(&mut *tx).await.map_err(err)?;
         sqlx::query("DELETE FROM chats WHERE id = $1").bind(id).execute(&mut *tx).await.map_err(err)?;
@@ -308,7 +311,7 @@ pub async fn write_messages(pool: &SqlitePool, id: &str, messages: &[Value], upd
     let err = |e: sqlx::Error| format!("record turn: {e}");
     let rows: Vec<crate::MsgSaveRow> =
         serde_json::from_value(Value::Array(messages.to_vec())).map_err(|e| format!("record turn: {e}"))?;
-    let mut tx = pool.begin().await.map_err(err)?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
     let rev: Option<Option<i64>> = sqlx::query_scalar("SELECT rev FROM chats WHERE id = $1")
         .bind(id)
         .fetch_optional(&mut *tx)

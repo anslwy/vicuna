@@ -169,6 +169,12 @@ impl AcpState {
     /// Stop for agy: end its whole process group (agy leaves the command a
     /// cancelled call started running), so nothing outlives the turn. The
     /// next turn respawns agy and resumes the saved session.
+    /// The warm engine process's pid (agy: to watch its background commands).
+    async fn engine_pid(&self, engine: Engine, workspace: &str) -> Option<u32> {
+        let ws = process_workspace(engine, workspace).to_string();
+        self.procs.lock().await.get(&(engine, ws)).and_then(|p| p.pid)
+    }
+
     async fn kill_tree(&self, engine: Engine, workspace: &str) {
         let ws = process_workspace(engine, workspace).to_string();
         if let Some(p) = self.procs.lock().await.remove(&(engine, ws)) {
@@ -280,6 +286,10 @@ pub struct McpSnapshot {
     pub tool_counts: HashMap<String, usize>,
     pub browser_command: Option<Vec<String>>,
     pub browser_server_url: String,
+    /// Per-session MCP pick (`vicuna session new --mcp a,b`): when set, only
+    /// these servers (by name or id, enabled or not) are handed over, plus
+    /// vicuna-mcp. `None` = the MCP dialog's enabled servers, as before.
+    pub only: Option<Vec<String>>,
 }
 
 impl McpSnapshot {
@@ -294,6 +304,7 @@ impl McpSnapshot {
             tool_counts,
             browser_command,
             browser_server_url: crate::browser::lb_server_url(),
+            only: None,
         }
     }
 }
@@ -378,7 +389,8 @@ fn skipped_note(skipped: &[PlannedServer]) -> Option<String> {
 pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Option<String>) {
     let files = crate::mcp::list_file_servers().unwrap_or_default();
     let mut planned = Vec::new();
-    for s in files.iter().filter(|s| s.enabled) {
+    let picked = |id: &str, name: &str| snap.only.as_ref().map(|o| o.iter().any(|x| x == id || x == name));
+    for s in files.iter().filter(|s| picked(&s.id, &s.name).unwrap_or(s.enabled)) {
         let tools = snap.tool_counts.get(&s.id).copied();
         let entry = if s.normalized_transport() == "stdio" {
             match s.command.as_deref().and_then(|c| stdio_entry(&s.name, c, s.env.clone())) {
@@ -392,7 +404,7 @@ pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Opt
         planned.push(PlannedServer { name: s.name.clone(), entry, tools });
     }
     let file_has_browser = files.iter().any(|s| s.id == BROWSER_MCP_ID || s.name == BROWSER_MCP_ID);
-    if !file_has_browser {
+    if !file_has_browser && picked(BROWSER_MCP_ID, BROWSER_MCP_ID) != Some(false) {
         if let Some(cmd) = &snap.browser_command {
             let env = HashMap::from([("LB_SERVER".to_string(), snap.browser_server_url.clone())]);
             if let Some(entry) = stdio_entry(BROWSER_MCP_ID, cmd, Some(env)) {
@@ -1783,10 +1795,16 @@ async fn run_turn_inner(
     let mut blocks = prompt_blocks(&text, &last_user.images);
 
     let mut first_round = true;
+    // follow-ups sent after agy ended a turn early on a backgrounded command
+    let mut agy_nudges = 0usize;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // agy's processes before this round: whatever is new at its end
+        // (and still alive) was started by this round's commands
+        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace).await } else { None };
+        let agy_baseline = agy_pid.map(super::agy::descendants).unwrap_or_default();
         emit_ev(
             on_event,
             stop,
@@ -1884,6 +1902,56 @@ async fn run_turn_inner(
             }
         }
 
+        // agy waits only ~10 s on a shell command, then moves it to the
+        // background and ends the turn ("I'll report when it finishes") — and
+        // never comes back by itself over ACP (verified with agy 1.5.9: no
+        // completion update, no self-initiated turn). Keep the turn open
+        // until the command's processes exit, then prompt agy to collect the
+        // output and carry on.
+        if let Some(pid) = agy_pid {
+            let pending: Vec<String> = tools
+                .values()
+                .filter(|t| t.started && !t.ended && t.kind == "execute")
+                .map(|t| t.name.clone())
+                .collect();
+            if !pending.is_empty() && agy_nudges < AGY_MAX_NUDGES {
+                emit_ev(on_event, stop, WorkAgentEvent::Status { label: Some("Waiting for the running command…".to_string()) });
+                let waited = wait_background_commands(pid, &agy_baseline, turn, stop).await;
+                emit_ev(on_event, stop, WorkAgentEvent::Status { label: None });
+                match waited {
+                    BgWait::Stopped => {
+                        state.kill_tree(engine, workspace).await;
+                        emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
+                        break;
+                    }
+                    BgWait::Finished => {
+                        for name in pending {
+                            emit_ev(on_event, stop, WorkAgentEvent::ToolEnd { name, output: "(finished in the background)".to_string() });
+                        }
+                        agy_nudges += 1;
+                        // queued messages ride along with the follow-up
+                        let queued = take_queue(turn);
+                        let mut text = AGY_BG_DONE_PROMPT.to_string();
+                        let mut images = None;
+                        if !queued.is_empty() {
+                            let ids: Vec<String> = queued.iter().map(|(id, _)| id.clone()).collect();
+                            let drained: Vec<ChatMessage> = queued.into_iter().map(|(_, m)| m).collect();
+                            emit_ev(on_event, stop, WorkAgentEvent::QueueDrained { ids, messages: drained.clone() });
+                            let (t, i) = messages_text(&drained);
+                            text = format!("{text}\n\nThe user also sent:\n{t}");
+                            images = i;
+                        }
+                        blocks = prompt_blocks(&text, &images);
+                        first_round = false;
+                        continue;
+                    }
+                    // a queued message interrupts the wait: it goes out below,
+                    // with a note that the command may still be running
+                    BgWait::Queued => {}
+                }
+            }
+        }
+
         // opencode has no mid-turn steering: messages queued while it worked
         // run as the next prompt of this same turn.
         let queued = take_queue(turn);
@@ -1912,9 +1980,54 @@ async fn run_turn_inner(
     Ok(())
 }
 
+/// How many times one Work turn re-prompts agy after a backgrounded command.
+const AGY_MAX_NUDGES: usize = 20;
+
+/// Sent (not shown as a user message) once agy's backgrounded command exits.
+const AGY_BG_DONE_PROMPT: &str = "[Vicuna] The command you started in the background has finished. Get its output (manage_task status), then continue the task. Do not end your turn while a command you need is still running.";
+
+#[derive(Debug, PartialEq)]
+enum BgWait {
+    Finished,
+    Stopped,
+    Queued,
+}
+
+/// Wait until every process agy started this round has exited (or Stop /
+/// a queued message ends the wait). Polls `ps` once a second.
+async fn wait_background_commands(
+    pid: u32,
+    baseline: &std::collections::HashSet<u32>,
+    turn: &Arc<TurnState>,
+    stop: &AtomicBool,
+) -> BgWait {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return BgWait::Stopped;
+        }
+        if turn.queue.lock().map(|q| !q.is_empty()).unwrap_or(false) {
+            return BgWait::Queued;
+        }
+        let now = tokio::task::spawn_blocking(move || super::agy::descendants(pid)).await.unwrap_or_default();
+        if now.difference(baseline).next().is_none() {
+            return BgWait::Finished;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_descendants_walk_the_whole_tree() {
+        // 10 = agy; 11 its shell; 12 the command; 20 unrelated; 13 an MCP server
+        let pairs = [(10, 1), (11, 10), (12, 11), (20, 1), (13, 10), (21, 20)];
+        let d = crate::agy::descendants_of(10, &pairs);
+        assert_eq!(d, [11, 12, 13].into_iter().collect());
+        assert!(crate::agy::descendants_of(99, &pairs).is_empty());
+    }
 
     #[test]
     fn cached_mcp_processes_are_scoped_to_their_workspace_routes() {

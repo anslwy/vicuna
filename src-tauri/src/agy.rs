@@ -94,6 +94,45 @@ pub fn kill_group(pid: Option<u32>) {
     let _ = pid;
 }
 
+/// Every process below `pid` (children, grandchildren, …). agy runs its
+/// shell commands as its own descendants, so a command it moved to the
+/// background shows up here until it exits. Empty where `ps` is unavailable
+/// (Windows), which turns the background-command wait off.
+pub fn descendants(pid: u32) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    #[cfg(unix)]
+    {
+        let Ok(o) = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid="]).stderr(std::process::Stdio::null()).output() else {
+            return out;
+        };
+        let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect();
+        out = descendants_of(pid, &pairs);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    out
+}
+
+/// `(pid, ppid)` pairs → every descendant of `root` (pure; tested).
+pub fn descendants_of(root: u32, pairs: &[(u32, u32)]) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        for (c, pp) in pairs {
+            if *pp == p && *c != root && out.insert(*c) {
+                frontier.push(*c);
+            }
+        }
+    }
+    out
+}
+
 pub fn acp_args(ask: bool) -> Vec<&'static str> {
     let mut args = vec!["acp", "--disable-telemetry"];
     if !ask {

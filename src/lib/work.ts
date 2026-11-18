@@ -5,7 +5,7 @@
 
 import type { ChatMsg } from "./ollama";
 import { isTauriRuntime } from "./ollama";
-import { invokeOrBridge, BridgeChannel, bridgeInvoke, isRemoteServer, useLocalIpc } from "./bridge";
+import { invokeOrBridge, BridgeChannel, bridgeInvoke, isRemoteServer, isServerBacked, useLocalIpc } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
 // pure formatters live in toolFormat.ts (node-testable; the server ports them)
@@ -603,7 +603,7 @@ let serverPersistCache: Promise<boolean> | null = null;
 /** Does this window's server record Work turns itself (and check chat
  *  revisions)? False for This computer, the dev bridge and older servers. */
 export function serverRecordsTurns(): Promise<boolean> {
-  if (!isRemoteServer()) return Promise.resolve(false);
+  if (!isServerBacked()) return Promise.resolve(false);
   serverPersistCache ??= bridgeInvoke("server_info", {})
     .then((i: any) => i?.persist === true)
     .catch(() => {

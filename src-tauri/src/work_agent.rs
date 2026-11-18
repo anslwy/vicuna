@@ -77,19 +77,32 @@ impl WorkAgentState {
         let turn_id = format!("turn-{}", self.seq.fetch_add(1, Ordering::Relaxed) + 1);
         if let Ok(mut turns) = self.turns.lock() {
             turns.insert(turn_id.clone(), turn);
-            while turns.len() > 20 {
-                if let Some(k) = turns.keys().next().cloned() {
-                    turns.remove(&k);
-                } else {
-                    break;
-                }
-            }
+            prune_turns(&mut turns, 20);
         }
         turn_id
     }
 
     pub fn get_turn(&self, turn_id: &str) -> Option<Arc<TurnState>> {
         self.turns.lock().ok()?.get(turn_id).cloned()
+    }
+}
+
+/// Keep at most `keep` turns, dropping FINISHED ones oldest first. A live
+/// turn is never dropped: `keys().next()` on a HashMap used to evict an
+/// arbitrary (often running) turn once a server had seen 20, so its answers
+/// failed with "unknown turn" and Stop saw it as idle while it ran on.
+fn prune_turns(turns: &mut HashMap<String, Arc<TurnState>>, keep: usize) {
+    if turns.len() <= keep {
+        return;
+    }
+    let seq = |k: &str| k.trim_start_matches("turn-").parse::<u64>().unwrap_or(0);
+    let mut done: Vec<String> = turns.iter().filter(|(_, t)| t.done.load(Ordering::Relaxed)).map(|(k, _)| k.clone()).collect();
+    done.sort_by_key(|k| seq(k));
+    for k in done {
+        if turns.len() <= keep {
+            break;
+        }
+        turns.remove(&k);
     }
 }
 
@@ -301,6 +314,31 @@ pub async fn work_agent_answer(
 }
 
 #[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_keeps_live_turns_and_drops_the_oldest_finished() {
+        let mut m: HashMap<String, Arc<TurnState>> = HashMap::new();
+        for i in 1..=25u64 {
+            let t = Arc::new(TurnState::new());
+            // odd turns finished, even ones still running
+            t.done.store(i % 2 == 1, Ordering::Relaxed);
+            m.insert(format!("turn-{i}"), t);
+        }
+        prune_turns(&mut m, 20);
+        assert_eq!(m.len(), 20);
+        for i in (2..=24).step_by(2) {
+            assert!(m.contains_key(&format!("turn-{i}")), "live turn-{i} kept");
+        }
+        for i in [1, 3, 5, 7, 9] {
+            assert!(!m.contains_key(&format!("turn-{i}")), "oldest finished turn-{i} dropped");
+        }
+        assert!(m.contains_key("turn-25"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -381,8 +419,18 @@ mod tests {
         let first = s.next_turn(Arc::new(TurnState::new()));
         assert_eq!(first, "turn-1");
         for _ in 0..25 {
-            s.next_turn(Arc::new(TurnState::new()));
+            let t = Arc::new(TurnState::new());
+            t.done.store(true, Ordering::Relaxed); // finished turns are prunable
+            s.next_turn(t);
         }
         assert!(s.turns.lock().unwrap().len() <= 20);
+        // a live turn is never pruned, however many follow it
+        let live = s.next_turn(Arc::new(TurnState::new()));
+        for _ in 0..30 {
+            let t = Arc::new(TurnState::new());
+            t.done.store(true, Ordering::Relaxed);
+            s.next_turn(t);
+        }
+        assert!(s.get_turn(&live).is_some());
     }
 }

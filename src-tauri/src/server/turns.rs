@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use vicuna_lib::work_agent::{agent_answer, agent_queue_msg, TurnState, WorkAgentEvent};
-use vicuna_lib::work_engine::Engine;
-use vicuna_lib::ChatMessage;
+use crate::work_agent::{agent_answer, agent_queue_msg, TurnState, WorkAgentEvent};
+use crate::work_engine::Engine;
+use crate::ChatMessage;
 
-use crate::persist::{self, Recorder};
-use crate::BridgeState;
+use crate::server::persist::{self, Recorder};
+use crate::server::BridgeState;
 
 /// How often a live turn's transcript is written while it streams.
 const WRITE_EVERY: Duration = Duration::from_secs(2);
@@ -64,7 +64,17 @@ pub fn uuid() -> String {
 /// for them are refused (the server is their only writer until the turn ends).
 pub fn live_sessions(st: &BridgeState) -> HashSet<String> {
     let recs: Vec<Arc<Mutex<RecState>>> = st.recorders.lock().map(|m| m.values().cloned().collect()).unwrap_or_default();
-    recs.iter().filter_map(|r| r.lock().ok().map(|r| r.rec.chat_id.clone())).collect()
+    recs.iter()
+        .filter_map(|r| {
+            let g = r.lock().ok()?;
+            // a recorder whose turn ended without a terminal event (finalize
+            // never started) would otherwise refuse every save of that session
+            // forever with SESSION_CHANGED; once finalize runs it is live
+            // until it removes itself
+            let ended = st.agent.get_turn(&g.turn_id).map_or(true, |t| t.done.load(Ordering::Relaxed));
+            (g.finishing || !ended).then(|| g.rec.chat_id.clone())
+        })
+        .collect()
 }
 
 fn chat_message(v: &Value) -> Option<ChatMessage> {
@@ -90,6 +100,8 @@ pub struct LaunchParams {
     pub lead: bool,
     pub rec: Option<Recorder>,
     pub report_to: Option<String>,
+    /// per-session MCP pick (`extra.mcp`), None = the MCP dialog's servers
+    pub mcp_only: Option<Vec<String>>,
 }
 
 /// The live turn of a session, if one is still running.
@@ -114,7 +126,8 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     let turn = Arc::new(TurnState::new());
     turn.lead.store(p.lead, Ordering::Relaxed);
     let turn_id = st.agent.next_turn(turn.clone());
-    let mcp_snapshot = vicuna_lib::acp::McpSnapshot::capture(&st.mcp, crate::test_resource_dir().as_deref()).await;
+    let mut mcp_snapshot = crate::acp::McpSnapshot::capture(&st.mcp, crate::server::test_resource_dir().as_deref()).await;
+    mcp_snapshot.only = p.mcp_only;
     if let (Some(sid), Ok(mut m)) = (&p.session_id, st.session_turns.lock()) {
         m.insert(sid.clone(), (turn_id.clone(), p.uuid.clone(), now_ms() as u64));
     }
@@ -143,7 +156,7 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     let (model, workspace, messages, session_id, goal_text, fresh, engine) =
         (p.model, p.workspace, p.messages, p.session_id, p.goal_text, p.fresh_session, p.engine);
     tokio::spawn(async move {
-        vicuna_lib::acp::run_turn(
+        crate::acp::run_turn(
             turn, model, workspace, messages, session_id, goal_text, fresh, on_event, &acp, mcp_snapshot, engine,
         )
         .await;
@@ -198,7 +211,7 @@ fn work_channel(
             }
         }
         let Some(rs) = &rs else {
-            crate::push_event(&st.events, &uuid, &raw);
+            crate::server::push_event(&st.events, &uuid, &raw);
             return Ok(());
         };
         let Ok(mut g) = rs.lock() else { return Ok(()) };
@@ -217,7 +230,7 @@ fn work_channel(
         }
         // pushed under the recorder lock: a reattaching window's snapshot
         // (which takes the same lock) never sees an event twice or misses one
-        crate::push_event(&st.events, &uuid, &raw);
+        crate::server::push_event(&st.events, &uuid, &raw);
         Ok(())
     })
 }
@@ -235,7 +248,7 @@ async fn write_rec(st: &BridgeState, rs: &Arc<Mutex<RecState>>, force: bool) {
         g.rec.touched = false;
         out
     };
-    if let Err(e) = vicuna_lib::server_store::write_messages(db, &id, &msgs, touched.then(now_ms)).await {
+    if let Err(e) = crate::server_store::write_messages(db, &id, &msgs, touched.then(now_ms)).await {
         eprintln!("vicuna: {e}");
         if e.contains("no longer exists") {
             if let Ok(mut g) = rs.lock() {
@@ -303,7 +316,7 @@ async fn finalize(st: Arc<BridgeState>, rs: Arc<Mutex<RecState>>, uuid: String, 
     }
     if let Ok(mut g) = rs.lock() {
         for raw in std::mem::take(&mut g.deferred) {
-            crate::push_event(&st.events, &uuid, &raw);
+            crate::server::push_event(&st.events, &uuid, &raw);
         }
     }
     if let Ok(mut m) = st.recorders.lock() {
@@ -313,9 +326,9 @@ async fn finalize(st: Arc<BridgeState>, rs: Arc<Mutex<RecState>>, uuid: String, 
 
 async fn report_to_lead(st: &Arc<BridgeState>, worker: &str, lead: &str, reply: &str, stopped: bool) {
     let Some(db) = &st.db else { return };
-    let Ok(Some(w)) = vicuna_lib::server_store::load_chat(db, worker).await else { return };
+    let Ok(Some(w)) = crate::server_store::load_chat(db, worker).await else { return };
     let extra = parse_extra(&w);
-    let engine = vicuna_lib::work_engine::effective_engine(extra.engine.as_deref());
+    let engine = crate::work_engine::effective_engine(extra.engine.as_deref());
     let model = if extra.engine.is_some() { extra.work_model.clone() } else { engine.saved_model() };
     let title = w.get("title").and_then(Value::as_str).unwrap_or("").to_string();
     let msg = json!({
@@ -336,16 +349,18 @@ async fn report_to_lead(st: &Arc<BridgeState>, worker: &str, lead: &str, reply: 
 }
 
 #[derive(Default)]
-struct Extra {
-    engine: Option<String>,
-    work_model: Option<String>,
-    lead: bool,
+pub struct Extra {
+    pub engine: Option<String>,
+    pub work_model: Option<String>,
+    pub lead: bool,
+    pub mcp: Option<Vec<String>>,
 }
 
-fn parse_extra(chat: &Value) -> Extra {
+pub fn parse_extra(chat: &Value) -> Extra {
     let o: Value = chat.get("extra").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let s = |k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
-    Extra { engine: s("engine"), work_model: s("workModel"), lead: o.get("role").and_then(Value::as_str) == Some("lead") }
+    let mcp = o.get("mcp").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    Extra { engine: s("engine"), work_model: s("workModel"), lead: o.get("role").and_then(Value::as_str) == Some("lead"), mcp }
 }
 
 /// Send a message into a session the way a window would: queued into its
@@ -367,7 +382,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         return Err(format!("session {chat_id} already has a Work turn running"));
     }
     let db = st.db.as_ref().ok_or("no server db")?;
-    let chat = vicuna_lib::server_store::load_chat(db, chat_id)
+    let chat = crate::server_store::load_chat(db, chat_id)
         .await?
         .ok_or_else(|| format!("session {chat_id} no longer exists"))?;
     if chat.get("mode").and_then(Value::as_str) != Some("work") {
@@ -378,7 +393,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         return Err(format!("session {chat_id} has no workspace"));
     }
     let extra = parse_extra(&chat);
-    let engine = vicuna_lib::work_engine::effective_engine(extra.engine.as_deref());
+    let engine = crate::work_engine::effective_engine(extra.engine.as_deref());
     if !engine.is_present() {
         return Err(engine.missing_message());
     }
@@ -386,7 +401,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
     let mut messages: Vec<Value> = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     messages.extend(user_msgs);
     messages.push(persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id())));
-    vicuna_lib::server_store::write_messages(db, chat_id, &messages, Some(now_ms())).await?;
+    crate::server_store::write_messages(db, chat_id, &messages, Some(now_ms())).await?;
     let native: Vec<ChatMessage> =
         persist::compacted_history(&messages[..messages.len() - 1]).iter().filter_map(chat_message).collect();
     let goal_text = chat
@@ -411,6 +426,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
             lead: extra.lead,
             rec: Some(rec),
             report_to,
+            mcp_only: extra.mcp,
         },
     )
     .await
@@ -423,26 +439,26 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
     let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
     let report = args.get("report").and_then(Value::as_bool) != Some(false);
     if action == "create" {
-        let lead = vicuna_lib::server_store::load_chat(db, lead_id).await?.ok_or("lead session no longer exists")?;
+        let lead = crate::server_store::load_chat(db, lead_id).await?.ok_or("lead session no longer exists")?;
         let requested = arg("engine");
-        let engine = if requested.is_empty() { vicuna_lib::work_engine::current_engine() }
+        let engine = if requested.is_empty() { crate::work_engine::current_engine() }
             else { Engine::parse(&requested).ok_or("unknown engine")? };
         if !engine.is_present() { return Err(engine.missing_message()); }
         let ws = if arg("workspace").is_empty() { lead["workspace"].as_str().unwrap_or("").to_string() } else { arg("workspace") };
-        let ws = vicuna_lib::work_validate_root_logic(ws).await?;
+        let ws = crate::work_validate_root_logic(ws).await?;
         let msg = arg("message");
         let title: String = if !arg("title").is_empty() { arg("title") } else if !msg.is_empty() { msg.clone() } else { "Worker".into() }.chars().take(40).collect();
         let id = uuid();
         let model = arg("model");
         let extra = json!({"engine":engine.id(), "workModel": if model.is_empty() {Value::Null} else {json!(model)}, "leadId":lead_id});
-        vicuna_lib::server_store::create_chat(db, &json!({"id":id,"title":title,"createdAt":now_ms(),"updatedAt":now_ms(),"mode":"work","workspace":ws,"extra":extra.to_string(),"messages":[]})).await?;
+        crate::server_store::create_chat(db, &json!({"id":id,"title":title,"createdAt":now_ms(),"updatedAt":now_ms(),"mode":"work","workspace":ws,"extra":extra.to_string(),"messages":[]})).await?;
         if !msg.is_empty() {
             start_server_turn(st, &id, vec![json!({"role":"user","content":msg})], report.then(|| lead_id.to_string())).await?;
         }
         return Ok(format!("Created \"{title}\" (session_id={id}, engine={}, workspace={ws}).{}", engine.id(), if !msg.is_empty() {" Its turn has started; its reply will reach the lead when it ends if reporting is enabled."} else {""}));
     }
     if action == "list" {
-        let chats = vicuna_lib::server_store::load_chats(db).await?;
+        let chats = crate::server_store::load_chats(db).await?;
         let rows: Vec<String> = chats.as_array().into_iter().flatten().filter(|c| c["mode"] == "work").take(40).map(|c| {
             let id = c["id"].as_str().unwrap_or("");
             format!("- {id} · \"{}\" · {} · {}", c["title"].as_str().unwrap_or(""), if live_turn(st,id).is_some() {"running"} else {"idle"}, c["workspace"].as_str().unwrap_or(""))
@@ -452,7 +468,7 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
     let id = if action == "set_workspace" && arg("session_id").is_empty() { lead_id.to_string() } else { arg("session_id") };
     if id.is_empty() { return Err("`session_id` is required (see list).".into()); }
     if id == lead_id && action != "set_workspace" { return Err("That is your own session.".into()); }
-    let mut chat = vicuna_lib::server_store::load_chat(db, &id).await?.ok_or_else(|| format!("No session {id}."))?;
+    let mut chat = crate::server_store::load_chat(db, &id).await?.ok_or_else(|| format!("No session {id}."))?;
     match action {
         "status" => {
             let reply = chat["messages"].as_array().and_then(|m|m.last()).and_then(|m|m["content"].as_str()).unwrap_or("");
@@ -474,15 +490,15 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
             }
         }
         "stop" => {
-            if let Some((_,turn)) = live_turn(st,&id) { vicuna_lib::work_agent::agent_stop(&turn); }
+            if let Some((_,turn)) = live_turn(st,&id) { crate::work_agent::agent_stop(&turn); }
             Ok(format!("Stopped {id}."))
         }
         "archive" | "unarchive" | "set_workspace" => {
             let _write = st.chat_lock.lock().await;
-            chat = vicuna_lib::server_store::load_chat(db, &id).await?.ok_or("session no longer exists")?;
+            chat = crate::server_store::load_chat(db, &id).await?.ok_or("session no longer exists")?;
             if action == "set_workspace" {
                 if id != lead_id && live_turn(st,&id).is_some() { return Err("Session is running; stop it or wait first.".into()); }
-                chat["workspace"] = json!(vicuna_lib::work_validate_root_logic(arg("workspace")).await?);
+                chat["workspace"] = json!(crate::work_validate_root_logic(arg("workspace")).await?);
                 chat["mode"] = json!("work");
             } else {
                 let mut extra: Value = chat["extra"].as_str().and_then(|s|serde_json::from_str(s).ok()).unwrap_or(json!({}));
@@ -491,10 +507,236 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
                 chat["extra"] = json!(extra.to_string());
             }
             chat["baseRev"] = chat["rev"].clone();
-            vicuna_lib::server_store::merge_json(db,&json!([chat]),vec![],&Default::default()).await?;
+            super::actions::as_save_row(&mut chat);
+            crate::server_store::merge_json(db,&json!([chat]),vec![],&Default::default()).await?;
             Ok(format!("Session {id}: {action} applied."))
         }
         _ => Err(format!("Unknown action {action}.")),
+    }
+}
+
+// ---------- `vicuna session …` (CLI) ----------
+
+/// A session id or unique prefix of one.
+async fn resolve_session(db: &crate::server_store::Pool, id: &str) -> Result<Value, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("session id required".into());
+    }
+    if let Some(c) = crate::server_store::load_chat(db, id).await? {
+        return Ok(c);
+    }
+    let chats = crate::server_store::load_chats(db).await?;
+    let hits: Vec<&str> = chats.as_array().into_iter().flatten().filter_map(|c| c["id"].as_str()).filter(|c| c.starts_with(id)).collect();
+    match hits.as_slice() {
+        [one] => crate::server_store::load_chat(db, one).await?.ok_or_else(|| format!("no session {id}")),
+        [] => Err(format!("no session matches {id}")),
+        many => Err(format!("{id} is ambiguous: {} sessions match ({}…)", many.len(), many.iter().take(3).map(|s| &s[..8.min(s.len())]).collect::<Vec<_>>().join(", "))),
+    }
+}
+
+fn extra_obj(chat: &Value) -> Value {
+    chat.get("extra").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).filter(Value::is_object).unwrap_or(json!({}))
+}
+
+fn session_row(st: &BridgeState, c: &Value) -> Value {
+    let id = c["id"].as_str().unwrap_or("");
+    let x = extra_obj(c);
+    let live = st.session_turns.lock().ok().and_then(|m| m.get(id).cloned()).filter(|_| live_turn(st, id).is_some());
+    json!({
+        "id": id,
+        "title": c["title"],
+        "workspace": c["workspace"],
+        "mode": c["mode"],
+        "engine": x.get("engine").cloned().unwrap_or(Value::Null),
+        "model": x.get("workModel").cloned().unwrap_or(Value::Null),
+        "mcp": x.get("mcp").cloned().unwrap_or(Value::Null),
+        "archived": x.get("archived").and_then(Value::as_bool).unwrap_or(false),
+        "lead": x.get("role").and_then(Value::as_str) == Some("lead"),
+        "updatedAt": c["updatedAt"],
+        "createdAt": c["createdAt"],
+        "running": live.is_some(),
+        "turnId": live.as_ref().map(|l| json!(l.0)).unwrap_or(Value::Null),
+        "channel": live.as_ref().map(|l| json!(l.1)).unwrap_or(Value::Null),
+        "startedMs": live.as_ref().map(|l| json!(l.2)).unwrap_or(Value::Null),
+    })
+}
+
+fn live_ids(st: &BridgeState, id: &str) -> Value {
+    match st.session_turns.lock().ok().and_then(|m| m.get(id).cloned()) {
+        Some((tid, ch, _)) => json!({ "turnId": tid, "channel": ch }),
+        None => Value::Null,
+    }
+}
+
+fn mcp_list(args: &Value) -> Option<Value> {
+    let a = args.get("mcp")?;
+    if a.is_null() {
+        return None;
+    }
+    let names: Vec<String> = a.as_array()?.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    Some(json!(names))
+}
+
+async fn check_engine_model(engine: &str) -> Result<Engine, String> {
+    let e = Engine::parse(engine).ok_or_else(|| format!("unknown harness {engine} (claude, codex, opencode, pi, fx, agy)"))?;
+    if !e.is_present() {
+        return Err(e.missing_message());
+    }
+    Ok(e)
+}
+
+/// Session control for the `vicuna` CLI (no window, no lead): list, get,
+/// create, send, stop, update, archive/unarchive, delete. Turns run through
+/// the same server-owned path as scheduled sends and worker sessions.
+pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> Result<Value, String> {
+    let db = st.db.as_ref().ok_or("this bridge has no session database; run `vicuna serve`")?;
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    match action {
+        "list" => {
+            let chats = crate::server_store::load_chats(db).await?;
+            let rows: Vec<Value> = chats.as_array().into_iter().flatten().map(|c| session_row(st, c)).collect();
+            return Ok(Value::Array(rows));
+        }
+        "create" => {
+            let engine = if arg("engine").is_empty() { crate::work_engine::current_engine() } else { check_engine_model(&arg("engine")).await? };
+            if !engine.is_present() {
+                return Err(engine.missing_message());
+            }
+            let ws = crate::work_validate_root_logic(arg("workspace")).await?;
+            let prompt = arg("prompt");
+            let src = if !arg("title").is_empty() { arg("title") } else if !prompt.is_empty() { prompt.clone() } else { "New session".into() };
+            let title = if src.chars().count() > 40 { format!("{}..", src.chars().take(38).collect::<String>()) } else { src };
+            let mut extra = json!({ "engine": engine.id() });
+            if !arg("model").is_empty() {
+                extra["workModel"] = json!(arg("model"));
+            }
+            if let Some(m) = mcp_list(args) {
+                extra["mcp"] = m;
+            }
+            let id = uuid();
+            let now = now_ms();
+            crate::server_store::create_chat(
+                db,
+                &json!({ "id": id, "title": title, "createdAt": now, "updatedAt": now, "mode": "work", "workspace": ws, "extra": extra.to_string(), "messages": [] }),
+            )
+            .await?;
+            if !prompt.is_empty() {
+                start_server_turn(st, &id, vec![json!({ "role": "user", "content": prompt })], None).await?;
+            }
+            let c = crate::server_store::load_chat(db, &id).await?.ok_or("session vanished")?;
+            return Ok(session_row(st, &c));
+        }
+        _ => {}
+    }
+    let chat = resolve_session(db, &arg("id")).await?;
+    let id = chat["id"].as_str().unwrap_or("").to_string();
+    match action {
+        "get" => {
+            let mut row = session_row(st, &chat);
+            row["messages"] = chat["messages"].clone();
+            row["goal"] = chat.get("goal").cloned().unwrap_or(Value::Null);
+            Ok(row)
+        }
+        "send" => {
+            let text = arg("text");
+            if text.is_empty() {
+                return Err("message text required".into());
+            }
+            if chat["mode"].as_str() != Some("work") {
+                return Err(format!("session {id} is a Chat-mode session; the CLI drives Work sessions only"));
+            }
+            let msg = json!({ "role": "user", "content": text });
+            if let Some((_, turn)) = live_turn(st, &id) {
+                agent_queue_msg(&turn, uuid(), chat_message(&msg).ok_or("bad message")?)?;
+                let mut out = live_ids(st, &id);
+                out["queued"] = json!(true);
+                out["id"] = json!(id);
+                return Ok(out);
+            }
+            start_server_turn(st, &id, vec![msg], None).await?;
+            let mut out = live_ids(st, &id);
+            out["queued"] = json!(false);
+            out["id"] = json!(id);
+            Ok(out)
+        }
+        "stop" => {
+            let running = live_turn(st, &id);
+            if let Some((_, turn)) = &running {
+                crate::work_agent::agent_stop(turn);
+            }
+            Ok(json!({ "id": id, "stopped": running.is_some() }))
+        }
+        "delete" => {
+            if let Some((_, turn)) = live_turn(st, &id) {
+                crate::work_agent::agent_stop(&turn);
+                // let the turn unwind so its recorder stops writing first
+                for _ in 0..100 {
+                    if live_turn(st, &id).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            let _write = st.chat_lock.lock().await;
+            crate::server_store::merge_json(db, &json!([]), vec![id.clone()], &Default::default()).await?;
+            schedule_drop_for(st, &id).await;
+            Ok(json!({ "id": id, "deleted": true }))
+        }
+        "update" | "archive" | "unarchive" => {
+            let _write = st.chat_lock.lock().await;
+            let mut chat = crate::server_store::load_chat(db, &id).await?.ok_or("session no longer exists")?;
+            let mut extra = extra_obj(&chat);
+            if action != "update" {
+                if action == "archive" && extra["role"] == "lead" {
+                    return Err("refusing to archive a lead session".into());
+                }
+                extra["archived"] = json!(action == "archive");
+            } else {
+                if !arg("engine").is_empty() {
+                    extra["engine"] = json!(check_engine_model(&arg("engine")).await?.id());
+                    if arg("model").is_empty() {
+                        // a model id belongs to its harness
+                        extra["workModel"] = Value::Null;
+                    }
+                }
+                if !arg("model").is_empty() {
+                    extra["workModel"] = json!(if arg("model") == "default" { "".to_string() } else { arg("model") });
+                }
+                if let Some(m) = args.get("mcp") {
+                    extra["mcp"] = if m.is_null() { Value::Null } else { mcp_list(args).unwrap_or(json!([])) };
+                }
+                if !arg("title").is_empty() {
+                    chat["title"] = json!(arg("title"));
+                }
+                if !arg("workspace").is_empty() {
+                    if live_turn(st, &id).is_some() {
+                        return Err("session is running; stop it or wait before moving it".into());
+                    }
+                    chat["workspace"] = json!(crate::work_validate_root_logic(arg("workspace")).await?);
+                    chat["mode"] = json!("work");
+                }
+            }
+            chat["extra"] = json!(extra.to_string());
+            chat["baseRev"] = chat["rev"].clone();
+            super::actions::as_save_row(&mut chat);
+            let out = crate::server_store::merge_json(db, &json!([chat]), vec![], &live_sessions(st)).await?;
+            if !out.conflicts.is_empty() {
+                return Err("the session is being written by a running turn; try again when it settles".into());
+            }
+            let c = crate::server_store::load_chat(db, &id).await?.ok_or("session vanished")?;
+            Ok(session_row(st, &c))
+        }
+        other => Err(format!("unknown session action {other}")),
+    }
+}
+
+/// Scheduled sends aimed at a deleted session go with it.
+async fn schedule_drop_for(st: &BridgeState, chat_id: &str) {
+    let Ok(Value::Array(list)) = schedule_list(st).await else { return };
+    let ids: Vec<String> = list.iter().filter(|it| it.get("chatId").and_then(Value::as_str) == Some(chat_id)).map(|it| item_id(it).to_string()).collect();
+    if !ids.is_empty() {
+        let _ = schedule_remove(st, ids).await;
     }
 }
 
@@ -550,14 +792,14 @@ pub fn record_answer(st: &BridgeState, turn: &Arc<TurnState>, turn_id: &str, ask
 const SCHED_KEY: &str = "scheduled";
 const SCHED_DONE_KEY: &str = "scheduled_done";
 
-async fn sched_load(db: &vicuna_lib::server_store::Pool) -> (Vec<Value>, Vec<String>) {
-    let items = vicuna_lib::server_store::meta_get(db, SCHED_KEY)
+async fn sched_load(db: &crate::server_store::Pool) -> (Vec<Value>, Vec<String>) {
+    let items = crate::server_store::meta_get(db, SCHED_KEY)
         .await
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
         .unwrap_or_default();
-    let done = vicuna_lib::server_store::meta_get(db, SCHED_DONE_KEY)
+    let done = crate::server_store::meta_get(db, SCHED_DONE_KEY)
         .await
         .ok()
         .flatten()
@@ -566,10 +808,10 @@ async fn sched_load(db: &vicuna_lib::server_store::Pool) -> (Vec<Value>, Vec<Str
     (items, done)
 }
 
-async fn sched_save(db: &vicuna_lib::server_store::Pool, items: &[Value], done: &[String]) -> Result<(), String> {
-    vicuna_lib::server_store::meta_put(db, SCHED_KEY, &Value::Array(items.to_vec()).to_string()).await?;
+async fn sched_save(db: &crate::server_store::Pool, items: &[Value], done: &[String]) -> Result<(), String> {
+    crate::server_store::meta_put(db, SCHED_KEY, &Value::Array(items.to_vec()).to_string()).await?;
     let keep = &done[done.len().saturating_sub(500)..];
-    vicuna_lib::server_store::meta_put(db, SCHED_DONE_KEY, &json!(keep).to_string()).await
+    crate::server_store::meta_put(db, SCHED_DONE_KEY, &json!(keep).to_string()).await
 }
 
 fn item_id(v: &Value) -> &str {
@@ -668,7 +910,7 @@ async fn deliver_scheduled(st: &Arc<BridgeState>, it: &Value) -> Result<(), Stri
         msg["images"] = imgs.clone();
     }
     if let Some(cid) = it.get("chatId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        if let Some(c) = vicuna_lib::server_store::load_chat(db, cid).await? {
+        if let Some(c) = crate::server_store::load_chat(db, cid).await? {
             if c.get("mode").and_then(Value::as_str) == Some("work") {
                 return deliver(st, cid, msg).await;
             }
@@ -676,17 +918,32 @@ async fn deliver_scheduled(st: &Arc<BridgeState>, it: &Value) -> Result<(), Stri
     }
     // the target is gone: a new session in the stored workspace
     let ws = it.get("workspace").and_then(Value::as_str).unwrap_or("").to_string();
-    let ws = vicuna_lib::work_validate_root_logic(ws).await?;
+    let ws = crate::work_validate_root_logic(ws).await?;
     let src = if text.is_empty() { "Image".to_string() } else { text.clone() };
     let title = if src.chars().count() > 32 { format!("{}..", src.chars().take(32).collect::<String>()) } else { src };
     let id = uuid();
     let now = now_ms();
-    vicuna_lib::server_store::create_chat(
+    crate::server_store::create_chat(
         db,
-        &json!({ "id": id, "title": title, "createdAt": now, "updatedAt": now, "mode": "work", "workspace": ws, "messages": [] }),
+        &json!({ "id": id, "title": title, "createdAt": now, "updatedAt": now, "mode": "work", "workspace": ws, "extra": sched_extra(it), "messages": [] }),
     )
     .await?;
     start_server_turn(st, &id, vec![msg], None).await.map(|_| ())
+}
+
+/// A scheduled new-session send may name its harness/model/MCP pick
+/// (`vicuna schedule add --new -e … -m … --mcp …`); none = server defaults.
+fn sched_extra(it: &Value) -> Value {
+    let mut x = json!({});
+    for (from, to) in [("engine", "engine"), ("model", "workModel")] {
+        if let Some(v) = it.get(from).and_then(Value::as_str).filter(|v| !v.is_empty()) {
+            x[to] = json!(v);
+        }
+    }
+    if let Some(m) = it.get("mcp").filter(|m| m.is_array()) {
+        x["mcp"] = m.clone();
+    }
+    if x.as_object().is_some_and(|o| o.is_empty()) { Value::Null } else { json!(x.to_string()) }
 }
 
 /// The agent's `schedule_wakeup`, resolved and stored on the server.
@@ -703,7 +960,7 @@ async fn handle_wakeup(st: &Arc<BridgeState>, turn: &Arc<TurnState>, chat_id: &s
         Err(e) => json!({ "ok": false, "error": e }),
         Ok(at) => {
             let chat = match &st.db {
-                Some(db) => vicuna_lib::server_store::load_chat(db, chat_id).await.ok().flatten(),
+                Some(db) => crate::server_store::load_chat(db, chat_id).await.ok().flatten(),
                 None => None,
             };
             let s = |k: &str| chat.as_ref().and_then(|c| c.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
@@ -742,9 +999,9 @@ mod tests {
 
     async fn recording() -> (Arc<BridgeState>, Arc<Mutex<RecState>>, Arc<TurnState>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vicuna-recording-{}", uuid()));
-        let db = vicuna_lib::server_store::open(&dir.join("test.db")).await.unwrap();
+        let db = crate::server_store::open(&dir.join("test.db")).await.unwrap();
         let messages = vec![json!({"role":"user", "content":"go"}), persist::assistant_placeholder("opencode")];
-        vicuna_lib::server_store::create_chat(&db, &json!({
+        crate::server_store::create_chat(&db, &json!({
             "id":"chat", "title":"Test", "createdAt":1, "mode":"work", "messages":messages,
         })).await.unwrap();
         let st = Arc::new(BridgeState { db: Some(db), ..Default::default() });
@@ -760,6 +1017,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recorder_left_by_an_ended_turn_does_not_lock_the_session() {
+        let (st, rs, turn, _dir) = recording().await;
+        assert!(live_sessions(&st).contains("chat"), "running turn: the server is the writer");
+        // the turn ended without a terminal event reaching the channel
+        turn.done.store(true, Ordering::Relaxed);
+        assert!(!live_sessions(&st).contains("chat"), "stale recorder must not refuse saves forever");
+        // while finalize writes the last copy it is still the only writer
+        rs.lock().unwrap().finishing = true;
+        assert!(live_sessions(&st).contains("chat"));
+    }
+
+    #[tokio::test]
     async fn event_channel_records_without_polling_and_attach_does_not_replay_content() {
         let (st, rs, turn, dir) = recording().await;
         let ch = work_channel(st.clone(), "channel".into(), Some(rs.clone()), turn.clone(), Some("chat".into()));
@@ -769,7 +1038,7 @@ mod tests {
         write_rec(&st, &rs, false).await;
         let snap = attach(&st, "chat");
         assert_eq!(snap["snapshot"]["pendingHead"]["name"], "read");
-        assert!(crate::drain_events(&st.events, "channel").is_empty(), "snapshot covers queued content");
+        assert!(crate::server::drain_events(&st.events, "channel").is_empty(), "snapshot covers queued content");
         ch.send(WorkAgentEvent::ToolEnd { name:"read".into(), output:"<file> & content".into() }).unwrap();
         ch.send(WorkAgentEvent::Token { text:"All done.".into() }).unwrap();
         ch.send(WorkAgentEvent::RoundEnd { gen_ms:50, gen_tps:Some(20.0), gen_cost:None }).unwrap();
@@ -779,19 +1048,19 @@ mod tests {
         // The terminal event is released only after its transcript is committed.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let events = crate::drain_events(&st.events, "channel");
+                let events = crate::server::drain_events(&st.events, "channel");
                 if events.iter().any(|e| e["type"] == "done") { break; }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
         let db = st.db.as_ref().unwrap();
-        let c = vicuna_lib::server_store::load_chat(db, "chat").await.unwrap().unwrap();
+        let c = crate::server_store::load_chat(db, "chat").await.unwrap().unwrap();
         assert_eq!(c["messages"][1]["content"], expected);
         assert_eq!(c["messages"][1]["thinking"], "Reasoning");
         assert_eq!(c["messages"][1]["genMs"], 50.0);
         db.close().await;
-        let reopened = vicuna_lib::server_store::open(&dir.join("test.db")).await.unwrap();
-        let c = vicuna_lib::server_store::load_chat(&reopened, "chat").await.unwrap().unwrap();
+        let reopened = crate::server_store::open(&dir.join("test.db")).await.unwrap();
+        let c = crate::server_store::load_chat(&reopened, "chat").await.unwrap().unwrap();
         assert_eq!(c["messages"][1]["content"], expected);
         reopened.close().await;
         std::fs::remove_dir_all(dir).unwrap();
@@ -813,7 +1082,7 @@ mod tests {
         drop(guard);
         write_rec(&st, &rs, true).await;
         periodic.await.unwrap();
-        let c = vicuna_lib::server_store::load_chat(st.db.as_ref().unwrap(), "chat").await.unwrap().unwrap();
+        let c = crate::server_store::load_chat(st.db.as_ref().unwrap(), "chat").await.unwrap().unwrap();
         assert_eq!(c["messages"][1]["content"], "partial complete");
         st.db.as_ref().unwrap().close().await;
         std::fs::remove_dir_all(dir).unwrap();
@@ -827,7 +1096,7 @@ mod tests {
         let status = session_control(&st,"lead","status",&json!({"session_id":"chat"})).await.unwrap();
         assert!(status.contains("running"));
         session_control(&st,"lead","archive",&json!({"session_id":"chat"})).await.unwrap();
-        let c = vicuna_lib::server_store::load_chat(st.db.as_ref().unwrap(),"chat").await.unwrap().unwrap();
+        let c = crate::server_store::load_chat(st.db.as_ref().unwrap(),"chat").await.unwrap().unwrap();
         assert!(c["extra"].as_str().unwrap().contains("true"));
         session_control(&st,"lead","send",&json!({"session_id":"chat","message":"follow up"})).await.unwrap();
         assert_eq!(turn.queue.lock().unwrap().len(),1);
@@ -846,7 +1115,7 @@ mod tests {
         schedule_put(&st, vec![item.clone()]).await.unwrap();
         assert_eq!(schedule_list(&st).await.unwrap()[0], item);
         st.db.as_ref().unwrap().close().await;
-        let db = vicuna_lib::server_store::open(&dir.join("test.db")).await.unwrap();
+        let db = crate::server_store::open(&dir.join("test.db")).await.unwrap();
         let restarted = BridgeState { db:Some(db), ..Default::default() };
         assert_eq!(schedule_list(&restarted).await.unwrap()[0], item);
         schedule_remove(&restarted, vec!["wake".into()]).await.unwrap();

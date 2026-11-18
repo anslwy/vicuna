@@ -48,7 +48,7 @@
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, serverRecordsTurns, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { invokeOrBridge, bridgeAvailable, isRemoteServer, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -2058,6 +2058,14 @@
     pendingDeleteId = null;
     const remaining = chats.filter((c) => c.id !== id);
     chats = remaining;
+    // server-backed: the delete is the server's action (it also stops the
+    // turn and drops the session's scheduled sends); the save below then
+    // only finds an id the server no longer has
+    if (serverPersist) {
+      void serverSavesIdle()
+        .then(() => invokeOrBridge("session_delete", { id }))
+        .catch((e: any) => (error = typeof e === "string" ? e : (e?.message ?? String(e))));
+    }
     if (id === activeId) {
       activeId = null;
       save();
@@ -3627,18 +3635,18 @@
     });
   }
 
-  function commitRename() {
+  async function commitRename() {
     if (renamingId == null) return;
+    const id = renamingId;
     const text = renameDraft.trim();
-    if (text) {
-      const c = chats.find((x) => x.id === renamingId);
-      if (c) {
-        c.title = text;
-        chats = [...chats];
-        save();
-      }
-    }
     renamingId = null;
+    if (!text) return;
+    const c = chats.find((x) => x.id === id);
+    if (!c) return;
+    if ((await serverAction("session_update", { id, title: text })) !== false) return;
+    c.title = text;
+    chats = [...chats];
+    save();
   }
 
   function cancelRename() {
@@ -3682,9 +3690,12 @@
     }
     if (editingIndex != null && editingIndex >= from) cancelEdit();
     copiedKey = null;
-    chat.messages = [...chat.messages.slice(0, from), ...chat.messages.slice(from + count)];
-    chats = [...chats];
-    save();
+    void serverAction("message_delete", { id: chat.id, index: i }).then((r) => {
+      if (r !== false) return;
+      chat.messages = [...chat.messages.slice(0, from), ...chat.messages.slice(from + count)];
+      chats = [...chats];
+      save();
+    });
   }
 
   function toggleModel() {
@@ -3931,39 +3942,70 @@
     } catch {}
   }
 
+  /** Database-changing operations are server actions (`vicuna api list`):
+   *  a server-backed window runs the action and adopts the server's copy
+   *  (its new revision becomes this window's baseline, so no generic save
+   *  re-sends it). Returns `false` when this window has no recording server
+   *  (the token-less dev bridge), so callers keep their old local path; null
+   *  when the action failed (the error is shown). */
+  async function serverAction(action: string, args: Record<string, unknown>): Promise<Chat | null | false> {
+    if (!serverPersist) return false;
+    await serverSavesIdle();
+    try {
+      const raw = await invokeOrBridge<any>(action, args);
+      if (!raw || typeof raw.id !== "string") return null;
+      const fresh = adoptServerChat(raw);
+      chats = chats.some((x) => x.id === fresh.id) ? chats.map((x) => (x.id === fresh.id ? fresh : x)) : [fresh, ...chats];
+      // hand back the REACTIVE copy: writes through the raw object would be
+      // invisible to the UI (#16) — a regenerate placeholder once was
+      return chats.find((x) => x.id === fresh.id) ?? null;
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+      return null;
+    }
+  }
+
   /** Archive hides a session from the sidebar; it does not stop its turn or
    *  touch its messages, engine session or background jobs. */
-  function setArchived(id: string, on: boolean) {
+  async function setArchived(id: string, on: boolean) {
     const c = chats.find((x) => x.id === id);
     ctxMenu = null;
     if (!c) return;
+    if ((await serverAction("session_update", { id, archived: on })) !== false) return;
     c.archived = on;
     chats = [...chats];
     save();
   }
 
-  function togglePin(id: string) {
+  async function togglePin(id: string) {
     const c = chats.find((x) => x.id === id);
     ctxMenu = null;
     if (!c) return;
+    if ((await serverAction("session_update", { id, pinned: !c.pinned })) !== false) return;
     c.pinned = !c.pinned;
     chats = [...chats];
     save();
   }
 
   /** the lead may manage other sessions; making one the lead also pins it */
-  function toggleLead(id: string) {
-    const c = chats.find((x) => x.id === id);
+  async function toggleLead(id: string) {
+    let c = chats.find((x) => x.id === id);
     ctxMenu = null;
     if (!c) return;
-    if (c.role === "lead") {
-      c.role = null;
+    const r = await serverAction("session_update", { id, role: c.role === "lead" ? null : "lead" });
+    if (r === null) return;
+    if (r) {
+      c = r;
     } else {
-      c.role = "lead";
-      c.pinned = true;
+      if (c.role === "lead") {
+        c.role = null;
+      } else {
+        c.role = "lead";
+        c.pinned = true;
+      }
+      chats = [...chats];
+      save();
     }
-    chats = [...chats];
-    save();
     flashNotice(c.role === "lead" ? `"${c.title}" is now a lead: from its next turn it can create, message, stop and remove sessions.` : `"${c.title}" is no longer a lead.`);
   }
 
@@ -4377,7 +4419,7 @@
     const i = editingIndex;
     const draft = editDraft;
     const imgs = [...editImages];
-    forkAt(i);
+    if (!(await forkAt(i))) return;
     // forkAt clears the edit state; restore the pending edits onto the fork
     editingIndex = i;
     editDraft = draft;
@@ -4407,6 +4449,14 @@
       cancelEdit();
       return;
     }
+    const r = await serverAction("message_edit", { id: chat.id, index: editingIndex, content: text, images: images ?? null });
+    if (r) {
+      cancelEdit();
+      isPinned = true;
+      scrollBottom();
+      return;
+    }
+    if (r === null) return;
     const updated = [...chat.messages];
     if (target.role === "assistant") {
       updated[editingIndex] = { ...target, content: text, images };
@@ -4439,6 +4489,18 @@
     // replies keep the exact text: trailing whitespace is meaningful when
     // continuing ("Yo! How's " must not collapse into "Yo! How's")
     const text = target.role === "assistant" ? editDraft : trimmed;
+    const edited = await serverAction("message_edit", { id: chat.id, index: editingIndex, content: text, images: images ?? null, truncate: true });
+    if (edited === null) return;
+    if (edited) {
+      cancelEdit();
+      isPinned = true;
+      if (target.role === "assistant") {
+        scrollBottom();
+        return;
+      }
+      await regenerateAfterEdit(edited);
+      return;
+    }
     if (target.role === "assistant") {
       // editing a reply: replace it in place and drop everything after,
       // no regeneration (use Continue to extend it)
@@ -4462,6 +4524,12 @@
       chat.title = text.slice(0, 32) + (text.length > 32 ? ".." : "");
     }
     cancelEdit();
+    await regenerateAfterEdit(chat);
+  }
+
+  /** After a user-message edit (history already truncated to it): run a
+   *  fresh reply — the agent for Work threads, a plain stream for Chat. */
+  async function regenerateAfterEdit(chat: Chat) {
     if ((chat.mode ?? "chat") === "work") {
       // work threads re-run the agent, not a plain reply (mirrors regenerate)
       if (!chat.workspace?.trim()) {
@@ -4492,13 +4560,15 @@
     }
   }
 
-  function forkAt(i: number) {
+  async function forkAt(i: number): Promise<boolean> {
     const c = chats.find((x) => x.id === activeId);
     // busy is the open session's: forking a live session is blocked, but a
     // turn running elsewhere never blocks forking this one (and forking must
     // never abort that other turn)
-    if (!c || busy) return;
-    const fork: Chat = {
+    if (!c || busy) return false;
+    const made = await serverAction("session_fork", { id: c.id, at: i });
+    if (made === null) return false;
+    const fork: Chat = made || {
       id: crypto.randomUUID(),
       title: `${c.title} (fork)`,
       createdAt: Date.now(),
@@ -4509,7 +4579,7 @@
       mode: c.mode ?? "chat",
       workspace: c.workspace ?? null
     };
-    chats = [fork, ...chats];
+    if (!made) chats = [fork, ...chats];
     activeId = fork.id;
     // keep the starter toggle consistent with the fork (matters for empty
     // forks; non-empty threads render from their own mode anyway)
@@ -4520,8 +4590,9 @@
     editDraft = "";
     editImages = [];
     pendingSaveConfirm = false;
-    save();
+    if (!made) save();
     void goto(`/s/${fork.id}`);
+    return true;
   }
 
   async function streamInto(chat: Chat, index: number, history: ChatMsg[], removeIfEmpty: boolean, opts: { think?: boolean | string; temperature?: number; generatePrompt?: string; rawStyle?: PromptStyle; stop?: string[]; mode?: "fresh" | "continue"; tools?: import("$lib/ollama").OllamaToolDef[]; onImagesStripped?: () => void; pinFollow?: boolean } = {}): Promise<{ text: string; toolCalls: import("$lib/ollama").OllamaToolCall[] }> {
@@ -7431,7 +7502,7 @@
     save();
   }
 
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; attach?: { turnId: string; channel: string; startedMs?: number; snapshot?: { messages: any[]; index: number; pendingHead: { name: string; args: Record<string, any> } | null; pendingAsk: WorkAgentEvent | null } } } = {}) {
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; retried?: boolean; attach?: { turnId: string; channel: string; startedMs?: number; snapshot?: { messages: any[]; index: number; pendingHead: { name: string; args: Record<string, any> } | null; pendingAsk: WorkAgentEvent | null } } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
     // a session pinned to its own harness (lead-created workers) runs on it;
@@ -7976,6 +8047,25 @@
       });
     } catch (e: any) {
       replyRoute.bind(null);
+      // the server has a newer copy than this window (a turn it recorded, or
+      // another window's save): take its transcript, put this message back on
+      // top and start once more — never drop what the user just sent
+      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+      const c = live();
+      const sent = c?.messages[index - 1];
+      if (persist && !opts.retried && msg.startsWith("SESSION_CHANGED") && c && sent?.role === "user" && isCurrentTurn()) {
+        const raw = await invokeOrBridge<any>("chats_get", { id: chat.id }).catch(() => null);
+        if (raw && isCurrentTurn()) {
+          const fresh = adoptServerChat(raw);
+          // the server's copy wins whole (title, pins, …: a rename made
+          // elsewhere must not be overwritten by this window's stale row)
+          Object.assign(c, fresh, { messages: [...fresh.messages, sent, { role: "assistant", content: "", thinking: "", model: turnModel }] });
+          chats = [...chats];
+          if (reportTo) reportIds.add(chat.id);
+          await runWorkTurn(chat, c.messages.length - 1, workspace, seedContext, { ...opts, retried: true });
+          return;
+        }
+      }
       if (!await warnIfOllamaUnavailable(workModel?.startsWith("ollama/") ?? false)) {
         error = typeof e === "string" ? e : (e?.message ?? String(e));
       }
@@ -8411,11 +8501,11 @@
       try {
         chats = await loadChats();
       } catch (e) {
-        if (!onServer) throw e;
+        if (!isServerBacked()) throw e;
         chats = [];
         srvLoadError = e instanceof Error ? e.message : String(e);
       }
-      if (onServer && !srvLoadError) {
+      if (isServerBacked() && !srvLoadError) {
         serverPersist = await serverRecordsTurns();
         if (serverPersist) await installServerSync();
       }
@@ -8937,7 +9027,7 @@
       <div class="srv-strip" data-testid="server-load-error" role="alert">
         <span>Can't load sessions from {srvLabel}: {srvLoadError}</span>
         <button class="mini-btn" onclick={() => window.location.reload()}>Retry</button>
-        <button class="mini-btn" onclick={() => void switchServer(null)}>Use this computer</button>
+        {#if onServer}<button class="mini-btn" onclick={() => void switchServer(null)}>Use this computer</button>{/if}
       </div>
     {/if}
     {#if composerMode === "work"}

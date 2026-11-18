@@ -44,6 +44,7 @@ pub mod vicuna_mcp;
 pub mod git_panel;
 pub mod server_store;
 pub mod servers;
+pub mod server;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -4412,6 +4413,17 @@ fn kill_job(pid: u32) {
     kill_pid(pid);
 }
 
+/// Kill every terminal pty in `state` (Quit; the embedded server's terminals).
+pub fn term_kill_all(state: &TermState) {
+    if let Ok(mut terms) = state.terms.lock() {
+        for (_, h) in terms.drain() {
+            if let Some(pid) = h.pid {
+                kill_pid(pid);
+            }
+        }
+    }
+}
+
 fn kill_pid(pid: u32) {
     #[cfg(not(windows))]
     let _ = Command::new("kill")
@@ -5136,6 +5148,7 @@ struct AppQuitState {
 /// terminal ptys. Best-effort — never fails the quit path.
 #[cfg(feature = "desktop")]
 fn shutdown_children(app: &AppHandle) {
+    server::embedded::shutdown();
     if let Some(s) = app.try_state::<browser::BrowserState>() {
         browser::kill_owned(&s);
     }
@@ -5691,6 +5704,21 @@ pub fn run() {
             work_usage::work_usage
         ])
         .setup(|app| {
+            // The main window's backend: the same server `vicuna serve` runs,
+            // embedded here (or a `vicuna serve` already running on this
+            // machine). The window reaches it as server "local"; the CLI's
+            // default target is the same server. Then, once, the chats this
+            // app kept in its own sqlite move over (read-only on that file).
+            {
+                let resources = app.path().resource_dir().ok();
+                let desktop_db = app.path().app_config_dir().ok().map(|d| d.join("vicuna.db"));
+                tauri::async_runtime::spawn(server::embedded::launch(resources, desktop_db));
+                let opener = app.handle().clone();
+                server::set_url_opener(move |url| {
+                    use tauri_plugin_opener::OpenerExt;
+                    opener.opener().open_url(url, None::<&str>).map_err(|e| format!("mcp: cannot open browser for sign-in: {e}"))
+                });
+            }
             // Warm the long-lived `opencode acp` process so the first Work
             // turn skips its cold start (no-op when opencode is missing).
             {

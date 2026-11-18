@@ -1,6 +1,6 @@
 [package]
 name = "vicuna-bridge"
-version = "0.0.22"
+version = "0.0.23"
 description = "vicuna — the Vicuna CLI: `vicuna serve` (headless server for the desktop app), `vicuna open`, and the dev bridge"
 authors = ["you"]
 edition = "2024"
@@ -10,7 +10,7 @@ edition = "2024"
 # of system OpenSSL — the binary runs on a bare VPS
 vicuna_lib = { package = "vicuna", path = "../src-tauri", default-features = false, features = ["rustls"] }
 tauri = { version = "2", default-features = false }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

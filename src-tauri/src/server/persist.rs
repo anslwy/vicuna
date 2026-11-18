@@ -676,7 +676,7 @@ mod tests {
     /// work.ts / leadSessions.ts / backgroundRun.ts / schedule.ts functions.
     #[test]
     fn formatters_match_the_shared_frontend_fixture() {
-        let text = include_str!("../../node-tests/fixtures/server-format.json");
+        let text = include_str!("../../../node-tests/fixtures/server-format.json");
         let cases: Vec<Value> = serde_json::from_str(text).unwrap();
         // raw args text, in wire order (serde_json's maps sort keys)
         type RawMap = std::collections::HashMap<String, Box<serde_json::value::RawValue>>;

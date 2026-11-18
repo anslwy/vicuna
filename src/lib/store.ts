@@ -1,7 +1,7 @@
 import type { ChatMsg } from "./ollama";
 import { validateOverride, type CatalogOverride } from "./library";
 import { normalizeContinueMode, type ContinueMode, type PromptStyle } from "./continue";
-import { activeServerId, invokeOrBridge } from "./bridge";
+import { activeServerId, invokeOrBridge, isServerBacked } from "./bridge";
 
 export interface Chat {
   id: string;
@@ -637,7 +637,9 @@ export function serverSavesIdle(): Promise<void> {
   return serverBackendApi ? serverBackendApi.idle() : Promise.resolve();
 }
 
-function createServerBackend(serverId: string): Backend {
+/** `keyScope`: the remote server id that scopes this window's local keys
+ *  (model, active chat); null = This computer, which keeps its old keys. */
+function createServerBackend(keyScope: string | null): Backend {
   const sent = new Map<string, string>(); // chat id -> last payload JSON the server has
   // chat id -> server revision this window last saw. Sent as baseRev: the
   // server refuses a save whose base moved on (it recorded a Work turn while
@@ -701,7 +703,7 @@ function createServerBackend(serverId: string): Backend {
     idle: () => (saveActive ? new Promise((r) => idleWaiters.push(r)) : Promise.resolve())
   };
 
-  const ls = (base: string) => serverKey(base, serverId);
+  const ls = (base: string) => (keyScope ? serverKey(base, keyScope) : base);
   return {
     async loadChats(): Promise<Chat[]> {
       const raw = await invokeOrBridge<any[]>("chats_load", {});
@@ -764,11 +766,11 @@ export function storageKind(): string {
 }
 
 export async function initStorage(): Promise<void> {
-  const server = activeServerId();
-  if (server) {
+  if (isServerBacked()) {
     // no silent fallback: writing a server's chats into local storage (or
-    // showing local chats as the server's) would be worse than an error
-    backend = createServerBackend(server);
+    // showing local chats as the server's) would be worse than an error.
+    // This computer is server-backed too (the embedded/local `vicuna serve`).
+    backend = createServerBackend(activeServerId());
     backendName = "server";
     return;
   }

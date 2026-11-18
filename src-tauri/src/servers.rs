@@ -53,7 +53,7 @@ fn path() -> Option<PathBuf> {
     crate::opencode::home_dir().map(|h| h.join("vicuna").join("config").join("servers.json"))
 }
 
-fn load() -> Vec<ServerEntry> {
+pub fn load() -> Vec<ServerEntry> {
     path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -215,10 +215,18 @@ pub async fn call(id: &str, path: &str, body: Option<Value>, timeout_ms: Option<
     if !(path == "/invoke" || path.starts_with("/poll/")) {
         return Err("unsupported server path".into());
     }
-    let s = load().into_iter().find(|s| s.id == id).ok_or("That server is no longer in your list.")?;
     let timeout = timeout_ms.map(Duration::from_millis).unwrap_or(DEFAULT_TIMEOUT);
+    // "local" = this machine's backend (embedded, or an adopted `vicuna serve`)
+    if id == LOCAL_ID {
+        let b = crate::server::embedded::wait_local(Duration::from_secs(120)).await?;
+        return request(&b.url, &b.token, path, body.as_ref(), timeout).await;
+    }
+    let s = load().into_iter().find(|s| s.id == id).ok_or("That server is no longer in your list.")?;
     request(&s.url, &s.token, path, body.as_ref(), timeout).await
 }
+
+/// Reserved server id of this machine's own backend (the main window).
+pub const LOCAL_ID: &str = "local";
 
 /// Copy a file from a server's workspace into `dest_dir` (~/Downloads) in
 /// 4MB base64 chunks over `/invoke work_read_chunk`. A clashing name gets
