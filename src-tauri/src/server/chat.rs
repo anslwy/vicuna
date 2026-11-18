@@ -31,6 +31,8 @@ struct Options {
     #[serde(default = "default_stop_words")]
     stop: Vec<String>,
     open_router_api_key: Option<String>,
+    #[serde(skip)]
+    temperature: Option<f64>,
 }
 
 fn default_stop_words() -> Vec<String> {
@@ -178,6 +180,61 @@ pub(super) async fn start(st: &Arc<BridgeState>, args: &Value) -> Result<Value, 
         record(&st, &id, &turn, completion).await;
     });
     Ok(response)
+}
+
+/// Summarize Work context with the selected Chat provider, without creating a Chat turn.
+pub(super) async fn summarize(
+    st: &Arc<BridgeState>,
+    model: &str,
+    api_key: Option<&str>,
+    messages: &[Value],
+) -> Result<String, String> {
+    let transcript = messages.iter().map(|msg| {
+        let who = match msg["role"].as_str() {
+            Some("user") => "User",
+            Some("assistant") => "Assistant",
+            Some("tool") => "Tool",
+            _ => "System",
+        };
+        let text = msg["content"].as_str().unwrap_or("");
+        let images = msg["images"].as_array().map_or(0, Vec::len);
+        if images == 0 {
+            format!("{who}: {text}")
+        } else {
+            format!("{who}: {text} [{images} image(s) attached]")
+        }
+    }).collect::<Vec<_>>().join("\n\n");
+    let turn = Arc::new(Turn {
+        id: turns::uuid(),
+        started_at: turns::now_ms(),
+        extending: false,
+        stop: Notify::new(),
+        state: Mutex::new(Live {
+            messages: vec![persist::assistant_placeholder(model)],
+            index: 0,
+            original: String::new(),
+            generated: String::new(),
+            first_token: true,
+            produced: false,
+            dirty: false,
+            channels: HashSet::new(),
+            images_stripped: false,
+        }),
+    });
+    let options = Options {
+        model: model.to_owned(),
+        think: Some(json!(false)),
+        temperature: Some(0.2),
+        open_router_api_key: api_key.map(str::to_owned),
+        ..Options::default()
+    };
+    let history = vec![
+        json!({"role": "system", "content": "Summarize this conversation transcript concisely: files listed/read/written, commands run and their key output, decisions made, and what remains to do. Keep file paths and facts; drop chatter."}),
+        json!({"role": "user", "content": transcript}),
+    ];
+    provider::generate(st, &turn, options, history).await?;
+    let live = turn.state.lock().unwrap();
+    Ok(live.messages[0]["content"].as_str().unwrap_or("").to_owned())
 }
 
 fn model_history(live: &Live, extending: bool) -> Vec<Value> {

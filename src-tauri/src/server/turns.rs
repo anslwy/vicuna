@@ -96,7 +96,6 @@ pub struct LaunchParams {
     pub workspace: String,
     pub messages: Vec<ChatMessage>,
     pub session_id: Option<String>,
-    pub goal_text: Option<String>,
     pub fresh_session: bool,
     pub lead: bool,
     pub rec: Option<Recorder>,
@@ -131,6 +130,7 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     mcp_snapshot.only = p.mcp_only;
     if let (Some(sid), Ok(mut m)) = (&p.session_id, st.session_turns.lock()) {
         m.insert(sid.clone(), (turn_id.clone(), p.uuid.clone(), now_ms() as u64));
+        st.redo_history.clear(sid);
     }
     let rs = match (p.rec, &st.db) {
         (Some(rec), Some(_)) => {
@@ -154,11 +154,11 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     let acp = st.acp.clone();
     let session_turns = st.session_turns.clone();
     let live_key = p.session_id.clone().map(|sid| (sid, turn_id.clone()));
-    let (model, workspace, messages, session_id, goal_text, fresh, engine) =
-        (p.model, p.workspace, p.messages, p.session_id, p.goal_text, p.fresh_session, p.engine);
+    let (model, workspace, messages, session_id, fresh, engine) =
+        (p.model, p.workspace, p.messages, p.session_id, p.fresh_session, p.engine);
     tokio::spawn(async move {
         crate::acp::run_turn(
-            turn, model, workspace, messages, session_id, goal_text, fresh, on_event, &acp, mcp_snapshot, engine,
+            turn, model, workspace, messages, session_id, None, fresh, on_event, &acp, mcp_snapshot, engine,
         )
         .await;
         if let (Some((sid, tid)), Ok(mut m)) = (live_key, session_turns.lock()) {
@@ -405,12 +405,6 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
     crate::server_store::write_messages(db, chat_id, &messages, Some(now_ms())).await?;
     let native: Vec<ChatMessage> =
         persist::compacted_history(&messages[..messages.len() - 1]).iter().filter_map(chat_message).collect();
-    let goal_text = chat
-        .get("goal")
-        .and_then(Value::as_str)
-        .and_then(|g| serde_json::from_str::<Value>(g).ok())
-        .filter(|g| g.get("paused").and_then(Value::as_bool) != Some(true))
-        .and_then(|g| g.get("text").and_then(Value::as_str).map(str::to_string));
     let idx = messages.len() - 1;
     let rec = Recorder::new(chat_id, messages, idx, pick.clone(), engine.id());
     launch(
@@ -422,7 +416,6 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
             workspace,
             messages: native,
             session_id: Some(chat_id.to_string()),
-            goal_text,
             fresh_session: false,
             lead: extra.lead,
             rec: Some(rec),
@@ -683,6 +676,7 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
             let _write = st.chat_lock.lock().await;
             super::chat::stop(st, &id, None);
             crate::server_store::merge_json(db, &json!([]), vec![id.clone()], &Default::default()).await?;
+            st.redo_history.clear(&id);
             schedule_drop_for(st, &id).await;
             Ok(json!({ "id": id, "deleted": true }))
         }

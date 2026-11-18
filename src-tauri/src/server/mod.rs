@@ -28,6 +28,7 @@ mod chat;
 pub mod embedded;
 pub mod persist;
 pub mod turns;
+mod session_tools;
 
 
 use std::collections::{HashMap, VecDeque};
@@ -80,6 +81,7 @@ pub struct BridgeState {
     /// being written to the db), see server_turns.rs
     pub recorders: turns::Recorders,
     chat_turns: chat::ChatTurns,
+    redo_history: session_tools::RedoHistory,
     /// session -> MCP servers added mid-turn that wake it when the turn ends
     pub mcp_wakes: Arc<Mutex<HashMap<String, Vec<(String, Option<usize>)>>>>,
     /// the user's UTC offset (minutes), as last reported by a window; the
@@ -113,6 +115,7 @@ impl Default for BridgeState {
             session_turns: Arc::new(Mutex::new(HashMap::new())),
             recorders: Arc::new(Mutex::new(HashMap::new())),
             chat_turns: Mutex::new(HashMap::new()),
+            redo_history: Default::default(),
             mcp_wakes: Arc::new(Mutex::new(HashMap::new())),
             tz_offset_min: std::sync::atomic::AtomicI64::new(0),
             sched_lock: tokio::sync::Mutex::new(()),
@@ -308,7 +311,6 @@ async fn dispatch(
                     workspace: s("workspace")?,
                     messages,
                     session_id,
-                    goal_text: arg_opt_str(args, "goalText"),
                     fresh_session: args.get("freshSession").and_then(|v| v.as_bool()).unwrap_or(false),
                     lead: args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false),
                     report_to: rec.as_ref().and(arg_opt_str(args, "reportTo")),
@@ -343,6 +345,23 @@ async fn dispatch(
                 arg_opt_str(args, "model").as_deref(),
             )?;
             Ok(serde_json::Value::Null)
+        }
+        "work_default_workspace" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no settings (run `vicuna serve`).")?;
+            let key = "pref_default_workspace";
+            match args.get("workspace") {
+                None => Ok(serde_json::json!(crate::server_store::meta_get(db, key).await?)),
+                Some(value) => {
+                    let path = value.as_str().ok_or("workspace must be a string")?;
+                    let workspace = if path.is_empty() {
+                        String::new()
+                    } else {
+                        crate::work_validate_root_logic(path.to_owned()).await?
+                    };
+                    crate::server_store::meta_put(db, key, &workspace).await?;
+                    Ok(serde_json::json!(workspace))
+                }
+            }
         }
         "work_usage" => Ok(serde_json::to_value(
             crate::work_usage::fetch_usage_logic(arg_opt_str(args, "engine")).await?,
@@ -579,10 +598,15 @@ async fn dispatch(
             // records Work turns itself + per-chat revisions (server_turns.rs)
             "persist": st.db.is_some(),
             "chatTurns": st.db.is_some(),
+            "sessionTools": st.db.is_some(),
         })),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
-            crate::server_store::load_chats(db).await
+            let mut chats = crate::server_store::load_chats(db).await?;
+            for chat in chats.as_array_mut().into_iter().flatten() {
+                st.redo_history.decorate(chat);
+            }
+            Ok(chats)
         }
         "chats_merge" => {
             let _write = st.chat_lock.lock().await;
@@ -593,12 +617,17 @@ async fn dispatch(
         }
         "chats_get" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
-            Ok(crate::server_store::load_chat(db, &s("id")?).await?.unwrap_or(serde_json::Value::Null))
+            let mut chat = crate::server_store::load_chat(db, &s("id")?).await?.unwrap_or(serde_json::Value::Null);
+            st.redo_history.decorate(&mut chat);
+            Ok(chat)
         }
+        "session_compact" => session_tools::compact(st, args).await,
+        "session_undo" => session_tools::change_turn(st, args, false).await,
+        "session_redo" => session_tools::change_turn(st, args, true).await,
         "schedule_list" => turns::schedule_list(st).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
         // session + message actions (server/actions.rs)
-        "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
+        "session_create" | "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
             actions::dispatch(st, cmd, args).await
         }
         "schedule_put" => {
@@ -1210,8 +1239,12 @@ static EMBEDDED_RESOURCE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::syn
 pub const API_ACTIONS: &[&str] = &[
     "message_delete",
     "message_edit",
+    "session_compact",
+    "session_create",
     "session_delete",
     "session_fork",
+    "session_redo",
+    "session_undo",
     "session_update",
     "app_build_info",
     "bridge_open_path",
@@ -1278,6 +1311,7 @@ pub const API_ACTIONS: &[&str] = &[
     "work_agent_start",
     "work_agent_stop",
     "work_agent_turn_live",
+    "work_default_workspace",
     "work_delete",
     "work_engine_info",
     "work_engine_select",

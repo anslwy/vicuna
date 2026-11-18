@@ -361,6 +361,7 @@
    *  writes their transcript, runs follow-ups and sends scheduled messages,
    *  so the window skips saving live turns and adopts the server's copy */
   let serverPersist = $state(false);
+  let serverSessionTools = $state(false);
   let serverChatTurns = $state(false);
   const scheduleNote = $derived(serverPersist ? SCHEDULE_SERVER_NOTE : SCHEDULE_OPEN_NOTE);
   /** per session: settle its current Work turn as stopped, from outside the
@@ -1940,7 +1941,7 @@
   });
 
   function save() {
-    void saveChats(chats);
+    if (!serverSessionTools) void saveChats(chats);
     void saveModel(selectedModel);
   }
 
@@ -1994,7 +1995,7 @@
     // No placeholder session is created: the sidebar stays unchanged and
     // the session only appears once the first message is sent (send()
     // builds it inline with the first message as its title).
-    if (chats.some((c) => c.messages.length === 0)) {
+    if (!serverSessionTools && chats.some((c) => c.messages.length === 0)) {
       chats = chats.filter((c) => c.messages.length > 0);
       save();
     }
@@ -2091,13 +2092,17 @@
     pendingDeleteId = null;
     const remaining = chats.filter((c) => c.id !== id);
     chats = remaining;
-    // server-backed: the delete is the server's action (it also stops the
-    // turn and drops the session's scheduled sends); the save below then
-    // only finds an id the server no longer has
+    // The server action stops the turn and drops the scheduled sends.
     if (serverPersist) {
       void serverSavesIdle()
         .then(() => invokeOrBridge("session_delete", { id }))
-        .catch((e: any) => (error = typeof e === "string" ? e : (e?.message ?? String(e))));
+        .catch(async (e: unknown) => {
+          if (serverSessionTools) {
+            const raw = await invokeOrBridge<unknown>("chats_get", { id }).catch(() => null);
+            if (raw && !chats.some((c) => c.id === id)) adoptChatTurn(raw);
+          }
+          error = e instanceof Error ? e.message : String(e);
+        });
     }
     if (id === activeId) {
       activeId = null;
@@ -3160,8 +3165,23 @@
     persistPrefs();
   }
 
+  let lastDefaultWorkspace = "";
+  let defaultWorkspaceWrite = Promise.resolve();
+
   function persistPrefs() {
     savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded, sessionFilter: sessionFilterRaw });
+    if (!serverSessionTools || lastDefaultWorkspace === defaultWorkspace) return;
+    const prev = lastDefaultWorkspace;
+    const workspace = defaultWorkspace;
+    lastDefaultWorkspace = workspace;
+    defaultWorkspaceWrite = defaultWorkspaceWrite.then(async () => {
+      try {
+        await invokeOrBridge("work_default_workspace", { workspace });
+      } catch (e) {
+        if (lastDefaultWorkspace === workspace) lastDefaultWorkspace = prev;
+        console.error("Could not save the server workspace default", e);
+      }
+    });
   }
 
   function setOllamaHost(text: string) {
@@ -3632,7 +3652,7 @@
       return;
     }
     // like New: don't pile up empty drafts
-    if (chats.some((c) => c.messages.length === 0)) {
+    if (!serverSessionTools && chats.some((c) => c.messages.length === 0)) {
       chats = chats.filter((c) => c.messages.length > 0);
     }
     const chat: Chat = {
@@ -3644,7 +3664,14 @@
       mode: "work",
       workspace: canon
     };
-    chats = [chat, ...chats];
+    if (serverSessionTools) {
+      const created = await serverAction("session_create", {
+        id: chat.id, title: chat.title, mode: chat.mode, workspace: chat.workspace
+      });
+      if (!created) return;
+    } else {
+      chats = [chat, ...chats];
+    }
     activeId = chat.id;
     isPinned = true;
     error = null;
@@ -3692,7 +3719,7 @@
   function dropActiveDraft(exceptId: string | null) {
     if (!activeId || activeId === exceptId) return;
     const c = chats.find((x) => x.id === activeId);
-    if (c && c.messages.length === 0) {
+    if (!serverSessionTools && c && c.messages.length === 0) {
       chats = chats.filter((x) => x.id !== activeId);
       save();
     }
@@ -3989,7 +4016,7 @@
       const raw = await invokeOrBridge<any>(action, args);
       if (!raw || typeof raw.id !== "string") return null;
       const fresh = adoptServerChat(raw);
-      if (action === "session_update" && serverChatFeeds.has(fresh.id)) {
+      if (action === "session_update" && (serverChatFeeds.has(fresh.id) || workRunningIds.includes(fresh.id))) {
         const live = chats.find((c) => c.id === fresh.id);
         if (live) fresh.messages = live.messages;
       }
@@ -5167,6 +5194,18 @@
       flashNotice("Nothing to compact — the session has no messages yet.");
       return;
     }
+    if (serverSessionTools) {
+      setToolStatus(chat.id, "Compacting context…");
+      try {
+        await runServerSessionTool("session_compact", chat, {
+          model: selectedModel,
+          ...(isOpenRouterSelection(selectedModel) ? { openRouterApiKey: openrouterKey } : {})
+        });
+      } finally {
+        setToolStatus(chat.id, null);
+      }
+      return;
+    }
     // model-visible transcript (drops anything already compacted): the UI
     // keeps every message, only the model's context is trimmed
     const visible = compactedHistory(chat.messages);
@@ -5760,15 +5799,13 @@
   });
 
   /** slash commands: like @-mentions but triggered by a leading "/" in an
-   *  otherwise empty composer (typing "/usr/…" filters, anything else hides).
-   *  Args ride along after the command word ("/goal ship it"). */
+   *  otherwise empty composer (typing "/usr/…" filters, anything else hides). */
   const SLASH_COMMANDS = [
     { name: "compact", desc: "Summarize older messages into one note to free context" },
-    { name: "goal", desc: "Set, show, pause, resume or clear the session objective", takesArgs: true },
     { name: "undo", desc: "Remove the last turn and revert its file changes" },
     { name: "redo", desc: "Re-apply the turn most recently undone" }
   ];
-  type SlashItem = { name: string; desc: string; takesArgs?: boolean; disabled?: boolean };
+  type SlashItem = { name: string; desc: string; disabled?: boolean };
   let slash = $state<{ query: string; items: SlashItem[]; index: number } | null>(null);
   /** message pairs removed by /undo, newest last, per session — /redo
    *  re-inserts them while the transcript still matches (afterLen). */
@@ -5781,7 +5818,6 @@
       slash = null;
       return;
     }
-    // match on the head word so "/goal ship it" still offers /goal
     const q = input.slice(1).trim().toLowerCase();
     const head = q.split(/\s+/)[0] ?? "";
     const chat = chats.find((c) => c.id === activeId) ?? null;
@@ -5802,156 +5838,28 @@
     slash = { query: q, items, index: firstEnabled < 0 ? 0 : firstEnabled };
   }
 
-  /** /goal forms: show, set/replace, pause, resume, clear (ZCode-style).
-   *  Setting mid-turn is allowed — the loop reads the live goal. */
-  function goalCommand(args: string) {
-    const chat = chats.find((c) => c.id === activeId);
-    if (!chat) {
-      // empty starter: no session yet. With an objective, create the Work
-      // session and kick it off (the goal is the first task). Bare `/goal`
-      // raises an empty work session so the header (with Configure) has
-      // somewhere to live.
-      if (composerMode !== "work") {
-        error = "/goal is only available in Work sessions.";
-        return;
-      }
-      if (!args) {
-        const ws0 = (pendingWorkspace || defaultWorkspace || "").trim();
-        const blank: Chat = {
-          id: crypto.randomUUID(),
-          title: "New session",
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          messages: [],
-          mode: "work",
-          workspace: ws0 || null
-        };
-        chats = [blank, ...chats];
-        activeId = blank.id;
-        isPinned = true;
-        error = null;
-        save();
-        goalPromptSession = blank.id;
-        goalDraft = "";
-        void goto(`/s/${blank.id}`);
-        return;
-      }
-      void startGoalOnHome(args);
-      return;
-    }
-    if ((chat.mode ?? "chat") !== "work") {
-      error = "/goal is only available in Work sessions.";
-      return;
-    }
-    const cur = chatGoal(chat);
-    const set = (text: string) => {
-      chat.goal = JSON.stringify({ text, paused: false, startedAt: Date.now(), pausedAt: null });
-      chats = [...chats];
-      save();
-    };
-    if (!args) {
-      // bare `/goal`: summon the header strip with its empty state —
-      // Configure opens the popup from there
-      goalPromptSession = chat.id;
-      return;
-    }
-    if (args === "pause") {
-      if (!cur) {
-        error = "No goal to pause — /goal <objective> to set one.";
-        return;
-      }
-      if (cur.paused) {
-        error = "Goal is already paused.";
-        return;
-      }
-      chat.goal = JSON.stringify({ ...cur, paused: true, pausedAt: Date.now() });
-      chats = [...chats];
-      save();
-      return;
-    }
-    if (args === "resume") {
-      if (!cur) {
-        error = "No goal to resume — /goal <objective> to set one.";
-        return;
-      }
-      if (!cur.paused) {
-        error = "Goal isn't paused.";
-        return;
-      }
-      const shift = cur.pausedAt != null ? Date.now() - cur.pausedAt : 0;
-      chat.goal = JSON.stringify({ ...cur, paused: false, startedAt: cur.startedAt + shift, pausedAt: null });
-      chats = [...chats];
-      save();
-      if (!busy) void startGoalTurn();
-      return;
-    }
-    if (args === "clear") {
-      if (!cur) {
-        error = "No goal set.";
-        return;
-      }
-      chat.goal = null;
-      chats = [...chats];
-      save();
-      goalPromptSession = chat.id;
-      return;
-    }
-    const m = args.match(/^replace\s+(.+)$/);
-    const text = (m ? m[1] : args).trim();
-    if (!text) {
-      error = "Goal text is empty — /goal <objective> to set one.";
-      return;
-    }
-    set(text);
-    if (!busy) void startGoalTurn();
-  }
-
-  /** `/goal <text>` on the empty starter: raise the Work session now (the
-   *  goal is its first task) and kick the agent — no extra prompt needed. */
-  async function startGoalOnHome(text: string) {
-    if (busy) return;
-    const ws = (pendingWorkspace || defaultWorkspace || "").trim();
-    const c: Chat = {
-      id: crypto.randomUUID(),
-      title: text.slice(0, 32) + (text.length > 32 ? ".." : ""),
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      messages: [],
-      mode: "work",
-      workspace: ws || null,
-      goal: JSON.stringify({ text, paused: false, startedAt: Date.now(), pausedAt: null })
-    };
-    chats = [c, ...chats];
-    activeId = c.id;
-    isPinned = true;
+  async function runServerSessionTool(action: "session_compact" | "session_undo" | "session_redo", chat: Chat, args: Record<string, unknown> = {}) {
+    if (isCompacting(chat.id)) return;
+    markCompacting(chat.id);
     error = null;
-    save();
-    await startGoalTurn();
-    // deferred navigation (like send): the route only changes once the
-    // turn is underway, and never if the user moved on meanwhile
-    if (activeId === c.id) void goto(`/s/${c.id}`);
-  }
-
-  /** setting or resuming a goal kicks the agent immediately (when idle)
-   *  instead of waiting for another prompt — the goal itself is the task */
-  async function startGoalTurn() {
-    const c = chats.find((x) => x.id === activeId);
-    if (!c || (c.mode ?? "chat") !== "work" || busy) return;
-    const g = chatGoal(c);
-    if (!g || g.paused) return;
-    if (!c.workspace?.trim()) {
-      error = "Work mode needs a workspace folder — pick one with the folder pill, then send a message.";
-      return;
+    try {
+      const result = await invokeOrBridge<{ chat?: unknown; notice?: string }>(action, {
+        id: chat.id, baseRev: serverSaveRow(chat)?.baseRev, ...args
+      });
+      if (result.chat && chats.some((c) => c.id === chat.id)) {
+        adoptChatTurn(result.chat);
+        if (activeId === chat.id) {
+          scrollBottom();
+          if (action !== "session_compact") void loadExplorer().catch(() => {});
+        }
+      }
+      if (result.notice && activeId === chat.id) flashNotice(result.notice);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      if (error.includes("SESSION_CHANGED")) await reloadServerChatTurn(chat.id);
+    } finally {
+      unmarkCompacting(chat.id);
     }
-    if (c.title === "New session" || c.title === "New Session") {
-      c.title = g.text.slice(0, 40);
-    }
-    c.messages = [...c.messages, { role: "user", content: g.text }, { role: "assistant", content: "", thinking: "", model: selectedModel }];
-    c.updatedAt = Date.now();
-    chats = [c, ...chats.filter((x) => x.id !== c.id)];
-    save();
-    scrollBottom();
-    await runWorkTurn(c, c.messages.length - 1, c.workspace);
   }
 
   /** /undo: drop the last user + assistant pair and revert the last turn's
@@ -5970,6 +5878,10 @@
       return;
     }
     if (busy) return;
+    if (serverSessionTools) {
+      await runServerSessionTool("session_undo", chat);
+      return;
+    }
     // last user message with a following assistant reply (the turn's pair).
     // Later messages (e.g. a /compact summary) stay — only the pair goes.
     let userIdx = -1;
@@ -6034,6 +5946,10 @@
       return;
     }
     if (busy || !redoPossible(chat)) return;
+    if (serverSessionTools) {
+      await runServerSessionTool("session_redo", chat);
+      return;
+    }
     const stack = undoStashes[chat.id] ?? [];
     const top = stack[stack.length - 1];
     if (!top) return;
@@ -6084,6 +6000,7 @@
    *  unchanged since (a new message or edit greys it out). */
   function redoPossible(chat: Chat | null): boolean {
     if (!chat || (chat.mode ?? "chat") !== "work" || busy) return false;
+    if (serverSessionTools) return chat.canRedo === true;
     const stack = undoStashes[chat.id];
     const top = stack?.[stack.length - 1];
     return !!top && chat.messages.length === top.afterLen;
@@ -6107,39 +6024,15 @@
     const cmd = item?.name;
     slash = null;
     if (!cmd || item?.disabled) return;
-    // args ride along after the command word ("/goal ship it") — grab
-    // them before the composer is cleared
-    const sp = cmd === "goal" ? input.indexOf(" ") : -1;
-    const args = sp < 0 ? "" : input.slice(sp + 1).trim();
     input = "";
     historyIndex = null;
     historyDraft = "";
     clearDraft(null);
     autosizeComposer();
     composerEl?.focus();
-    if (cmd === "goal") {
-      goalCommand(args);
-      return;
-    }
     if (cmd === "compact") void compactSession();
     if (cmd === "undo") void undoSession();
     if (cmd === "redo") void redoSession();
-  }
-
-  /** Tab on a bare args-taking command ("/go", "/goal") completes it with a
-   *  trailing space so args can follow, instead of running it with no args.
-   *  Tab with args present (or on arg-less commands) runs as usual. */
-  function completeSlash() {
-    const item = slash?.items[slash.index];
-    if (!item) return;
-    input = `/${item.name} `;
-    clearDraft(null);
-    refreshSlashMenu();
-    requestAnimationFrame(() => {
-      composerEl?.setSelectionRange(input.length, input.length);
-      composerEl?.focus();
-      syncBackdropScroll();
-    });
   }
 
   /** context window of the selected model for the usage ring (cached per
@@ -7332,15 +7225,7 @@
       if (e.key === "Tab") {
         e.preventDefault();
         popupKeyHandled = true;
-        const item = slash.items[slash.index];
-        // bare args-taking command ("/go", "/goal"): complete it with a
-        // trailing space so args can follow, instead of running with none.
-        // Tab with args present, or on arg-less commands, runs as usual.
-        if (item?.takesArgs && !/\s\S/.test(input)) {
-          completeSlash();
-        } else {
-          runSlash();
-        }
+        runSlash();
         return;
       }
       if (e.key === "Enter" && !e.shiftKey) {
@@ -7533,47 +7418,6 @@
     return messages.slice(from).map(toHistory);
   }
 
-  /** Work-only session objective (/goal), persisted as a JSON blob on the
-   *  chat. The turn loop keeps running until an unpaused goal reads as met. */
-  interface SessionGoal {
-    text: string;
-    paused: boolean;
-    startedAt: number;
-    pausedAt: number | null;
-  }
-
-  /** parse the stored goal; null when unset or corrupt */
-  function chatGoal(c: Chat | undefined | null): SessionGoal | null {
-    if (!c?.goal) return null;
-    try {
-      const g = JSON.parse(c.goal) as Partial<SessionGoal>;
-      if (typeof g.text !== "string" || !g.text) return null;
-      return {
-        text: g.text,
-        paused: g.paused === true,
-        startedAt: typeof g.startedAt === "number" ? g.startedAt : Date.now(),
-        pausedAt: typeof g.pausedAt === "number" ? g.pausedAt : null
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /** the open thread's goal, for the header strip */
-  const goalNow = $derived(activeChat ? chatGoal(activeChat) : null);
-  /** goal settings popup (Configure button) + editable objective draft */
-  let goalOpen = $state(false);
-  let goalDraft = $state("");
-  /** show the goal strip's "<no goal yet>" empty state for one session:
-   *  keyed by chat id (not a boolean) so creating/navigating to the session
-   *  doesn't race the activeId-change effect that closes the popup */
-  let goalPromptSession: string | null = $state(null);
-  // settings belong to one session: close them when navigating away
-  $effect(() => {
-    activeId;
-    goalOpen = false;
-  });
-
   function noteImagesStripped() {
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
@@ -7638,10 +7482,12 @@
         defaultPath: hint && !(isWindows && hint === "/") ? hint : undefined
       });
       if (typeof picked !== "string" || !picked) return; // cancelled
+      const workspaceChat = activeChat;
       pendingWorkspace = picked;
       if (composerMode === "work" && activeChat) activeChat.workspace = picked;
       workspaceError = await validateWorkspace(picked);
       if (!workspaceError) {
+        await persistSessionWorkspace(workspaceChat, picked);
         defaultWorkspace = picked;
         persistPrefs();
       }
@@ -7705,16 +7551,23 @@
    *  + persist-default flow as the desktop picker (empty draft = cancel).
    *  The popup stays open on validation failure so the error is visible
    *  next to the path it rejects. */
+  async function persistSessionWorkspace(chat: Chat | undefined | null, workspace: string) {
+    if (!serverSessionTools || chat?.mode !== "work" || serverSaveRow(chat)?.baseRev == null) return;
+    await serverAction("session_update", { id: chat.id, workspace });
+  }
+
   async function commitWorkspacePicker() {
     const picked = workspaceDraft.trim();
     if (!picked) {
       workspacePickerOpen = false;
       return;
     }
+    const workspaceChat = activeChat;
     pendingWorkspace = picked;
     if (composerMode === "work" && activeChat) activeChat.workspace = picked || null;
     workspaceError = await validateWorkspace(picked);
     if (!workspaceError) {
+      await persistSessionWorkspace(workspaceChat, picked);
       defaultWorkspace = picked;
       persistPrefs();
       workspacePickerOpen = false;
@@ -7727,7 +7580,7 @@
    *  mirrors the semantic event stream below into the bubble (collapsed
    *  markdown results for persistence, ask cards, steering bubbles) exactly
    *  like the old in-thread loop did. Settle paths (leftovers, follow-up
-   *  turns, goal retirement, stats) are unchanged. */
+   *  turns and stats) are unchanged. */
   /** Follow Work turns the server is still running for sessions this window
    *  shows (the window that started them closed or reloaded). Without this
    *  the turn ran on unseen, its output was never saved, and the next send
@@ -7806,8 +7659,11 @@
     const local = chats.find((x) => x.id === id);
     const fresh = adoptServerChat(raw);
     if (!local) return;
-    local.messages = fresh.messages;
-    if ((fresh.updatedAt ?? 0) > (local.updatedAt ?? 0)) local.updatedAt = fresh.updatedAt;
+    if (serverSessionTools) Object.assign(local, fresh);
+    else {
+      local.messages = fresh.messages;
+      if ((fresh.updatedAt ?? 0) > (local.updatedAt ?? 0)) local.updatedAt = fresh.updatedAt;
+    }
     chats = [...chats];
     save();
   }
@@ -7939,7 +7795,6 @@
         ];
       }
     }
-    const startGoal = chatGoal(live());
     // visible history: opencode keeps its own session context; a fresh
     // session (fork/restart/regenerate) gets this as a preamble backend-side.
     // opencode brings its own tools; enabled MCP servers are handed to it in
@@ -8352,7 +8207,6 @@
         workspace,
         messages: native,
         sessionId: chat.id,
-        goalText: startGoal && !startGoal.paused ? startGoal.text : null,
         onEvent: (ev) => handleEvent(ev)
       });
     } catch (e: any) {
@@ -8422,7 +8276,15 @@
       forkedFrom: { id: src.id, title: src.title },
       forkFromIndex: null
     };
-    chats = [fork, ...chats];
+    if (serverSessionTools && !ws) {
+      const created = await serverAction("session_create", {
+        id: fork.id, title: fork.title, mode: fork.mode,
+        forkedFromId: src.id, placeholderModel: selectedModel
+      });
+      if (!created) return;
+    } else {
+      chats = [fork, ...chats];
+    }
     activeId = fork.id;
     isPinned = true;
     pendingMode = "work";
@@ -8825,9 +8687,18 @@
         chatsLoaded = true;
       }
       if (isServerBacked() && !srvLoadError) {
-        const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean }>("server_info", {}).catch(() => null);
+        const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean; sessionTools?: boolean }>("server_info", {}).catch(() => null);
         serverPersist = info?.persist === true;
         serverChatTurns = info?.chatTurns === true;
+        serverSessionTools = info?.sessionTools === true;
+        if (serverSessionTools) {
+          const workspace = await invokeOrBridge<string | null>("work_default_workspace", {}).catch(() => null);
+          if (workspace !== null) {
+            pendingWorkspace = workspace;
+            defaultWorkspace = workspace;
+          }
+          lastDefaultWorkspace = workspace ?? "";
+        }
         setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
@@ -8836,7 +8707,7 @@
       const savedActive = await loadActiveChat();
       // empty drafts are never listed: drop any persisted from older
       // builds so a stale "New session" row can't linger in the sidebar
-      if (chats.some((c) => c.messages.length === 0)) {
+      if (!serverSessionTools && chats.some((c) => c.messages.length === 0)) {
         chats = chats.filter((c) => c.messages.length > 0);
         save();
       }
@@ -9496,46 +9367,6 @@
           {/if}
           </span>
         </div>
-        {#if goalNow || goalPromptSession === activeId}
-          {@const goalLive = goalNow && activeWorkRunning}
-          <div class="goal-wrap">
-            <div class="goal-strip" data-testid="goal-strip">
-              <span class="goal-badge">Goal</span>
-              <span class="goal-text" title={goalNow?.text ?? ""}>{goalNow ? goalNow.text : "<no goal yet>"}</span>
-              {#if goalNow}
-                <span class="goal-state {goalLive && !goalNow.paused ? 'shimmer' : ''}" data-testid="goal-status">{goalNow.paused ? "paused" : goalLive ? "running" : "stopped"}</span>
-              {:else}
-                <button class="goal-badge goal-btn goal-dim" data-testid="goal-dismiss-btn" title="Dismiss goal header" onclick={() => (goalPromptSession = null)}>Dismiss</button>
-              {/if}
-              <button class="goal-badge goal-btn" data-testid="goal-configure-btn" title="Manage goal" onclick={() => { goalDraft = goalNow?.text ?? ""; goalOpen = true; }}>Configure</button>
-            </div>
-            {#if goalOpen}
-              <button class="model-backdrop" data-testid="goal-backdrop" aria-label="Close goal settings" onclick={() => (goalOpen = false)} tabindex="-1"></button>
-              <div class="goal-popup" data-testid="goal-popup" role="dialog" aria-label="Goal settings" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); goalOpen = false; } }}>
-                <div class="goal-edit-row">
-                  <input
-                    class="pull-input"
-                    data-testid="goal-input"
-                    placeholder="Session objective…"
-                    bind:value={goalDraft}
-                    onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); goalCommand("replace " + goalDraft.trim()); goalOpen = false; } }}
-                  />
-                  <button class="mini-btn primary" data-testid="goal-save-btn" disabled={goalDraft.trim() === ""} onclick={() => { goalCommand("replace " + goalDraft.trim()); goalOpen = false; }}>Save</button>
-                </div>
-                {#if goalNow}
-                  <div class="goal-actions-row">
-                    {#if goalNow.paused}
-                      <button class="mini-btn" data-testid="goal-resume-btn" onclick={() => goalCommand("resume")}>Resume</button>
-                    {:else}
-                      <button class="mini-btn" data-testid="goal-pause-btn" onclick={() => goalCommand("pause")}>Pause</button>
-                    {/if}
-                    <button class="mini-btn" data-testid="goal-clear-btn" onclick={() => goalCommand("clear")}>Clear</button>
-                  </div>
-                {/if}
-              </div>
-            {/if}
-          </div>
-        {/if}
       {/if}
       <div
         class="messages"
@@ -9866,7 +9697,16 @@
               pendingWorkspace = v;
               if (activeChat) activeChat.workspace = v || null;
             }}
-            onblur={() => { workspaceEditing = false; void validateWorkspace(pendingWorkspace).then((e) => (workspaceError = e)); }}
+            onblur={() => {
+              workspaceEditing = false;
+              const chat = activeChat;
+              const path = pendingWorkspace;
+              if (!path.trim()) return;
+              void validateWorkspace(path).then((e) => {
+                workspaceError = e;
+                if (!e) void persistSessionWorkspace(chat, path);
+              });
+            }}
           />
           {#if workspaceError}
             <div class="goto-error" data-testid="workspace-inline-error">{workspaceError}</div>
@@ -9994,14 +9834,7 @@
                   e.preventDefault();
                   if (item.disabled) return;
                   if (slash) slash.index = i;
-                  const picked = slash?.items[i];
-                  // same as Tab: bare args-taking commands complete
-                  // ("/goal" → "/goal ") instead of running with no args
-                  if (picked?.takesArgs && !/\s\S/.test(input)) {
-                    completeSlash();
-                  } else {
-                    runSlash();
-                  }
+                  runSlash();
                 }}
                 onmousemove={() => {
                   if (slash && !item.disabled && slash.index !== i) slash.index = i;
@@ -12644,19 +12477,6 @@
   .ctx-wrap:hover .ctx-popup, .ctx-wrap:focus-within .ctx-popup { display: block; }
   .ctx-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; color: var(--text); padding: 2px 0; font-variant-numeric: tabular-nums; }
   .ctx-row span:first-child { color: var(--muted-2); }
-  .goal-strip { display: flex; align-items: center; gap: 8px; }
-  .goal-wrap { position: relative; max-width: 860px; width: 100%; margin: 0 auto; padding: 6px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
-  .goal-popup { position: absolute; top: calc(100% + 6px); left: 24px; right: 54px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px; z-index: 30; display: flex; flex-direction: column; gap: 8px; }
-  .goal-edit-row { display: flex; gap: 8px; }
-  .goal-edit-row .pull-input { flex: 1; min-width: 0; }
-  .goal-actions-row { display: flex; gap: 8px; }
-  .goal-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 8px; }
-  button.goal-badge { background: transparent; cursor: pointer; font-family: inherit; }
-  button.goal-badge:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-  button.goal-badge.goal-dim { color: var(--text); border-color: var(--border-strong); }
-  button.goal-badge.goal-dim:hover { background: var(--hover); }
-  .goal-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
-  .goal-state { flex-shrink: 0; font-size: 11px; color: var(--muted-2); }
   .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
@@ -12778,12 +12598,11 @@
   .mcp-pat-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
   .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
   .mcp-pat-link:hover { text-decoration: underline; }
-
   /* Narrow main column (small window OR side panels open): shift the Work
-   * banner + goal strip right so the collapsed-rail toggle can't overlap them.
+   * banner right so the collapsed-rail toggle can't overlap them.
    * Viewport media queries can't see panel-driven narrowing, hence @container. */
   @container (max-width: 920px) {
-    .work-banner, .goal-wrap { padding-left: 60px; }
+    .work-banner { padding-left: 60px; }
   }
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
@@ -12793,7 +12612,7 @@
     .model-pill { max-width: 150px; }
     .model-drop { width: 330px; max-width: calc(100vw - 48px); }
   .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
-    .work-banner, .goal-wrap { padding-left: 60px; }
+    .work-banner { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
     .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
     .confirm-card { width: calc(100vw - 32px); }

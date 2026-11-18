@@ -119,14 +119,14 @@ async fn commit(st: &BridgeState, chat: &mut Value) -> Result<Value, String> {
     crate::server_store::load_chat(db, &id).await?.ok_or_else(|| "session vanished".into())
 }
 
-async fn load(st: &BridgeState, id: &str) -> Result<Value, String> {
+pub(super) async fn load(st: &BridgeState, id: &str) -> Result<Value, String> {
     let db = st.db.as_ref().ok_or("this bridge stores no sessions (run `vicuna serve`)")?;
     crate::server_store::load_chat(db, id).await?.ok_or_else(|| format!("no session {id}"))
 }
 
 /// Message edits/deletes are refused while the session's turn runs (the
 /// window gated them on `busy`; the server is now the authority).
-fn idle(st: &BridgeState, id: &str) -> Result<(), String> {
+pub(super) fn idle(st: &BridgeState, id: &str) -> Result<(), String> {
     if live_turn(st, id).is_some() || super::chat::is_running(st, id) {
         return Err("the session is running; wait for it or stop it first".into());
     }
@@ -164,6 +164,41 @@ pub(super) fn fork_row(src: &Value, id: &str, at: usize, fork_id: &str, msgs: Ve
 
 pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Value, String> {
     match cmd {
+        "session_create" => {
+            let id = arg_str(args, "id")?;
+            if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err("Invalid session id.".into());
+            }
+            let mode = args["mode"].as_str().unwrap_or("chat");
+            if !matches!(mode, "chat" | "work") {
+                return Err("Invalid session mode.".into());
+            }
+            let title = args["title"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("New session");
+            let workspace = match args["workspace"].as_str().filter(|path| !path.trim().is_empty()) {
+                Some(path) if mode == "work" => Some(crate::work_validate_root_logic(path.to_owned()).await?),
+                _ => None,
+            };
+            let db = st.db.as_ref().ok_or("this bridge stores no sessions")?;
+            let _write = st.chat_lock.lock().await;
+            if crate::server_store::load_chat(db, &id).await?.is_some() {
+                return Err("A session with that id already exists.".into());
+            }
+            let now = now_ms();
+            let mut chat = json!({
+                "id": id, "title": title, "createdAt": now, "updatedAt": now,
+                "mode": mode, "workspace": workspace, "messages": [],
+            });
+            if let Some(source) = args["forkedFromId"].as_str() {
+                let original = load(st, source).await?;
+                chat["forkedFrom"] = json!({"id": source, "title": original["title"]});
+                if let Some(model) = args["placeholderModel"].as_str() {
+                    chat["messages"] = json!([super::persist::assistant_placeholder(model)]);
+                }
+            }
+            as_save_row(&mut chat);
+            crate::server_store::create_chat(db, &chat).await?;
+            load(st, &id).await
+        }
         "session_update" => {
             let id = arg_str(args, "id")?;
             let _w = st.chat_lock.lock().await;
@@ -190,8 +225,18 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                     o.remove("role");
                 }
             }
+            if let Some(workspace) = args.get("workspace") {
+                idle(st, &id)?;
+                if chat["mode"] != "work" {
+                    return Err("Only Work sessions have a workspace.".into());
+                }
+                chat["workspace"] = match workspace.as_str().filter(|path| !path.trim().is_empty()) {
+                    Some(path) => json!(crate::work_validate_root_logic(path.to_owned()).await?),
+                    None => Value::Null,
+                };
+            }
             chat["extra"] = json!(extra.to_string());
-            if super::chat::is_running(st, &id) {
+            if live_turn(st, &id).is_some() || super::chat::is_running(st, &id) {
                 // The live recorder owns messages. Sidebar changes touch only
                 // metadata, and the recorder's next checkpoint preserves them.
                 let db = st.db.as_ref().ok_or("this bridge stores no sessions")?;

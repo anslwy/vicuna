@@ -19,10 +19,10 @@ export interface Chat {
   mode?: "chat" | "work";
   /** canonical workspace root for work sessions (null/undefined = unset) */
   workspace?: string | null;
-  /** work-only session objective (/goal): JSON blob, null when unset.
-   *  { text, paused, startedAt, pausedAt } — the turn loop keeps running
-   *  until an unpaused goal reads as met. */
+  /** Legacy Work objective, kept for compatibility with existing records. */
   goal?: string | null;
+  /** Whether the server can restore a Work turn that was undone. */
+  canRedo?: boolean;
   /** Work harness this session runs on ("claude" | "codex" | …); null = the
    *  global pick in Settings. */
   engine?: string | null;
@@ -600,6 +600,7 @@ export function normalizeServerChat(c: any): Chat {
     mode: c.mode === "work" ? "work" : "chat",
     workspace: typeof c.workspace === "string" ? c.workspace : null,
     goal: typeof c.goal === "string" ? c.goal : null,
+    canRedo: c.canRedo === true,
     ...parseChatExtra(c.extra),
     messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
       role: m.role as ChatMsg["role"],
