@@ -532,7 +532,6 @@ export interface WorkTurnParams {
   workspace: string;
   messages: ChatMsg[];
   sessionId?: string;
-  goalText?: string | null;
   /** the user's lead session: vicuna-mcp manage_sessions is allowed */
   lead?: boolean;
   /** server mode: the session as it stands at turn start (save row with its
@@ -554,7 +553,6 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     workspace: p.workspace,
     messages: p.messages,
     sessionId: p.sessionId ?? null,
-    goalText: p.goalText ?? null,
     lead: p.lead ?? false,
     // server mode (ignored elsewhere): see WorkTurnParams.persist
     ...(p.persist ? { persistChat: p.persist.chat, persistIndex: p.persist.index, reportTo: p.reportTo ?? null } : {}),

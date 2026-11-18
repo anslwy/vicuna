@@ -61,7 +61,7 @@ async fn ollama(
     mut history: Vec<Value>,
     prompt: Option<String>,
 ) -> Result<Stats, String> {
-    let temperature = turn.extending.then_some(0.2);
+    let temperature = turn.extending.then_some(0.2).or(options.temperature);
     let stop = turn.extending.then_some(options.stop);
     let mut retries = 0;
     loop {

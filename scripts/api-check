@@ -1,0 +1,207 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+const engines = ["claude", "codex", "opencode", "pi", "fx", "agy"];
+const options = new Map();
+for (let i = 2; i < process.argv.length; i += 2) {
+  const key = process.argv[i];
+  const value = process.argv[i + 1];
+  if (!["--bin", "--engine", "--model"].includes(key) || !value || value.startsWith("--")) {
+    throw new Error("Usage: scripts/api-check [--bin PATH] [--engine NAME|all] [--model ID]");
+  }
+  options.set(key, value);
+}
+const engineChoice = options.get("--engine");
+const selectedEngines = engineChoice === "all" ? engines : engineChoice ? [engineChoice] : [];
+if (selectedEngines.some((engine) => !engines.includes(engine))) throw new Error("Unknown Work harness.");
+if (options.has("--model") && selectedEngines.length !== 1) throw new Error("--model needs one --engine.");
+
+const bin = options.get("--bin") ?? "vicuna";
+const runFile = promisify(execFile);
+const scratch = await mkdtemp(join(tmpdir(), "vicuna-api-check-"));
+const summaryText = "Fixture summary of the Work transcript.";
+const replyText = "Fixture Chat reply.";
+
+async function withServer(name, callback, serverEnv = {}) {
+  const token = randomUUID();
+  const child = spawn(bin, ["serve", "--port", "0", "--db", join(scratch, name + ".db")], {
+    env: { ...process.env, ...serverEnv, VICUNA_SERVER_TOKEN: token },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  const endpoint = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Vicuna did not listen within 15 seconds.")), 15000);
+    const finish = (error, address) => {
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(address);
+    };
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk;
+      const address = stdout.match(/on (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+      if (address) finish(null, address);
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr = (stderr + chunk).slice(-3000); });
+    child.once("error", finish);
+    child.once("exit", (code) => finish(new Error(`Vicuna server exited (${code}). ${stderr.trim()}`)));
+  });
+  try {
+    const url = await endpoint;
+    const env = { ...process.env, VICUNA_SERVER: url, VICUNA_SERVER_TOKEN: token };
+    const run = async (...args) => (await runFile(bin, args, { env, timeout: 150000 })).stdout.trim();
+    const api = async (action, args = {}) => JSON.parse(await run("api", action, JSON.stringify(args)));
+    await callback({ api, run });
+  } finally {
+    child.kill();
+    await closed;
+  }
+}
+
+async function checkCore() {
+  // Redirect only this server's Ollama requests to a fixture. The harness
+  // checks below use their normal provider connections and a separate DB.
+  const fixture = createServer(async (req, res) => {
+    const path = new URL(req.url, "http://localhost:11434");
+    if (path.hostname !== "localhost" || path.pathname !== "/api/chat" || req.method !== "POST") {
+      res.writeHead(404).end();
+      return;
+    }
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    const summarize = body.messages[0]?.role === "system";
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    res.write(JSON.stringify({ message: { content: summarize ? summaryText : replyText }, done: false }) + "\n");
+    res.end(JSON.stringify({ message: { content: "" }, done: true, done_reason: "stop" }) + "\n");
+  });
+  fixture.listen(0, "127.0.0.1");
+  await once(fixture, "listening");
+  const proxy = `http://127.0.0.1:${fixture.address().port}`;
+  try {
+    await withServer("actions", async ({ api, run }) => {
+      const info = await api("server_info");
+      assert.equal(info.sessionTools, true);
+      assert.equal((await api("work_usage", { engine: "pi" })).engine, "pi");
+      assert.equal(await api("work_default_workspace"), null);
+      const savedWorkspace = await api("work_default_workspace", { workspace: scratch });
+      assert.equal(await api("work_default_workspace"), savedWorkspace);
+
+      const id = randomUUID();
+      const workspace = scratch;
+      const blank = await api("session_create", { id, mode: "work", title: "API check", workspace });
+      assert.deepEqual(blank.messages, []);
+      const user = { role: "user", content: "Fixture question" };
+      const assistant = { role: "assistant", content: "Fixture answer" };
+      // Simulate importing an existing transcript without requiring an account.
+      await api("chats_merge", { chats: [{ ...blank, baseRev: blank.rev, messages: [user, assistant] }] });
+      const get = () => api("chats_get", { id });
+      const previous = await get();
+      const compact = await api("session_compact", { id, model: "fixture", baseRev: previous.rev });
+      assert.equal(compact.chat.messages.at(-1).content, summaryText);
+      assert.equal(compact.chat.messages.at(-1).summary, true);
+      assert.deepEqual(compact.chat.messages.slice(0, 2), previous.messages);
+      assert.match((await api("session_compact", { id, model: "fixture" })).notice, /Already compacted/);
+
+      await assert.rejects(api("session_undo", { id, baseRev: previous.rev }), /SESSION_CHANGED/);
+      const undone = await api("session_undo", { id, baseRev: compact.chat.rev });
+      assert.deepEqual(undone.chat.messages, [compact.chat.messages[2]]);
+      assert.equal((await get()).canRedo, true);
+      const restored = await api("session_redo", { id, baseRev: undone.chat.rev });
+      assert.deepEqual((await get()).messages, compact.chat.messages);
+      assert.equal(restored.chat.canRedo, false);
+
+      const fork = await api("session_fork", { id, at: 1 });
+      const edited = await api("message_edit", { id: fork.id, index: 0, content: " Edited " });
+      assert.equal(edited.messages[0].content, "Edited");
+      const emptied = await api("message_delete", { id: fork.id, index: 1 });
+      assert.deepEqual(emptied.messages, []);
+      const item = { id: randomUUID(), chatId: id, text: "Fixture schedule", at: Date.now() + 3600000 };
+      await api("schedule_put", { items: [item] });
+      assert.equal((await api("schedule_list"))[0].id, item.id);
+      await api("session_delete", { id });
+      assert.deepEqual(await api("schedule_list"), []);
+      assert.equal(await get(), null);
+      await api("session_delete", { id: fork.id });
+
+      const chatId = randomUUID();
+      const stream = await run("api", "chat_turn_start", JSON.stringify({
+        id: chatId, operation: "send", model: "fixture", content: "Hello",
+        onEvent: "@channel",
+      }));
+      assert.match(stream, /"type":"done"/);
+      assert.equal((await api("chats_get", { id: chatId })).messages.at(-1).content, replyText);
+      await api("session_delete", { id: chatId });
+      console.log("PASS API actions, transcript revisions, scheduling, usage routing and Chat streaming");
+    }, { HTTP_PROXY: proxy, http_proxy: proxy, NO_PROXY: "", no_proxy: "" });
+  } finally {
+    fixture.closeAllConnections();
+    await new Promise((resolve) => fixture.close(resolve));
+  }
+}
+
+async function checkEngine(engine) {
+  const model = options.get("--model");
+  await withServer(engine, async ({ api, run }) => {
+    const created = await api("cli_session", {
+      action: "create", engine, workspace: scratch, title: "API check", mcp: [],
+      ...(model ? { model } : {}),
+    });
+    const id = created.id;
+    const get = () => api("chats_get", { id });
+    try {
+      const toolOutput = "VICUNA_API_CHECK_TOOLS_OK";
+      await writeFile(join(scratch, "harness-check.txt"), toolOutput);
+      await run("session", "send", id, "-p", "Use a read-only tool to read harness-check.txt in this workspace. Reply with the file contents.");
+      assert.match((await get()).messages.at(-1).content, new RegExp(toolOutput));
+
+      await run("session", "send", id, "-p", "Reply with VICUNA_API_CHECK_CONTINUE_OK.");
+      const before = (await get()).messages;
+      assert.match(before.at(-1).content, /VICUNA_API_CHECK_CONTINUE_OK/);
+
+      await api("session_undo", { id });
+      assert.equal((await get()).messages.length, before.length - 2);
+      await api("session_redo", { id });
+      assert.deepEqual((await get()).messages, before);
+
+      await run("session", "send", id, "-p", "Call vicuna-mcp ask_user with a question and choices, then wait for the answer.", "--detach");
+      let ask;
+      const deadline = Date.now() + 60000;
+      while (!ask && Date.now() < deadline) {
+        ask = (await api("work_agent_attach", { sessionId: id }))?.snapshot?.pendingAsk;
+        if (!ask) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      assert.ok(ask, `${engine} did not produce an ask card.`);
+      await api("cli_session", { action: "stop", id });
+      console.log(`PASS ${engine}: Work turn, tool, continuation, Undo/Redo, ask card and Stop`);
+    } finally {
+      await api("session_delete", { id });
+    }
+  });
+}
+
+try {
+  await checkCore();
+  const failures = [];
+  for (const engine of selectedEngines) {
+    try {
+      await checkEngine(engine);
+    } catch (error) {
+      failures.push(error);
+      console.error(`FAIL ${engine}: ${error.message}`);
+    }
+  }
+  if (failures.length) process.exitCode = 1;
+} finally {
+  await rm(scratch, { recursive: true, force: true });
+}
