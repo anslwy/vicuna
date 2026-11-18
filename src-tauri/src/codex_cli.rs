@@ -338,11 +338,12 @@ pub fn mcp_servers(entries: &[Value], ask: bool) -> Option<Value> {
 /// (anything not known-safe asks first). Auto: `never` (nothing asks; like
 /// Claude's auto mode). The sandbox is the user's config.toml `sandbox_mode`
 /// when set, else `workspace-write` (the agent edits its workspace).
-pub fn thread_params(workspace: &str, ask: bool, user_sandbox: Option<&str>, model: Option<&str>, mcp: &[Value]) -> Value {
+pub fn thread_params(workspace: &str, ask: bool, user_config: Option<&Value>, model: Option<&str>, mcp: &[Value]) -> Value {
+    let sandbox = user_config.and_then(|c| c["config"]["sandbox_mode"].as_str()).unwrap_or("workspace-write");
     let mut p = json!({
         "cwd": workspace,
         "approvalPolicy": if ask { "untrusted" } else { "never" },
-        "sandbox": user_sandbox.unwrap_or("workspace-write"),
+        "sandbox": sandbox,
     });
     if let Some(m) = model {
         p["model"] = json!(m);
@@ -351,10 +352,37 @@ pub fn thread_params(workspace: &str, ask: bool, user_sandbox: Option<&str>, mod
     // mode (pinned here; Vicuna never runs Plan mode): questions go through
     // vicuna-mcp's ask_user, and a stray one is routed to the ask card.
     p["config"] = json!({ "features": { "default_mode_request_user_input": false } });
+    if let Some(response) = user_config.filter(|c| sandbox == "workspace-write" && use_workspace_network_default(c)) {
+        let mut settings = response["config"]["sandbox_workspace_write"].as_object().cloned().unwrap_or_default();
+        settings.insert("network_access".into(), json!(true));
+        p["config"]["sandbox_workspace_write"] = json!(settings);
+    }
     if let Some(servers) = mcp_servers(mcp, ask) {
         p["config"]["mcp_servers"] = servers;
     }
     p
+}
+
+/// ConfigReadResponse layers are raw config. The effective config can report
+/// false by default even when the user only set another workspace-write key.
+fn use_workspace_network_default(response: &Value) -> bool {
+    let config = &response["config"];
+    if !config.is_object()
+        || config["sandbox_workspace_write"]["network_access"] == true
+        || config["default_permissions"].is_string()
+        || response["origins"].get("sandbox_workspace_write.network_access").is_some()
+    {
+        return false;
+    }
+    let Some(layers) = response["layers"].as_array() else {
+        return false;
+    };
+    !layers.iter().any(|layer| {
+        let config = &layer["config"];
+        layer["disabledReason"].is_null()
+            && (config["sandbox_workspace_write"]["network_access"].is_boolean()
+                || config["default_permissions"].is_string())
+    })
 }
 
 // ---------- tool cards ----------
@@ -692,11 +720,9 @@ fn plan_note(params: &Value) -> Option<String> {
 
 // ---------- one Work turn ----------
 
-/// The user's config.toml `sandbox_mode`, via `config/read` (so Vicuna never
-/// widens or narrows a sandbox the user chose).
-async fn user_sandbox(server: &mut Server, workspace: &str) -> Option<String> {
-    let r = server.request("config/read", json!({ "cwd": workspace })).await.ok()?;
-    r.pointer("/config/sandbox_mode").and_then(Value::as_str).map(str::to_string)
+/// Read Codex's effective config and raw layers without touching config files.
+async fn user_config(server: &mut Server, workspace: &str) -> Option<Value> {
+    server.request("config/read", json!({ "cwd": workspace, "includeLayers": true })).await.ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -742,8 +768,8 @@ pub async fn run_turn_inner(
     );
 
     let mut server = Server::start(&cli, Path::new(workspace)).await.map_err(|e| acp::friendly_prompt_error(Engine::Codex, e))?;
-    let sandbox = user_sandbox(&mut server, workspace).await;
-    let params = thread_params(workspace, crate::work_engine::approval_ask(), sandbox.as_deref(), picked.as_deref(), &mcp);
+    let config = user_config(&mut server, workspace).await;
+    let params = thread_params(workspace, crate::work_engine::approval_ask(), config.as_ref(), picked.as_deref(), &mcp);
 
     // resume the chat's thread; a thread Codex no longer has starts over with
     // the history preamble
@@ -1057,13 +1083,38 @@ mod tests {
     }
 
     #[test]
+    fn codex_defaults_workspace_write_to_networking_without_overriding_explicit_config() {
+        let with_roots = json!({
+            "config": { "sandbox_workspace_write": { "network_access": false, "writable_roots": ["/build"] } },
+            "layers": [{ "config": { "sandbox_workspace_write": { "writable_roots": ["/build"] } } }],
+        });
+        let networking = |config: &Value| {
+            thread_params("/w", false, Some(config), None, &[])["config"]["sandbox_workspace_write"].clone()
+        };
+        assert_eq!(networking(&with_roots), json!({ "network_access": true, "writable_roots": ["/build"] }));
+        assert_eq!(networking(&json!({"config": {}, "layers": []})), json!({"network_access": true}));
+        for enabled in [false, true] {
+            let explicit = json!({
+                "config": { "sandbox_workspace_write": { "network_access": enabled } },
+                "layers": [{ "config": { "sandbox_workspace_write": { "network_access": enabled } } }],
+            });
+            assert!(networking(&explicit).is_null());
+        }
+        for sandbox in ["read-only", "danger-full-access"] {
+            assert!(networking(&json!({"config": {"sandbox_mode": sandbox}, "layers": []})).is_null());
+        }
+        assert!(networking(&json!({"config": {}, "layers": [{"config": {"default_permissions": "restricted"}}]})).is_null());
+        assert!(networking(&json!({"config": {}})).is_null());
+    }
+
+    #[test]
     fn approval_toggle_maps_to_codex_policy() {
         let auto = thread_params("/w", false, None, None, &[]);
         assert_eq!(auto["approvalPolicy"], "never");
         assert_eq!(auto["sandbox"], "workspace-write");
         assert!(auto.get("model").is_none(), "no pick: the user's config.toml model runs");
         assert!(auto["config"].get("mcp_servers").is_none());
-        let ask = thread_params("/w", true, Some("read-only"), Some("gpt-6-luna"), &[json!({ "name": "p", "command": "x" })]);
+        let ask = thread_params("/w", true, Some(&json!({"config": {"sandbox_mode": "read-only"}, "layers": []})), Some("gpt-6-luna"), &[json!({ "name": "p", "command": "x" })]);
         assert_eq!(ask["approvalPolicy"], "untrusted");
         assert_eq!(ask["sandbox"], "read-only", "the user's sandbox_mode is kept");
         assert_eq!(ask["model"], "gpt-6-luna");
