@@ -1541,7 +1541,12 @@ usage:
   Wherever an argument is the string \"@channel\" (e.g. onEvent=@channel), a
   channel is opened and its events stream to stdout as NDJSON until a
   done/error/exit event (or --wait SECONDS of silence, default 600).
-  Server selection: --server / VICUNA_SERVER, as for every client command.";
+  Server selection: --server / VICUNA_SERVER, as for every client command.
+
+Chat example:
+  vicuna api chat_turn_start id=my-chat operation=send model=qwen3 content=Hello onEvent=@channel
+  vicuna api chat_turn_attach id=my-chat onEvent=@channel
+  vicuna api chat_turn_stop id=my-chat";
 
 /// `k=v` pairs → JSON object (values parsed as JSON when valid, else strings).
 pub fn kv_args(pairs: &[String]) -> Result<Value, String> {

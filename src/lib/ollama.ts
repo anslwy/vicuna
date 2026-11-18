@@ -1,12 +1,14 @@
 // Vicuna Ollama client.
 //
 // Architecture: the Rust backend (src-tauri/src/lib.rs) owns all inference
-// traffic to Ollama. These functions are display-layer adapters: inside the
-// Tauri webview they invoke backend commands and render streamed events;
-// outside Tauri (plain `npm run dev` in a browser) they fall back to direct
-// fetch so web-only dev keeps working without the shell.
+// traffic to Ollama for server-backed sessions. These functions route model
+// operations to that server. A standalone browser still uses direct fetch,
+// and an older desktop backend still uses the original Tauri commands.
 
+import { BridgeChannel, invokeOrBridge, isTauriRuntime } from "./bridge";
 import { isOpenRouterSelection, openRouterChatStream, openRouterModelId } from "./openrouter";
+
+export { isTauriRuntime };
 
 export const OLLAMA_BASE = "http://localhost:11434";
 /** Plain-browser override for the Ollama endpoint (Settings → General →
@@ -30,17 +32,24 @@ export function isCloudModel(name: string): boolean {
   return tag === "cloud" || tag.endsWith("-cloud");
 }
 
-export function isTauriRuntime(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)
-  );
-}
-
 type TauriCore = typeof import("@tauri-apps/api/core");
 
 async function tauri(): Promise<TauriCore> {
   return await import("@tauri-apps/api/core");
+}
+
+let serverOllama = false;
+
+export function setServerOllama(enabled: boolean): void {
+  serverOllama = enabled;
+}
+
+async function ollamaCommand<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (serverOllama) {
+    return await invokeOrBridge<T>(cmd, args);
+  }
+  const { invoke } = await tauri();
+  return await invoke<T>(cmd, args);
 }
 
 export interface OllamaTag {
@@ -51,9 +60,8 @@ export interface OllamaTag {
 }
 
 export async function listModels(): Promise<OllamaTag[]> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    const data = await invoke<{ models?: OllamaTag[] }>("ollama_list_models");
+  if (serverOllama || isTauriRuntime()) {
+    const data = await ollamaCommand<{ models?: OllamaTag[] }>("ollama_list_models");
     return data.models ?? [];
   }
   const res = await fetch(`${ollamaBase()}/api/tags`);
@@ -72,9 +80,8 @@ export interface RunningModel {
 }
 
 export async function listRunning(): Promise<RunningModel[]> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    const data = await invoke<{ models?: RunningModel[] }>("ollama_list_running");
+  if (serverOllama || isTauriRuntime()) {
+    const data = await ollamaCommand<{ models?: RunningModel[] }>("ollama_list_running");
     return data.models ?? [];
   }
   const res = await fetch(`${ollamaBase()}/api/ps`);
@@ -85,9 +92,8 @@ export async function listRunning(): Promise<RunningModel[]> {
 
 /** Local Ollama server version (`/api/version`). Throws when unreachable. */
 export async function serverVersion(): Promise<string> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    return await invoke<string>("ollama_server_version");
+  if (serverOllama || isTauriRuntime()) {
+    return await ollamaCommand<string>("ollama_server_version");
   }
   const res = await fetch(`${ollamaBase()}/api/version`).catch(() => {
     throw new Error("ollama server not reachable");
@@ -178,9 +184,8 @@ export async function modelContextLength(model: string): Promise<number | null> 
   if (showCache.has(model)) return showCache.get(model) ?? null;
   let len: number | null = null;
   try {
-    if (isTauriRuntime()) {
-      const { invoke } = await tauri();
-      const info = await invoke<{ context_length?: number | null }>("ollama_model_show", { model });
+    if (serverOllama || isTauriRuntime()) {
+      const info = await ollamaCommand<{ context_length?: number | null }>("ollama_model_show", { model });
       len = typeof info?.context_length === "number" && info.context_length > 0 ? info.context_length : null;
     } else {
       const res = await fetch(`${ollamaBase()}/api/show`, {
@@ -216,9 +221,8 @@ export async function modelFamily(model: string): Promise<string | null> {
   if (showFamilyCache.has(model)) return showFamilyCache.get(model) ?? null;
   let family: string | null = null;
   try {
-    if (isTauriRuntime()) {
-      const { invoke } = await tauri();
-      const info = await invoke<{ family?: string | null }>("ollama_model_show", { model });
+    if (serverOllama || isTauriRuntime()) {
+      const info = await ollamaCommand<{ family?: string | null }>("ollama_model_show", { model });
       family = typeof info?.family === "string" && info.family.trim() ? info.family.trim() : null;
     } else {
       const res = await fetch(`${ollamaBase()}/api/show`, {
@@ -270,9 +274,8 @@ export async function modelThinking(model: string): Promise<ModelThinking | null
   if (showThinkingCache.has(model)) return showThinkingCache.get(model) ?? null;
   let out: ModelThinking | null = null;
   try {
-    if (isTauriRuntime()) {
-      const { invoke } = await tauri();
-      const info = await invoke<{ thinking?: { values?: unknown; default?: unknown } | null }>("ollama_model_show", { model });
+    if (serverOllama || isTauriRuntime()) {
+      const info = await ollamaCommand<{ thinking?: { values?: unknown; default?: unknown } | null }>("ollama_model_show", { model });
       out = parseShowThinking(info?.thinking ?? null);
     } else {
       const res = await fetch(`${ollamaBase()}/api/show`, {
@@ -304,9 +307,8 @@ export async function unloadModelFromMemory(name: string): Promise<void> {
 }
 
 async function warmModel(name: string, keepAlive: string): Promise<void> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    await invoke("ollama_warm_model", { model: name, keepAlive });
+  if (serverOllama || isTauriRuntime()) {
+    await ollamaCommand("ollama_warm_model", { model: name, keepAlive });
     return;
   }
   const res = await fetch(`${ollamaBase()}/api/generate`, {
@@ -808,6 +810,28 @@ export async function pullModel(
   onProgress: (p: PullProgress) => void,
   signal?: AbortSignal
 ): Promise<void> {
+  if (serverOllama) {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    const channel = new BridgeChannel();
+    let abort = () => {};
+    try {
+      const result = new Promise<void>((resolve, reject) => {
+        abort = () => reject(new DOMException("aborted", "AbortError"));
+        signal?.addEventListener("abort", abort, { once: true });
+        channel.onmessage = (event) => {
+          if (event.type === "progress") onProgress(event);
+          else if (event.type === "error") reject(new Error(event.message));
+          else if (event.type === "done") resolve();
+        };
+        void invokeOrBridge("ollama_pull_model", { model: name, onEvent: channel.marker() }).catch(reject);
+      });
+      await result;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      channel.stop();
+    }
+    return;
+  }
   if (isTauriRuntime()) {
     const { invoke, Channel } = await tauri();
     if (signal?.aborted) throw new DOMException("aborted", "AbortError");
@@ -882,9 +906,8 @@ export async function pullModel(
 
 /** Delete a model from local storage. The caller should unload it first. */
 export async function deleteModel(name: string): Promise<void> {
-  if (isTauriRuntime()) {
-    const { invoke } = await tauri();
-    await invoke("ollama_delete_model", { model: name });
+  if (serverOllama || isTauriRuntime()) {
+    await ollamaCommand("ollama_delete_model", { model: name });
     return;
   }
   const res = await fetch(`${ollamaBase()}/api/delete`, {

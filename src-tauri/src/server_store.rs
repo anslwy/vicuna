@@ -359,6 +359,18 @@ pub async fn write_messages(pool: &SqlitePool, id: &str, messages: &[Value], upd
     Ok(rev)
 }
 
+/// Update sidebar metadata independently of the live transcript.
+pub(crate) async fn write_title_and_extra(db: &Pool, id: &str, chat: &Value) -> Result<(), String> {
+    sqlx::query("UPDATE chats SET title = $2, extra = $3, rev = COALESCE(rev, 0) + 1 WHERE id = $1")
+        .bind(id)
+        .bind(chat["title"].as_str().unwrap_or("Untitled"))
+        .bind(chat["extra"].as_str())
+        .execute(db)
+        .await
+        .map_err(|e| format!("update session: {e}"))?;
+    Ok(())
+}
+
 /// Create a chat the server starts on its own (a scheduled send into a new
 /// session). Same payload shape as a client save row.
 pub async fn create_chat(pool: &SqlitePool, chat: &Value) -> Result<(), String> {
