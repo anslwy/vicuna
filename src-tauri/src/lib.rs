@@ -87,6 +87,16 @@ struct MsgSaveRow {
     summary: Option<bool>,
 }
 
+/// A string field that may also arrive as a JSON value: strings pass through,
+/// null stays None, anything else is re-serialized to JSON text.
+fn de_json_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        other => Some(other.to_string()),
+    })
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ChatSaveRow {
@@ -94,6 +104,10 @@ struct ChatSaveRow {
     title: String,
     created_at: i64,
     updated_at: Option<i64>,
+    /// JSON text. The frontend sends it stringified, but `load_chats` (and so
+    /// the desktop→server import) yields the parsed object: accept both, or
+    /// one forked chat fails the whole batch ("invalid type: map").
+    #[serde(deserialize_with = "de_json_text")]
     forked_from: Option<String>,
     fork_from_index: Option<i64>,
     mode: Option<String>,

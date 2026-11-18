@@ -134,17 +134,43 @@ fn message_json(m: &sqlx::sqlite::SqliteRow) -> Value {
 /// Every chat with all messages, shaped like the frontend's `Chat`, newest
 /// activity first (same order as the desktop's sqlite loadChats).
 pub async fn load_chats(pool: &SqlitePool) -> Result<Value, String> {
+    load_chats_with_queries(
+        pool,
+        &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
+        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost FROM messages ORDER BY chat_id, idx",
+    )
+    .await
+}
+
+/// Read pre-server desktop history without migrating the original database.
+/// The row decoders already handle optional columns missing from older files.
+pub async fn load_desktop_chats(path: &Path) -> Result<Value, String> {
+    let opts = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let result = load_chats_with_queries(
+        &pool,
+        "SELECT * FROM chats ORDER BY created_at DESC",
+        "SELECT * FROM messages ORDER BY chat_id, idx",
+    )
+    .await;
+    pool.close().await;
+    result
+}
+
+async fn load_chats_with_queries(pool: &SqlitePool, chats_sql: &str, messages_sql: &str) -> Result<Value, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("load chats: {e}"))?;
-    let chats = sqlx::query(&format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"))
+    let chats = sqlx::query(chats_sql)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| format!("load chats: {e}"))?;
-    let msgs = sqlx::query(
-        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost FROM messages ORDER BY chat_id, idx",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("load messages: {e}"))?;
+    let msgs = sqlx::query(messages_sql)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("load messages: {e}"))?;
     tx.commit().await.map_err(|e| format!("load chats: {e}"))?;
     let mut by_chat: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for m in &msgs {
@@ -511,6 +537,31 @@ mod tests {
             "id": id, "title": title, "createdAt": 1, "updatedAt": 2, "mode": "work", "workspace": "/srv/p",
             "messages": msgs.iter().map(|(r, c)| json!({ "role": r, "content": c, "thinking": "", "images": null })).collect::<Vec<_>>(),
         })
+    }
+
+    /// `load_chats` yields `forkedFrom` as an object while the frontend sends
+    /// it stringified; the desktop→server import feeds the former straight
+    /// into a merge, so both must parse (one forked chat used to fail the
+    /// whole import batch with "invalid type: map, expected a string").
+    #[tokio::test]
+    async fn loaded_chats_merge_back_including_forks() {
+        let dir = std::env::temp_dir().join(format!("vicuna-server-store-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = open(&dir.join("src.db")).await.unwrap();
+        let mut forked = row("f", "Fork", &[("user", "hi")]);
+        forked["forkedFrom"] = json!(r#"{"id":"a","title":"A"}"#);
+        merge_chats(&src, parse_rows(&json!([row("a", "A", &[("user", "hi")]), forked])).unwrap(), vec![], &Default::default())
+            .await
+            .unwrap();
+        let loaded = load_chats(&src).await.unwrap();
+        assert!(loaded.as_array().unwrap().iter().any(|c| c["forkedFrom"]["id"] == "a"), "{loaded}");
+
+        let dst = open(&dir.join("dst.db")).await.unwrap();
+        merge_chats(&dst, parse_rows(&loaded).expect("loaded chats parse"), vec![], &Default::default()).await.unwrap();
+        let back = load_chats(&dst).await.unwrap();
+        let f = back.as_array().unwrap().iter().find(|c| c["id"] == "f").unwrap();
+        assert_eq!(f["forkedFrom"], json!({"id":"a","title":"A"}));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

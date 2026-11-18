@@ -165,28 +165,21 @@ pub async fn import_desktop_chats(desktop_db: PathBuf, backend: &LocalBackend) -
     if marker.exists() || !desktop_db.exists() {
         return Ok(0);
     }
-    let pool = crate::server_store::open(&desktop_db).await?;
-    let local = crate::server_store::load_chats(&pool).await?;
-    pool.close().await;
+    let local = crate::server_store::load_desktop_chats(&desktop_db).await?;
     let call = |cmd: &str, args: Value| {
         let (url, token) = (backend.url.clone(), backend.token.clone());
         let body = json!({ "cmd": cmd, "args": args });
         async move { crate::servers::request(&url, &token, "/invoke", Some(&body), Duration::from_secs(120)).await }
     };
     let have = call("chats_load", json!({})).await?;
-    let have_ids: std::collections::HashSet<String> = have["data"]
+    let have_ids: std::collections::HashSet<&str> = have["data"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .filter(|_| have["ok"] == true)
+        .ok_or_else(|| have["error"].as_str().unwrap_or("Invalid chats_load response during desktop import").to_string())?
+        .iter()
+        .filter_map(|c| c["id"].as_str())
         .collect();
-    let rows: Vec<Value> = local
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|c| c["id"].as_str().is_some_and(|id| !have_ids.contains(id)))
-        .cloned()
-        .collect();
+    let rows = desktop_import_rows(local, &have_ids);
     let n = rows.len();
     // in batches: one huge body could pass the server's 32 MB cap
     for chunk in rows.chunks(50) {
@@ -202,9 +195,56 @@ pub async fn import_desktop_chats(desktop_db: PathBuf, backend: &LocalBackend) -
     Ok(n)
 }
 
+fn desktop_import_rows(local: Value, have_ids: &std::collections::HashSet<&str>) -> Vec<Value> {
+    local
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["id"].as_str().is_some_and(|id| !have_ids.contains(id)))
+        .cloned()
+        .map(|mut c| {
+            // load_chats yields forkedFrom as an object, save rows take JSON
+            // text. Send text so an adopted older server (0.0.23 rejected the
+            // object: "invalid type: map") still accepts forked chats.
+            if c["forkedFrom"].is_object() {
+                c["forkedFrom"] = Value::String(c["forkedFrom"].to_string());
+            }
+            c
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn desktop_import_reads_old_schema_and_sends_legacy_fork_format() {
+        let path = std::env::temp_dir().join(format!("vicuna-desktop-import-{}.db", std::process::id()));
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE chats (id TEXT, title TEXT, created_at INTEGER, forked_from TEXT);
+             CREATE TABLE messages (chat_id TEXT, role TEXT, content TEXT, idx INTEGER);
+             INSERT INTO chats VALUES ('parent', 'Parent', 1, NULL);
+             INSERT INTO chats VALUES ('fork', 'Fork', 2, '{\"id\":\"parent\"}');
+             INSERT INTO messages VALUES ('fork', 'user', 'hello', 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        let original = std::fs::read(&path).unwrap();
+
+        let loaded = crate::server_store::load_desktop_chats(&path).await.unwrap();
+        let rows = desktop_import_rows(loaded, &["parent"].into_iter().collect());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "fork");
+        assert_eq!(rows[0]["forkedFrom"].as_str(), Some(r#"{"id":"parent"}"#));
+        assert_eq!(rows[0]["messages"][0]["content"], "hello");
+        assert!(std::fs::read(&path).unwrap() == original, "source database was changed");
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// The desktop startup path end to end, isolated: temp HOME, a foreign
     /// occupant on the "default" port. Must start its own server elsewhere,

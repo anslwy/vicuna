@@ -223,6 +223,20 @@ export async function spawnTerm(
   return await invoke<string>("term_spawn", { root, cols, rows, onEvent: ch });
 }
 
+/** Terminal commands go where `spawnTerm` put the pty: the remote server for
+ *  a server window, otherwise this app's own Tauri pty. Never the local
+ *  embedded server — the main window is server-backed (`local`) since 0.0.23,
+ *  so `invokeOrBridge` would send writes there, to a server that never heard
+ *  of the Tauri pty's id (typing did nothing while output still showed). */
+async function termCmd(cmd: string, args: Record<string, any>): Promise<void> {
+  if (isRemoteServer()) {
+    await bridgeInvoke(cmd, args);
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke(cmd, args);
+}
+
 /** Send keystrokes to a terminal (desktop only). Serialized per terminal. */
 export async function writeTerm(id: string, data: string): Promise<void> {
   if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
@@ -238,7 +252,7 @@ export async function writeTerm(id: string, data: string): Promise<void> {
     while (q.pending) {
       const chunk = q.pending;
       q.pending = "";
-      await invokeCmd<void>("term_write", { id, data: chunk });
+      await termCmd("term_write", { id, data: chunk });
     }
   } finally {
     q.busy = false;
@@ -248,7 +262,7 @@ export async function writeTerm(id: string, data: string): Promise<void> {
 /** Resize a terminal (desktop only). */
 export async function resizeTerm(id: string, cols: number, rows: number): Promise<void> {
   if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
-  await invokeCmd<void>("term_resize", { id, cols, rows });
+  await termCmd("term_resize", { id, cols, rows });
 }
 
 /** Kill a terminal's shell (desktop only, best-effort). */
@@ -258,7 +272,7 @@ export async function killTerm(id: string): Promise<void> {
   remoteTermChannels.delete(id);
   termWriteQueues.delete(id);
   try {
-    await invokeCmd<void>("term_kill", { id });
+    await termCmd("term_kill", { id });
   } catch {
     /* already gone */
   }
