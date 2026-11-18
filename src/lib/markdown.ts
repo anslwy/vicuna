@@ -77,10 +77,54 @@ marked.use({
 // (``` fences, $math$, tables). marked ends an HTML block at the first blank
 // line, so without masking the body remainder parses as Markdown — an odd
 // ``` count in one fetched README then swallows the NEXT tool block's header
-// (verified: 2 of 12 blocks vanished from a real transcript). Non-greedy to
-// the first closer is safe: bodies are HTML-escaped, so they never contain a
-// raw </details>; an unclosed span (crash mid-tool) simply doesn't match.
-const TOOL_SPAN = /<details class="tool-result">[\s\S]*?<\/details>/g;
+// (verified: 2 of 12 blocks vanished from a real transcript).
+//
+// Where a card ends: older builds appended harness notes (an approved shell
+// command) raw inside the card, and a command can contain any markup —
+// `</details>`, `</code></pre></details>`, `<!--`. Ending at the first
+// `</details>` then closed cards early and spilled the rest as stray code.
+// Real openers always start a line (`\n\n` + opener, toolFormat.ts), and a
+// note sits before the card's output, so a card runs from one real opener to
+// the LAST real closer before the next opener. An unclosed card (crash
+// mid-tool, or still running) has no closer: at the end of the reply it is
+// left as-is (a live card), but one followed by another opener is closed
+// there — two tools started in parallel used to leave the first one open,
+// and an open <details> swallows the rest of the reply.
+const SPAN_OPEN = '<details class="tool-result">';
+const SPAN_OPEN_LINE = /(^|\n)<details class="tool-result">/g;
+const SPAN_BODY_OPEN = "<pre><code>";
+const SPAN_BODY_CLOSE = "</code></pre></details>";
+
+/** [start, end, closed] of every tool card that can be stashed: closed ones
+ *  plus unclosed ones another card follows. Exported for headless checks. */
+export function findToolSpans(src: string): Array<[number, number, boolean]> {
+  const starts: number[] = [];
+  for (const m of src.matchAll(SPAN_OPEN_LINE)) starts.push((m.index ?? 0) + m[1].length);
+  const spans: Array<[number, number, boolean]> = [];
+  for (let i = 0; i < starts.length; i++) {
+    const last = i + 1 >= starts.length;
+    const segEnd = last ? src.length : starts[i + 1];
+    const close = src.lastIndexOf(SPAN_BODY_CLOSE, segEnd - SPAN_BODY_CLOSE.length);
+    if (close >= starts[i] + SPAN_OPEN.length) spans.push([starts[i], close + SPAN_BODY_CLOSE.length, true]);
+    else if (!last && src.indexOf(SPAN_BODY_OPEN, starts[i]) > -1 && src.indexOf(SPAN_BODY_OPEN, starts[i]) < segEnd) spans.push([starts[i], segEnd, false]);
+  }
+  return spans;
+}
+
+/** Re-escape stray markup inside a tool card's body. Bodies are written
+ *  escaped, but older builds appended harness notes (an approved command)
+ *  raw; one containing `<!--` opened an HTML comment that hid the rest of
+ *  the reply. Only `<`/`>` are touched, so correct bodies (entities only)
+ *  come out unchanged. Exported for headless checks. */
+export function repairToolSpan(span: string): string {
+  const start = span.indexOf(SPAN_BODY_OPEN);
+  if (start < 0 || !span.endsWith(SPAN_BODY_CLOSE)) return span;
+  const from = start + SPAN_BODY_OPEN.length;
+  const to = span.length - SPAN_BODY_CLOSE.length;
+  if (to < from) return span;
+  const body = span.slice(from, to).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return span.slice(0, from) + body + SPAN_BODY_CLOSE;
+}
 
 /** Replace each tool-result span with a single-line div placeholder that
  *  marked passes through as an opaque HTML block. Returns the masked source
@@ -90,10 +134,14 @@ export function maskToolBlocks(src: string): { masked: string; stashed: string[]
   // per-call nonce: tool/user text could otherwise forge a placeholder and
   // get it replaced with (or deleted for) another block's content
   const nonce = Math.random().toString(36).slice(2);
-  const masked = src.replace(TOOL_SPAN, (m) => {
-    stashed.push(m);
-    return `\n\n<div data-vicuna-tool="${stashed.length - 1}-${nonce}"></div>\n\n`;
-  });
+  let masked = "";
+  let at = 0;
+  for (const [s, e, closed] of findToolSpans(src)) {
+    stashed.push(repairToolSpan(closed ? src.slice(s, e) : src.slice(s, e).trimEnd() + SPAN_BODY_CLOSE));
+    masked += src.slice(at, s) + `\n\n<div data-vicuna-tool="${stashed.length - 1}-${nonce}"></div>\n\n`;
+    at = e;
+  }
+  masked += src.slice(at);
   return { masked, stashed, nonce };
 }
 

@@ -12,6 +12,15 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** A harness display note ("Auto-approved: …", engine notices) appended to
+ *  the live reply. Between a tool's head and tail the reply sits inside the
+ *  card's raw `<pre><code>`, where markdown never applies, so the note must be
+ *  escaped there: an approved command containing `<!--` once opened an HTML
+ *  comment that hid every later card and the final answer. */
+export function formatDisplayNote(text: string, inToolCard: boolean): string {
+  return inToolCard ? escapeHtml(text) : text;
+}
+
 /** One-line label for a tool call, shared by the result header and the
  *  running indicator. */
 export function toolLabel(name: string, args: Record<string, any>): string {

@@ -179,5 +179,21 @@
       "  check CI  "
     ],
     "expected": "Scheduled wake-up (you asked Vicuna to wake you now): check CI"
+  },
+  {
+    "fn": "formatDisplayNote",
+    "args": [
+      "\n> Auto-approved: Bash: cat <<'EOF'\n<!-- body --> & \"q\"\n",
+      true
+    ],
+    "expected": "\n&gt; Auto-approved: Bash: cat &lt;&lt;'EOF'\n&lt;!-- body --&gt; &amp; &quot;q&quot;\n"
+  },
+  {
+    "fn": "formatDisplayNote",
+    "args": [
+      "\n> Auto-approved: Bash: ls <dir>\n",
+      false
+    ],
+    "expected": "\n> Auto-approved: Bash: ls <dir>\n"
   }
 ]

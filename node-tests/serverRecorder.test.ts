@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
-import { formatAskRecord, formatToolCallHead, formatToolCallTail } from "../src/lib/toolFormat.ts";
+import { formatAskRecord, formatToolCallHead, formatToolCallTail, formatDisplayNote } from "../src/lib/toolFormat.ts";
 import { workReplyModel } from "../src/lib/workGate.ts";
 import { workerDoneMessage } from "../src/lib/leadSessions.ts";
 import { mcpWakeMessage } from "../src/lib/backgroundRun.ts";
@@ -18,6 +18,7 @@ const fns: Record<string, (...a: any[]) => string> = {
   formatToolCallHead,
   formatToolCallTail,
   formatAskRecord,
+  formatDisplayNote,
   workReplyModel,
   workerDoneMessage,
   mcpWakeMessage,
@@ -41,7 +42,9 @@ const cases: Array<{ fn: string; args: unknown[] }> = [
   { fn: "workerDoneMessage", args: [{ id: "w2", title: "T", engine: "opencode", model: null }, "", true] },
   { fn: "workerDoneMessage", args: [{ id: "w3", title: "Long", engine: "codex", model: null }, "line\n".repeat(2000), false] },
   { fn: "mcpWakeMessage", args: [[{ name: "gh", tools: 1 }, { name: "x", tools: null }, { name: "y", tools: 5 }]] },
-  { fn: "wakeMessage", args: ["  check CI  "] }
+  { fn: "wakeMessage", args: ["  check CI  "] },
+  { fn: "formatDisplayNote", args: ["\n> Auto-approved: Bash: cat <<'EOF'\n<!-- body --> & \"q\"\n", true] },
+  { fn: "formatDisplayNote", args: ["\n> Auto-approved: Bash: ls <dir>\n", false] }
 ];
 
 test("server-side formatter fixture matches the frontend", () => {

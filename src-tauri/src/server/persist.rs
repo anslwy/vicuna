@@ -85,6 +85,13 @@ pub fn tool_call_tail(output: &str) -> String {
     format!("{}</code></pre></details>", escape_html(&js_slice(output, 6000)))
 }
 
+/// toolFormat.ts `formatDisplayNote`: inside an open tool card the reply is
+/// raw `<pre><code>`, so a harness note (an approved command with `<!--` in
+/// it) must be escaped or it hides the rest of the reply.
+pub fn display_note(text: &str, in_tool_card: bool) -> String {
+    if in_tool_card { escape_html(text) } else { text.to_string() }
+}
+
 /// work.ts `formatAskRecord`.
 pub fn ask_record(question: &str, answer: &str, dismissed: bool) -> String {
     let one = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -244,7 +251,10 @@ impl Recorder {
                     }
                 }
             }
-            "displaynote" => self.append(&text("text")),
+            "displaynote" => {
+                let in_card = self.pending_head.as_ref().is_some_and(|(n, _, _)| n != "ask" && n != "say");
+                self.append(&display_note(&text("text"), in_card));
+            }
             "contextcompacted" => self.append(&format!("\n{}\n", text("note"))),
             "queuedrained" => {
                 for q in ev.get("messages").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -709,6 +719,7 @@ mod tests {
                     &a[0].as_array().unwrap().iter().map(|x| (x["name"].as_str().unwrap().to_string(), x["tools"].as_u64().map(|n| n as usize))).collect::<Vec<_>>(),
                 ),
                 "wakeMessage" => wake_message(&s(0)),
+                "formatDisplayNote" => display_note(&s(0), a[1].as_bool().unwrap()),
                 other => panic!("unknown fixture fn {other}"),
             };
             assert_eq!(got, c["expected"].as_str().unwrap(), "{c}");
