@@ -5,7 +5,7 @@
 
 import type { ChatMsg } from "./ollama";
 import { isTauriRuntime } from "./ollama";
-import { invokeOrBridge, BridgeChannel, bridgeInvoke, isRemoteServer, isServerBacked, useLocalIpc } from "./bridge";
+import { invokeOrBridge, BridgeChannel, bridgeInvoke, bridgeAvailable, isRemoteServer, isServerBacked, useLocalIpc } from "./bridge";
 import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
 // pure formatters live in toolFormat.ts (node-testable; the server ports them)
@@ -183,8 +183,20 @@ export interface TermStreamEvent {
 const remoteTermChannels = new Map<string, BridgeChannel>();
 const termWriteQueues = new Map<string, { pending: string; busy: boolean }>();
 
-/** Spawn an interactive shell rooted at the workspace (desktop only; on a
- *  remote server the shell runs on the server). Output/exit stream through
+/** Decide where terminal commands go: remote server windows and plain-browser
+ *  dev-bridge sessions use `BridgeChannel`/`bridgeInvoke`; desktop main
+ *  windows stay on their own Tauri pty (never the local embedded server — the
+ *  main window is server-backed (`local`) since 0.0.23, so `invokeOrBridge`
+ *  would send writes to a server that never heard of the Tauri pty's id). */
+async function termUsesBridge(): Promise<boolean> {
+  if (isRemoteServer()) return true;
+  if (isTauriRuntime()) return false;
+  if (await bridgeAvailable()) return true;
+  throw new Error("workspace tools need the Vicuna desktop app.");
+}
+
+/** Spawn an interactive shell rooted at the workspace (desktop or dev bridge;
+ *  on a remote server the shell runs on the server). Output/exit stream through
  *  the callbacks; returns the terminal id. */
 export async function spawnTerm(
   root: string,
@@ -193,12 +205,12 @@ export async function spawnTerm(
   onOutput: (text: string) => void,
   onExit: (code: number | null) => void
 ): Promise<string> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  const useBridge = await termUsesBridge();
   const handle = (ev: TermStreamEvent) => {
     if (ev.type === "output") onOutput(ev.text ?? "");
     else if (ev.type === "exit") onExit(ev.code ?? null);
   };
-  if (isRemoteServer()) {
+  if (useBridge) {
     const ch = new BridgeChannel();
     let id = "";
     ch.onmessage = (ev) => {
@@ -223,13 +235,8 @@ export async function spawnTerm(
   return await invoke<string>("term_spawn", { root, cols, rows, onEvent: ch });
 }
 
-/** Terminal commands go where `spawnTerm` put the pty: the remote server for
- *  a server window, otherwise this app's own Tauri pty. Never the local
- *  embedded server — the main window is server-backed (`local`) since 0.0.23,
- *  so `invokeOrBridge` would send writes there, to a server that never heard
- *  of the Tauri pty's id (typing did nothing while output still showed). */
 async function termCmd(cmd: string, args: Record<string, any>): Promise<void> {
-  if (isRemoteServer()) {
+  if (await termUsesBridge()) {
     await bridgeInvoke(cmd, args);
     return;
   }
@@ -237,9 +244,9 @@ async function termCmd(cmd: string, args: Record<string, any>): Promise<void> {
   await invoke(cmd, args);
 }
 
-/** Send keystrokes to a terminal (desktop only). Serialized per terminal. */
+/** Send keystrokes to a terminal (desktop or dev bridge). Serialized per terminal. */
 export async function writeTerm(id: string, data: string): Promise<void> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
+  await termUsesBridge();
   let q = termWriteQueues.get(id);
   if (!q) {
     q = { pending: "", busy: false };
@@ -259,20 +266,25 @@ export async function writeTerm(id: string, data: string): Promise<void> {
   }
 }
 
-/** Resize a terminal (desktop only). */
+/** Resize a terminal (desktop or dev bridge). */
 export async function resizeTerm(id: string, cols: number, rows: number): Promise<void> {
-  if (!isTauriRuntime()) throw new Error("workspace tools need the Vicuna desktop app.");
   await termCmd("term_resize", { id, cols, rows });
 }
 
-/** Kill a terminal's shell (desktop only, best-effort). */
+/** Kill a terminal's shell (desktop or dev bridge, best-effort). */
 export async function killTerm(id: string): Promise<void> {
-  if (!isTauriRuntime()) return;
+  const useBridge = isRemoteServer() || (!isTauriRuntime() && (remoteTermChannels.has(id) || (await bridgeAvailable())));
+  if (!isTauriRuntime() && !useBridge) return;
   remoteTermChannels.get(id)?.stop();
   remoteTermChannels.delete(id);
   termWriteQueues.delete(id);
   try {
-    await termCmd("term_kill", { id });
+    if (useBridge) {
+      await bridgeInvoke("term_kill", { id });
+    } else {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("term_kill", { id });
+    }
   } catch {
     /* already gone */
   }
