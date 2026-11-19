@@ -227,10 +227,47 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
             return Err("could not extract the archive".to_string());
         }
         let bin = std::fs::read(work.join("vicuna")).map_err(|_| "archive has no vicuna binary".to_string())?;
+        if work.join("lb-sidecar").is_dir() {
+            let dest = install_sidecar(&work.join("lb-sidecar"), &install_exe(opts.force)?)?;
+            println!("==> Installed the bundled browser engine to {}", dest.display());
+        }
         finish(&opts, Some(&bin), &tag, server_dir, dry)
     })();
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// Put the release's `lb-sidecar/` where `vicuna serve` looks for it
+/// (`<prefix>/share/vicuna/lb-sidecar` beside `<prefix>/bin/vicuna`, see
+/// `browser::headless_resource_dir`). Copied to a `.new` dir, then swapped
+/// in: a running lb keeps its open inode, the next start gets the new one.
+pub fn install_sidecar(src: &Path, exe: &Path) -> Result<PathBuf, String> {
+    let prefix = exe.parent().and_then(|d| d.parent()).ok_or("can't place the browser engine")?;
+    let share = prefix.join("share").join("vicuna");
+    let dest = share.join("lb-sidecar");
+    let tmp = share.join("lb-sidecar.new");
+    let _ = std::fs::remove_dir_all(&tmp);
+    copy_dir(src, &tmp).map_err(|e| format!("copy browser engine: {e}"))?;
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("install browser engine: {e}"))?;
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(&dest).status();
+    }
+    Ok(dest)
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), &to)?; // keeps the exec bit
+        }
+    }
+    Ok(())
 }
 
 fn finish(opts: &Opts, bin: Option<&[u8]>, tag: &str, server_dir: &Path, dry: &str) -> Result<(), String> {
@@ -324,6 +361,26 @@ mod tests {
         assert_eq!(parse_sha256(&format!("{}  vicuna.tar.gz\n", "A".repeat(64))), Some("a".repeat(64)));
         assert_eq!(parse_sha256("nothex  x"), None);
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn sidecar_lands_in_share_and_replaces_the_old_one() {
+        let t = std::env::temp_dir().join(format!("vicuna-sc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let src = t.join("pkg").join("lb-sidecar");
+        std::fs::create_dir_all(src.join("web/dist")).unwrap();
+        std::fs::write(src.join("lb"), b"new").unwrap();
+        std::fs::write(src.join("web/dist/index.html"), b"ui").unwrap();
+        let old = t.join("share/vicuna/lb-sidecar");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("stale"), b"x").unwrap();
+        let dest = install_sidecar(&src, &t.join("bin").join("vicuna")).unwrap();
+        assert_eq!(dest, old);
+        assert_eq!(std::fs::read(dest.join("lb")).unwrap(), b"new");
+        assert!(dest.join("web/dist/index.html").is_file());
+        assert!(!dest.join("stale").exists());
+        assert!(!t.join("share/vicuna/lb-sidecar.new").exists());
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

@@ -116,7 +116,7 @@ fn report(r: Result<(), String>) {
 
 /// Parse `serve` options (shared by `serve` and `install-service`).
 fn parse_serve(args: &[String]) -> Config {
-    let mut cfg = Config { bind: "127.0.0.1".into(), port: 7421, token: None, db: None, tailscale: false, https_port: None, resource_dir: None };
+    let mut cfg = Config { bind: "127.0.0.1".into(), port: 7421, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().unwrap_or_else(|| die(&format!("{a} needs a value")));
@@ -224,13 +224,13 @@ fn main() {
         },
         Some("bridge") => {
             let port = rest.first().map(|p| p.parse().unwrap_or_else(|_| die("bad port"))).unwrap_or(1421);
-            run(Config { bind: "127.0.0.1".into(), port, token: None, db: None, tailscale: false, https_port: None, resource_dir: None });
+            run(Config { bind: "127.0.0.1".into(), port, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir() });
         }
         Some("-h") | Some("--help") | Some("help") => println!("{USAGE}"),
         Some("-V") | Some("--version") | Some("version") => println!("vicuna {}", env!("CARGO_PKG_VERSION")),
         // `cargo run -- <port>` (the old bridge invocation) keeps working
         Some(p) if p.parse::<u16>().is_ok() => {
-            run(Config { bind: "127.0.0.1".into(), port: p.parse().unwrap(), token: None, db: None, tailscale: false, https_port: None, resource_dir: None })
+            run(Config { bind: "127.0.0.1".into(), port: p.parse().unwrap(), token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir() })
         }
         // `vicuna [path]` — the old desktop launcher's behavior
         Some(p) if !p.starts_with('-') => match cli::open_in_app(Some(p)) {
@@ -242,7 +242,7 @@ fn main() {
         },
         Some(other) => die(&format!("unknown option {other}")),
         // no args: the dev bridge, as before (docs/scripts run `cargo run` here)
-        None => run(Config { bind: "127.0.0.1".into(), port: 1421, token: None, db: None, tailscale: false, https_port: None, resource_dir: None }),
+        None => run(Config { bind: "127.0.0.1".into(), port: 1421, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir() }),
     }
 }
 

@@ -366,8 +366,13 @@ jobs:
             fi
           fi
           ./target/release/vicuna --version
+          # ship the pinned lb with the CLI so `vicuna serve` runs it instead
+          # of whatever `lb` is on the server's PATH (install-cli.sh/upgrade
+          # put it in <prefix>/share/vicuna/lb-sidecar)
+          sh ../scripts/fetch-lb-sidecar.sh
+          cp -R ../src-tauri/lb-sidecar target/release/lb-sidecar
           mkdir -p ../dist
-          tar -C target/release -czf ../dist/vicuna-${{ matrix.target }}.tar.gz vicuna
+          tar -C target/release -czf ../dist/vicuna-${{ matrix.target }}.tar.gz vicuna lb-sidecar
           cd ../dist
           (command -v sha256sum >/dev/null && sha256sum vicuna-${{ matrix.target }}.tar.gz || shasum -a 256 vicuna-${{ matrix.target }}.tar.gz) > vicuna-${{ matrix.target }}.tar.gz.sha256
 

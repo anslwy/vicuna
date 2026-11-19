@@ -494,6 +494,31 @@ fn bundled_search_roots(resource_dir: Option<&Path>) -> Vec<PathBuf> {
     }
 }
 
+/// Resource root for the headless `vicuna` binary (`vicuna serve`/`bridge`),
+/// which has no Tauri resource dir. The CLI release ships `lb-sidecar/` in
+/// its tarball and `install-cli.sh` puts it in `<prefix>/share/vicuna/`
+/// beside `<prefix>/bin/vicuna`; an unpacked tarball keeps it next to the
+/// binary. Without this the server fell back to whatever `lb` was on PATH
+/// (often older than the version the release was tested with).
+/// `VICUNA_RESOURCE_DIR` overrides.
+pub fn headless_resource_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("VICUNA_RESOURCE_DIR").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    headless_root_for_exe(&exe)
+}
+
+fn headless_root_for_exe(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let mut roots = vec![dir.to_path_buf()];
+    if let Some(prefix) = dir.parent() {
+        roots.push(prefix.join("share").join("vicuna"));
+    }
+    roots.into_iter().find(|r| bundled_candidates(r).iter().any(|p| p.is_file()))
+}
+
 /// Resolve the `lb` binary: bundled resource first, PATH fallback.
 /// Returns the binary path plus where it came from.
 pub fn resolve_lb_bin(resource_dir: Option<&Path>) -> Option<(PathBuf, LbSource)> {
@@ -1461,6 +1486,28 @@ pub fn kill_owned(state: &BrowserState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_root_finds_sidecar_beside_or_in_share() {
+        let t = std::env::temp_dir().join(format!("vicuna-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let bin = t.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("vicuna");
+        assert_eq!(headless_root_for_exe(&exe), None, "nothing bundled → PATH fallback");
+        let share = t.join("share").join("vicuna");
+        for p in bundled_candidates(&share) {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        assert_eq!(headless_root_for_exe(&exe), Some(share), "installed layout");
+        for p in bundled_candidates(&bin) {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        assert_eq!(headless_root_for_exe(&exe), Some(bin), "unpacked tarball wins");
+        let _ = std::fs::remove_dir_all(&t);
+    }
 
     #[test]
     fn health_parses_lb_probe() {
