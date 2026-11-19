@@ -5,7 +5,7 @@ use std::{
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tauri::ipc::{Channel, InvokeResponseBody};
+use crate::ipc::{Channel, InvokeResponseBody};
 
 use super::{BridgeState, Options, Turn, images_stripped, token};
 use crate::{ChatMessage, ollama_chat_stream, ollama_generate_stream, ollama_model_show};

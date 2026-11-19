@@ -6,10 +6,9 @@ authors = ["you"]
 edition = "2024"
 
 [dependencies]
-# headless: no `desktop` feature, so no WebKit/GTK at runtime; rustls instead
-# of system OpenSSL — the binary runs on a bare VPS
+# headless: no `desktop` feature (and no `tauri`), so no WebKit/GTK at build or
+# runtime; rustls instead of system OpenSSL — builds statically against musl
 vicuna_lib = { package = "vicuna", path = "../src-tauri", default-features = false, features = ["rustls"] }
-tauri = { version = "2", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

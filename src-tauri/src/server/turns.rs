@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tauri::ipc::{Channel, InvokeResponseBody};
+use crate::ipc::{Channel, InvokeResponseBody};
 use crate::work_agent::{agent_answer, agent_queue_msg, TurnState, WorkAgentEvent};
 use crate::work_engine::Engine;
 use crate::ChatMessage;

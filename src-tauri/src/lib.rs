@@ -15,16 +15,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
-use tauri::ipc::Channel;
+use crate::ipc::Channel;
 #[cfg(feature = "desktop")]
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 #[cfg(feature = "desktop")]
 use tauri::tray::TrayIconBuilder;
+#[cfg(feature = "desktop")]
 use tauri::State;
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
 #[cfg(feature = "desktop")]
 use tauri_plugin_sql::{DbInstances, DbPool};
+pub mod ipc;
 pub mod acp;
 pub mod agy;
 pub mod browser;
@@ -57,7 +59,7 @@ pub const OLLAMA_BASE: &str = "http://localhost:11434";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
@@ -250,7 +252,7 @@ fn ollama_error(context: &str, status: reqwest::StatusCode, body: &str) -> Strin
     format!("ollama {context} failed: {status} {body}")
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_list_models() -> Result<serde_json::Value, String> {
     let res = reqwest::get(format!("{OLLAMA_BASE}/api/tags"))
         .await
@@ -267,7 +269,7 @@ async fn ollama_list_models() -> Result<serde_json::Value, String> {
     Ok(data)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_list_running() -> Result<serde_json::Value, String> {
     let res = reqwest::get(format!("{OLLAMA_BASE}/api/ps"))
         .await
@@ -316,7 +318,7 @@ struct ModelShowInfo {
     family: Option<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_model_show(model: String) -> Result<ModelShowInfo, String> {
     let client = reqwest::Client::new();
     let res = client
@@ -361,7 +363,7 @@ async fn ollama_model_show(model: String) -> Result<ModelShowInfo, String> {
 
 /// Load/unload a model by generating one throwaway token with the given
 /// keep-alive. Same 32k ctx as chat so follow-ups don't trigger a reload.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_warm_model(model: String, keep_alive: String) -> Result<(), String> {
     let client = reqwest::Client::new();
     let res = client
@@ -388,7 +390,7 @@ async fn ollama_warm_model(model: String, keep_alive: String) -> Result<(), Stri
 /// Streaming chat completion. Emits Token/Think/Done events over the channel
 /// and returns the full concatenated content. `stop` words are forwarded as
 /// `options.stop` so the model ends the turn instead of roleplaying new ones.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_chat_stream(
     model: String,
     messages: Vec<ChatMessage>,
@@ -547,7 +549,7 @@ async fn ollama_chat_stream(
 /// uses this with the family's own prompt prefill (src/lib/continue.ts) —
 /// their chat template closes the assistant turn, so /api/chat starts a new
 /// turn; every other Continue goes through /api/chat.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_generate_stream(
     model: String,
     prompt: String,
@@ -662,7 +664,7 @@ async fn ollama_generate_stream(
 /// Streaming model pull. Forwards each /api/pull status line as a Progress
 /// event; a final line with {"status":"success"} ends the stream. An
 /// {"error": ...} line fails the command.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_pull_model(model: String, on_event: Channel<PullEvent>) -> Result<(), String> {
     let client = reqwest::Client::new();
     let res = client
@@ -720,7 +722,7 @@ async fn ollama_pull_model(model: String, on_event: Channel<PullEvent>) -> Resul
 
 /// Delete a model from local storage. The frontend unloads it first so the
 /// delete is never rejected as in-use.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_delete_model(model: String) -> Result<(), String> {
     let client = reqwest::Client::new();
     let res = client
@@ -1125,7 +1127,7 @@ async fn ollama_version_inner(client: &reqwest::Client) -> Result<String, String
 }
 
 /// Report the local Ollama server version, or an error when it is down.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_server_version() -> Result<String, String> {
     let client = reqwest::Client::new();
     ollama_version_inner(&client).await
@@ -1134,6 +1136,7 @@ async fn ollama_server_version() -> Result<String, String> {
 /// Start a local `ollama serve` when none is reachable. If a server already
 /// answers (user's terminal, another app), it is adopted as-is instead of
 /// spawning a second one on the busy port.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn ollama_start_server(state: State<'_, OllamaServerState>) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -1192,6 +1195,7 @@ async fn ollama_start_server(state: State<'_, OllamaServerState>) -> Result<Stri
 
 /// Stop the `ollama serve` this app launched. Refuses when Vicuna didn't
 /// start one — kill foreign servers in their own terminal.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn ollama_stop_server(state: State<'_, OllamaServerState>) -> Result<(), String> {
     let mut guard = state
@@ -2111,12 +2115,12 @@ pub async fn work_exec_logic(root: String, command: String, timeout_ms: Option<u
 /// agent loop (work_agent.rs) can call them directly. These thin wrappers
 /// preserve the exact command names the frontend invokes — the IPC contract
 /// is unchanged.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_list_dir(root: String, path: Option<String>) -> Result<Vec<WorkDirEntry>, String> {
     work_list_dir_logic(root, path).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_read_file(
     root: String,
     path: String,
@@ -2127,17 +2131,17 @@ async fn work_read_file(
     work_read_file_logic(root, path, max_bytes, offset, limit).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_read_image(root: String, path: String) -> Result<WorkImageContent, String> {
     work_read_image_logic(root, path).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_grep(root: String, pattern: String, include: Option<String>) -> Result<Vec<WorkGrepHit>, String> {
     work_grep_logic(root, pattern, include).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_write_file(root: String, path: String, content: String) -> Result<String, String> {
     work_write_file_logic(root, path, content).await
 }
@@ -2161,59 +2165,59 @@ async fn work_open_path(app: AppHandle, root: String, path: String) -> Result<()
 
 // ---- Git panel (side panel Git tab; logic in git_panel.rs, shared with the bridge) ----
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_status(root: String) -> Result<git_panel::GitStatus, String> {
     git_panel::git_status_logic(root).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_diff(root: String, path: String, staged: bool, untracked: bool) -> Result<git_panel::GitDiff, String> {
     git_panel::git_diff_logic(root, path, staged, untracked).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_stage(root: String, paths: Vec<String>) -> Result<(), String> {
     git_panel::git_stage_logic(root, paths).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_unstage(root: String, paths: Vec<String>) -> Result<(), String> {
     git_panel::git_unstage_logic(root, paths).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_discard(root: String, paths: Vec<String>, untracked: Vec<String>) -> Result<(), String> {
     git_panel::git_discard_logic(root, paths, untracked).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn git_apply(root: String, patch: String, cached: bool, reverse: bool, intent_to_add: Vec<String>) -> Result<(), String> {
     git_panel::git_apply_logic(root, patch, cached, reverse, intent_to_add).await
 }
 
 // ---- remote servers (see src/servers.rs) ----
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn server_list() -> Vec<servers::ServerInfo> {
     servers::list()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn server_connect(url: String, token: Option<String>) -> Result<servers::ServerInfo, String> {
     servers::connect(&url, token).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn server_touch(id: String) -> Result<(), String> {
     servers::touch(&id)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn server_remove(id: String) -> Result<(), String> {
     servers::remove(&id)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn server_call(
     id: String,
     path: String,
@@ -2223,28 +2227,28 @@ async fn server_call(
     servers::call(&id, &path, body, timeout_ms).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn server_download_file(id: String, root: String, path: String) -> Result<String, String> {
     servers::download_file(&id, &root, &path, &downloads_dir()?).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn server_lb_proxy_url(id: String) -> Result<String, String> {
     servers::lb_proxy_url(&id).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
     work_exec_logic(root, command, timeout_ms).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn upload_read_file(session_id: String, name: String) -> Result<WorkFileContent, String> {
     upload_read_file_logic(session_id, name).await
 }
 
 /// ---------- In-app update wrappers (same _logic pattern) ----------
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_engine_info() -> Result<opencode::WorkEngineInfo, String> {
     // re-detects on every call: the UI's Refresh / window focus picks up an
     // engine installed while Vicuna is running. Returns the current engine
@@ -2252,17 +2256,17 @@ async fn work_engine_info() -> Result<opencode::WorkEngineInfo, String> {
     Ok(work_engine::engines_info().await)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn app_build_info() -> Result<serde_json::Value, String> {
     app_build_info_logic().await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn github_latest_release() -> Result<serde_json::Value, String> {
     github_latest_release_logic().await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn github_download_asset(url: String, file_name: String) -> Result<String, String> {
     github_download_asset_logic(url, file_name).await
 }
@@ -2270,42 +2274,42 @@ async fn github_download_asset(url: String, file_name: String) -> Result<String,
 // ---------- More command wrappers (same pattern: logic is pub + callable
 // headlessly, wrappers preserve the exact IPC names). These cover the
 // remaining backend surface the headless bridge drives.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_validate_root(path: String) -> Result<String, String> {
     work_validate_root_logic(path).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_tree(root: String, max_depth: Option<usize>) -> Result<Vec<WorkTreeEntry>, String> {
     work_tree_logic(root, max_depth).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_rename(root: String, path: String, new_name: String) -> Result<String, String> {
     work_rename_logic(root, path, new_name).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_delete(root: String, path: String) -> Result<(), String> {
     work_delete_logic(root, path).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_import_file(root: String, path: String, base64: String) -> Result<String, String> {
     work_import_file_logic(root, path, base64).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn upload_stage_file(session_id: String, file_name: String, base64: String) -> Result<String, String> {
     upload_stage_file_logic(session_id, file_name, base64).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn ollama_fetch_text(url: String) -> Result<String, String> {
     ollama_fetch_text_logic(url).await
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_fetch_url(url: String) -> Result<WorkFetchContent, String> {
     work_fetch_url_logic(url).await
 }
@@ -2629,24 +2633,28 @@ pub fn bg_kill_running(state: &BgExecState) {
 }
 
 /// Start a detached shell command; returns the job id immediately.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_exec_start(root: String, command: String, state: State<'_, BgExecState>) -> Result<String, String> {
     bg_start(&state, root, command).await
 }
 
 /// Poll one background job (full captured output so far + running flag).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_exec_status(id: String, state: State<'_, BgExecState>) -> Result<BgJobStatus, String> {
     bg_snapshot(&state, &id)
 }
 
 /// List background jobs (newest last, no output payload).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_exec_list(state: State<'_, BgExecState>) -> Result<Vec<BgJobSummary>, String> {
     bg_list(&state)
 }
 
 /// Kill a background job (best-effort); returns the latest snapshot.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_exec_kill(id: String, state: State<'_, BgExecState>) -> Result<BgJobStatus, String> {
     bg_kill(&state, &id)
@@ -3450,6 +3458,7 @@ pub async fn agent_shell_interrupt(
 }
 
 /// Persistent-shell command wrappers (same IPC naming pattern as the rest).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_shell_exec(
     root: String,
@@ -3462,12 +3471,14 @@ async fn work_shell_exec(
     agent_shell_exec(&state, root, key, command, timeout_ms).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_shell_status(root: String, key: Option<String>, state: State<'_, AgentShellState>) -> Result<ShellRun, String> {
     let key = key.unwrap_or_else(|| root.clone());
     agent_shell_status(&state, root, key).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_shell_input(
     root: String,
@@ -3479,6 +3490,7 @@ async fn work_shell_input(
     agent_shell_input(&state, root, key, text).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_shell_interrupt(root: String, key: Option<String>, state: State<'_, AgentShellState>) -> Result<ShellRun, String> {
     let key = key.unwrap_or_else(|| root.clone());
@@ -3883,6 +3895,7 @@ pub async fn work_redo_logic(state: &UndoState, session_id: String) -> Result<St
 
 /// Revert the last recorded Work turn's file changes for a session.
 /// Pops one undo frame; chat bubbles are removed frontend-side.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_undo(session_id: String, state: State<'_, UndoState>) -> Result<String, String> {
     work_undo_logic(&state, session_id).await
@@ -3890,6 +3903,7 @@ async fn work_undo(session_id: String, state: State<'_, UndoState>) -> Result<St
 
 /// Re-apply the turn most recently reverted by /undo. Chat bubbles are
 /// restored frontend-side.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn work_redo(session_id: String, state: State<'_, UndoState>) -> Result<String, String> {
     work_redo_logic(&state, session_id).await
@@ -4274,21 +4288,21 @@ async fn cli_env() -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), Stri
 }
 
 /// Report the `vicuna` launcher status (install location + PATH state).
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn cli_status() -> Result<CliStatus, String> {
     let (all_dirs, home) = cli_env().await?;
     cli_status_inner(&all_dirs, &home)
 }
 
 /// Install (or reinstall) the `vicuna` launcher script.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn cli_install() -> Result<CliInstallResult, String> {
     let (all_dirs, home) = cli_env().await?;
     cli_install_inner(&all_dirs, &home)
 }
 
 /// Remove the launcher this app installed. Refuses foreign binaries.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn cli_uninstall() -> Result<String, String> {
     let (all_dirs, home) = cli_env().await?;
     cli_uninstall_inner(&all_dirs, &home)
@@ -4636,6 +4650,7 @@ pub fn term_kill_logic(state: &TermState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn term_spawn(
     root: String,
@@ -4647,11 +4662,13 @@ async fn term_spawn(
     term_spawn_logic(&state, &root, cols, rows, on_event)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn term_write(id: String, data: String, state: State<'_, TermState>) -> Result<(), String> {
     term_write_logic(&state, &id, &data)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn term_resize(
     id: String,
@@ -4662,6 +4679,7 @@ async fn term_resize(
     term_resize_logic(&state, &id, cols, rows)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn term_kill(id: String, state: State<'_, TermState>) -> Result<(), String> {
     term_kill_logic(&state, &id)
@@ -4721,7 +4739,7 @@ pub fn fs_list_dirs_logic(path: Option<String>, hidden: bool) -> Result<serde_js
     }))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn fs_list_dirs(path: Option<String>, hidden: Option<bool>) -> Result<serde_json::Value, String> {
     fs_list_dirs_logic(path, hidden.unwrap_or(false))
 }
@@ -5396,21 +5414,22 @@ async fn tray_set_status(
 /// shape) — the file is the source of truth, the UI edits it. Connections
 /// are runtime-only in the McpManager (stdio children die on disconnect).
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn mcp_list_servers() -> Result<Vec<mcp::McpServerConfig>, String> {
     mcp::list_file_servers()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn mcp_save_server(config: mcp::McpServerConfig) -> Result<Vec<mcp::McpServerConfig>, String> {
     mcp::save_file_server(&config)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn mcp_delete_server(id: String) -> Result<Vec<mcp::McpServerConfig>, String> {
     mcp::delete_file_server(&id)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_connect(
     config: mcp::McpServerConfig,
@@ -5419,11 +5438,13 @@ async fn mcp_connect(
     state.connect(&config).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_disconnect(id: String, state: State<'_, mcp::McpManager>) -> Result<(), String> {
     state.disconnect(&id).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_list_tools(
     id: String,
@@ -5432,6 +5453,7 @@ async fn mcp_list_tools(
     state.list_tools(&id).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_call_tool(
     server_id: String,
@@ -5463,6 +5485,7 @@ async fn mcp_signin(
 }
 
 /// Forget the stored OAuth login and drop the connection, if any.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_signout(id: String, state: State<'_, mcp::McpManager>) -> Result<(), String> {
     // server names key the token store; resolve the id first
@@ -5478,7 +5501,7 @@ async fn mcp_signout(id: String, state: State<'_, mcp::McpManager>) -> Result<()
 
 /// Whether an OAuth login is stored for the server (drives the UI's
 /// "Signed in / Sign out" affordance).
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn mcp_login_present(id: String) -> Result<bool, String> {
     let name = mcp::list_file_servers()?
         .into_iter()
@@ -5519,6 +5542,7 @@ async fn browser_start(
     browser::browser_start_logic(browser_resource_dir(&app), &state).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn browser_stop(state: State<'_, browser::BrowserState>) -> Result<browser::BrowserStatus, String> {
     browser::browser_stop_logic(&state).await

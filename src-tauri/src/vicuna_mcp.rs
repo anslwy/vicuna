@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use sqlx::Row;
-use tauri::ipc::Channel;
+use crate::ipc::Channel;
+#[cfg(feature = "desktop")]
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1796,7 +1797,7 @@ async fn stream_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauri::ipc::InvokeResponseBody;
+    use crate::ipc::InvokeResponseBody;
 
     #[test]
     fn calls_route_to_the_named_caller_session() {
@@ -2062,7 +2063,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_sessions_dead_channel_stops_the_turn_without_dispatch() {
-        let ch = Channel::<WorkAgentEvent>::new(|_| Err(tauri::Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))));
+        let ch = Channel::<WorkAgentEvent>::new(|_| Err(crate::ipc::io_error(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))));
         let turn = Arc::new(TurnState::new());
         turn.lead.store(true, Ordering::Relaxed);
         let target = Target { seq: 0, workspace: ws(), session_id: Some("lead".into()), turn: turn.clone(), on_event: ch };

@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+#[cfg(feature = "desktop")]
 use tauri::State;
 
 use crate::opencode::{home_dir, OpencodeModels, WorkEngineInfo};
@@ -283,21 +284,25 @@ pub fn set_model(engine: Option<&str>, model: Option<&str>) -> Result<(), String
 
 // ---------- Tauri commands ----------
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_engine_select(engine: String) -> Result<WorkEngineInfo, String> {
     select_engine(&engine).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_models(engine: Option<String>, acp: State<'_, crate::acp::AcpState>) -> Result<OpencodeModels, String> {
     list_models(effective_engine(engine.as_deref()), &acp).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
     set_approval(ask).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_set_model(engine: Option<String>, model: Option<String>) -> Result<(), String> {
     set_model(engine.as_deref(), model.as_deref())

@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::{ipc::Channel, AppHandle, Manager, State};
+use crate::ipc::Channel;
+#[cfg(feature = "desktop")]
+use tauri::{AppHandle, Manager, State};
 use tokio::sync::oneshot;
 
 use super::ChatMessage;
@@ -266,6 +268,7 @@ pub async fn work_agent_start(
     Ok(turn_id)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_agent_stop(turn_id: String, agent_state: State<'_, WorkAgentState>) -> Result<(), String> {
     let turn = get_turn(&agent_state, &turn_id)?;
@@ -274,11 +277,13 @@ pub async fn work_agent_stop(turn_id: String, agent_state: State<'_, WorkAgentSt
 }
 
 /// Whether a turn is still running backend-side (see `turn_is_live`).
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_agent_turn_live(turn_id: String, agent_state: State<'_, WorkAgentState>) -> Result<bool, String> {
     Ok(turn_is_live(&agent_state, &turn_id))
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_agent_queue(
     turn_id: String,
@@ -292,6 +297,7 @@ pub async fn work_agent_queue(
 
 /// Drop a still-queued steering message (composer chip removed). Already
 /// drained messages are untouched — they have bubbles by then.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_agent_remove(
     turn_id: String,
@@ -302,6 +308,7 @@ pub async fn work_agent_remove(
     agent_remove_msg(&turn, &id)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_agent_answer(
     turn_id: String,

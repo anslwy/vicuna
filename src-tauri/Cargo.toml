@@ -22,12 +22,13 @@ required-features = ["desktop"]
 
 # `desktop` (default) = the Tauri app: WebKit runtime, tray, plugins, every
 # #[tauri::command]. The headless server (`vicuna serve`, bridge/ crate) builds
-# with `default-features = false, features = ["rustls"]`: only the logic +
-# tauri::ipc::Channel remain, so the Linux binary links no GUI libraries
-# (verified: NEEDED = libc/libgcc only) and runs on a bare VPS.
+# with `default-features = false, features = ["rustls"]`: `tauri` itself is
+# excluded (via `src/ipc.rs`), so Linux builds need no GTK/WebKit headers or
+# system OpenSSL and compile statically against musl for x86_64 and aarch64.
 [features]
 default = ["desktop"]
 desktop = [
+    "dep:tauri",
     "tauri/default",
     "tauri/tray-icon",
     "dep:tauri-plugin-deep-link",
@@ -49,7 +50,7 @@ rustls = ["reqwest/rustls-tls"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", default-features = false , features = [] }
+tauri = { version = "2", default-features = false, features = [], optional = true }
 tauri-plugin-deep-link = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
@@ -61,7 +62,7 @@ tauri-plugin-sql = { version = "2", features = ["sqlite"], optional = true }
 # run the chat-history rewrite as ONE transaction — keep versions in lockstep
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.3"

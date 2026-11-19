@@ -356,6 +356,7 @@ mod tests {
         assert!(o.check && o.force && o.no_restart && o.dry_run);
         assert!(parse_opts(&["--nope".into()]).is_err());
         assert_eq!(target("linux", "x86_64"), Some("linux-x86_64"));
+        assert_eq!(target("linux", "aarch64"), Some("linux-aarch64"));
         assert_eq!(target("macos", "aarch64"), Some("macos-universal"));
         assert_eq!(target("windows", "x86_64"), None);
         assert_eq!(parse_sha256(&format!("{}  vicuna.tar.gz\n", "A".repeat(64))), Some("a".repeat(64)));

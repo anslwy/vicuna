@@ -16,7 +16,7 @@
 
 set -eu
 
-PINNED_VERSION="v0.4.22"
+PINNED_VERSION="v0.4.23"
 VERSION="${LB_VERSION:-$PINNED_VERSION}"
 PINNED=1
 if [ "$VERSION" != "$PINNED_VERSION" ]; then PINNED=0; fi
@@ -49,13 +49,14 @@ case "$OS" in
   *) echo "fetch-lb-sidecar: unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-# Pinned SHA-256 per asset (v0.4.22, computed from the downloaded release assets).
+# Pinned SHA-256 per asset (v0.4.23, computed from the downloaded release assets).
 sha_for() {
   case "$1" in
-    live-browser-v0.4.22-darwin-arm64.tar.gz) echo "35219fe8466237d0d8edb8cf776fa478ba3ed7437b4651a7b80ac8237daccc95" ;;
-    live-browser-v0.4.22-darwin-x86_64.tar.gz) echo "34887a8038b0efa56f8fadddcf5f8a4d2e2e5c6e3a2d4d1baec23434ad483d6a" ;;
-    live-browser-v0.4.22-linux-x86_64.tar.gz) echo "a429d4b3d16dd0388043d3e2a163d48d17769511c73cd81f791979e3ca338a39" ;;
-    live-browser-v0.4.22-windows-x86_64.zip) echo "62e6bf12fa6ce1cad1cf1cae9ffdbf78ba9afaf63ee3548b13c351efd19f6bfc" ;;
+    live-browser-v0.4.23-darwin-arm64.tar.gz) echo "68ca9552482dd1d1d8598801031a9d4a2fe8eeb4851cdd59aea15e98419c0ac9" ;;
+    live-browser-v0.4.23-darwin-x86_64.tar.gz) echo "f723acf6f5302d9a0cb1ff1cb5b60123f6fe398ce8e041e901cd175929c8cc41" ;;
+    live-browser-v0.4.23-linux-x86_64.tar.gz) echo "6a15b5a0f3eb69db9ef8a616418856e12370535a0445c4a2cdaa9351faa38417" ;;
+    live-browser-v0.4.23-linux-aarch64.tar.gz) echo "1091ab8698afd11fbf1d02fd672d42441b589914c8ce7a34cf8af3f54124ea58" ;;
+    live-browser-v0.4.23-windows-x86_64.zip) echo "8eca1a741310a506221cd1734c21438671bb58370f892efb04ad06f13d00b5fd" ;;
     *) echo "" ;;
   esac
 }
@@ -135,13 +136,14 @@ elif [ "$PLATFORM" = "windows" ]; then
   cp -r "$SRC/web/dist" "$DEST/web/dist"
 else
   case "$ARCH" in
-    x86_64) ;;
-    *) echo "fetch-lb-sidecar: no linux asset for $ARCH (x86_64 only)" >&2; exit 1 ;;
+    x86_64|amd64) LINUX_ARCH="x86_64" ;;
+    aarch64|arm64) LINUX_ARCH="aarch64" ;;
+    *) echo "fetch-lb-sidecar: no linux asset for $ARCH (x86_64, aarch64 only)" >&2; exit 1 ;;
   esac
-  ASSET="live-browser-$VERSION-linux-x86_64.tar.gz"
+  ASSET="live-browser-$VERSION-linux-$LINUX_ARCH.tar.gz"
   fetch_asset "$ASSET"
   tar -xzf "$TMP/$ASSET" -C "$TMP"
-  SRC="$TMP/live-browser-$VERSION-linux-x86_64"
+  SRC="$TMP/live-browser-$VERSION-linux-$LINUX_ARCH"
   cp "$SRC/lb" "$DEST/lb"
   chmod +x "$DEST/lb"
   mkdir -p "$DEST/web"

@@ -33,7 +33,7 @@ mod session_tools;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tauri::ipc::{Channel, InvokeResponseBody};
+use crate::ipc::{Channel, InvokeResponseBody, IpcResponse};
 
 use crate::acp::AcpState;
 use crate::browser::BrowserState;
@@ -209,7 +209,7 @@ fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
-fn channel_for<T: tauri::ipc::IpcResponse>(queues: &EventQueues, uuid: &str) -> Channel<T> {
+fn channel_for<T: IpcResponse>(queues: &EventQueues, uuid: &str) -> Channel<T> {
     // Real Tauri Channel wired into the poll queue: run_loop is unchanged,
     // its Token/Think/Tool/Done sends land here as JSON for GET /poll/<id>.
     let queues = queues.clone();

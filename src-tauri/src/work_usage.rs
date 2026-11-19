@@ -797,6 +797,7 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
     .map_err(|e| format!("usage task failed: {e}"))?
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn work_usage(engine: Option<String>) -> Result<WorkUsageReport, String> {
     fetch_usage_logic(engine).await

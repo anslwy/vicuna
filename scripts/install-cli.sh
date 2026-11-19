@@ -49,7 +49,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading $asset ..."
-fetch "$base/$asset" "$tmp/$asset" || die "no $target build in this release yet ($base/$asset). Supported: linux-x86_64, macos-universal (linux-aarch64 when available)."
+fetch "$base/$asset" "$tmp/$asset" || die "no $target build in this release yet ($base/$asset). Supported: linux-x86_64, linux-aarch64, macos-universal."
 if fetch "$base/$asset.sha256" "$tmp/$asset.sha256" 2>/dev/null; then
   want=$(cut -d' ' -f1 < "$tmp/$asset.sha256")
   if command -v sha256sum >/dev/null 2>&1; then
@@ -70,6 +70,8 @@ if [ -e "$dest" ] && [ "${VICUNA_FORCE:-}" != "1" ]; then
     say "Replacing the old Vicuna launcher at $dest (vicuna open does its job now)."
   elif "$dest" --version 2>/dev/null | grep -q '^vicuna '; then
     :
+  elif "$dest" --version 2>&1 | grep -q 'GLIBC_' && LC_ALL=C tr -cd ' -~\n' < "$dest" 2>/dev/null | grep -q 'vicuna-cli/'; then
+    say "Replacing an earlier incompatible Vicuna binary at $dest."
   else
     die "$dest exists and isn't Vicuna's. Set VICUNA_INSTALL_DIR, or VICUNA_FORCE=1 to replace it."
   fi
@@ -95,7 +97,8 @@ if [ "$os" = "Darwin" ]; then
   [ -d "$share/lb-sidecar" ] && xattr -dr com.apple.quarantine "$share/lb-sidecar" 2>/dev/null || true
 fi
 
-say "Installed $("$dest" --version) to $dest"
+ver=$("$dest" --version) || die "installed binary at $dest failed to run"
+say "Installed $ver to $dest"
 [ -f "$share/lb-sidecar/LB_VERSION" ] && say "Browser engine: lb $(cat "$share/lb-sidecar/LB_VERSION") in $share/lb-sidecar"
 case ":$PATH:" in
   *":$DIR:"*) ;;

@@ -498,11 +498,13 @@ pub fn save_model(model: Option<&str>) -> Result<(), String> {
 
 // ---------- Tauri commands ----------
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn opencode_models() -> Result<OpencodeModels, String> {
     list_models().await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn opencode_set_model(model: Option<String>) -> Result<(), String> {
     save_model(model.as_deref())
