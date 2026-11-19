@@ -73,6 +73,11 @@ const HEARTBEAT: Duration = if cfg!(test) { Duration::from_millis(100) } else { 
 /// the engines' 60 s defaults would cut a slow answer off mid-typing.
 pub const ASK_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+/// agy's MCP call timeout is a fixed 3 minutes (measured: agy 1.5.12 fails the
+/// call at 3:00 and ends the turn), so its waiting ask_user calls return a
+/// "still waiting" poll well before that.
+pub const AGY_ASK_POLL_SECS: u64 = 150;
+
 const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the chat. \
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
@@ -649,19 +654,64 @@ async fn ask(target: &Target, args: &Value, client_gone: impl std::future::Futur
     if turn.stop.load(Ordering::Relaxed) {
         return text_result("The user stopped the turn; no question was shown.", true);
     }
-    let ask_id = format!("ask-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
-    let (tx, rx) = oneshot::channel::<String>();
-    if let Ok(mut m) = turn.ask_pending.lock() {
-        m.insert(ask_id.clone(), tx);
-    }
-    emit_ev(
-        &target.on_event,
-        &turn.stop,
-        WorkAgentEvent::AskRequest { ask_id: ask_id.clone(), question, options: choices, multi: multiple },
-    );
-    let answer = tokio::select! {
-        a = rx => a.ok(),
-        _ = client_gone => None,
+    // a repeat of a question whose card is still up (the engine gave up on
+    // the earlier call, or it was a "still waiting" poll) re-attaches to it
+    let key = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    let parked = turn.ask_parked.lock().ok().and_then(|mut p| {
+        let i = p.iter().position(|a| a.question.split_whitespace().collect::<Vec<_>>().join(" ") == key)?;
+        Some(p.remove(i))
+    });
+    let (ask_id, mut rx) = match parked {
+        Some(p) => (p.ask_id, p.rx),
+        None => {
+            let ask_id = format!("ask-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+            let (tx, rx) = oneshot::channel::<String>();
+            if let Ok(mut m) = turn.ask_pending.lock() {
+                m.insert(ask_id.clone(), tx);
+            }
+            emit_ev(
+                &target.on_event,
+                &turn.stop,
+                WorkAgentEvent::AskRequest { ask_id: ask_id.clone(), question: question.clone(), options: choices, multi: multiple },
+            );
+            (ask_id, rx)
+        }
+    };
+    let poll = turn.ask_poll_secs.load(Ordering::Relaxed);
+    let poll_wait = async move {
+        if poll == 0 {
+            std::future::pending::<()>().await
+        } else {
+            tokio::time::sleep(Duration::from_secs(poll)).await
+        }
+    };
+    // None = no answer yet (poll elapsed or the client left)
+    let (answer, polled) = tokio::select! {
+        a = &mut rx => (Some(a.ok()), false),
+        _ = client_gone => (None, false),
+        _ = poll_wait => (None, true),
+    };
+    let answer = match answer {
+        Some(a) => a,
+        None => {
+            if turn.stop.load(Ordering::Relaxed) {
+                turn.ask_pending.lock().ok().map(|mut m| m.remove(&ask_id));
+                return text_result("The user stopped the turn before answering.", true);
+            }
+            // keep the card up: a repeat call re-attaches, an answer meanwhile
+            // is queued as a message (work_agent::agent_answer)
+            if let Ok(mut p) = turn.ask_parked.lock() {
+                p.push(crate::work_agent::ParkedAsk { ask_id, question, multi: multiple, rx });
+            }
+            return text_result(
+                if polled {
+                    "The user has not answered yet; the question is still shown to them. Call ask_user again right away with exactly the same question to keep waiting for the answer. Do not ask in plain text and do not end your turn."
+                } else {
+                    "The question is still shown to the user; their answer will reach you as a message."
+                },
+                false,
+            );
+        }
     };
     if let Ok(mut m) = turn.ask_pending.lock() {
         m.remove(&ask_id);
@@ -2145,6 +2195,33 @@ mod tests {
         let r = pending.await.unwrap().1.unwrap();
         assert_eq!(r["result"]["isError"], false);
         assert!(result_text(&r).starts_with("The user will answer this later"), "{r}");
+    }
+
+    /// agy times MCP calls out at 3 min: the call polls, the repeat call
+    /// re-attaches to the same card (no second card), and the answer lands.
+    #[tokio::test]
+    async fn polled_ask_reattaches_to_the_same_card() {
+        let (ch, seen) = capture();
+        let turn = Arc::new(TurnState::new());
+        turn.ask_poll_secs.store(1, Ordering::Relaxed);
+        let reg = register(None, &ws(), None, turn.clone(), ch).await.unwrap();
+        let r = post(&reg.url, call("Which  db?", json!({}))).await.1.unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        assert!(result_text(&r).contains("Call ask_user again"), "{r}");
+        let ev = wait_ask(&seen).await;
+        let id = ev["ask_id"].as_str().unwrap().to_string();
+        let url = reg.url.clone();
+        let again = tokio::spawn(async move { post(&url, call("Which db?", json!({}))).await });
+        // wait until the repeat call has re-attached (parked list empties)
+        for _ in 0..100 {
+            if turn.ask_parked.lock().unwrap().is_empty() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::work_agent::agent_answer(&turn, &id, "Postgres".into()).unwrap();
+        let r = again.await.unwrap().1.unwrap();
+        assert_eq!(result_text(&r), "The user answered: Postgres");
+        let cards = seen.lock().unwrap().iter().filter(|e| e["type"] == "askrequest").count();
+        assert_eq!(cards, 1, "the repeat call must not raise a second card");
     }
 
     #[tokio::test]
