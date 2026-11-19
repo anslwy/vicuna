@@ -12,6 +12,10 @@ export interface Chat {
    *  sessions — readers fall back to createdAt via chatActivity(). */
   updatedAt?: number;
   messages: ChatMsg[];
+  /** Server list copy (`chats_list`): message text is a short preview, with
+   *  no thinking or images. Never saved; the window swaps in the full copy
+   *  (`chats_get`) when the session is opened or written to. */
+  partial?: boolean;
   forkedFrom?: { id: string; title: string } | null;
   /** index of the last forked message; the note renders right after it */
   forkFromIndex?: number | null;
@@ -601,6 +605,7 @@ export function normalizeServerChat(c: any): Chat {
     workspace: typeof c.workspace === "string" ? c.workspace : null,
     goal: typeof c.goal === "string" ? c.goal : null,
     canRedo: c.canRedo === true,
+    ...(c.partial === true ? { partial: true } : {}),
     ...parseChatExtra(c.extra),
     messages: (Array.isArray(c.messages) ? c.messages : []).map((m: any) => ({
       role: m.role as ChatMsg["role"],
@@ -638,6 +643,20 @@ export function serverSavesIdle(): Promise<void> {
   return serverBackendApi ? serverBackendApi.idle() : Promise.resolve();
 }
 
+/** The server's session list. Servers with `chats_list` send light copies
+ *  (message previews, `partial: true`); older ones only have the full
+ *  `chats_load`. */
+export async function loadServerChatList(): Promise<any[]> {
+  let raw: unknown;
+  try {
+    raw = await invokeOrBridge<any[]>("chats_list", {});
+  } catch (e) {
+    if (!/unknown bridge command/i.test(String((e as any)?.message ?? e))) throw e;
+    raw = await invokeOrBridge<any[]>("chats_load", {});
+  }
+  return Array.isArray(raw) ? raw : [];
+}
+
 /** `keyScope`: the remote server id that scopes this window's local keys
  *  (model, active chat); null = This computer, which keeps its old keys. */
 function createServerBackend(keyScope: string | null): Backend {
@@ -656,6 +675,7 @@ function createServerBackend(keyScope: string | null): Backend {
 
   async function push(chats: Chat[]): Promise<void> {
     const items = toSavePayload(chats);
+    const partialIds = new Set(chats.filter((c) => c.partial).map((c) => c.id));
     const current = new Set(items.map((i) => i.id));
     const changed: typeof items = [];
     const json = new Map<string, string>();
@@ -663,7 +683,8 @@ function createServerBackend(keyScope: string | null): Backend {
       const j = JSON.stringify(it);
       json.set(it.id, j);
       // a live server-recorded turn: the server is its only writer
-      if (sent.get(it.id) !== j && !serverSync.skip(it.id)) changed.push(it);
+      // a list copy (partial) holds message previews only: never send it
+      if (sent.get(it.id) !== j && !serverSync.skip(it.id) && !partialIds.has(it.id)) changed.push(it);
     }
     const deleted = [...sent.keys()].filter((id) => !current.has(id));
     if (changed.length === 0 && deleted.length === 0) return;
@@ -707,7 +728,7 @@ function createServerBackend(keyScope: string | null): Backend {
   const ls = (base: string) => (keyScope ? serverKey(base, keyScope) : base);
   return {
     async loadChats(): Promise<Chat[]> {
-      const raw = await invokeOrBridge<any[]>("chats_load", {});
+      const raw = await loadServerChatList();
       // what the server already has: the first save sends nothing unchanged
       sent.clear();
       revs.clear();

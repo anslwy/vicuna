@@ -634,10 +634,19 @@ async fn dispatch(
             "persist": st.db.is_some(),
             "chatTurns": st.db.is_some(),
             "sessionTools": st.db.is_some(),
+            "chatsList": st.db.is_some(),
         })),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
             let mut chats = crate::server_store::load_chats(db).await?;
+            for chat in chats.as_array_mut().into_iter().flatten() {
+                st.redo_history.decorate(chat);
+            }
+            Ok(chats)
+        }
+        "chats_list" => {
+            let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
+            let mut chats = crate::server_store::load_chat_list(db).await?;
             for chat in chats.as_array_mut().into_iter().flatten() {
                 st.redo_history.decorate(chat);
             }
@@ -1295,6 +1304,7 @@ pub const API_ACTIONS: &[&str] = &[
     "chat_turn_start",
     "chat_turn_stop",
     "chats_get",
+    "chats_list",
     "chats_load",
     "chats_merge",
     "cli_session",
