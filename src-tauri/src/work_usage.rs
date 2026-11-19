@@ -75,80 +75,6 @@ impl WorkUsageReport {
     }
 }
 
-/// Clean ANSI terminal output while preserving cursor-forward spacing (`\x1b[NC`).
-pub fn clean_ansi(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x1b {
-            // ESC
-            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                // CSI sequence: ESC [ <params> <final 0x40..=0x7E>
-                let mut j = i + 2;
-                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                    j += 1;
-                }
-                if j < bytes.len() {
-                    let final_byte = bytes[j];
-                    if final_byte == b'C' {
-                        // Cursor forward: emit spaces so words don't glue together.
-                        let param = std::str::from_utf8(&bytes[i + 2..j]).unwrap_or("1");
-                        let n: usize = param.parse().unwrap_or(1).min(40);
-                        for _ in 0..n {
-                            out.push(' ');
-                        }
-                    } else if final_byte == b'G' {
-                        if !out.ends_with('\n') && !out.ends_with(' ') {
-                            out.push(' ');
-                        }
-                    } else if final_byte == b'B' || final_byte == b'H' || final_byte == b'f' {
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            } else if i + 1 < bytes.len() && bytes[i + 1] == b']' {
-                // OSC sequence: ESC ] ... (BEL or ESC \)
-                let mut j = i + 2;
-                while j < bytes.len() {
-                    if bytes[j] == 0x07 {
-                        j += 1;
-                        break;
-                    }
-                    if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                        j += 2;
-                        break;
-                    }
-                    j += 1;
-                }
-                i = j;
-                continue;
-            } else if i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-        } else if b == b'\r' {
-            i += 1;
-            continue;
-        }
-        // Decode UTF-8 char safely
-        let s = &input[i..];
-        if let Some(ch) = s.chars().next() {
-            if !ch.is_control() || ch == '\n' || ch == '\t' {
-                out.push(ch);
-            }
-            i += ch.len_utf8();
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Drive an interactive CLI (`/usage`) inside a tall PTY so the full view fits without paging.
 fn run_pty_slash_usage(
     bin: &Path,
@@ -156,12 +82,12 @@ fn run_pty_slash_usage(
     done_markers: &[&str],
     settle_after_done: Duration,
     total_timeout: Duration,
-) -> Result<String, String> {
+) -> Result<PtyCapture, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 80,
-            cols: 200,
+            rows: PTY_ROWS,
+            cols: PTY_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -208,21 +134,36 @@ fn run_pty_slash_usage(
     });
 
     let start = Instant::now();
-    let mut raw = String::new();
+    // Render what the CLI draws instead of concatenating the byte stream:
+    // terminals repaint only the cells that changed (always on Windows'
+    // ConPTY, and for Ink's partial redraws everywhere), so the stream read
+    // as text dropped letters ("Current ses ion", losing that meter) and kept
+    // stale values ("0% used" after a later repaint to 12%).
+    let mut screen = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
+    // every distinct rendered frame, oldest first: some facts show only on a
+    // passing frame (agy's "(Google AI Pro)" on its loading view), while the
+    // parsers read the meters from the last frame
+    let mut frames = String::new();
+    let mut last_frame = String::new();
     let mut trusted = false;
     let mut sent = false;
     let mut done_at: Option<Instant> = None;
 
     while start.elapsed() < total_timeout {
         match rx.recv_timeout(Duration::from_millis(120)) {
-            Ok(chunk) => {
-                raw.push_str(&String::from_utf8_lossy(&chunk));
-            }
+            Ok(chunk) => screen.process(&chunk),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        let cleaned = clean_ansi(&raw);
+        let cleaned = screen.screen().contents();
+        if cleaned != last_frame {
+            if frames.len() < FRAMES_CAP {
+                frames.push_str(&cleaned);
+                frames.push('\n');
+            }
+            last_frame = cleaned.clone();
+        }
         if !trusted && !sent && cleaned.contains("Do you trust") {
             let _ = writer.write_all(b"\r");
             let _ = writer.flush();
@@ -239,8 +180,9 @@ fn run_pty_slash_usage(
                 sent = true;
             }
         } else if sent {
-            let after_cmd = cleaned.rsplit("/usage").next().unwrap_or(&cleaned);
-            if done_at.is_none() && done_markers.iter().any(|m| after_cmd.contains(m)) {
+            // the screen holds only the current view, so no earlier frame can
+            // match (and the view's own "/usage-credits" hint must not hide it)
+            if done_at.is_none() && done_markers.iter().any(|m| cleaned.contains(m)) {
                 done_at = Some(Instant::now());
             }
             if let Some(t) = done_at {
@@ -251,13 +193,45 @@ fn run_pty_slash_usage(
         }
     }
 
+    if let Some(pid) = child.process_id() {
+        kill_tree(pid);
+    }
     let _ = child.kill();
     let _ = child.wait();
     drop(writer);
     drop(pair.master);
 
-    Ok(clean_ansi(&raw))
+    Ok(PtyCapture { screen: screen.screen().contents(), frames })
 }
+
+/// What the PTY drew: the final screen (parse this) and every distinct
+/// frame before it (for facts only a passing frame shows).
+struct PtyCapture {
+    screen: String,
+    frames: String,
+}
+
+const PTY_ROWS: u16 = 80;
+const FRAMES_CAP: usize = 4 * 1024 * 1024;
+const PTY_COLS: u16 = 200;
+
+/// Windows: npm installs the CLIs as `.cmd` shims, so killing the child only
+/// ends `cmd.exe` and the real CLI kept running after every usage check.
+/// End the whole tree. (Unix: the plain kill reaches the CLI itself.)
+#[cfg(windows)]
+fn kill_tree(pid: u32) {
+    use std::os::windows::process::CommandExt as _;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .status();
+}
+
+#[cfg(not(windows))]
+fn kill_tree(_pid: u32) {}
 
 fn parse_percent_line(line: &str) -> Option<f64> {
     // Matches e.g. "[██████████░░] 86.63%" or "12% used"
@@ -665,6 +639,12 @@ fn fetch_codex_usage(bin: &Path) -> Result<WorkUsageReport, String> {
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
     }
+    // every hover/refresh of the usage meter runs this: no console flash
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start codex app-server: {e}"))?;
@@ -750,6 +730,7 @@ fn fetch_codex_usage(bin: &Path) -> Result<WorkUsageReport, String> {
         }
     }
 
+    kill_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
     result.unwrap_or_else(|| Err("Timed out waiting for Codex rate limits".to_string()))
@@ -764,14 +745,21 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                 r.error = Some(eng.missing_message());
                 return Ok(r);
             };
-            let cleaned = run_pty_slash_usage(
+            let cap = run_pty_slash_usage(
                 &bin,
                 &["for shortcuts"],
                 &["Refreshes in", "Quota available"],
                 Duration::from_millis(600),
-                Duration::from_secs(12),
+                // agy sometimes takes over 12 s to load quota; a normal run
+                // still returns as soon as the meters are on screen
+                Duration::from_secs(20),
             )?;
-            Ok(parse_agy_usage(&cleaned))
+            let mut r = parse_agy_usage(&cap.screen);
+            if r.plan.is_none() {
+                // agy names the plan only on its loading view
+                r.plan = parse_agy_usage(&cap.frames).plan;
+            }
+            Ok(r)
         }
         Engine::Claude => {
             let Some(bin) = crate::claude::find_claude() else {
@@ -779,14 +767,14 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                 r.error = Some(eng.missing_message());
                 return Ok(r);
             };
-            let cleaned = run_pty_slash_usage(
+            let cap = run_pty_slash_usage(
                 &bin,
                 &["Claude Code", "for agents"],
                 &["Current week", "Current session"],
                 Duration::from_millis(1400),
                 Duration::from_secs(10),
             )?;
-            Ok(parse_claude_usage(&cleaned))
+            Ok(parse_claude_usage(&cap.screen))
         }
         Engine::Codex => {
             let Some(bin) = crate::codex::find_codex() else {
@@ -818,10 +806,34 @@ pub async fn work_usage(engine: Option<String>) -> Result<WorkUsageReport, Strin
 mod tests {
     use super::*;
 
+    /// What the PTY loop does with the CLI's output: render it to a screen.
+    fn render(stream: &str) -> String {
+        let mut p = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
+        p.process(stream.as_bytes());
+        p.screen().contents()
+    }
+
+    fn meters(r: &WorkUsageReport) -> Vec<(String, f64)> {
+        r.groups.iter().flat_map(|g| g.meters.iter().map(|m| (m.label.clone(), m.percent))).collect()
+    }
+
     #[test]
-    fn clean_ansi_preserves_cursor_forward_spaces() {
-        let s = "\x1b[32mCurrent\x1b[1Cweek\x1b[1C(all\x1b[1Cmodels)\x1b[0m\r\n";
-        assert_eq!(clean_ansi(s), "Current week (all models)\n");
+    fn conpty_repaints_render_like_the_screen() {
+        // Windows ConPTY: absolute cursor moves, blank runs as ECH/CUF, and a
+        // later repaint of only the changed cell (0% -> 12%). Read as a byte
+        // stream this parsed as "0% used" with a stray "12%" line.
+        let s = render("\x1b[2J\x1b[1;1H> /usage\x1b[5;3HCurrent\x1b[1Csession\x1b[12X\x1b[12C\u{2588}\x1b[1C0%\x1b[1Cused\x1b[6;3HResets\x1b[1C5pm\x1b[8;3HCurrent\x1b[1Cweek\x1b[1C(all\x1b[1Cmodels)\x1b[2C\u{2588}\x1b[1C40%\x1b[1Cused\x1b[5;32H12% used");
+        assert!(s.contains("12% used") && !s.contains(" 0% used"), "{s}");
+        assert_eq!(meters(&parse_claude_usage(&s)), [("Current session".into(), 12.0), ("Current week (all models)".into(), 40.0)]);
+    }
+
+    #[test]
+    fn partially_redrawn_labels_keep_every_letter() {
+        // Ink redraws a frame by rewriting only changed cells; the stream
+        // then lacked letters ("Current ses ion") and the meter was lost
+        // (seen live on Linux: the 49% session meter never parsed).
+        let s = render("Current ses ion\r\n\u{2588}\u{2588} 49% used\r\nRese s 11:29pm\x1b[1;12Hs\x1b[3;5Ht");
+        assert_eq!(meters(&parse_claude_usage(&s)), [("Current session".into(), 49.0)]);
     }
 
     #[test]
