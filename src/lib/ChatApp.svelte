@@ -9277,16 +9277,6 @@
                 {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
                 {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
                 {#if c.role === "lead"}<span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>{/if}
-                {#if c.role === "lead" && telegramLive}<span
-                    class="tg-badge"
-                    data-testid="telegram-badge"
-                    role="button"
-                    tabindex="0"
-                    title="Telegram bridge connected — click to manage"
-                    aria-label="Telegram bridge settings"
-                    onclick={(e) => { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; }}
-                    onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; } }}
-                  ><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>{/if}
                 {#if c.engine && c.mode === "work"}<span class="work-badge engine-tag" data-testid="session-engine" title={c.workModel ? `${c.engine}/${c.workModel}` : c.engine}>{c.engine}</span>{/if}
                 {#if c.mode === "work"}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
@@ -9299,6 +9289,16 @@
                     <span class="work-badge" title="Work session">Work</span>
                   {/if}
                 {/if}
+                {#if c.role === "lead" && telegramLive}<span
+                    class="work-badge tg-badge"
+                    data-testid="telegram-badge"
+                    role="button"
+                    tabindex="0"
+                    title="Telegram bridge connected — click to manage"
+                    aria-label="Telegram bridge settings"
+                    onclick={(e) => { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; }}
+                    onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; } }}
+                  ><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>{/if}
               {/if}
             </button>
           {/each}
@@ -12261,9 +12261,9 @@
   .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .lead-badge { background: var(--text); color: var(--bg); }
-  .tg-badge { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-left: 4px; border-radius: 50%; background: #2aabee; color: #fff; cursor: pointer; }
-  .tg-badge:hover { filter: brightness(1.1); }
-  .tg-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .work-badge.tg-badge { display: inline-flex; align-items: center; align-self: center; padding: 3px 7px; background: #2aabee; color: #fff; cursor: pointer; line-height: 0; }
+  .work-badge.tg-badge:hover { filter: brightness(1.08); }
+  .work-badge.tg-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .engine-tag { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 600; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
