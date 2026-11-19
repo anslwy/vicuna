@@ -55,7 +55,10 @@ try {
   }
 
   Write-Host 'Running Vicuna installer...'
-  $proc = Start-Process -FilePath $InstallerPath -ArgumentList $InstallerArgs -Wait -PassThru
+  # Windows PowerShell 5.1 rejects an empty -ArgumentList, so only pass it when set.
+  $StartArgs = @{ FilePath = $InstallerPath; Wait = $true; PassThru = $true }
+  if ($InstallerArgs.Count -gt 0) { $StartArgs.ArgumentList = $InstallerArgs }
+  $proc = Start-Process @StartArgs
   if ($proc.ExitCode -ne 0) {
     throw "Installer exited with code $($proc.ExitCode)."
   }
