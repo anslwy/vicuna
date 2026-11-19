@@ -55,6 +55,7 @@
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
+  import TelegramModal from "$lib/TelegramModal.svelte";
   import { hideSplash } from "$lib/splash";
   import {
     APP_UPDATE_RELEASES_URL,
@@ -4062,6 +4063,9 @@
   }
 
   /** the lead may manage other sessions; making one the lead also pins it */
+  // Telegram bridge dialog (lead session menu); the session it was opened for
+  let telegramFor = $state<string | null>(null);
+
   async function toggleLead(id: string) {
     let c = chats.find((x) => x.id === id);
     ctxMenu = null;
@@ -9303,6 +9307,9 @@
           <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
           {#if (ctxChat?.mode ?? "chat") === "work"}
             <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>{ctxChat?.role === "lead" ? "Remove lead" : "Make lead"}</button>
+            {#if ctxChat?.role === "lead"}
+              <button class="ctx-item" data-testid="telegram-item" onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}>Telegram…</button>
+            {/if}
           {/if}
           <div class="ctx-continue-row">
             <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
@@ -11082,6 +11089,9 @@
     onPick={onFolderPicked}
     onClose={() => (folderPicker = null)}
   />
+{/if}
+{#if telegramFor}
+  <TelegramModal leadTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""} onClose={() => (telegramFor = null)} />
 {/if}
 {#if srvDialogOpen}
   <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
