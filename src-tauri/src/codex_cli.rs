@@ -337,14 +337,23 @@ pub fn mcp_servers(entries: &[Value], ask: bool) -> Option<Value> {
 /// "Ask before running tools" -> Codex approval policy. Ask: `untrusted`
 /// (anything not known-safe asks first). Auto: `never` (nothing asks; like
 /// Claude's auto mode). The sandbox is the user's config.toml `sandbox_mode`
-/// when set, else `workspace-write` (the agent edits its workspace).
+/// when set, else `danger-full-access`: Claude Code, OpenCode, pi and fx run
+/// commands with the user's own permissions under Vicuna, and a Codex-only
+/// `workspace-write` default blocked writes outside the workspace that every
+/// other harness allowed. A config.toml `default_permissions` profile without
+/// `sandbox_mode` sends no sandbox at all, so the user's profile decides.
 pub fn thread_params(workspace: &str, ask: bool, user_config: Option<&Value>, model: Option<&str>, mcp: &[Value]) -> Value {
-    let sandbox = user_config.and_then(|c| c["config"]["sandbox_mode"].as_str()).unwrap_or("workspace-write");
+    let config = user_config.map(|c| &c["config"]);
+    let profile = config.is_some_and(|c| c["default_permissions"].is_string());
+    let sandbox = config.and_then(|c| c["sandbox_mode"].as_str()).or((!profile).then_some("danger-full-access"));
     let mut p = json!({
         "cwd": workspace,
         "approvalPolicy": if ask { "untrusted" } else { "never" },
-        "sandbox": sandbox,
     });
+    if let Some(s) = sandbox {
+        p["sandbox"] = json!(s);
+    }
+    let sandbox = sandbox.unwrap_or("");
     if let Some(m) = model {
         p["model"] = json!(m);
     }
@@ -1085,17 +1094,19 @@ mod tests {
     #[test]
     fn codex_defaults_workspace_write_to_networking_without_overriding_explicit_config() {
         let with_roots = json!({
-            "config": { "sandbox_workspace_write": { "network_access": false, "writable_roots": ["/build"] } },
+            "config": { "sandbox_mode": "workspace-write", "sandbox_workspace_write": { "network_access": false, "writable_roots": ["/build"] } },
             "layers": [{ "config": { "sandbox_workspace_write": { "writable_roots": ["/build"] } } }],
         });
         let networking = |config: &Value| {
             thread_params("/w", false, Some(config), None, &[])["config"]["sandbox_workspace_write"].clone()
         };
         assert_eq!(networking(&with_roots), json!({ "network_access": true, "writable_roots": ["/build"] }));
-        assert_eq!(networking(&json!({"config": {}, "layers": []})), json!({"network_access": true}));
+        let explicit_ww = json!({"config": {"sandbox_mode": "workspace-write"}, "layers": []});
+        assert_eq!(networking(&explicit_ww), json!({"network_access": true}));
+        assert!(networking(&json!({"config": {}, "layers": []})).is_null(), "no sandbox_mode: full access, nothing to patch");
         for enabled in [false, true] {
             let explicit = json!({
-                "config": { "sandbox_workspace_write": { "network_access": enabled } },
+                "config": { "sandbox_mode": "workspace-write", "sandbox_workspace_write": { "network_access": enabled } },
                 "layers": [{ "config": { "sandbox_workspace_write": { "network_access": enabled } } }],
             });
             assert!(networking(&explicit).is_null());
@@ -1111,7 +1122,11 @@ mod tests {
     fn approval_toggle_maps_to_codex_policy() {
         let auto = thread_params("/w", false, None, None, &[]);
         assert_eq!(auto["approvalPolicy"], "never");
-        assert_eq!(auto["sandbox"], "workspace-write");
+        assert_eq!(auto["sandbox"], "danger-full-access", "like the other harnesses: no Codex-only sandbox");
+        let unset = thread_params("/w", false, Some(&json!({"config": {}, "layers": []})), None, &[]);
+        assert_eq!(unset["sandbox"], "danger-full-access");
+        let profile = thread_params("/w", false, Some(&json!({"config": {"default_permissions": "restricted"}, "layers": []})), None, &[]);
+        assert!(profile.get("sandbox").is_none(), "a permissions profile decides on its own");
         assert!(auto.get("model").is_none(), "no pick: the user's config.toml model runs");
         assert!(auto["config"].get("mcp_servers").is_none());
         let ask = thread_params("/w", true, Some(&json!({"config": {"sandbox_mode": "read-only"}, "layers": []})), Some("gpt-6-luna"), &[json!({ "name": "p", "command": "x" })]);
