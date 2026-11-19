@@ -130,19 +130,48 @@ pub(crate) fn push_event(queues: &EventQueues, id: &str, raw: &str) {
     let v: serde_json::Value =
         serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
     if let Ok(mut map) = queues.lock() {
-        let q = map.entry(id.to_string()).or_default();
-        // merge adjacent token/think chunks: nobody may poll for hours (window
-        // closed mid-turn), and the cap below must not drop streamed text
-        if let Some(prev) = q.back_mut() {
-            if merge_text_event(prev, &v) {
-                return;
+        // the channel's own queue plus every reader a reattaching client
+        // opened on it (`<id>~<reader>`, see `open_reader`)
+        let prefix = format!("{id}{READER_SEP}");
+        let readers: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+        enqueue(map.entry(id.to_string()).or_default(), v.clone());
+        for r in readers {
+            if let Some(q) = map.get_mut(&r) {
+                enqueue(q, v.clone());
             }
         }
-        q.push_back(v);
-        while q.len() > EVENT_CAP {
-            q.pop_front();
+    }
+}
+
+fn enqueue(q: &mut VecDeque<serde_json::Value>, v: serde_json::Value) {
+    // merge adjacent token/think chunks: nobody may poll for hours (window
+    // closed mid-turn), and the cap below must not drop streamed text
+    if let Some(prev) = q.back_mut() {
+        if merge_text_event(prev, &v) {
+            return;
         }
     }
+    q.push_back(v);
+    while q.len() > EVENT_CAP {
+        q.pop_front();
+    }
+}
+
+/// Separates a channel id from a reader id in a reader queue's key.
+pub(crate) const READER_SEP: char = '~';
+
+/// A second client following a live channel (a window reattaching, `vicuna
+/// session attach`) gets its own queue: polling the channel's own queue
+/// would split every event between it and the client already following
+/// (each saw a shredded reply). The reader starts with `seed` and then gets
+/// every event pushed to the channel. Returns the key to poll.
+pub(crate) fn open_reader(queues: &EventQueues, id: &str, seed: Vec<serde_json::Value>) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let key = format!("{id}{READER_SEP}r{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    if let Ok(mut map) = queues.lock() {
+        map.insert(key.clone(), seed.into());
+    }
+    key
 }
 
 /// Append `next`'s text onto `prev` when both are the same token/think event.
@@ -168,7 +197,13 @@ fn merge_text_event(prev: &mut serde_json::Value, next: &serde_json::Value) -> b
 fn drain_events(queues: &EventQueues, id: &str) -> Vec<serde_json::Value> {
     if let Ok(mut map) = queues.lock() {
         if let Some(q) = map.get_mut(id) {
-            return q.drain(..).collect();
+            let out: Vec<serde_json::Value> = q.drain(..).collect();
+            // a reader has nothing left to follow once the turn ended
+            let ended = out.iter().any(|e| matches!(e.get("type").and_then(|t| t.as_str()), Some("done" | "error")));
+            if ended && id.contains(READER_SEP) {
+                map.remove(id);
+            }
+            return out;
         }
     }
     Vec::new()
@@ -1410,6 +1445,13 @@ fn spawn_term_reaper(st: Arc<BridgeState>) {
             if let Ok(mut q) = st.events.lock() {
                 q.remove(&ch);
             }
+        }
+        // reader queues whose client went away (window closed mid-turn)
+        let lp = st.last_poll.lock().map(|m| m.clone()).unwrap_or_default();
+        if let Ok(mut q) = st.events.lock() {
+            q.retain(|k, _| {
+                !k.contains(READER_SEP) || lp.get(k).is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(90))
+            });
         }
     });
 }
