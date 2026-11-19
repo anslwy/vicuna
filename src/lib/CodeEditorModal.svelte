@@ -513,8 +513,17 @@
   .ed-preview :global(.codecopy:hover) { background: var(--hover); color: var(--text); }
   .ed-preview :global(.codecopy.ok) { color: var(--ok); }
   .ed-preview :global(blockquote) { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid var(--border-2); color: var(--muted); }
-  .ed-preview :global(table) { border-collapse: collapse; margin-bottom: 12px; }
-  .ed-preview :global(th), .ed-preview :global(td) { border: 1px solid var(--border); padding: 4px 10px; }
+  .ed-preview :global(.table-wrap) { width: fit-content; max-width: 100%; box-sizing: border-box; overflow-x: auto; margin: 0 0 12px 0; border: 1px solid var(--border-2); border-radius: 10px; background: var(--bg); }
+  .ed-preview :global(.table-wrap:last-child) { margin-bottom: 0; }
+  .ed-preview :global(table) { border-collapse: separate; border-spacing: 0; margin: 0; word-break: normal; overflow-wrap: normal; }
+  .ed-preview :global(th), .ed-preview :global(td) { border: none; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 8px 12px; font-size: 13.5px; line-height: 1.55; vertical-align: top; }
+  .ed-preview :global(th) { background: var(--code-bg); font-weight: 600; color: var(--text); border-bottom-color: var(--border-2); vertical-align: bottom; }
+  .ed-preview :global(th:not([align])) { text-align: left; }
+  .ed-preview :global(th:last-child), .ed-preview :global(td:last-child) { border-right: none; }
+  .ed-preview :global(tbody tr:last-child td) { border-bottom: none; }
+  .ed-preview :global(table > thead:last-child tr:last-child th) { border-bottom: none; }
+  .ed-preview :global(tbody tr:hover) { background: color-mix(in srgb, var(--hover-3) 55%, transparent); }
+  .ed-preview :global(th code), .ed-preview :global(td code) { font-size: 12.5px; padding: 1px 4px; }
   .ed-preview :global(img) { max-width: 100%; }
   .ed-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 13px; }
   .ed-msg p { margin: 0; }

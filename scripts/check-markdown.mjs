@@ -115,6 +115,15 @@ eq(
   eq(findToolSpans(`text${open1}partial output`).length, 0, "a live last card is left as-is");
 }
 
+// tables get wrapped in .table-wrap and keep explicit column alignment
+const tableHtml = renderMarkdownUnsanitized(
+  `| Col | Center | Right |\n| --- | :---: | ---: |\n| a | b | 1 |`
+);
+eq(tableHtml.includes('<div class="table-wrap"><table>'), true, "table wrapped in .table-wrap");
+eq(tableHtml.includes("</table></div>"), true, "table wrapper closes cleanly");
+eq(tableHtml.includes('<th align="center">Center</th>'), true, "center alignment kept");
+eq(tableHtml.includes('<td align="right">1</td>'), true, "right alignment kept");
+
 if (failures) {
   console.error(`${failures} failure(s)`);
   process.exit(1);

@@ -12080,7 +12080,7 @@
   .asst-row { justify-content: flex-start; }
   .bubble { max-width: 100%; padding: 10px 14px; border-radius: 16px; font-size: var(--msg-font-size, 14.5px); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
   .bubble.user { background: var(--accent); color: var(--accent-fg); }
-  .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; white-space: normal; user-select: text; }
+  .bubble.asst { background: transparent; padding-left: 0; padding-right: 0; white-space: normal; word-break: normal; overflow-wrap: break-word; user-select: text; }
   .answer { user-select: text; white-space: normal; }
   .ask-card { margin: 12px 0 2px; max-width: 560px; border: 1px solid var(--border-2); border-radius: 14px; background: var(--card); padding: 12px; }
   .ask-question { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 10px; line-height: 1.45; }
@@ -12199,9 +12199,17 @@
   .answer :global(h1) { font-size: 1.38em; } .answer :global(h2) { font-size: 1.24em; } .answer :global(h3) { font-size: 1.1em; } .answer :global(h4) { font-size: 1.03em; } .answer :global(h5), .answer :global(h6) { font-size: 1em; }
   .answer :global(a) { color: var(--link); }
   .answer :global(blockquote) { border-left: 3px solid var(--border-2); margin: 0 0 12px 0; padding-left: 12px; color: var(--text-dim); }
-  .answer :global(table) { border-collapse: collapse; margin: 0; }
-  .answer :global(.table-wrap) { overflow-x: auto; max-width: 100%; margin: 0 0 12px 0; }
-  .answer :global(th), .answer :global(td) { border: 1px solid var(--border-2); padding: 6px 10px; font-size: 13.5px; }
+  .answer :global(.table-wrap) { width: fit-content; max-width: 100%; box-sizing: border-box; overflow-x: auto; margin: 0 0 12px 0; border: 1px solid var(--border-2); border-radius: 10px; background: var(--bg); }
+  .answer :global(.table-wrap:last-child) { margin-bottom: 0; }
+  .answer :global(table) { border-collapse: separate; border-spacing: 0; margin: 0; word-break: normal; overflow-wrap: normal; }
+  .answer :global(th), .answer :global(td) { border: none; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 8px 12px; font-size: 13.5px; line-height: 1.55; vertical-align: top; }
+  .answer :global(th) { background: var(--code-bg); font-weight: 600; color: var(--text); border-bottom-color: var(--border-2); vertical-align: bottom; }
+  .answer :global(th:not([align])) { text-align: left; }
+  .answer :global(th:last-child), .answer :global(td:last-child) { border-right: none; }
+  .answer :global(tbody tr:last-child td) { border-bottom: none; }
+  .answer :global(table > thead:last-child tr:last-child th) { border-bottom: none; }
+  .answer :global(tbody tr:hover) { background: color-mix(in srgb, var(--hover-3) 55%, transparent); }
+  .answer :global(th code), .answer :global(td code) { font-size: 12.5px; padding: 1px 4px; }
   .err { max-width: 720px; margin: 0 auto; color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 12px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
   .err span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .err-x { flex: none; border: 0; background: none; color: inherit; opacity: .6; font-size: 15px; line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
