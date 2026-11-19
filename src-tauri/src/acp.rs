@@ -1498,6 +1498,11 @@ pub async fn run_turn(
     // fx/agy: a resumed session keeps the MCP connections of the warm
     // process (agy: one per workspace), so the same stable per-workspace
     // route as opencode.
+    // agy times every MCP call out after 3 minutes (no knob over ACP): a
+    // waiting ask_user returns a "still waiting, call again" poll before that
+    if engine == Engine::Agy {
+        turn.ask_poll_secs.store(crate::vicuna_mcp::AGY_ASK_POLL_SECS, Ordering::Relaxed);
+    }
     let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),

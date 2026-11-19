@@ -1,3 +1,4 @@
+
 // Work mode turn bookkeeping + Tauri commands.
 //
 // The agent itself is the user's opencode CLI over ACP (acp.rs); this module
@@ -118,6 +119,23 @@ pub struct TurnState {
     /// the backend loop for this turn has returned (turns stay in the map
     /// after finishing, so presence alone says nothing about liveness)
     pub done: AtomicBool,
+    /// agent questions (vicuna-mcp `ask_user`) whose card is still up but no
+    /// tool call is waiting on right now: the engine gave up on the call, or
+    /// it returned a "still waiting" poll (see `ask_poll_secs`). A repeat call
+    /// with the same question re-attaches; an answer meanwhile is queued as a
+    /// user message.
+    pub ask_parked: Mutex<Vec<ParkedAsk>>,
+    /// >0: a waiting `ask_user` call returns a "still waiting, call again"
+    /// result after this many seconds, for engines that time MCP calls out
+    /// with no way to raise the limit (agy: 3 minutes)
+    pub ask_poll_secs: AtomicU64,
+}
+
+pub struct ParkedAsk {
+    pub ask_id: String,
+    pub question: String,
+    pub multi: bool,
+    pub rx: oneshot::Receiver<String>,
 }
 
 /// Marks a turn finished when dropped: held for the whole of
@@ -155,6 +173,8 @@ impl TurnState {
             ask_seq: AtomicU64::new(1),
             lead: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            ask_parked: Mutex::new(Vec::new()),
+            ask_poll_secs: AtomicU64::new(0),
         }
     }
 }
@@ -174,6 +194,9 @@ pub fn agent_stop(turn: &Arc<TurnState>) {
         for (_, tx) in m.drain() {
             let _ = tx.send("cancelled".to_string());
         }
+    }
+    if let Ok(mut p) = turn.ask_parked.lock() {
+        p.clear();
     }
 }
 
@@ -198,13 +221,45 @@ pub fn agent_answer(turn: &Arc<TurnState>, ask_id: &str, answer: String) -> Resu
         .lock()
         .map_err(|_| "agent state poisoned".to_string())?
         .remove(ask_id);
-    match tx {
-        Some(tx) => {
+    let parked = turn.ask_parked.lock().ok().and_then(|mut p| {
+        let i = p.iter().position(|a| a.ask_id == ask_id)?;
+        Some(p.remove(i))
+    });
+    match (tx, parked) {
+        // no tool call is waiting on this card right now
+        (Some(_), Some(p)) => answer_parked(turn, &p, answer),
+        (Some(tx), None) => {
             let _ = tx.send(answer);
             Ok(())
         }
-        None => Err("unknown question".to_string()),
+        (None, _) => Err("unknown question".to_string()),
     }
+}
+
+/// The user answered a question no `ask_user` call is waiting on (the engine
+/// gave up on the call, or is between "still waiting" polls): hand the answer
+/// to the agent as a queued user message (it joins the running turn at its
+/// next step), quoting the question.
+fn answer_parked(turn: &Arc<TurnState>, ask: &ParkedAsk, answer: String) -> Result<(), String> {
+    if turn.done.load(Ordering::Relaxed) || turn.stop.load(Ordering::Relaxed) {
+        return Err("the agent stopped waiting for this answer and its turn has ended; send it as a message".to_string());
+    }
+    let a = crate::vicuna_mcp::parse_ask_answer(&answer);
+    let q = ask.question.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = if a.text.trim() == crate::vicuna_mcp::ASK_LATER {
+        "The user will answer this later; the answer will reach you as a message. Do not ask again.".to_string()
+    } else if a.text.trim().is_empty() {
+        "(see the attached image)".to_string()
+    } else {
+        crate::vicuna_mcp::format_answer(&a.text, ask.multi)
+    };
+    let images: Vec<String> = a.images.into_iter().map(|(_, data)| data).collect();
+    let mut msg = serde_json::json!({ "role": "user", "content": format!("Answer to your earlier question \"{q}\":\n\n{body}") });
+    if !images.is_empty() {
+        msg["images"] = serde_json::json!(images);
+    }
+    let msg: ChatMessage = serde_json::from_value(msg).map_err(|e| e.to_string())?;
+    agent_queue_msg(turn, format!("late-{}", ask.ask_id), msg)
 }
 
 fn get_turn(agent_state: &WorkAgentState, turn_id: &str) -> Result<Arc<TurnState>, String> {
@@ -418,6 +473,35 @@ mod tests {
         assert!(t.stop.load(Ordering::Relaxed));
         assert_eq!(rx.try_recv().unwrap(), "cancelled");
         assert!(agent_answer(&t, "q", "x".into()).is_err());
+    }
+
+    fn park(t: &Arc<TurnState>, id: &str, q: &str) {
+        let (tx, rx) = oneshot::channel();
+        t.ask_pending.lock().unwrap().insert(id.into(), tx);
+        t.ask_parked.lock().unwrap().push(ParkedAsk { ask_id: id.into(), question: q.into(), multi: false, rx });
+    }
+
+    #[test]
+    fn answer_to_a_parked_question_is_queued() {
+        let t = Arc::new(TurnState::new());
+        assert_eq!(agent_answer(&t, "ask-1", "x".into()).unwrap_err(), "unknown question");
+        park(&t, "ask-1", "Which  fruit?");
+        agent_answer(&t, "ask-1", "Kiwi".into()).unwrap();
+        {
+            let q = t.queue.lock().unwrap();
+            assert_eq!(q.len(), 1);
+            assert_eq!(q[0].0, "late-ask-1");
+            assert_eq!(q[0].1.content, "Answer to your earlier question \"Which fruit?\":\n\nThe user answered: Kiwi");
+        }
+        assert!(t.ask_parked.lock().unwrap().is_empty());
+        assert!(agent_answer(&t, "ask-1", "x".into()).is_err());
+        // an ended turn says so instead of "unknown question"
+        park(&t, "ask-3", "Q");
+        t.done.store(true, Ordering::Relaxed);
+        assert!(agent_answer(&t, "ask-3", "y".into()).unwrap_err().contains("turn has ended"));
+        // Stop clears parked cards
+        agent_stop(&t);
+        assert!(t.ask_parked.lock().unwrap().is_empty());
     }
 
     #[test]

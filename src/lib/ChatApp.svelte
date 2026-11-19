@@ -7832,8 +7832,26 @@
     // The channel can deliver before start returns its id. Keep its origin
     // independent of the mutable per-chat map (settle/replacement clears it).
     const replyRoute = createTurnReplyRoute();
-    const replyToTurn = (askId: string, answer: string, record?: { display: string; dismissed: boolean }) => {
+    const replyToTurn = (askId: string, answer: string, record?: { display: string; dismissed: boolean }, question?: string) => {
       void replyRoute.send(askId, answer, answerWorkAgentAsk, record).catch((e) => {
+        // the engine gave up on the question (agy times MCP calls out) and the
+        // turn has since ended: deliver the answer as a normal message
+        if (question && record && !record.dismissed && /stopped waiting for this answer/.test(String(e))) {
+          let text = record.display;
+          let images: string[] = [];
+          try {
+            const env = JSON.parse(answer)?.vicunaAskAnswer;
+            if (env) { text = env.text ?? text; images = env.images ?? []; }
+          } catch { /* plain-text answer */ }
+          const m = laterAnswerMessage(question, { text, images, multi: false, picked: [] });
+          if (m) {
+            const msg: ChatMsg = { role: "user", content: m.text, ...(m.images.length ? { images: m.images } : {}) };
+            void sendToWorkSession(chat.id, msg)
+              .then((sent) => { if (!sent) error = "The agent stopped waiting for your answer; the session is busy, so send it again in a moment."; })
+              .catch((err) => { error = `Answer not sent: ${String(err)}`; });
+            return;
+          }
+        }
         console.error("Work reply delivery failed", { chatId: chat.id, askId, error: e });
         error = `Could not deliver the Work reply: ${String(e)}. The action may have run; check before retrying.`;
       });
@@ -8170,7 +8188,7 @@
                   saveSoon();
                 }
                 // a server recording the turn writes the same record
-                replyToTurn(ev.ask_id, answer, isAgentQuestion(ev.ask_id) ? { display: display ?? answer, dismissed: outcome === "dismiss" } : undefined);
+                replyToTurn(ev.ask_id, answer, isAgentQuestion(ev.ask_id) ? { display: display ?? answer, dismissed: outcome === "dismiss" } : undefined, ev.question);
                 scrollIfOpen();
               }
             }
