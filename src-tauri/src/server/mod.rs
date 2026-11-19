@@ -29,6 +29,7 @@ pub mod embedded;
 pub mod persist;
 pub mod turns;
 mod session_tools;
+pub mod telegram;
 
 
 use std::collections::{HashMap, VecDeque};
@@ -669,6 +670,9 @@ async fn dispatch(
         "session_undo" => session_tools::change_turn(st, args, false).await,
         "session_redo" => session_tools::change_turn(st, args, true).await,
         "schedule_list" => turns::schedule_list(st).await,
+        "telegram_status" | "telegram_save" | "telegram_set" | "telegram_unpair" | "telegram_remove" => {
+            telegram::action(st, cmd, args).await
+        }
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
         // session + message actions (server/actions.rs)
         "session_create" | "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
@@ -1342,6 +1346,11 @@ pub const API_ACTIONS: &[&str] = &[
     "schedule_remove",
     "server_info",
     "server_search_chats",
+    "telegram_remove",
+    "telegram_save",
+    "telegram_set",
+    "telegram_status",
+    "telegram_unpair",
     "term_kill",
     "term_resize",
     "term_spawn",
@@ -1417,6 +1426,7 @@ pub async fn bind(cfg: &Config) -> Result<Bound, String> {
     if state.db.is_some() {
         // server mode: scheduled sends and MCP wake-ups run with no window
         turns::spawn_scheduler(state.clone());
+        telegram::spawn(state.clone());
         let wakes = state.mcp_wakes.clone();
         crate::vicuna_mcp::set_mcp_wake_hook(move |sid, name, tools| {
             if let Ok(mut m) = wakes.lock() {
