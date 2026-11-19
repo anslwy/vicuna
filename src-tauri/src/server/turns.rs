@@ -756,14 +756,29 @@ pub fn attach(st: &BridgeState, session_id: &str) -> Value {
         let Ok(g) = rs.lock() else { return out };
         let snap = g.rec.snapshot();
         let has_ask = !snap["pendingAsk"].is_null();
-        if let Ok(mut map) = st.events.lock() {
-            if let Some(q) = map.get_mut(&ch) {
-                q.retain(|e| {
-                    let k = e.get("type").and_then(Value::as_str).unwrap_or("");
-                    !persist::is_content_event(k) && !(has_ask && k == "askrequest")
-                });
-            }
+        // A reader queue of its own: the channel's queue may still be
+        // followed by the client that started the turn, and sharing it split
+        // every event between the two (both saw a shredded reply). Seeded
+        // with what is still queued minus content (the snapshot holds that;
+        // replaying would double the text). Opened under the recorder lock,
+        // so no event lands between the snapshot and the reader.
+        let seed: Vec<Value> = st
+            .events
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&ch).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| {
+                let k = e.get("type").and_then(Value::as_str).unwrap_or("");
+                !persist::is_content_event(k) && !(has_ask && k == "askrequest")
+            })
+            .collect();
+        let reader = crate::server::open_reader(&st.events, &ch, seed);
+        if let Ok(mut lp) = st.last_poll.lock() {
+            lp.insert(reader.clone(), std::time::Instant::now());
         }
+        out["channel"] = json!(reader);
         out["snapshot"] = snap;
     }
     out
@@ -1035,9 +1050,17 @@ mod tests {
         write_rec(&st, &rs, false).await;
         let snap = attach(&st, "chat");
         assert_eq!(snap["snapshot"]["pendingHead"]["name"], "read");
-        assert!(crate::server::drain_events(&st.events, "channel").is_empty(), "snapshot covers queued content");
+        let reader = snap["channel"].as_str().unwrap().to_string();
+        assert!(reader.starts_with("channel~"), "attach opens a reader of its own");
+        assert!(crate::server::drain_events(&st.events, &reader).is_empty(), "snapshot covers queued content");
+        // the client already following the channel keeps every event
+        let owner = crate::server::drain_events(&st.events, "channel");
+        let kinds: Vec<&str> = owner.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert_eq!(kinds, ["token", "think", "toolstart"], "attach must not strip the owner's queue");
         ch.send(WorkAgentEvent::ToolEnd { name:"read".into(), output:"<file> & content".into() }).unwrap();
         ch.send(WorkAgentEvent::Token { text:"All done.".into() }).unwrap();
+        let fanned = crate::server::drain_events(&st.events, &reader);
+        assert_eq!(fanned, crate::server::drain_events(&st.events, "channel"), "both clients see each new event");
         ch.send(WorkAgentEvent::RoundEnd { gen_ms:50, gen_tps:Some(20.0), gen_cost:None }).unwrap();
         let expected = rs.lock().unwrap().rec.messages[1]["content"].clone();
         turn.done.store(true, Ordering::Relaxed);
@@ -1050,6 +1073,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
+        let tail = crate::server::drain_events(&st.events, &reader);
+        assert!(tail.iter().any(|e| e["type"] == "done"), "the reader gets the end of the turn too");
+        assert!(!st.events.lock().unwrap().contains_key(&reader), "an ended reader is dropped");
         let db = st.db.as_ref().unwrap();
         let c = crate::server_store::load_chat(db, "chat").await.unwrap().unwrap();
         assert_eq!(c["messages"][1]["content"], expected);

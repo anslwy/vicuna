@@ -657,12 +657,42 @@ async fn follow(c: &Arc<Client>, ctl: &Arc<Ctl>, r: &mut Renderer, session: &str
         // leftover queued messages start a follow-up turn right after
         tokio::time::sleep(Duration::from_millis(600)).await;
         let row = c.session("get", json!({ "id": session })).await?;
+        // `channel` may be a reader queue (`<channel>~<reader>`, from attach)
+        let reader = channel.contains('~');
+        let base = channel.split('~').next().unwrap_or("").to_string();
         match (row["running"].as_bool(), row["channel"].as_str(), row["turnId"].as_str()) {
-            (Some(true), Some(ch), Some(t)) if ch != channel => {
+            (Some(true), Some(ch), Some(t)) if ch != base => {
                 channel = ch.to_string();
                 turn = t.to_string();
+                if reader {
+                    // follow the next turn through a reader too, so this
+                    // client never takes events from whoever owns it
+                    let at = c.invoke("work_agent_attach", json!({ "sessionId": session })).await?;
+                    if at["turnId"].as_str() == Some(t) {
+                        if let Some(ch2) = at["channel"].as_str() {
+                            channel = ch2.to_string();
+                            print_reply_so_far(r, &at);
+                        }
+                    }
+                }
             }
             _ => return Ok(Outcome::Done),
+        }
+    }
+}
+
+/// The current reply as an attach snapshot holds it (what was said before
+/// this client started reading the turn).
+fn print_reply_so_far(r: &mut Renderer, at: &Value) {
+    if r.json {
+        return;
+    }
+    let snap = &at["snapshot"];
+    if let Some(m) = snap["messages"].as_array().and_then(|m| m.get(snap["index"].as_u64().unwrap_or(0) as usize)) {
+        let so_far = plain_transcript(m["content"].as_str().unwrap_or(""));
+        if !so_far.is_empty() {
+            print!("{so_far}");
+            r.last = 't';
         }
     }
 }
