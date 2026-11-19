@@ -66,7 +66,7 @@ test("Work reply label is the opencode model, never the Chat model", () => {
 });
 
 // ---------- Claude Code as a second engine ----------
-import { engineId, engineLabel, workEngineChoices } from "../src/lib/workGate.ts";
+import { engineId, engineLabel, workEngineChoices, workEngineMenuItems } from "../src/lib/workGate.ts";
 
 const claudeMissing: WorkEngineInfo = {
   id: "claude", label: "Claude Code", installed: false, path: null, version: null,
@@ -93,6 +93,19 @@ test("engine picker lists only installed engines; older backends default to open
   assert.equal(engineId(legacy), "opencode");
   assert.equal(engineLabel(legacy), "OpenCode");
   assert.deepEqual(workEngineChoices(legacy), []);
+});
+
+test("engine menu items include uninstalled harnesses in order so they render disabled", () => {
+  assert.deepEqual(
+    workEngineMenuItems(claudeMissing).map((e) => ({ id: e.id, installed: e.installed })),
+    [
+      { id: "opencode", installed: true },
+      { id: "claude", installed: false },
+    ],
+  );
+  assert.deepEqual(workEngineMenuItems(null), []);
+  const legacy: WorkEngineInfo = { installed: true, path: "/x", version: "1", installUrl: "u", model: null, configPath: null };
+  assert.deepEqual(workEngineMenuItems(legacy), []);
 });
 
 test("Claude reply label is claude/<model>, never the Chat model", () => {

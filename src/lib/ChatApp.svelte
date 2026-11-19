@@ -45,7 +45,7 @@
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { BridgeChannel, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -2175,8 +2175,8 @@
       workModel = next.model;
     }
   }
-  /** Engine picker (composer model menu + Settings): shown when two or more
-   *  engines are installed. */
+  /** Engine picker (composer model menu + Settings): lists every harness,
+   *  disabling ones that are not installed. */
   async function pickWorkEngine(id: string) {
     if (workEngineInfo && engineId(workEngineInfo) === id) return;
     try {
@@ -2197,6 +2197,7 @@
   }
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
   const workEngines = $derived(workEngineChoices(workEngineInfo));
+  const workEngineList = $derived(workEngineMenuItems(workEngineInfo));
   /** quota harness the header meter icon summarizes (null hides the icon) */
   const usageHoverEngine = $derived(usageTabs(workEngines, engineId(workEngineInfo)).initial);
   /** Send gate: no engine → Work send disabled with the install hint. */
@@ -9948,14 +9949,14 @@
           {#if composerMode === "work"}
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" data-engine={engineId(workEngineInfo)} title={workModel ? `${workEngineLabel}: ${workModel}` : `${workEngineLabel} default model`} disabled={!workEngineInfo?.installed && workEngines.length === 0} onclick={toggleModel}>
-              {#if workEngines.length > 1}<span class="engine-chip" data-testid="work-engine-chip" title={workEngineLabel}>{@render engineIcon(engineId(workEngineInfo))}</span>{/if}
+              {#if workEngineList.length > 1}<span class="engine-chip" data-testid="work-engine-chip" title={workEngineLabel}>{@render engineIcon(engineId(workEngineInfo))}</span>{/if}
               <span class="model-name" data-testid="work-model-name">{workModel ?? `${engineId(workEngineInfo)} default`}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
             {#if modelOpen}
               <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
               <div class="model-drop" data-testid="model-dropdown" data-engine={engineId(workEngineInfo)}>
-                {#if workEngines.length > 1}
+                {#if workEngineList.length > 1}
                   <div class="engine-select" data-testid="work-engine-picker">
                     <button class="engine-select-btn" data-testid="work-engine-toggle" aria-haspopup="listbox" aria-expanded={engineMenuOpen} aria-label="Work engine" onclick={() => (engineMenuOpen = !engineMenuOpen)}>
                       {@render engineIcon(engineId(workEngineInfo))}<span>{workEngineLabel}</span>
@@ -9963,8 +9964,8 @@
                     </button>
                     {#if engineMenuOpen}
                       <div class="engine-select-list" role="listbox" aria-label="Work engine">
-                        {#each workEngines as eng (eng.id)}
-                          <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} title={`${eng.label} ${eng.version ?? ""}`} onclick={() => { engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{eng.label}</span>{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
+                        {#each workEngineList as eng (eng.id)}
+                          <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={eng.installed ? `${eng.label} ${eng.version ?? ""}`.trim() : (eng.missing ?? "not installed")} onclick={() => { if (!eng.installed) return; engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{eng.label}{eng.installed ? "" : " (not installed)"}</span>{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
                         {/each}
                       </div>
                     {/if}
@@ -12430,12 +12431,13 @@
   .engine-select { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 2px; }
   .engine-select-btn, .engine-select-opt { display: flex; align-items: center; gap: 8px; width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 10px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; text-align: left; }
   .engine-select-btn span, .engine-select-opt span { flex: 1; min-width: 0; }
-  .engine-select-btn:hover, .engine-select-opt:hover { background: var(--hover); }
+  .engine-select-btn:hover, .engine-select-opt:hover:not(:disabled) { background: var(--hover); }
   .engine-select-chev { color: var(--muted); transition: transform .15s; }
   .engine-select-chev.open { transform: rotate(180deg); }
   .engine-select-list { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
   .engine-select-opt { border-color: transparent; color: var(--muted); }
   .engine-select-opt.sel { color: var(--text); background: var(--hover); }
+  .engine-select-opt:disabled { opacity: .5; cursor: default; }
   .engine-select-check { color: var(--accent); }
   .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }

@@ -54,10 +54,15 @@ export function engineLabel(info: WorkEngineInfo | null): string {
   return info?.label || (id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : id === "fx" ? "fx" : id === "agy" ? "Antigravity" : id === "pi" ? "pi" : "OpenCode");
 }
 
-/** Engines the picker offers: the installed ones. The picker only shows
- *  when there is a real choice (two or more installed). */
+/** Installed Work engines (for fallback actions, lead delegation and quota tabs). */
 export function workEngineChoices(info: WorkEngineInfo | null): EngineSummary[] {
   return (info?.engines ?? []).filter((e) => e.installed);
+}
+
+/** All Work engines shown in the harness picker menu (installed and uninstalled,
+ *  so missing harnesses still appear disabled with "(not installed)"). */
+export function workEngineMenuItems(info: WorkEngineInfo | null): EngineSummary[] {
+  return info?.engines ?? [];
 }
 
 export interface OpencodeModel {
