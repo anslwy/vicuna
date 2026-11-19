@@ -85,6 +85,7 @@
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
   import { OLLAMA_ICON_PATH, OPENROUTER_ICON_PATH, CLAUDE_ICON_PATH, OPENCODE_ICON_PATH, OPENCODE_ICON_INNER_PATH, CODEX_ICON_OUTLINE_PATH, CODEX_ICON_PROMPT_PATH, FX_ICON_PATH, AGY_ICON_PATH, PI_ICON_PATH } from "$lib/modelIcons";
+  import pkg from "../../package.json";
   import type { Terminal as XTerm, ITheme as XTermTheme } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 
@@ -2689,6 +2690,64 @@
   let srvCopied = $state<string | null>(null);
   const srvCurrent = $derived(srvList.find((x) => x.id === activeServer) ?? null);
   const srvLabel = $derived(onServer ? (srvCurrent?.name ?? "Remote server") : "This computer");
+
+  /** this app's version vs. the remote `vicuna serve` it talks to */
+  const clientVersion: string = pkg.version;
+  let srvVersion = $state<string | null>(null);
+  let srvLatest = $state<string | null>(null);
+  let srvCanUpgrade = $state(false);
+  let srvUpgrading = $state(false);
+  let srvVersionChecked = false;
+  const srvVersionSkew = $derived(!!srvVersion && srvVersion !== clientVersion);
+  const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && cmpVersion(srvLatest, srvVersion) > 0);
+
+  function cmpVersion(a: string, b: string): number {
+    const p = (v: string) => v.replace(/^v/, "").split(/[-+]/)[0].split(".").map((x) => Number(x) || 0);
+    const [x, y] = [p(a), p(b)];
+    for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) - (y[i] ?? 0);
+    return 0;
+  }
+
+  async function loadServerVersion() {
+    const info = await invokeOrBridge<{ version?: string; canUpgrade?: boolean }>("server_info", {}).catch(() => null);
+    srvVersion = info?.version ?? null;
+    srvCanUpgrade = !!info?.canUpgrade;
+    if (!srvCanUpgrade) return;
+    const chk = await invokeOrBridge<{ latest?: string }>("server_upgrade_check", {}).catch(() => null);
+    srvLatest = chk?.latest ?? null;
+  }
+
+  $effect(() => {
+    if (onServer && uiReady && !srvVersionChecked) {
+      srvVersionChecked = true;
+      void loadServerVersion();
+    }
+  });
+
+  async function upgradeServer() {
+    if (srvUpgrading || !srvLatest) return;
+    const from = srvVersion;
+    srvUpgrading = true;
+    try {
+      await invokeOrBridge("server_upgrade", {});
+      flashNotice(`Upgrading ${srvLabel} to v${srvLatest}… it restarts in a few seconds.`);
+      // wait for the restarted server to answer with a new version
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const info = await invokeOrBridge<{ version?: string }>("server_info", {}).catch(() => null);
+        if (info?.version && info.version !== from) {
+          srvVersion = info.version;
+          flashNotice(`${srvLabel} is now on v${info.version}.`);
+          return;
+        }
+      }
+      error = `${srvLabel} did not come back on a new version. Check ~/vicuna/server/upgrade.log there.`;
+    } catch (e) {
+      error = `Server upgrade failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      srvUpgrading = false;
+    }
+  }
 
   /** scheduled sends target chat ids, which belong to one backend: keep a
    *  separate list per server so nothing fires against the wrong machine */
@@ -9239,8 +9298,14 @@
           {@render chatList(grouped.older)}
         {/if}
         {#if !chatsLoaded}
-          <div class="empty-hint loading-sessions" data-testid="sessions-loading" role="status">
-            <span class="shimmer">Loading sessions{onServer ? ` from ${srvLabel}` : ""}…</span>{#if loadingSecs >= 3}{" "}{loadingSecs}s{/if}
+          <div class="skel-list" data-testid="sessions-loading" role="status" aria-label={`Loading sessions${onServer ? ` from ${srvLabel}` : ""}`}>
+            <div class="skel skel-label"></div>
+            {#each [78, 62, 88, 54, 70, 46, 66] as w, k (k)}
+              <div class="skel-row"><div class="skel" style="width: {w}%"></div></div>
+            {/each}
+            {#if loadingSecs >= 5}
+              <div class="skel-note">{onServer ? `Loading from ${srvLabel}` : "Loading"} · {loadingSecs}s</div>
+            {/if}
           </div>
         {:else if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
           <div class="group-label">{sessionFilter === ALL_FILTER ? "Today" : "No matches"}</div>
@@ -9263,6 +9328,18 @@
                   </button>
                 {/each}
                 <div class="srv-sep"></div>
+                {#if onServer && srvVersion}
+                  <div class="srv-version" data-testid="server-version">
+                    <span>Server v{srvVersion} · App v{clientVersion}</span>
+                    {#if srvVersionSkew && !srvUpgradeAvailable}<span class="srv-skew" title="The server and this app run different versions">differs</span>{/if}
+                  </div>
+                  {#if srvUpgradeAvailable && srvCanUpgrade}
+                    <button class="srv-item srv-upgrade" data-testid="server-upgrade" role="menuitem" disabled={srvUpgrading} onclick={upgradeServer}>
+                      <span class="srv-check">↑</span><span class="srv-item-name">{srvUpgrading ? "Upgrading server…" : `Upgrade server to v${srvLatest}`}</span>
+                    </button>
+                  {/if}
+                  <div class="srv-sep"></div>
+                {/if}
                 <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
                   <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
                 </button>
@@ -9271,6 +9348,7 @@
             <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
               <span class="srv-name">{srvLabel}</span>
+              {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
               <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
             </button>
           </div>
@@ -9510,7 +9588,17 @@
           {@render forkNote(forkInfo.title, forkInfo.id, "Continue from chat")}
         {/if}
         {#if activeLoading}
-          <div class="session-loading" data-testid="session-loading">Loading session…</div>
+          <div class="skel-thread" data-testid="session-loading" role="status" aria-label="Loading session">
+            {#each [{ u: 46 }, { a: [96, 88, 72] }, { u: 34 }, { a: [92, 80, 94, 58] }] as b, k (k)}
+              {#if b.u}
+                <div class="skel skel-bubble" style="width: {b.u}%"></div>
+              {:else}
+                <div class="skel-answer">
+                  {#each b.a ?? [] as w, j (j)}<div class="skel" style="width: {w}%"></div>{/each}
+                </div>
+              {/if}
+            {/each}
+          </div>
         {/if}
         {#each activeLoading ? [] : activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
@@ -12061,7 +12149,23 @@
   .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .search-host { flex-shrink: 0; margin-left: auto; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--muted-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
   .search-row.sel .search-host { color: var(--muted); border-color: var(--border-strong); }
-  .session-loading { padding: 24px; text-align: center; font-size: 13px; color: var(--muted-2); }
+  /* loading skeletons: grey blocks with a light sweep */
+  .skel {
+    height: 10px;
+    border-radius: 5px;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--text) 7%, transparent) 25%, color-mix(in srgb, var(--text) 15%, transparent) 50%, color-mix(in srgb, var(--text) 7%, transparent) 75%);
+    background-size: 200% 100%;
+    animation: skel-sweep 1.4s ease-in-out infinite;
+  }
+  @keyframes skel-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  .skel-list { padding: 4px 8px; display: flex; flex-direction: column; }
+  .skel-label { width: 34%; height: 8px; margin: 10px 0 8px; opacity: .7; }
+  .skel-row { height: 32px; display: flex; align-items: center; padding: 0 4px; }
+  .skel-note { margin-top: 8px; font-size: 11px; color: var(--faint); padding: 0 4px; }
+  .skel-thread { display: flex; flex-direction: column; gap: 22px; padding: 24px 0; max-width: 760px; width: 100%; margin: 0 auto; }
+  .skel-bubble { align-self: flex-end; height: 38px; border-radius: 14px; }
+  .skel-answer { display: flex; flex-direction: column; gap: 10px; }
+  @media (prefers-reduced-motion: reduce) { .skel { animation: none; } }
   .search-note { margin: 0; padding: 4px 18px 8px; font-size: 12px; color: var(--muted-2); }
   .search-note.search-fail { color: var(--danger); }
   .search-note.search-old { color: var(--muted-2); font-style: italic; }
@@ -12106,6 +12210,10 @@
   .srv-check { width: 16px; flex: none; color: var(--muted); text-align: center; }
   .srv-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .srv-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+  .srv-version { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 4px 10px; }
+  .srv-skew { font-size: 10.5px; font-weight: 600; color: var(--accent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
+  .srv-upgrade { color: var(--accent); }
+  .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .confirm-card.srv-card { width: min(460px, calc(100vw - 48px)); display: flex; flex-direction: column; gap: 6px; }
