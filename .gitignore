@@ -5,6 +5,7 @@ node_modules
 /package
 bridge/target/
 src-tauri/target/
+src-tauri/target-tg/
 # lb-sidecar build artifact (see src-tauri/lb-sidecar/README.md): keep the dir + README
 src-tauri/lb-sidecar/lb
 src-tauri/lb-sidecar/lb.exe
