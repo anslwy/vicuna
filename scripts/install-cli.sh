@@ -75,12 +75,28 @@ if [ -e "$dest" ] && [ "${VICUNA_FORCE:-}" != "1" ]; then
   fi
 fi
 install -m 755 "$tmp/vicuna" "$dest" 2>/dev/null || { cp "$tmp/vicuna" "$dest" && chmod 755 "$dest"; }
+
+# The pinned live-browser engine (`lb` + its web UI) for the Browser tab.
+# `vicuna serve` looks for it in <prefix>/share/vicuna/lb-sidecar, so the
+# server runs the lb it was released with, not whatever `lb` is on PATH.
+share="$(cd "$DIR/.." && pwd)/share/vicuna"
+if [ -d "$tmp/lb-sidecar" ]; then
+  mkdir -p "$share"
+  rm -rf "$share/lb-sidecar.new"
+  cp -R "$tmp/lb-sidecar" "$share/lb-sidecar.new"
+  # swap: a running lb keeps its open inode, the next start gets the new one
+  rm -rf "$share/lb-sidecar"
+  mv "$share/lb-sidecar.new" "$share/lb-sidecar"
+fi
+
 if [ "$os" = "Darwin" ]; then
   # unsigned download: drop the quarantine flag so Gatekeeper lets it run
   xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+  [ -d "$share/lb-sidecar" ] && xattr -dr com.apple.quarantine "$share/lb-sidecar" 2>/dev/null || true
 fi
 
 say "Installed $("$dest" --version) to $dest"
+[ -f "$share/lb-sidecar/LB_VERSION" ] && say "Browser engine: lb $(cat "$share/lb-sidecar/LB_VERSION") in $share/lb-sidecar"
 case ":$PATH:" in
   *":$DIR:"*) ;;
   *) say ""; say "Add it to your PATH (then open a new shell):"; say "  echo 'export PATH=\"$DIR:\$PATH\"' >> ~/.profile" ;;

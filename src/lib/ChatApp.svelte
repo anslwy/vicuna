@@ -4410,6 +4410,36 @@
     if (!ok) void copyText(text);
   }
 
+  /** terminal right-click menu (see the xterm `contextmenu` listener) */
+  let termCtx = $state.raw<{ x: number; y: number; term: XTerm; sel: string } | null>(null);
+
+  function termMenu(action: "copy" | "paste" | "selectAll" | "clear") {
+    const c = termCtx;
+    termCtx = null;
+    if (!c) return;
+    const { term } = c;
+    if (action === "copy") {
+      void copyText(c.sel).then((ok) => flashNotice(ok ? "Copied" : "Copy failed (clipboard unavailable)", 1500));
+    } else if (action === "paste") {
+      const clip = navigator.clipboard;
+      if (!clip?.readText) {
+        flashNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V.");
+      } else {
+        clip
+          .readText()
+          .then((text) => {
+            if (text) term.paste(text);
+          })
+          .catch(() => flashNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V."));
+      }
+    } else if (action === "selectAll") {
+      term.selectAll();
+    } else {
+      term.clear();
+    }
+    term.focus();
+  }
+
   function copyMessage(i: number) {
     const m = activeChat?.messages[i];
     if (!m) return;
@@ -6759,23 +6789,19 @@
         copyTermSelection(term);
         return false;
       });
-      // Tauri disables the native WebView context menu; make right-click copy
-      // a selection, or paste when there is none (Windows Terminal behavior).
+      // Tauri disables the native WebView context menu, so right-click opens
+      // our own (Copy / Paste / Select All / Clear). It used to copy silently
+      // on right-click, with no sign anything happened.
       el.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
-        if (term.hasSelection()) {
-          copyTermSelection(term);
-          return;
-        }
-        const clip = navigator.clipboard;
-        if (clip?.readText) {
-          clip
-            .readText()
-            .then((text) => {
-              if (text) term.paste(text);
-            })
-            .catch(() => {});
-        }
+        ev.stopPropagation();
+        termCtx = {
+          x: Math.max(8, Math.min(ev.clientX, window.innerWidth - 200)),
+          y: Math.max(8, Math.min(ev.clientY, window.innerHeight - 180)),
+          term,
+          // read now: focus leaves the terminal once the menu is clicked
+          sel: term.getSelection()
+        };
       });
       const setTab = (patch: Partial<SideTab>) => {
         sideTabs = sideTabs.map((t) => (t.key === key ? { ...t, ...patch } : t));
@@ -8460,6 +8486,12 @@
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (expCtx) {
         closeExpCtx();
+        e.preventDefault();
+        return;
+      }
+      if (termCtx) {
+        termCtx.term.focus();
+        termCtx = null;
         e.preventDefault();
         return;
       }
@@ -10873,6 +10905,25 @@
     </aside>
   {/if}
 </div>
+{#if termCtx}
+  <button
+    class="ctx-backdrop"
+    data-testid="terminal-menu-backdrop"
+    aria-label="Close terminal menu"
+    onclick={() => (termCtx = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      termCtx = null;
+    }}
+    tabindex="-1"
+  ></button>
+  <div class="ctx-menu" data-testid="terminal-menu" style="left: {termCtx.x}px; top: {termCtx.y}px;">
+    <button class="ctx-item" data-testid="terminal-copy" disabled={!termCtx.sel} onclick={() => termMenu("copy")}>Copy</button>
+    <button class="ctx-item" data-testid="terminal-paste" onclick={() => termMenu("paste")}>Paste</button>
+    <button class="ctx-item" data-testid="terminal-select-all" onclick={() => termMenu("selectAll")}>Select All</button>
+    <button class="ctx-item" data-testid="terminal-clear" onclick={() => termMenu("clear")}>Clear</button>
+  </div>
+{/if}
 {#if expCtx}
   <button
     class="ctx-backdrop"
