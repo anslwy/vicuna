@@ -211,18 +211,18 @@
   let expRenameDraft = $state("");
   /** two-step delete confirm: armed row path (null = unarmed) */
   let expConfirmDelete = $state<string | null>(null);
-  /** transient action notice (open/reveal/rename/delete/import failures):
-   *  unlike explorerError it never replaces the file list */
+  /** transient side-panel notice (files, terminal, browser actions):
+   *  floats at the bottom of the right panel without replacing tab content */
   let expNotice = $state<string | null>(null);
   let expNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function flashExpNotice(msg: string) {
+  function flashExpNotice(msg: string, ttl = 4500) {
     expNotice = msg;
     if (expNoticeTimer) clearTimeout(expNoticeTimer);
     expNoticeTimer = setTimeout(() => {
       expNotice = null;
       expNoticeTimer = null;
-    }, 4500);
+    }, ttl);
   }
   /** explorer panel width (drag the left edge; in-memory only) */
   let explorerWidth = $state(300);
@@ -4419,18 +4419,18 @@
     if (!c) return;
     const { term } = c;
     if (action === "copy") {
-      void copyText(c.sel).then((ok) => flashNotice(ok ? "Copied" : "Copy failed (clipboard unavailable)", 1500));
+      void copyText(c.sel).then((ok) => flashExpNotice(ok ? "Copied" : "Copy failed (clipboard unavailable)", 1800));
     } else if (action === "paste") {
       const clip = navigator.clipboard;
       if (!clip?.readText) {
-        flashNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V.");
+        flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V.");
       } else {
         clip
           .readText()
           .then((text) => {
             if (text) term.paste(text);
           })
-          .catch(() => flashNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V."));
+          .catch(() => flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V."));
       }
     } else if (action === "selectAll") {
       term.selectAll();
@@ -6730,14 +6730,14 @@
     }
   }
 
-  /** open a Terminal tab rooted at the workspace (desktop only) */
+  /** open a Terminal tab rooted at the workspace (desktop or dev bridge) */
   async function openSideTerminal() {
     newTabMenu = false;
     const key = `term-${sideTabSeq++}`;
     sideTabs = [...sideTabs, { key, kind: "terminal", title: explorerRootBase || "Terminal" }];
     activeSideTab = key;
     await tick();
-    if (!isTauriRuntime()) {
+    if (!isTauriRuntime() && !(await bridgeAvailable())) {
       sideTabs = sideTabs.map((t) =>
         t.key === key ? { ...t, error: "Terminal needs the Vicuna desktop app." } : t
       );
@@ -10815,9 +10815,6 @@
           {/each}
         {/if}
       </div>
-      {#if expNotice}
-        <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
-      {/if}
           {:else if t.kind === "git"}
             <GitPanel
               root={explorerRoot.trim()}
@@ -10902,6 +10899,9 @@
           {/if}
         </div>
       {/each}
+      {#if expNotice}
+        <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
+      {/if}
     </aside>
   {/if}
 </div>
@@ -12592,7 +12592,8 @@
   .exp-file .exp-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .exp-size { flex-shrink: 0; font-size: 11px; color: var(--faint); }
   .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
-  .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 44px; z-index: 8; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; }
+  .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 20; background: var(--card); border: 1px solid var(--border-2); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; text-align: center; animation: notice-in .14s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .explorer-toast { animation: none; } }
   .mcp-btn { position: relative; }
   .mcp-dot { position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; }
   .mcp-backdrop { position: fixed; inset: 0; z-index: 60; border: none; background: rgba(0,0,0,.45); cursor: default; padding: 0; }
