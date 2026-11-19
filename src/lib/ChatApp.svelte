@@ -14,6 +14,7 @@
     serverSync,
     adoptServerChat,
     normalizeServerChat,
+    loadServerChatList,
     serverSaveRow,
     serverSavesIdle,
     loadChats,
@@ -1222,12 +1223,18 @@
   /** the OPEN session has a live turn (single request, Work agent turn, or
    *  compaction). Every edit/send/delete gate reads this, so a turn running
    *  in another session never blocks the one being used. */
-  const busy = $derived(isSessionBusy(activeId));
+  /** sessions the server reports a live Work turn for, before this window
+   *  has attached to it: shown as running at once (the attach waits on a
+   *  snapshot, and a running worker used to look stopped meanwhile) */
+  let liveHintIds = $state<string[]>([]);
+  /** the open session is a list copy still being swapped for its full copy */
+  const activeLoading = $derived(!!activeChat?.partial);
+  const busy = $derived(isSessionBusy(activeId) || activeLoading || (activeId != null && liveHintIds.includes(activeId)));
   const activeStreaming = $derived(activeId != null && streamingIds.includes(activeId));
   const activeWorkRunning = $derived(activeId != null && workRunningIds.includes(activeId));
   /** sidebar shimmer: a session with a live chat stream or work turn */
   function isSessionStreaming(id: string): boolean {
-    return isChatStreaming(id) || isWorkRunning(id);
+    return isChatStreaming(id) || isWorkRunning(id) || liveHintIds.includes(id);
   }
   // live elapsed ("32m 25s", "1h 32m", "3d 2h") since the task/query started
   function formatLiveElapsed(ms: number): string {
@@ -1601,6 +1608,7 @@
     const gate = workSendGate(workEngineInfo);
     if (gate.blocked && !chat.engine) throw new Error(gate.reason ?? "The Work engine is not available.");
     const ws = await canonicalWorkspace(chat.workspace);
+    await ensureChatFull(chat);
     // the await may have outlived the session or its idle state
     if (!chats.some((x) => x.id === chatId) || isWorkRunning(chatId) || isCompacting(chatId) || isChatStreaming(chatId)) return false;
     const reply: ChatMsg = { role: "assistant", content: "", thinking: "", model: selectedModel };
@@ -5299,6 +5307,10 @@
 
   async function send() {
     if (blockedWhileLoading()) return;
+    if (activeChat?.partial) {
+      await ensureChatFull(activeChat);
+      if (activeChat?.partial) return;
+    }
     const text = input.trim();
     if (!text && attachImages.length === 0 && attachFiles.length === 0) return;
     // only THIS session's own live turn blocks its composer: a turn running
@@ -7648,19 +7660,40 @@
    *  Sessions the server created on its own (a scheduled send into a new
    *  session) are fetched first. */
   async function reattachRecordedTurns() {
-    await serverSavesIdle();
-    const rows = await invokeOrBridge<any[]>("chats_load", {}).catch(() => []);
-    for (const raw of rows) {
-      const local = chats.find((c) => c.id === raw.id);
-      if (workRunningIds.includes(raw.id) || serverChatFeeds.has(raw.id)) continue;
-      const base = local ? serverSaveRow(local)?.baseRev : null;
-      if (!local || (typeof raw.rev === "number" && typeof base === "number" && raw.rev > base)) {
-        const fresh = adoptServerChat(raw);
-        chats = local ? chats.map((c) => c.id === fresh.id ? fresh : c) : [fresh, ...chats];
+    // which turns are live comes first and is cheap: those sessions show as
+    // running right away, before the list refresh and the attach
+    const livePromise = liveWorkTurns();
+    const chatTurns = serverChatTurns ? reattachServerChatTurns() : Promise.resolve();
+    const live = await livePromise;
+    liveHintIds = Object.keys(live).filter((id) => !workRunningIds.includes(id));
+    try {
+      await serverSavesIdle();
+      const rows = await loadServerChatList().catch(() => []);
+      for (const raw of rows) {
+        const local = chats.find((c) => c.id === raw.id);
+        if (workRunningIds.includes(raw.id) || serverChatFeeds.has(raw.id)) continue;
+        const base = local ? serverSaveRow(local)?.baseRev : null;
+        if (!local || (typeof raw.rev === "number" && typeof base === "number" && raw.rev > base)) {
+          if (local && !local.partial && raw.partial) {
+            // a full copy here stays full: fetch the new revision whole
+            const full = await invokeOrBridge<any>("chats_get", { id: raw.id }).catch(() => null);
+            if (!full || workRunningIds.includes(raw.id) || serverChatFeeds.has(raw.id)) continue;
+            const fresh = adoptServerChat(full);
+            chats = chats.map((c) => c.id === fresh.id ? fresh : c);
+          } else {
+            const fresh = adoptServerChat(raw);
+            chats = local ? chats.map((c) => c.id === fresh.id ? fresh : c) : [fresh, ...chats];
+          }
+        }
       }
+      await chatTurns;
+      await attachLiveWorkTurns(live);
+    } finally {
+      liveHintIds = [];
     }
-    if (serverChatTurns) await reattachServerChatTurns();
-    const live = await liveWorkTurns();
+  }
+
+  async function attachLiveWorkTurns(live: Awaited<ReturnType<typeof liveWorkTurns>>) {
     for (const id of Object.keys(live)) {
       if (workTurnIds.has(id) || workRunningIds.includes(id)) continue;
       if (!chats.some((x) => x.id === id)) {
@@ -7671,11 +7704,44 @@
       const snap = await attachWorkAgentSnapshot(id);
       const c = chats.find((x) => x.id === id);
       if (!snap?.snapshot || !c || c.mode !== "work" || workTurnIds.has(id) || workRunningIds.includes(id)) continue;
+      await ensureChatFull(c);
+      if (workTurnIds.has(id) || workRunningIds.includes(id)) continue;
       c.messages = normalizeServerChat({ id, messages: snap.snapshot.messages }).messages;
       chats = [...chats];
       void runWorkTurn(c, snap.snapshot.index, c.workspace ?? "", [], { attach: snap });
     }
   }
+
+  /** Server mode: swap a list copy (`partial`, message previews only) for
+   *  the full session, in place so callers holding the object keep it.
+   *  Messages added locally past the server's copy are kept. */
+  const fullLoads = new Map<string, Promise<void>>();
+  function ensureChatFull(chat: Chat | null | undefined): Promise<void> {
+    if (!chat?.partial) return Promise.resolve();
+    const id = chat.id;
+    let p = fullLoads.get(id);
+    if (!p) {
+      p = (async () => {
+        const raw = await invokeOrBridge<any>("chats_get", { id }).catch(() => null);
+        const local = chats.find((x) => x.id === id);
+        if (!local?.partial) return;
+        if (!raw || typeof raw.id !== "string") {
+          error = "Couldn't load this session from the server.";
+          return;
+        }
+        const fresh = adoptServerChat(raw);
+        const messages = [...fresh.messages, ...local.messages.slice(fresh.messages.length)];
+        Object.assign(local, fresh, { messages });
+        delete local.partial;
+        chats = [...chats];
+      })().finally(() => fullLoads.delete(id));
+      fullLoads.set(id, p);
+    }
+    return p;
+  }
+  $effect(() => {
+    if (ready && activeChat?.partial) void ensureChatFull(activeChat);
+  });
 
   /** Server mode: take the server's transcript of a session (after its turn
    *  ended, or when a save was refused). Local metadata (title, pins) stays;
@@ -8301,6 +8367,8 @@
     // only the source session's own live turn blocks the fork — and forking
     // never aborts anything (the source keeps running in the background)
     if (!src || isSessionBusy(id)) return;
+    await ensureChatFull(src);
+    if (src.partial) return;
     ctxMenu = null;
     workspacePickerOpen = false;
     const ws = defaultWorkspace || pendingWorkspace || "";
@@ -9434,7 +9502,10 @@
         {#if forkInfo && forkNoteIndex == null}
           {@render forkNote(forkInfo.title, forkInfo.id, "Continue from chat")}
         {/if}
-        {#each activeChat.messages as m, i}
+        {#if activeLoading}
+          <div class="session-loading" data-testid="session-loading">Loading session…</div>
+        {/if}
+        {#each activeLoading ? [] : activeChat.messages as m, i}
           {@const copyKey = `${activeId}:${i}`}
           {@const bgDone = m.role === "user" && editingIndex !== i ? parseBgDoneMessage(m.content) : null}
           {@const mcpWake = !bgDone && m.role === "user" && editingIndex !== i ? parseMcpWakeMessage(m.content) : null}
@@ -11980,6 +12051,7 @@
   .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .search-host { flex-shrink: 0; margin-left: auto; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--muted-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
   .search-row.sel .search-host { color: var(--muted); border-color: var(--border-strong); }
+  .session-loading { padding: 24px; text-align: center; font-size: 13px; color: var(--muted-2); }
   .search-note { margin: 0; padding: 4px 18px 8px; font-size: 12px; color: var(--muted-2); }
   .search-note.search-fail { color: var(--danger); }
   .search-note.search-old { color: var(--muted-2); font-style: italic; }

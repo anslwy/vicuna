@@ -142,6 +142,30 @@ pub async fn load_chats(pool: &SqlitePool) -> Result<Value, String> {
     .await
 }
 
+/// Characters of each message kept by `load_chat_list`.
+pub const LIST_PREVIEW_CHARS: i64 = 240;
+
+/// Every chat for the session list, without the heavy parts: each message
+/// keeps its role, model and stats, but its text is cut to a short preview
+/// and thinking + images are left out. Chats carry `"partial": true`; a
+/// client fetches the full copy (`load_chat`) when it opens one. A remote
+/// window used to wait for megabytes of history and base64 images before it
+/// could show its sidebar.
+pub async fn load_chat_list(pool: &SqlitePool) -> Result<Value, String> {
+    let mut out = load_chats_with_queries(
+        pool,
+        &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
+        &format!(
+            "SELECT chat_id, role, substr(content, 1, {LIST_PREVIEW_CHARS}) AS content, model, gen_ms, gen_tps, summary, gen_cost FROM messages ORDER BY chat_id, idx"
+        ),
+    )
+    .await?;
+    for c in out.as_array_mut().into_iter().flatten() {
+        c["partial"] = json!(true);
+    }
+    Ok(out)
+}
+
 /// Read pre-server desktop history without migrating the original database.
 /// The row decoders already handle optional columns missing from older files.
 pub async fn load_desktop_chats(path: &Path) -> Result<Value, String> {
@@ -555,6 +579,30 @@ mod tests {
     /// it stringified; the desktop→server import feeds the former straight
     /// into a merge, so both must parse (one forked chat used to fail the
     /// whole import batch with "invalid type: map, expected a string").
+    #[tokio::test]
+    async fn chat_list_trims_messages_and_keeps_counts() {
+        let dir = std::env::temp_dir().join(format!("vicuna-server-store-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir.join("v.db")).await.unwrap();
+        let long = "é".repeat(1000);
+        let mut r = row("a", "A", &[("user", "hi"), ("assistant", &long)]);
+        r["messages"][0]["images"] = json!(["data:image/png;base64,AAAA"]);
+        r["messages"][1]["thinking"] = json!("deep thoughts");
+        merge_chats(&db, parse_rows(&json!([r])).unwrap(), vec![], &Default::default()).await.unwrap();
+        let list = load_chat_list(&db).await.unwrap();
+        let c = &list[0];
+        assert_eq!(c["partial"], true);
+        let m = c["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(m[0].get("images").is_none() && m[1].get("thinking").is_none(), "{c}");
+        assert_eq!(m[1]["content"].as_str().unwrap().chars().count(), LIST_PREVIEW_CHARS as usize);
+        let full = load_chat(&db, "a").await.unwrap().unwrap();
+        assert!(full.get("partial").is_none());
+        assert_eq!(full["messages"][1]["content"].as_str().unwrap(), long);
+        assert!(full["messages"][0]["images"].is_array());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn loaded_chats_merge_back_including_forks() {
         let dir = std::env::temp_dir().join(format!("vicuna-server-store-fork-{}", std::process::id()));
