@@ -70,6 +70,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 flate2 = "1"
 futures-util = "0.3"
 portable-pty = "0.9.0"
+# renders /usage PTY output to a screen grid (terminals repaint cells in place)
+vt100 = "0.16"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = { version = "0.1" }
