@@ -7,7 +7,27 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { badgeFor, buildPatch, buildTree, hljsLanguageFor, parseDiff, splitStatus, stepTreeFile, type Picks } from "../src/lib/gitDiff.ts";
+import {
+  badgeFor,
+  buildPatch,
+  buildTree,
+  clickTreeFile,
+  contextMenuSelection,
+  EMPTY_SELECTION,
+  formatCopyText,
+  gitFileName,
+  gitFullPath,
+  hljsLanguageFor,
+  parseDiff,
+  reconcileSelection,
+  selectAllInSection,
+  selectedItemsInOrder,
+  singleSelection,
+  splitStatus,
+  stepSelection,
+  stepTreeFile,
+  type Picks
+} from "../src/lib/gitDiff.ts";
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "vicuna-gitdiff-"));
@@ -193,4 +213,168 @@ test("stepTreeFile navigates visible files and clamps at section ends", () => {
 
   const collapsed = buildTree(items, new Set(["src"]));
   assert.equal(stepTreeFile(collapsed, "src/a.ts", 1)?.path, "README.md");
+});
+
+const mkItems = (paths: string[]) =>
+  paths.map((path) => ({ path, origPath: null, letter: "M", newFile: false, untracked: false }));
+
+test("clickTreeFile: plain, Shift range (2nd -> 5th selects 2,3,4,5), reverse Shift, Cmd/Ctrl toggle", () => {
+  // visible order: dir/a.ts, dir/b.ts, f3.ts, f4.ts, f5.ts, f6.ts (1..6)
+  const items = mkItems(["dir/a.ts", "dir/b.ts", "f3.ts", "f4.ts", "f5.ts", "f6.ts"]);
+  const rows = buildTree(items, new Set());
+
+  // select 2nd item (dir/b.ts)
+  let sel = clickTreeFile(EMPTY_SELECTION, rows, false, "dir/b.ts");
+  assert.deepEqual([...sel.paths], ["dir/b.ts"]);
+  assert.equal(sel.primary, "dir/b.ts");
+  assert.equal(sel.anchor, "dir/b.ts");
+
+  // shift-select 5th item (f5.ts) => selects 2nd, 3rd, 4th, 5th
+  sel = clickTreeFile(sel, rows, false, "f5.ts", { shift: true });
+  assert.deepEqual(
+    selectedItemsInOrder(sel, false, rows, items).map((i) => i.path),
+    ["dir/b.ts", "f3.ts", "f4.ts", "f5.ts"]
+  );
+  assert.equal(sel.primary, "f5.ts");
+  assert.equal(sel.anchor, "dir/b.ts");
+
+  // shifting again adjusts from the same anchor (2nd -> 3rd => 2,3)
+  sel = clickTreeFile(sel, rows, false, "f3.ts", { shift: true });
+  assert.deepEqual(
+    selectedItemsInOrder(sel, false, rows, items).map((i) => i.path),
+    ["dir/b.ts", "f3.ts"]
+  );
+
+  // reverse Shift (5th -> 2nd => 2,3,4,5)
+  sel = clickTreeFile(EMPTY_SELECTION, rows, false, "f5.ts");
+  sel = clickTreeFile(sel, rows, false, "dir/b.ts", { shift: true });
+  assert.deepEqual(
+    selectedItemsInOrder(sel, false, rows, items).map((i) => i.path),
+    ["dir/b.ts", "f3.ts", "f4.ts", "f5.ts"]
+  );
+  assert.equal(sel.anchor, "f5.ts");
+  assert.equal(sel.primary, "dir/b.ts");
+
+  // Cmd/Ctrl-click removes an item from the selection without losing the rest
+  sel = clickTreeFile(sel, rows, false, "f3.ts", { toggle: true });
+  assert.deepEqual(
+    selectedItemsInOrder(sel, false, rows, items).map((i) => i.path),
+    ["dir/b.ts", "f4.ts", "f5.ts"]
+  );
+
+  // Cmd/Ctrl-click adds a non-contiguous item
+  sel = clickTreeFile(sel, rows, false, "f6.ts", { toggle: true });
+  assert.deepEqual(
+    selectedItemsInOrder(sel, false, rows, items).map((i) => i.path),
+    ["dir/b.ts", "f4.ts", "f5.ts", "f6.ts"]
+  );
+
+  // Cmd/Ctrl-click removing the last selected item clears selection
+  const one = singleSelection(false, "f6.ts");
+  assert.equal(clickTreeFile(one, rows, false, "f6.ts", { toggle: true }).paths.size, 0);
+
+  // Shift-click in the other section starts a fresh selection there
+  const cross = clickTreeFile(sel, rows, true, "f3.ts", { shift: true });
+  assert.equal(cross.staged, true);
+  assert.deepEqual([...cross.paths], ["f3.ts"]);
+
+  // Shift-click skips files hidden inside collapsed folders
+  const collapsed = buildTree(items, new Set(["dir"]));
+  let csel = clickTreeFile(EMPTY_SELECTION, collapsed, false, "f3.ts");
+  csel = clickTreeFile(csel, collapsed, false, "f5.ts", { shift: true });
+  assert.deepEqual(
+    selectedItemsInOrder(csel, false, collapsed, items).map((i) => i.path),
+    ["f3.ts", "f4.ts", "f5.ts"]
+  );
+});
+
+test("contextMenuSelection keeps multi-selection on right-clicking a selected item", () => {
+  const items = mkItems(["a.ts", "b.ts", "c.ts", "d.ts"]);
+  const rows = buildTree(items, new Set());
+  let sel = clickTreeFile(EMPTY_SELECTION, rows, false, "a.ts");
+  sel = clickTreeFile(sel, rows, false, "c.ts", { shift: true });
+
+  // right-clicking b.ts (already selected) preserves a, b, c
+  const kept = contextMenuSelection(sel, false, "b.ts");
+  assert.equal(kept, sel);
+  assert.deepEqual([...kept.paths].sort(), ["a.ts", "b.ts", "c.ts"]);
+
+  // right-clicking d.ts (outside selection) switches to just d.ts
+  const switched = contextMenuSelection(sel, false, "d.ts");
+  assert.deepEqual([...switched.paths], ["d.ts"]);
+
+  // right-clicking in the other section switches section
+  const other = contextMenuSelection(sel, true, "b.ts");
+  assert.equal(other.staged, true);
+  assert.deepEqual([...other.paths], ["b.ts"]);
+});
+
+test("stepSelection (Shift+Arrow) and selectAllInSection", () => {
+  const items = mkItems(["a.ts", "b.ts", "c.ts", "d.ts"]);
+  const rows = buildTree(items, new Set());
+  let sel = singleSelection(false, "b.ts");
+  sel = stepSelection(sel, rows, false, 1, true)!;
+  sel = stepSelection(sel, rows, false, 1, true)!;
+  assert.deepEqual([...sel.paths].sort(), ["b.ts", "c.ts", "d.ts"]);
+  assert.equal(sel.anchor, "b.ts");
+  assert.equal(sel.primary, "d.ts");
+
+  // Shift+ArrowUp shrinks range back toward anchor
+  sel = stepSelection(sel, rows, false, -1, true)!;
+  assert.deepEqual([...sel.paths].sort(), ["b.ts", "c.ts"]);
+
+  // plain ArrowDown collapses to single next item
+  sel = stepSelection(sel, rows, false, 1, false)!;
+  assert.deepEqual([...sel.paths], ["d.ts"]);
+
+  // select all
+  const all = selectAllInSection(rows, false, "c.ts");
+  assert.deepEqual([...all.paths].sort(), ["a.ts", "b.ts", "c.ts", "d.ts"]);
+  assert.equal(all.primary, "c.ts");
+});
+
+test("reconcileSelection hands view to neighbour after bulk stage/discard, or follows across when empty", () => {
+  const prevOrder = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"];
+  const sel = { staged: false, paths: new Set(["b.ts", "c.ts", "d.ts"]), primary: "d.ts", anchor: "b.ts" };
+
+  // bulk staged b, c, d => e.ts is next neighbour in unstaged
+  const r1 = reconcileSelection(sel, prevOrder, mkItems(["a.ts", "e.ts"]), mkItems(["b.ts", "c.ts", "d.ts"]));
+  assert.equal(r1.staged, false);
+  assert.deepEqual([...r1.paths], ["e.ts"]);
+
+  // bulk staged b, c, d, e => falls back to a.ts before them
+  const selEnd = { staged: false, paths: new Set(["b.ts", "c.ts", "d.ts", "e.ts"]), primary: "e.ts", anchor: "b.ts" };
+  const r2 = reconcileSelection(selEnd, prevOrder, mkItems(["a.ts"]), mkItems(["b.ts", "c.ts", "d.ts", "e.ts"]));
+  assert.equal(r2.staged, false);
+  assert.deepEqual([...r2.paths], ["a.ts"]);
+
+  // section became empty after staging => follows primary across to staged
+  const selAll = { staged: false, paths: new Set(["a.ts", "b.ts"]), primary: "b.ts", anchor: "a.ts" };
+  const r3 = reconcileSelection(selAll, ["a.ts", "b.ts"], [], mkItems(["a.ts", "b.ts"]));
+  assert.equal(r3.staged, true);
+  assert.deepEqual([...r3.paths], ["b.ts"]);
+
+  // section became empty after discarding => clears selection
+  const r4 = reconcileSelection(selAll, ["a.ts", "b.ts"], [], []);
+  assert.equal(r4.paths.size, 0);
+
+  // partial external removal keeps surviving selected files
+  const r5 = reconcileSelection(sel, prevOrder, mkItems(["a.ts", "b.ts", "d.ts", "e.ts"]), []);
+  assert.equal(r5.staged, false);
+  assert.deepEqual([...r5.paths].sort(), ["b.ts", "d.ts"]);
+});
+
+test("gitFileName, gitFullPath and formatCopyText handle POSIX, Windows and multi-file copies", () => {
+  assert.equal(gitFileName("src/lib/GitPanel.svelte"), "GitPanel.svelte");
+  assert.equal(gitFileName("README.md"), "README.md");
+  assert.equal(gitFileName("src/lib/"), "lib");
+
+  assert.equal(gitFullPath("/repo/vicuna/", "src/lib/GitPanel.svelte"), "/repo/vicuna/src/lib/GitPanel.svelte");
+  assert.equal(gitFullPath("\\\\?\\C:\\dev\\vicuna\\", "src/lib/GitPanel.svelte"), "C:\\dev\\vicuna\\src\\lib\\GitPanel.svelte");
+  assert.equal(gitFullPath("\\\\?\\UNC\\srv\\share\\repo", "a/b.ts"), "\\srv\\share\\repo\\a\\b.ts");
+
+  const paths = ["src/a.ts", "src/lib/b.ts", "README.md"];
+  assert.equal(formatCopyText("/repo", paths, "name"), "a.ts\nb.ts\nREADME.md");
+  assert.equal(formatCopyText("/repo", paths, "path"), "src/a.ts\nsrc/lib/b.ts\nREADME.md");
+  assert.equal(formatCopyText("/repo", paths, "fullPath"), "/repo/src/a.ts\n/repo/src/lib/b.ts\n/repo/README.md");
 });

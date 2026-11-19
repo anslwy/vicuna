@@ -312,6 +312,11 @@ export function itemsUnder(items: SectionItem[], dir: string): SectionItem[] {
   return items.filter((i) => i.path === dir || i.path.startsWith(dir + "/"));
 }
 
+/** Visible file paths of a section's tree rows in display order. */
+export function visibleFilePaths(rows: TreeRow[]): string[] {
+  return rows.flatMap((r) => (r.item ? [r.item.path] : []));
+}
+
 /** Pick the next (+1) or previous (-1) visible file in a section's tree rows.
  *  Starts from the first (+1) or last (-1) file when `currentPath` is null or
  *  hidden, and clamps at the ends of the section. */
@@ -322,6 +327,218 @@ export function stepTreeFile(rows: TreeRow[], currentPath: string | null, dir: 1
   const idx = files.findIndex((f) => f.path === currentPath);
   if (idx < 0) return dir > 0 ? files[0] : files[files.length - 1];
   return files[Math.max(0, Math.min(files.length - 1, idx + dir))];
+}
+
+// ---- multi-selection ----
+
+export interface FileSelection {
+  staged: boolean;
+  /** Selected file paths within `staged` (always contains `primary` when non-empty). */
+  paths: ReadonlySet<string>;
+  /** Focused/active file (diff preview target + keyboard cursor). */
+  primary: string | null;
+  /** Range anchor for Shift-click / Shift+Arrow. */
+  anchor: string | null;
+}
+
+export const EMPTY_SELECTION: FileSelection = {
+  staged: false,
+  paths: new Set(),
+  primary: null,
+  anchor: null
+};
+
+export function singleSelection(staged: boolean, path: string): FileSelection {
+  return { staged, paths: new Set([path]), primary: path, anchor: path };
+}
+
+/** Update selection on a file click (plain, Shift range, or Cmd/Ctrl toggle). */
+export function clickTreeFile(
+  sel: FileSelection,
+  rows: TreeRow[],
+  staged: boolean,
+  path: string,
+  opts: { shift?: boolean; toggle?: boolean } = {}
+): FileSelection {
+  const shift = Boolean(opts.shift);
+  const toggle = Boolean(opts.toggle);
+  const order = visibleFilePaths(rows);
+  const sameSection = sel.paths.size > 0 && sel.staged === staged;
+
+  if (shift) {
+    const anchorPath =
+      sameSection && sel.anchor && order.includes(sel.anchor)
+        ? sel.anchor
+        : sameSection && sel.primary && order.includes(sel.primary)
+          ? sel.primary
+          : null;
+    const b = order.indexOf(path);
+    if (anchorPath !== null && b >= 0) {
+      const a = order.indexOf(anchorPath);
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      const next = toggle ? new Set(sel.paths) : new Set<string>();
+      for (let i = lo; i <= hi; i++) next.add(order[i]);
+      return { staged, paths: next, primary: path, anchor: anchorPath };
+    }
+    return singleSelection(staged, path);
+  }
+
+  if (toggle && sameSection) {
+    const next = new Set(sel.paths);
+    if (next.has(path)) {
+      next.delete(path);
+      if (!next.size) return EMPTY_SELECTION;
+      let nextPrimary = sel.primary;
+      if (!nextPrimary || !next.has(nextPrimary)) {
+        const idx = order.indexOf(path);
+        let picked: string | null = null;
+        if (idx >= 0) {
+          for (let i = idx + 1; i < order.length; i++) {
+            if (next.has(order[i])) { picked = order[i]; break; }
+          }
+          if (!picked) {
+            for (let i = idx - 1; i >= 0; i--) {
+              if (next.has(order[i])) { picked = order[i]; break; }
+            }
+          }
+        }
+        nextPrimary = picked ?? [...next][next.size - 1];
+      }
+      const nextAnchor = sel.anchor && next.has(sel.anchor) ? sel.anchor : nextPrimary;
+      return { staged, paths: next, primary: nextPrimary, anchor: nextAnchor };
+    }
+    next.add(path);
+    return { staged, paths: next, primary: path, anchor: path };
+  }
+
+  return singleSelection(staged, path);
+}
+
+/** Right-click preserves an existing multi-selection when the clicked file is
+ *  already part of it; otherwise selects just the clicked file. */
+export function contextMenuSelection(sel: FileSelection, staged: boolean, path: string): FileSelection {
+  if (sel.staged === staged && sel.paths.has(path)) return sel;
+  return singleSelection(staged, path);
+}
+
+/** ArrowUp / ArrowDown (optionally with Shift to extend range). */
+export function stepSelection(
+  sel: FileSelection,
+  rows: TreeRow[],
+  staged: boolean,
+  dir: 1 | -1,
+  extend = false
+): FileSelection | null {
+  const currentPath = sel.paths.size > 0 && sel.staged === staged ? sel.primary : null;
+  const next = stepTreeFile(rows, currentPath, dir);
+  if (!next) return null;
+  return extend ? clickTreeFile(sel, rows, staged, next.path, { shift: true }) : singleSelection(staged, next.path);
+}
+
+/** Select all visible files in a section (Cmd/Ctrl+A). */
+export function selectAllInSection(rows: TreeRow[], staged: boolean, currentPrimary: string | null = null): FileSelection {
+  const order = visibleFilePaths(rows);
+  if (!order.length) return EMPTY_SELECTION;
+  const primary = currentPrimary && order.includes(currentPrimary) ? currentPrimary : order[0];
+  return { staged, paths: new Set(order), primary, anchor: order[0] };
+}
+
+/** Selected items in visible tree order (falling back to section order for any
+ *  item inside a collapsed folder). */
+export function selectedItemsInOrder(
+  sel: FileSelection,
+  staged: boolean,
+  rows: TreeRow[],
+  items: SectionItem[]
+): SectionItem[] {
+  if (sel.staged !== staged || !sel.paths.size) return [];
+  const seen = new Set<string>();
+  const ordered: SectionItem[] = [];
+  for (const r of rows) {
+    if (r.item && sel.paths.has(r.item.path)) {
+      ordered.push(r.item);
+      seen.add(r.item.path);
+    }
+  }
+  for (const it of items) {
+    if (sel.paths.has(it.path) && !seen.has(it.path)) ordered.push(it);
+  }
+  return ordered;
+}
+
+/** Reconcile selection after a status refresh: keep surviving items; when all
+ *  selected items left the section, move to the next (else previous) visible
+ *  neighbour in the same section, and only follow across once the section has
+ *  no visible neighbour left. */
+export function reconcileSelection(
+  sel: FileSelection,
+  prevOrder: string[],
+  unstaged: SectionItem[],
+  stagedItems: SectionItem[]
+): FileSelection {
+  if (!sel.paths.size || !sel.primary) return EMPTY_SELECTION;
+  const curList = sel.staged ? stagedItems : unstaged;
+  const otherList = sel.staged ? unstaged : stagedItems;
+  const live = new Set(curList.map((i) => i.path));
+  const surviving = new Set([...sel.paths].filter((p) => live.has(p)));
+
+  if (surviving.size > 0) {
+    const primary = live.has(sel.primary)
+      ? sel.primary
+      : (prevOrder.find((p) => surviving.has(p)) ?? [...surviving][0]);
+    const anchor = sel.anchor && surviving.has(sel.anchor) ? sel.anchor : primary;
+    return { staged: sel.staged, paths: surviving, primary, anchor };
+  }
+
+  let at = prevOrder.indexOf(sel.primary);
+  if (at < 0) at = prevOrder.findIndex((p) => sel.paths.has(p));
+  if (at >= 0) {
+    for (let i = at + 1; i < prevOrder.length; i++) {
+      if (live.has(prevOrder[i])) return singleSelection(sel.staged, prevOrder[i]);
+    }
+    for (let i = at - 1; i >= 0; i--) {
+      if (live.has(prevOrder[i])) return singleSelection(sel.staged, prevOrder[i]);
+    }
+  }
+
+  const other = otherList.find((i) => i.path === sel.primary) ?? otherList.find((i) => sel.paths.has(i.path));
+  return other ? singleSelection(!sel.staged, other.path) : EMPTY_SELECTION;
+}
+
+// ---- copy helpers ----
+
+/** File or folder basename from a slash-separated relative path. */
+export function gitFileName(relPath: string): string {
+  const clean = relPath.replace(/\/+$/, "");
+  return clean.split("/").pop() ?? clean;
+}
+
+/** Join a workspace root with a workspace-relative slash path, preserving
+ *  Windows separators and stripping Rust's `\\?\` verbatim prefix. */
+export function gitFullPath(root: string, relPath: string): string {
+  let base = root.trim();
+  if (base.startsWith("\\\\?\\UNC\\")) base = "\\" + base.slice("\\\\?\\UNC\\".length);
+  else if (base.startsWith("\\\\?\\")) base = base.slice("\\\\?\\".length);
+  const rel = relPath.replace(/^\/+/, "");
+  if (!base) return rel;
+  const win = base.includes("\\") && !base.includes("/");
+  if (win) {
+    const cleanBase = base.replace(/\\+$/, "");
+    const winRel = rel.replace(/\//g, "\\");
+    return winRel ? `${cleanBase}\\${winRel}` : cleanBase;
+  }
+  const cleanBase = base.replace(/\/+$/, "");
+  return rel ? `${cleanBase}/${rel}` : cleanBase;
+}
+
+export type CopyKind = "name" | "path" | "fullPath";
+
+/** Format clipboard text for one or more workspace-relative paths. */
+export function formatCopyText(root: string, relPaths: string[], kind: CopyKind): string {
+  return relPaths
+    .map((p) => (kind === "name" ? gitFileName(p) : kind === "path" ? p : gitFullPath(root, p)))
+    .join("\n");
 }
 
 /** highlight.js language id from a file name (null = plain). */

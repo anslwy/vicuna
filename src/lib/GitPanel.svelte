@@ -1,10 +1,11 @@
 <script lang="ts">
   // Side panel Git tab (Fork / Sourcetree style, stacked for the narrow
   // panel): Unstaged / Staged folder trees on top, a drag divider, and the
-  // selected file's diff below. Stage / unstage / discard work on whole
-  // files and folders, single hunks, or the lines selected in a hunk
-  // (click, shift-click for a range). Patches for hunks and lines come from
-  // gitDiff.ts; the backend is src-tauri/src/git_panel.rs.
+  // selected file's diff (or multi-file summary) below. Stage / unstage /
+  // discard work on single or multi-selected files (Shift range, Cmd/Ctrl
+  // toggle, Shift+Arrows, Cmd/Ctrl+A), folders, single hunks, or selected
+  // lines in a hunk. Patches for hunks and lines come from gitDiff.ts; the
+  // backend is src-tauri/src/git_panel.rs.
   import { onDestroy, tick, untrack } from "svelte";
   import hljs from "highlight.js/lib/common";
   import { gitApply, gitDiff, gitDiscard, gitStage, gitStatus, gitUnstage, type GitStatus } from "./git";
@@ -12,12 +13,25 @@
     badgeFor,
     buildPatch,
     buildTree,
+    clickTreeFile,
+    contextMenuSelection,
+    EMPTY_SELECTION,
+    formatCopyText,
+    gitFileName,
+    gitFullPath,
     hljsLanguageFor,
     itemsUnder,
     parseDiff,
+    reconcileSelection,
+    selectAllInSection,
+    selectedItemsInOrder,
+    singleSelection,
     splitStatus,
-    stepTreeFile,
+    stepSelection,
+    visibleFilePaths,
+    type CopyKind,
     type FileDiff,
+    type FileSelection,
     type PatchMode,
     type Picks,
     type SectionItem
@@ -47,8 +61,8 @@
   let collapsedUn = $state<Set<string>>(new Set());
   let collapsedSt = $state<Set<string>>(new Set());
 
-  /** selected file: path + which section it was picked from */
-  let selected = $state<{ path: string; staged: boolean } | null>(null);
+  /** selected file(s) within one section (supports Shift range & Cmd/Ctrl toggle) */
+  let selection = $state<FileSelection>(EMPTY_SELECTION);
   let diff = $state<FileDiff | null>(null);
   let diffLoading = $state(false);
   let diffError = $state<string | null>(null);
@@ -59,6 +73,8 @@
 
   let confirm = $state<{ title: string; message: string; label: string; run: () => Promise<void> } | null>(null);
   let menu = $state<{ x: number; y: number; staged: boolean; item: SectionItem | null; dir: string | null } | null>(null);
+  let toast = $state<string | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** top pane height as % of the panel (drag divider) */
   let topPct = $state(42);
@@ -67,11 +83,46 @@
   const sections = $derived(splitStatus(status?.files ?? []));
   const unRows = $derived(buildTree(sections.unstaged, collapsedUn));
   const stRows = $derived(buildTree(sections.staged, collapsedSt));
-  const selItem = $derived.by(() => {
-    if (!selected) return null;
-    const list = selected.staged ? sections.staged : sections.unstaged;
-    return list.find((i) => i.path === selected!.path) ?? null;
-  });
+  const selectedItems = $derived.by(() =>
+    selectedItemsInOrder(
+      selection,
+      selection.staged,
+      selection.staged ? stRows : unRows,
+      selection.staged ? sections.staged : sections.unstaged
+    )
+  );
+  const selItem = $derived(selectedItems.length === 1 ? selectedItems[0] : null);
+  const hasDiscardableSelection = $derived(selectedItems.some((i) => i.letter !== "U"));
+
+  function flashToast(msg: string) {
+    toast = msg;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toast = null;
+      toastTimer = null;
+    }, 1800);
+  }
+
+  async function copyText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+  }
 
   function errText(e: any): string {
     return typeof e === "string" ? e : (e?.message ?? String(e));
@@ -83,8 +134,8 @@
 
   /** per-line highlighted HTML, [hunk][line] */
   const lineHtml = $derived.by(() => {
-    if (!diff || !selected) return [] as string[][];
-    const lang = hljsLanguageFor(selected.path);
+    if (!diff || !selItem) return [] as string[][];
+    const lang = hljsLanguageFor(selItem.path);
     const total = diff.hunks.reduce((n, h) => n + h.lines.length, 0);
     const useHl = !!lang && !!hljs.getLanguage(lang) && total <= 4000;
     return diff.hunks.map((h) =>
@@ -99,6 +150,10 @@
     );
   });
 
+  function singleKey(sel: FileSelection): string | null {
+    return sel.paths.size === 1 && sel.primary ? `${sel.staged}:${sel.primary}` : null;
+  }
+
   let statusSeq = 0;
   async function refresh() {
     const r = root.trim();
@@ -109,25 +164,20 @@
     }
     const seq = ++statusSeq;
     loading = !status;
-    // display order of the selected file's section before the refresh, so a
-    // file that leaves it (staged / unstaged / went clean) hands the view to
-    // its neighbour in the same list
-    const prevOrder = selected ? sectionOrder(selected.staged) : [];
+    // display order of the selected file's section before the refresh, so files
+    // that leave it (staged / unstaged / went clean) hand the view to their
+    // neighbour in the same list
+    const prevOrder = selection.paths.size ? visibleFilePaths(selection.staged ? stRows : unRows) : [];
+    const prevSingle = singleKey(selection);
     try {
       const s = await gitStatus(r);
       if (seq !== statusSeq) return;
       status = s;
       error = null;
-      if (selected && !selItem) {
-        const next = neighbourAfterRemoval(prevOrder, selected.path, selected.staged);
-        if (next) {
-          selected = { path: next, staged: selected.staged };
-        } else {
-          // its section is empty now: follow the file to the other section
-          const other = (selected.staged ? sections.unstaged : sections.staged).find((i) => i.path === selected!.path);
-          selected = other ? { path: other.path, staged: !selected.staged } : null;
-        }
-        diff = null;
+      if (selection.paths.size) {
+        const next = reconcileSelection(selection, prevOrder, sections.unstaged, sections.staged);
+        selection = next;
+        if (singleKey(next) !== prevSingle) diff = null;
       }
       await loadDiff();
     } catch (e) {
@@ -138,37 +188,22 @@
     }
   }
 
-  /** visible file paths of a section in tree order (files in collapsed folders skipped) */
-  function sectionOrder(staged: boolean): string[] {
-    const rows = staged ? stRows : unRows;
-    return rows.flatMap((row) => (row.item ? [row.item.path] : []));
-  }
-
-  /** next file after `path` in the old order that is still in the section, else the previous one */
-  function neighbourAfterRemoval(prevOrder: string[], path: string, staged: boolean): string | null {
-    const live = new Set((staged ? sections.staged : sections.unstaged).map((i) => i.path));
-    const at = prevOrder.indexOf(path);
-    if (at < 0) return null;
-    for (let i = at + 1; i < prevOrder.length; i++) if (live.has(prevOrder[i])) return prevOrder[i];
-    for (let i = at - 1; i >= 0; i--) if (live.has(prevOrder[i])) return prevOrder[i];
-    return null;
-  }
-
   let diffSeq = 0;
   async function loadDiff() {
     const seq = ++diffSeq;
     lineSel = new Set();
     anchor = null;
     const item = selItem;
-    if (!selected || !item) {
+    if (!item) {
       diff = null;
       diffError = null;
       diffTooLarge = false;
+      diffLoading = false;
       return;
     }
     diffLoading = !diff;
     try {
-      const d = await gitDiff(root.trim(), item.path, selected.staged, item.untracked);
+      const d = await gitDiff(root.trim(), item.path, selection.staged, item.untracked);
       if (seq !== diffSeq) return;
       diffTooLarge = d.tooLarge;
       diff = d.tooLarge ? null : parseDiff(d.text);
@@ -182,11 +217,14 @@
     }
   }
 
-  function select(item: SectionItem, staged: boolean) {
-    if (selected?.path === item.path && selected.staged === staged) return;
-    selected = { path: item.path, staged };
-    diff = null;
-    void loadDiff();
+  function applySelection(next: FileSelection) {
+    const prevKey = singleKey(selection);
+    const nextKey = singleKey(next);
+    selection = next;
+    if (nextKey !== prevKey) {
+      diff = null;
+      void loadDiff();
+    }
   }
 
   async function run(fn: () => Promise<void>) {
@@ -314,25 +352,68 @@
 
   function openMenu(e: MouseEvent, staged: boolean, item: SectionItem | null, dir: string | null) {
     e.preventDefault();
-    menu = { x: e.clientX, y: e.clientY, staged, item, dir };
+    const x = typeof window === "undefined" ? e.clientX : Math.max(8, Math.min(e.clientX, window.innerWidth - 210));
+    const y = typeof window === "undefined" ? e.clientY : Math.max(8, Math.min(e.clientY, window.innerHeight - 280));
+    menu = { x, y, staged, item, dir };
   }
 
   function menuItems(): SectionItem[] {
     if (!menu) return [];
     const list = menu.staged ? sections.staged : sections.unstaged;
-    if (menu.item) return [menu.item];
+    if (menu.item) {
+      if (selection.staged === menu.staged && selection.paths.has(menu.item.path) && selection.paths.size > 1) {
+        return selectedItemsInOrder(selection, menu.staged, menu.staged ? stRows : unRows, list);
+      }
+      return [menu.item];
+    }
     return menu.dir ? itemsUnder(list, menu.dir) : [];
   }
 
-  function menuAct(kind: "stage" | "unstage" | "discard" | "open" | "reveal") {
-    const items = menuItems();
+  const menuTargetItems = $derived(menu ? menuItems() : []);
+  const menuCopyPaths = $derived.by(() => {
+    if (!menu) return [] as string[];
+    if (menu.dir) return [menu.dir];
+    return menuTargetItems.map((i) => i.path);
+  });
+  const menuMulti = $derived(Boolean(menu && !menu.dir && menuTargetItems.length > 1));
+  const menuDiscardable = $derived(menuTargetItems.some((i) => i.letter !== "U"));
+
+  function menuAct(kind: "stage" | "unstage" | "discard" | "open" | "reveal" | "copyName" | "copyPath" | "copyFullPath") {
+    const items = menuTargetItems;
+    const copyPaths = menuCopyPaths;
     const target = menu?.item?.path ?? menu?.dir ?? "";
+    const isDir = Boolean(menu?.dir);
     menu = null;
     if (kind === "stage") stageItems(items);
     else if (kind === "unstage") unstageItems(items);
     else if (kind === "discard") discardItems(items);
     else if (kind === "open" && target) onopenfile?.(target);
     else if (kind === "reveal" && target) onreveal?.(target);
+    else if (kind === "copyName" || kind === "copyPath" || kind === "copyFullPath") {
+      if (!copyPaths.length) return;
+      const copyKind: CopyKind = kind === "copyName" ? "name" : kind === "copyPath" ? "path" : "fullPath";
+      const text = formatCopyText(root, copyPaths, copyKind);
+      void copyText(text).then((ok) => {
+        if (!ok) {
+          flashToast("Copy failed (clipboard unavailable)");
+        } else if (copyPaths.length === 1) {
+          const label =
+            kind === "copyName"
+              ? isDir
+                ? "folder name"
+                : "file name"
+              : kind === "copyPath"
+                ? isDir
+                  ? "folder path"
+                  : "file path"
+                : "full path";
+          flashToast(`Copied ${label}`);
+        } else {
+          const label = kind === "copyName" ? "file names" : kind === "copyPath" ? "file paths" : "full paths";
+          flashToast(`Copied ${copyPaths.length} ${label}`);
+        }
+      });
+    }
   }
 
   // ---- divider ----
@@ -366,9 +447,11 @@
     const r = root.trim();
     if (r !== lastRoot) {
       lastRoot = r;
-      selected = null;
+      selection = EMPTY_SELECTION;
       diff = null;
       status = null;
+      menu = null;
+      confirm = null;
       collapsedUn = new Set();
       collapsedSt = new Set();
     }
@@ -390,6 +473,7 @@
   if (typeof window !== "undefined") window.addEventListener("focus", onWindowFocus);
   onDestroy(() => {
     if (typeof window !== "undefined") window.removeEventListener("focus", onWindowFocus);
+    if (toastTimer) clearTimeout(toastTimer);
   });
 
   function onKey(e: KeyboardEvent) {
@@ -398,29 +482,43 @@
       if (menu) menu = null;
       else if (confirm) confirm = null;
       else if (lineSel.size) lineSel = new Set();
-      else return;
+      else if (selection.paths.size > 1 && selection.primary) {
+        applySelection(singleSelection(selection.staged, selection.primary));
+      } else return;
       e.preventDefault();
       e.stopPropagation();
       return;
     }
-    if ((e.key !== "ArrowDown" && e.key !== "ArrowUp") || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (menu || confirm) return;
     const el = e.target instanceof Element ? e.target : null;
     if (el && (el.closest("input, textarea, select") || (el as HTMLElement).isContentEditable)) return;
 
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "a") {
+      if (el?.closest(".gp-code")) return;
+      const secEl = el?.closest("[data-testid='git-staged'], [data-testid='git-unstaged']");
+      const focusedStaged = secEl ? secEl.getAttribute("data-testid") === "git-staged" : null;
+      const staged = focusedStaged ?? (selection.paths.size ? selection.staged : unRows.some((r) => r.item) ? false : true);
+      const rows = staged ? stRows : unRows;
+      if (!rows.some((r) => r.item)) return;
+      e.preventDefault();
+      applySelection(selectAllInSection(rows, staged, selection.staged === staged ? selection.primary : null));
+      return;
+    }
+
+    if ((e.key !== "ArrowDown" && e.key !== "ArrowUp") || e.altKey || e.ctrlKey || e.metaKey) return;
+
     const secEl = el?.closest("[data-testid='git-staged'], [data-testid='git-unstaged']");
     const focusedStaged = secEl ? secEl.getAttribute("data-testid") === "git-staged" : null;
-    const staged = focusedStaged ?? (selected ? selected.staged : unRows.some((r) => r.item) ? false : true);
+    const staged = focusedStaged ?? (selection.paths.size ? selection.staged : unRows.some((r) => r.item) ? false : true);
     const rows = staged ? stRows : unRows;
-    const currentPath = selected && selected.staged === staged ? selected.path : null;
     const dir = e.key === "ArrowDown" ? 1 : -1;
-    const next = stepTreeFile(rows, currentPath, dir);
+    const next = stepSelection(selection, rows, staged, dir, e.shiftKey);
     e.preventDefault();
     if (!next) return;
-    select(next, staged);
+    applySelection(next);
     void tick().then(() => {
       const row = shell?.querySelector<HTMLButtonElement>(
-        `[data-testid="${staged ? "git-staged" : "git-unstaged"}"] .gp-file.sel`
+        `[data-testid="${staged ? "git-staged" : "git-unstaged"}"] .gp-file.active`
       );
       if (!row) return;
       row.scrollIntoView({ block: "nearest" });
@@ -430,10 +528,12 @@
 </script>
 
 {#snippet section(title: string, staged: boolean, items: SectionItem[], rows: ReturnType<typeof buildTree>)}
+  {@const secSelCount = selection.staged === staged ? selection.paths.size : 0}
   <div class="gp-section" data-testid={staged ? "git-staged" : "git-unstaged"}>
     <div class="gp-sec-head">
       <span class="gp-sec-title">{title}</span>
       {#if items.length}<span class="gp-count">{items.length}</span>{/if}
+      {#if secSelCount > 1}<span class="gp-sel-count" data-testid={staged ? "git-staged-sel-count" : "git-unstaged-sel-count"}>{secSelCount} selected</span>{/if}
       <span class="gp-grow"></span>
       <button
         class="gp-btn"
@@ -465,22 +565,34 @@
           </button>
         {:else if row.item}
           {@const b = badgeFor(row.item.letter)}
-          {@const sel = selected?.path === row.item.path && selected.staged === staged}
+          {@const sel = selection.staged === staged && selection.paths.has(row.item.path)}
+          {@const activeRow = selection.staged === staged && selection.primary === row.item.path}
           <button
             class="gp-row gp-file"
             class:sel
+            class:active={activeRow}
             data-testid="git-file"
             data-path={row.item.path}
+            aria-selected={sel}
             style="padding-left: {22 + row.depth * 14}px"
             title={row.item.origPath ? `${row.item.origPath} → ${row.item.path}` : row.item.path}
             onclick={(e) => {
               (e.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
-              select(row.item!, staged);
+              applySelection(
+                clickTreeFile(selection, rows, staged, row.item!.path, {
+                  shift: e.shiftKey,
+                  toggle: e.metaKey || e.ctrlKey
+                })
+              );
             }}
-            ondblclick={() => (staged ? unstageItems([row.item!]) : stageItems([row.item!]))}
+            ondblclick={(e) => {
+              if (e.shiftKey || e.metaKey || e.ctrlKey) return;
+              if (staged) unstageItems([row.item!]);
+              else stageItems([row.item!]);
+            }}
             oncontextmenu={(e) => {
               (e.currentTarget as HTMLButtonElement).focus({ preventScroll: true });
-              select(row.item!, staged);
+              applySelection(contextMenuSelection(selection, staged, row.item!.path));
               openMenu(e, staged, row.item!, null);
             }}
           >
@@ -535,13 +647,37 @@
       onkeydown={onDividerKey}
     ></div>
     <div class="gp-diff" data-testid="git-diff">
-      {#if !selected || !selItem}
+      {#if selectedItems.length > 1}
+        <div class="gp-diff-head">
+          <span class="gp-diff-name" data-testid="git-multi-count">{selectedItems.length} files selected</span>
+          <span class="gp-grow"></span>
+          {#if selection.staged}
+            <button class="gp-btn" data-testid="git-file-unstage" disabled={busy} onclick={() => unstageItems(selectedItems)}>Unstage ({selectedItems.length})</button>
+          {:else}
+            <button class="gp-btn" data-testid="git-file-stage" disabled={busy} onclick={() => stageItems(selectedItems)}>Stage ({selectedItems.length})</button>
+            <button class="gp-btn ghost" data-testid="git-file-discard" disabled={busy || !hasDiscardableSelection} onclick={() => discardItems(selectedItems)}>Discard…</button>
+          {/if}
+        </div>
+        <div class="gp-multi-list" data-testid="git-multi-list">
+          {#each selectedItems as it (it.path)}
+            {@const b = badgeFor(it.letter)}
+            <button
+              class="gp-multi-row"
+              title={it.path}
+              onclick={() => applySelection(singleSelection(selection.staged, it.path))}
+            >
+              <span class="gp-badge {b.tone}" aria-label="status {it.letter}">{b.text}</span>
+              <span class="gp-multi-path">{it.path}</span>
+            </button>
+          {/each}
+        </div>
+      {:else if !selItem}
         <div class="gp-msg">Select a file to see its changes.</div>
       {:else}
         <div class="gp-diff-head">
           <span class="gp-diff-name" title={selItem.path}>{selItem.path.split("/").pop()}</span>
           <span class="gp-grow"></span>
-          {#if selected.staged}
+          {#if selection.staged}
             <button class="gp-btn" data-testid="git-file-unstage" disabled={busy} onclick={() => unstageItems([selItem])}>Unstage</button>
           {:else}
             <button class="gp-btn" data-testid="git-file-stage" disabled={busy} onclick={() => stageItems([selItem])}>Stage</button>
@@ -566,7 +702,7 @@
               <div class="gp-hunk-head" data-testid="git-hunk">
                 <span class="gp-hunk-label">@@ -{h.oldStart},{h.oldCount} +{h.newStart},{h.newCount} @@ {h.section}</span>
                 <span class="gp-hunk-btns">
-                  {#if selected.staged}
+                  {#if selection.staged}
                     <button class="gp-btn sm" data-testid="git-hunk-unstage" disabled={busy} onclick={() => applyHunk(hi, "unstage")}>{picked ? "Unstage lines" : "Unstage hunk"}</button>
                   {:else}
                     <button class="gp-btn sm" data-testid="git-hunk-stage" disabled={busy} onclick={() => applyHunk(hi, "stage")}>{picked ? "Stage lines" : "Stage hunk"}</button>
@@ -601,21 +737,56 @@
     </div>
   {/if}
 
+  {#if toast}
+    <div class="gp-toast" data-testid="git-toast" role="status">{toast}</div>
+  {/if}
+
   {#if menu}
+    {@const count = menuTargetItems.length}
+    {@const singleCopy = menuCopyPaths.length === 1 ? menuCopyPaths[0] : null}
     <button class="gp-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => (menu = null)} oncontextmenu={(e) => { e.preventDefault(); menu = null; }}></button>
     <div class="gp-menu" style="left: {menu.x}px; top: {menu.y}px" data-testid="git-menu">
       {#if menu.staged}
-        <button class="gp-mi" onclick={() => menuAct("unstage")}>Unstage</button>
+        <button class="gp-mi" data-testid="git-menu-unstage" disabled={busy || !count} onclick={() => menuAct("unstage")}>
+          {count > 1 ? `Unstage ${count} files` : "Unstage"}
+        </button>
       {:else}
-        <button class="gp-mi" onclick={() => menuAct("stage")}>Stage</button>
-        <button class="gp-mi danger" onclick={() => menuAct("discard")}>Discard changes…</button>
+        <button class="gp-mi" data-testid="git-menu-stage" disabled={busy || !count} onclick={() => menuAct("stage")}>
+          {count > 1 ? `Stage ${count} files` : "Stage"}
+        </button>
+        <button class="gp-mi danger" data-testid="git-menu-discard" disabled={busy || !menuDiscardable} onclick={() => menuAct("discard")}>
+          {count > 1 ? `Discard ${count} files…` : "Discard changes…"}
+        </button>
       {/if}
-      {#if menu.item && menu.item.letter !== "D"}
+      {#if menuCopyPaths.length}
         <div class="gp-sep"></div>
-        <button class="gp-mi" onclick={() => menuAct("open")}>Open in editor</button>
+        <button
+          class="gp-mi"
+          data-testid="git-menu-copy-name"
+          title={singleCopy ? gitFileName(singleCopy) : undefined}
+          onclick={() => menuAct("copyName")}
+        >{menu.dir ? "Copy folder name" : menuMulti ? "Copy file names" : "Copy file name"}</button>
+        <button
+          class="gp-mi"
+          data-testid="git-menu-copy-path"
+          title={singleCopy ?? undefined}
+          onclick={() => menuAct("copyPath")}
+        >{menu.dir ? "Copy folder path" : menuMulti ? "Copy file paths" : "Copy file path"}</button>
+        <button
+          class="gp-mi"
+          data-testid="git-menu-copy-full-path"
+          title={singleCopy ? gitFullPath(root, singleCopy) : undefined}
+          onclick={() => menuAct("copyFullPath")}
+        >{menuMulti ? "Copy full paths" : "Copy full path"}</button>
       {/if}
-      {#if onreveal && !(menu.item && menu.item.letter === "D")}
-        <button class="gp-mi" onclick={() => menuAct("reveal")}>Reveal in Finder</button>
+      {#if !menuMulti && ((menu.item && menu.item.letter !== "D") || (onreveal && !(menu.item && menu.item.letter === "D")))}
+        <div class="gp-sep"></div>
+      {/if}
+      {#if !menuMulti && menu.item && menu.item.letter !== "D"}
+        <button class="gp-mi" data-testid="git-menu-open" onclick={() => menuAct("open")}>Open in editor</button>
+      {/if}
+      {#if !menuMulti && onreveal && !(menu.item && menu.item.letter === "D")}
+        <button class="gp-mi" data-testid="git-menu-reveal" onclick={() => menuAct("reveal")}>Reveal in Finder</button>
       {/if}
     </div>
   {/if}
@@ -655,12 +826,13 @@
   .gp-err span { flex: 1; }
   .gp-x { border: none; background: transparent; color: inherit; cursor: pointer; font-size: 15px; line-height: 1; }
 
-  .gp-top { display: flex; flex-direction: column; min-height: 0; flex-shrink: 0; }
+  .gp-top { display: flex; flex-direction: column; min-height: 0; flex-shrink: 0; -webkit-user-select: none; user-select: none; }
   .gp-section { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
   .gp-section + .gp-section { border-top: 1px solid var(--border); }
   .gp-sec-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; }
   .gp-sec-title { font-weight: 600; font-size: 12.5px; }
   .gp-count { font-size: 11px; color: var(--muted); background: var(--chip); border-radius: 999px; padding: 0 6px; }
+  .gp-sel-count { font-size: 11px; font-weight: 500; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 999px; padding: 0 6px; white-space: nowrap; }
   .gp-tree { flex: 1; min-height: 0; overflow: auto; padding-bottom: 4px; }
   .gp-empty-row { padding: 4px 12px; color: var(--faint); font-size: 12px; }
   .gp-row {
@@ -668,7 +840,10 @@
     font: inherit; font-size: 12.5px; text-align: left; padding-top: 3px; padding-bottom: 3px; padding-right: 8px; cursor: pointer; border-radius: 6px;
   }
   .gp-row:hover { background: var(--hover); }
+  .gp-row:focus:not(:focus-visible) { outline: none; }
+  .gp-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .gp-row.sel { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .gp-row.sel:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); }
   .gp-chev { width: 10px; color: var(--muted); font-size: 10px; flex-shrink: 0; }
   .gp-folder { color: #d9822b; flex-shrink: 0; }
   .gp-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -698,6 +873,13 @@
   .gp-diff { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .gp-diff-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--border); }
   .gp-diff-name { font-weight: 600; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gp-multi-list { flex: 1; min-height: 0; overflow: auto; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+  .gp-multi-row {
+    display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: transparent; color: var(--text);
+    font: inherit; font-size: 12px; text-align: left; padding: 4px 6px; border-radius: 6px; cursor: pointer;
+  }
+  .gp-multi-row:hover { background: var(--hover); }
+  .gp-multi-path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .gp-code {
     flex: 1; min-height: 0; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12px; line-height: 1.5; -webkit-user-select: text; user-select: text;
@@ -733,13 +915,21 @@
   .gp-text :global(.hljs-attr), .gp-text :global(.hljs-attribute), .gp-text :global(.hljs-variable), .gp-text :global(.hljs-template-variable) { color: var(--code-attr); }
   .gp-text :global(.hljs-name), .gp-text :global(.hljs-selector-id), .gp-text :global(.hljs-selector-class) { color: var(--code-builtin); }
 
+  .gp-toast {
+    position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 8;
+    background: var(--card); border: 1px solid var(--border-2); border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); padding: 7px 11px; font-size: 12px; color: var(--text);
+    pointer-events: none; text-align: center;
+  }
+
   .gp-backdrop { position: fixed; inset: 0; z-index: 40; border: 0; background: transparent; cursor: default; }
   .gp-menu {
     position: fixed; z-index: 41; min-width: 170px; padding: 5px; background: var(--card); border: 1px solid var(--border-2);
     border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
   }
   .gp-mi { display: block; width: 100%; text-align: left; border: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
-  .gp-mi:hover { background: var(--hover); }
+  .gp-mi:hover:not(:disabled) { background: var(--hover); }
+  .gp-mi:disabled { opacity: 0.45; cursor: default; }
   .gp-mi.danger { color: var(--danger, #cf222e); }
   .gp-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 
