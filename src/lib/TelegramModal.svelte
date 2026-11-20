@@ -6,6 +6,17 @@
   import { onMount, onDestroy } from "svelte";
   import { invokeOrBridge } from "$lib/bridge";
 
+  let copied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  async function copyCode(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+      clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => (copied = false), 1500);
+    } catch {}
+  }
+
   interface Status {
     configured: boolean;
     enabled: boolean;
@@ -148,7 +159,10 @@
     {:else}
       <div class="tg-box" data-testid="telegram-pairing">
         <div>Send this to <a href={"https://t.me/" + st.botUsername + "?start=" + st.pairCode} target="_blank" rel="noreferrer">@{st.botUsername}</a> from your phone:</div>
-        <div class="tg-code" data-testid="telegram-code">/start {st.pairCode}</div>
+        <div class="tg-code-row">
+          <div class="tg-code" data-testid="telegram-code">/start {st.pairCode}</div>
+          <button class="tg-btn small" data-testid="telegram-code-copy" onclick={() => copyCode("/start " + st!.pairCode)}>{copied ? "Copied" : "Copy"}</button>
+        </div>
         <div class="tg-muted small">Only the account that sends the code can use the bot. Waiting…</div>
       </div>
     {/if}
@@ -219,6 +233,7 @@
   .tg-input { flex: 1; min-width: 0; border: 1px solid var(--border-2); border-radius: 10px; padding: 8px 10px; font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; background: transparent; color: var(--text); }
   .tg-input:focus { outline: none; border-color: var(--accent); }
   .tg-box { border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px; line-height: 1.5; }
+  .tg-code-row { display: flex; align-items: center; gap: 10px; }
   .tg-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 20px; letter-spacing: 1px; user-select: text; }
   .tg-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .tg-dot.on { background: #3fb950; }
