@@ -678,6 +678,7 @@ async fn dispatch(
         "telegram_status" | "telegram_save" | "telegram_set" | "telegram_unpair" | "telegram_remove" => {
             telegram::action(st, cmd, args).await
         }
+        "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
         // session + message actions (server/actions.rs)
         "session_create" | "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
@@ -1404,6 +1405,9 @@ pub const API_ACTIONS: &[&str] = &[
     "work_validate_root",
     "work_write_file",
     "api_actions",
+    "whisper_install",
+    "whisper_status",
+    "whisper_uninstall",
 ];
 
 /// A bound (not yet serving) server.

@@ -26,7 +26,7 @@ required-features = ["desktop"]
 # excluded (via `src/ipc.rs`), so Linux builds need no GTK/WebKit headers or
 # system OpenSSL and compile statically against musl for x86_64 and aarch64.
 [features]
-default = ["desktop"]
+default = ["desktop", "whisper"]
 desktop = [
     "dep:tauri",
     "tauri/default",
@@ -45,11 +45,18 @@ desktop = [
 ]
 # server builds: Rust-native TLS, so no system OpenSSL is needed either
 rustls = ["reqwest/rustls-tls"]
+# optional on-device voice transcription (Telegram voice memos), pure Rust
+whisper = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:ogg", "dep:opus-decoder"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+ogg = { version = "0.9", optional = true }
+opus-decoder = { version = "0.1", optional = true }
 tauri = { version = "2", default-features = false, features = [], optional = true }
 tauri-plugin-deep-link = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
