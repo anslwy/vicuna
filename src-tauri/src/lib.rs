@@ -49,6 +49,7 @@ pub mod server_store;
 pub mod servers;
 pub mod server;
 pub mod whisper;
+pub mod plugins;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
