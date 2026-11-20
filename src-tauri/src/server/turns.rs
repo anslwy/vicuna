@@ -487,7 +487,7 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
     }
     if action == "list" {
         let chats = crate::server_store::load_chats(db).await?;
-        let rows: Vec<String> = chats.as_array().into_iter().flatten().filter(|c| c["mode"] == "work").take(40).map(|c| {
+        let rows: Vec<String> = chats.as_array().into_iter().flatten().filter(|c| c["mode"] == "work" && extra_obj(c)["archived"] != true).take(40).map(|c| {
             let id = c["id"].as_str().unwrap_or("");
             format!("- {id} · \"{}\" · {} · {}", c["title"].as_str().unwrap_or(""), if live_turn(st,id).is_some() {"running"} else {"idle"}, c["workspace"].as_str().unwrap_or(""))
         }).collect();
