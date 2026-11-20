@@ -4238,6 +4238,9 @@
     return () => clearInterval(t);
   });
 
+  /** Make/Replace lead prompt (explainer + optional Telegram setup). */
+  let leadPrompt = $state<{ id: string; prevTitle: string | null } | null>(null);
+
   async function toggleLead(id: string) {
     let c = chats.find((x) => x.id === id);
     ctxMenu = null;
@@ -9529,7 +9532,19 @@
           <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
           <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
           {#if (ctxChat?.mode ?? "chat") === "work"}
-            <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>{ctxChat?.role === "lead" ? "Remove lead" : "Make lead"}</button>
+            {#if ctxChat?.role === "lead"}
+              <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>Remove lead</button>
+            {:else}
+              {@const hasLead = chats.some((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)}
+              <button
+                class="ctx-item ctx-telegram"
+                data-testid="lead-item"
+                onclick={() => { leadPrompt = { id: ctxMenu!.chatId, prevTitle: chats.find((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)?.title ?? null }; ctxMenu = null; }}
+              >
+                <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
+                <span class="ctx-tg-label">{hasLead ? "Replace lead" : "Make lead"}</span>
+              </button>
+            {/if}
             {#if ctxChat?.role === "lead"}
               <button
                 class="ctx-item ctx-telegram"
@@ -11330,6 +11345,14 @@
     pickError={folderPickError}
     onPick={onFolderPicked}
     onClose={() => (folderPicker = null)}
+  />
+{/if}
+{#if leadPrompt}
+  {@const lp = leadPrompt}
+  <TelegramModal
+    leadTitle={chats.find((c) => c.id === lp.id)?.title ?? ""}
+    lead={{ prevTitle: lp.prevTitle, onConfirm: () => { leadPrompt = null; void toggleLead(lp.id).then(refreshTelegramStatus); } }}
+    onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
   />
 {/if}
 {#if telegramFor}
