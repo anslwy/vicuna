@@ -740,25 +740,21 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
     // voice memos: transcribe on the server (if a Whisper model is installed),
     // show the transcript on the phone first, then send it to the lead as text
     if let Some(v) = msg.get("voice") {
-        let fid = v.get("file_id").and_then(Value::as_str).unwrap_or("");
+        let fid = v.get("file_id").and_then(Value::as_str).unwrap_or("").to_string();
         if crate::whisper::installed_model().is_some() {
-            let _ = call(&token, "sendChatAction", json!({"chat_id": chat, "action": "typing"})).await;
-            let res = match download_file(&token, fid, MAX_FILE).await {
-                Ok(b) => crate::whisper::transcribe_ogg(b).await,
-                Err(e) => Err(e),
-            };
-            match res {
-                Ok(Some(tx)) if !tx.trim().is_empty() => {
-                    send_text(&token, chat, &format!("🎙 {}", tx.trim()), None).await;
-                    text_out = if text_out.is_empty() { tx.trim().to_string() } else { format!("{text_out}\n\n{}", tx.trim()) };
+            let outcome = voice_to_text(&token, chat, &fid, |bytes, tx| async move {
+                crate::whisper::transcribe_ogg_partial(bytes, move |p| {
+                    let _ = tx.send(p.to_string());
+                })
+                .await
+            })
+            .await;
+            match outcome {
+                VoiceOutcome::Text(tx) => {
+                    text_out = if text_out.is_empty() { tx } else { format!("{text_out}\n\n{tx}") };
                 }
-                Ok(_) => {
-                    send_text(&token, chat, "🎙 (no speech recognized)", None).await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    send_text(&token, chat, &format!("⚠️ Couldn't transcribe the voice memo: {e}. Sending the audio file instead."), None).await;
-                }
+                VoiceOutcome::Empty => return Ok(()),
+                VoiceOutcome::Failed => {} // the audio file goes to the lead below
             }
             if !text_out.is_empty() && text_out != t {
                 // transcript ready: a waiting free-form question takes it as the answer
@@ -769,6 +765,8 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
                     return Ok(());
                 }
             }
+        } else {
+            send_text(&token, chat, "🎙 Got your voice memo. No transcription model is installed on the server, so it goes to the lead as an audio file.", None).await;
         }
     }
     let transcribed = text_out != t;
@@ -965,6 +963,93 @@ async fn set_lead(st: &Arc<BridgeState>, lead: &str, engine: &str, model: &str) 
     turns::cli_session(st, "update", &json!({"id": lead, "engine": engine, "model": model})).await?;
     let note = if live_turn(st, lead).is_some() { " (from the next turn; one is running now)" } else { "" };
     Ok(format!("✅ Lead now runs {engine}/{model}{note}."))
+}
+
+/// Minimum gap between edits of the voice placeholder (Telegram rate limits).
+const PARTIAL_EDIT_EVERY: Duration = Duration::from_millis(1500);
+
+#[derive(Debug, PartialEq)]
+pub enum VoiceOutcome {
+    Text(String),
+    /// no speech: nothing goes to the lead
+    Empty,
+    /// download/transcription failed: send the audio file instead
+    Failed,
+}
+
+/// Acknowledge a voice memo at once, keep "typing…" going while it is
+/// transcribed, stream partial text into the placeholder, then edit it into
+/// the transcript (or a clear error). `transcribe` gets the audio bytes and
+/// a sender for partial text.
+pub async fn voice_to_text<F, Fut>(token: &str, chat: i64, file_id: &str, transcribe: F) -> VoiceOutcome
+where
+    F: FnOnce(Vec<u8>, tokio::sync::mpsc::UnboundedSender<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    let placeholder = send_text(token, chat, "🎙 Got it, transcribing…", None).await;
+    let show = |text: String| async move {
+        match placeholder {
+            Some(m) => edit_text(token, chat, m, &text).await,
+            None => {
+                send_text(token, chat, &text, None).await;
+            }
+        }
+    };
+    let typing = {
+        let (token, stop) = (token.to_string(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let s2 = stop.clone();
+        tokio::spawn(async move {
+            // a chat action lasts ~5 s: refresh it until the transcript is in
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = call(&token, "sendChatAction", json!({"chat_id": chat, "action": "typing"})).await;
+                for _ in 0..8 {
+                    if s2.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        });
+        stop
+    };
+    let res = match download_file(token, file_id, MAX_FILE).await {
+        Err(e) => Err(e),
+        Ok(bytes) => {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let fut = transcribe(bytes, tx);
+            tokio::pin!(fut);
+            let mut last = std::time::Instant::now();
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    r = &mut fut => break r,
+                    p = rx.recv(), if open => match p {
+                        Some(p) if placeholder.is_some() && last.elapsed() >= PARTIAL_EDIT_EVERY && !p.trim().is_empty() => {
+                            edit_text(token, chat, placeholder.unwrap_or_default(), &format!("🎙 {}…", p.trim())).await;
+                            last = std::time::Instant::now();
+                        }
+                        Some(_) => {}
+                        None => open = false,
+                    },
+                }
+            }
+        }
+    };
+    typing.store(true, std::sync::atomic::Ordering::Relaxed);
+    match res {
+        Ok(Some(tx)) if !tx.trim().is_empty() => {
+            show(format!("🎙 {}", tx.trim())).await;
+            VoiceOutcome::Text(tx.trim().to_string())
+        }
+        Ok(_) => {
+            show("🎙 No speech recognized in that voice memo.".into()).await;
+            VoiceOutcome::Empty
+        }
+        Err(e) => {
+            show(format!("⚠️ Couldn't transcribe the voice memo ({e}). Sending the audio file to the lead instead.")).await;
+            VoiceOutcome::Failed
+        }
+    }
 }
 
 /// Telegram's getFile serves files up to 20 MB to bots.
@@ -1214,6 +1299,77 @@ mod tests {
         let b = a.replace("1db06ccf", "fbf7a937");
         let t = fold_tool_runs(&format!("Archiving.\n▸ {}\n\n▸ {}\nDone.", tool_line(a), tool_line(&b)));
         assert_eq!(t, "Archiving.\n▸ manage_sessions ×2: archive · 1db06ccf, fbf7a937\nDone.");
+    }
+
+    #[test]
+    fn voice_placeholder_is_edited_into_the_transcript() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // fake Bot API: records "path body" and answers every call the same way
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let log2 = log.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut c, _) = l.accept().await.unwrap();
+                    let log = log2.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        loop {
+                            let n = c.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 { break; }
+                            buf.extend_from_slice(&tmp[..n]);
+                            let s = String::from_utf8_lossy(&buf).to_string();
+                            if let Some(h) = s.find("\r\n\r\n") {
+                                let len = s[..h].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                                if buf.len() >= h + 4 + len { break; }
+                            }
+                        }
+                        let s = String::from_utf8_lossy(&buf).to_string();
+                        let path = s.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let body = s.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                        let method = path.rsplit('/').next().unwrap_or("").to_string();
+                        log.lock().unwrap().push(format!("{method} {body}"));
+                        let resp = r#"{"ok":true,"result":{"message_id":42,"file_path":"voice/f.oga"}}"#;
+                        let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}", resp.len()).as_bytes()).await;
+                    });
+                }
+            });
+            unsafe { std::env::set_var("VICUNA_TELEGRAM_API", format!("http://127.0.0.1:{port}")) };
+
+            // success with one streamed partial
+            let out = voice_to_text("1:tok", 7, "F", |_bytes, tx| async move {
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+                let _ = tx.send("hello".into());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(Some(" hello world ".into()))
+            }).await;
+            assert_eq!(out, VoiceOutcome::Text("hello world".into()));
+            let calls = std::mem::take(&mut *log.lock().unwrap());
+            assert!(calls[0].starts_with("sendMessage") && calls[0].contains("transcribing"), "{calls:?}");
+            let edits: Vec<&String> = calls.iter().filter(|c| c.starts_with("editMessageText")).collect();
+            assert_eq!(edits.len(), 2, "{calls:?}");
+            assert!(edits[0].contains("🎙 hello…") && edits[0].contains("\"message_id\":42"), "{calls:?}");
+            assert!(edits[1].contains("🎙 hello world\""), "{calls:?}");
+            assert!(calls.iter().any(|c| c.starts_with("sendChatAction") && c.contains("typing")), "{calls:?}");
+            assert!(calls.iter().any(|c| c.starts_with("getFile")), "{calls:?}");
+            assert_eq!(calls.iter().filter(|c| c.starts_with("sendMessage")).count(), 1, "transcript edits the placeholder, no new message");
+
+            // failure: the placeholder becomes a clear error
+            let out = voice_to_text("1:tok", 7, "F", |_b, _tx| async move { Err("model broke".to_string()) }).await;
+            assert_eq!(out, VoiceOutcome::Failed);
+            let calls = std::mem::take(&mut *log.lock().unwrap());
+            let last = calls.iter().rev().find(|c| c.starts_with("editMessageText")).expect("edited");
+            assert!(last.contains("Couldn't transcribe") && last.contains("model broke"), "{calls:?}");
+
+            // no speech
+            let out = voice_to_text("1:tok", 7, "F", |_b, _tx| async move { Ok(Some("  ".into())) }).await;
+            assert_eq!(out, VoiceOutcome::Empty);
+            unsafe { std::env::remove_var("VICUNA_TELEGRAM_API") };
+        });
     }
 
     #[test]
