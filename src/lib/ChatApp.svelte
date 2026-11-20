@@ -56,6 +56,7 @@
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
+  import { telegramConnLabel, telegramConnState, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { hideSplash } from "$lib/splash";
   import {
     APP_UPDATE_RELEASES_URL,
@@ -3562,6 +3563,9 @@
       x: Math.min(e.clientX, window.innerWidth - 280),
       y: Math.min(e.clientY, window.innerHeight - 160)
     };
+    if (chats.find((x) => x.id === id)?.role === "lead") {
+      void refreshTelegramStatus();
+    }
   }
 
   /** Folder pill inside the session menu ("Continue in Work" row): change
@@ -4147,20 +4151,20 @@
   /** the lead may manage other sessions; making one the lead also pins it */
   // Telegram bridge dialog (lead session menu); the session it was opened for
   let telegramFor = $state<string | null>(null);
-  // the bridge is on, polling and paired: the lead row shows a Telegram icon
-  let telegramLive = $state(false);
-  async function refreshTelegramLive() {
+  // connection status for the dot next to the Telegram icon in the lead menu
+  let telegramState = $state<TelegramConnState>("unconfigured");
+  async function refreshTelegramStatus() {
     try {
-      const s = await invokeOrBridge<{ enabled: boolean; polling: boolean; paired: unknown }>("telegram_status", {});
-      telegramLive = !!(s?.enabled && s.polling && s.paired);
+      const s = await invokeOrBridge<TelegramStatusSnapshot>("telegram_status", {});
+      telegramState = telegramConnState(s);
     } catch {
-      telegramLive = false; // older server without the bridge
+      telegramState = "unconfigured"; // older server without the bridge
     }
   }
   $effect(() => {
     if (!ready) return;
-    void refreshTelegramLive();
-    const t = setInterval(refreshTelegramLive, 15000);
+    void refreshTelegramStatus();
+    const t = setInterval(refreshTelegramStatus, 15000);
     return () => clearInterval(t);
   });
 
@@ -9334,16 +9338,6 @@
                     <span class="work-badge" title="Work session">Work</span>
                   {/if}
                 {/if}
-                {#if c.role === "lead" && telegramLive}<span
-                    class="work-badge tg-badge"
-                    data-testid="telegram-badge"
-                    role="button"
-                    tabindex="0"
-                    title="Telegram bridge connected — click to manage"
-                    aria-label="Telegram bridge settings"
-                    onclick={(e) => { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; }}
-                    onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); e.preventDefault(); telegramFor = c.id; } }}
-                  ><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>{/if}
               {/if}
             </button>
           {/each}
@@ -9466,7 +9460,16 @@
           {#if (ctxChat?.mode ?? "chat") === "work"}
             <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>{ctxChat?.role === "lead" ? "Remove lead" : "Make lead"}</button>
             {#if ctxChat?.role === "lead"}
-              <button class="ctx-item" data-testid="telegram-item" onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}>Telegram…</button>
+              <button
+                class="ctx-item ctx-telegram"
+                data-testid="telegram-item"
+                title={telegramConnLabel(telegramState)}
+                onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}
+              >
+                <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
+                <span class="ctx-tg-label">Telegram</span>
+                <span class="ctx-tg-dot {telegramState}" data-testid="telegram-status-dot" data-status={telegramState} aria-label={telegramConnLabel(telegramState)}></span>
+              </button>
             {/if}
           {/if}
           <div class="ctx-continue-row">
@@ -11259,7 +11262,7 @@
   />
 {/if}
 {#if telegramFor}
-  <TelegramModal leadTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""} onClose={() => { telegramFor = null; void refreshTelegramLive(); }} />
+  <TelegramModal leadTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""} onClose={() => { telegramFor = null; void refreshTelegramStatus(); }} />
 {/if}
 {#if srvDialogOpen}
   <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
@@ -12325,13 +12328,17 @@
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
   .chat-item .work-badge.lead-badge { margin-right: auto; }
-  .work-badge.tg-badge { display: inline-flex; align-items: center; align-self: center; padding: 3px 7px; background: #2aabee; color: #fff; cursor: pointer; line-height: 0; }
-  .work-badge.tg-badge:hover { filter: brightness(1.08); }
-  .work-badge.tg-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
+  .ctx-item.ctx-telegram { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
+  .ctx-tg-label { flex: 1; min-width: 0; }
+  .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }
+  .ctx-tg-dot { flex: none; margin-left: auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+  .ctx-tg-dot.connected { background: #22c55e; }
+  .ctx-tg-dot.disconnected { background: #ef4444; }
+  .ctx-tg-dot.unconfigured { background: transparent; border: 1.5px solid var(--muted-2); }
   .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
   .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
   .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
