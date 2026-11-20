@@ -193,6 +193,22 @@ fn work_channel(
                 return Ok(());
             }
         }
+        if kind == "schedulecontrol" && st.db.is_some() {
+            if let Some(sid) = session_id.clone() {
+                let (st, turn) = (st.clone(), turn.clone());
+                tokio::spawn(async move {
+                    let req = v.get("req_id").and_then(Value::as_str).unwrap_or("");
+                    let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+                    let lead = v.get("lead").and_then(Value::as_bool).unwrap_or(false);
+                    let reply = match schedule_control(&st, &sid, lead, action, &v["args"]).await {
+                        Ok(text) => json!({"ok": true, "text": text}),
+                        Err(error) => json!({"ok": false, "error": error}),
+                    };
+                    let _ = agent_answer(&turn, req, reply.to_string());
+                });
+                return Ok(());
+            }
+        }
         // Server-owned session management must keep worker chains moving
         // even with every window asleep. Deletion retains the user card.
         if kind == "sessioncontrol" && st.db.is_some() && v.get("action").and_then(Value::as_str) != Some("delete") {
@@ -931,20 +947,208 @@ pub async fn schedule_tick(st: &Arc<BridgeState>) {
     };
     for it in due {
         let id = item_id(&it).to_string();
+        // claim it first: an item cancelled (or moved) since the scan above
+        // must never fire, and a claimed id can't be re-added by a window
+        let Some(it) = schedule_claim(st, &id).await else { continue };
         match deliver_scheduled(st, &it).await {
-            Ok(()) => {
-                let _ = schedule_remove(st, vec![id]).await;
-            }
+            Ok(()) => {}
             Err(e) => {
+                // put it back, flagged, so the user sees why it didn't go
                 let _g = st.sched_lock.lock().await;
-                let (mut list, done) = sched_load(db).await;
-                if let Some(x) = list.iter_mut().find(|x| item_id(x) == id) {
-                    x["missed"] = json!(true);
-                    x["error"] = json!(e);
-                }
+                let (mut list, mut done) = sched_load(db).await;
+                done.retain(|d| d != &id);
+                let mut x = it.clone();
+                x["missed"] = json!(true);
+                x["error"] = json!(e);
+                list.push(x);
                 let _ = sched_save(db, &list, &done).await;
             }
         }
+    }
+}
+
+/// Take a due item off the list (and mark it done) iff it is still there and
+/// still due; None when it was cancelled, rescheduled or already taken.
+async fn schedule_claim(st: &BridgeState, id: &str) -> Option<Value> {
+    let db = st.db.as_ref()?;
+    let _g = st.sched_lock.lock().await;
+    let (mut list, mut done) = sched_load(db).await;
+    let pos = list.iter().position(|x| item_id(x) == id)?;
+    let it = &list[pos];
+    if it.get("missed").and_then(Value::as_bool) == Some(true) || !it.get("at").and_then(Value::as_i64).is_some_and(|a| a <= now_ms()) {
+        return None;
+    }
+    let it = list.remove(pos);
+    done.push(id.to_string());
+    sched_save(db, &list, &done).await.ok()?;
+    Some(it)
+}
+
+const WAKE_PREFIX: &str = "Scheduled wake-up (you asked Vicuna to wake you now): ";
+
+fn sched_kind(it: &Value) -> &'static str {
+    match it.get("kind").and_then(Value::as_str) {
+        Some("wakeup") => "wakeup",
+        Some(_) => "send",
+        None if it.get("text").and_then(Value::as_str).is_some_and(|t| t.starts_with(WAKE_PREFIX)) => "wakeup",
+        None => "send",
+    }
+}
+
+fn sched_preview(it: &Value) -> String {
+    let t = it.get("text").and_then(Value::as_str).unwrap_or("");
+    let t = t.strip_prefix(WAKE_PREFIX).unwrap_or(t).replace('\n', " ");
+    if t.chars().count() > 120 { format!("{}…", t.chars().take(120).collect::<String>()) } else { t }
+}
+
+fn sched_owner(it: &Value) -> &str {
+    it.get("chatId").and_then(Value::as_str).unwrap_or("")
+}
+
+/// vicuna-mcp `manage_schedule`. Any session manages items aimed at itself;
+/// only a lead (`lead`, from the calling turn) touches other sessions' items
+/// or new-session items (no `chatId`).
+pub async fn schedule_control(st: &BridgeState, caller: &str, lead: bool, action: &str, args: &Value) -> Result<String, String> {
+    let db = st.db.as_ref().ok_or("no server db")?;
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    let lead_only = "only the user's lead session can manage other sessions' scheduled items";
+    let may = |owner: &str| lead || owner == caller;
+    let now = now_ms();
+    let offset = st.tz_offset_min.load(Ordering::Relaxed);
+    let resolve = || -> Result<Option<i64>, String> {
+        let at = args.get("at").and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+        let mins = args.get("in_minutes").and_then(Value::as_f64);
+        if at.is_none() && mins.is_none() {
+            return Ok(None);
+        }
+        if at.is_some() && mins.is_some() {
+            return Err("give either `in_minutes` or `at`, not both".into());
+        }
+        if let Some(m) = mins {
+            if !(m.is_finite() && (1.0..=43200.0).contains(&m)) {
+                return Err("`in_minutes` must be between 1 and 43200 (30 days)".into());
+            }
+        }
+        let t = persist::resolve_wake_time(at, mins, now, offset)?;
+        if t <= now {
+            return Err("that time is in the past".into());
+        }
+        Ok(Some(t))
+    };
+    let find = |list: &[Value], id: &str| -> Result<Value, String> {
+        if id.is_empty() {
+            return Err("give the item's `id` (see `list`)".into());
+        }
+        let hits: Vec<&Value> = list.iter().filter(|x| item_id(x).starts_with(id)).collect();
+        match hits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(format!("no scheduled item {id} (it may have been sent or cancelled already)")),
+            _ => Err(format!("id {id} is ambiguous; give more characters")),
+        }
+    };
+    match action {
+        "list" => {
+            let (list, _) = sched_load(db).await;
+            let all = args.get("all").and_then(Value::as_bool) == Some(true);
+            let target = arg("session_id");
+            let target = if target.is_empty() { caller.to_string() } else { target };
+            if (all || target != caller) && !lead {
+                return Err(lead_only.into());
+            }
+            let include_missed = args.get("include_past").and_then(Value::as_bool) == Some(true);
+            let mut rows: Vec<&Value> = list
+                .iter()
+                .filter(|it| all || sched_owner(it) == target)
+                .filter(|it| include_missed || it.get("missed").and_then(Value::as_bool) != Some(true))
+                .collect();
+            rows.sort_by_key(|it| it.get("at").and_then(Value::as_i64).unwrap_or(0));
+            if rows.is_empty() {
+                return Ok(if all { "No scheduled items.".into() } else { format!("No scheduled items for session {target}.") });
+            }
+            let mut out = format!("{} scheduled item(s):", rows.len());
+            for it in rows {
+                let at = it.get("at").and_then(Value::as_i64).unwrap_or(0);
+                let owner = sched_owner(it);
+                let title = it.get("title").and_then(Value::as_str).unwrap_or("");
+                let by = it.get("createdBy").and_then(Value::as_str).unwrap_or(if sched_kind(it) == "wakeup" { owner } else { "user" });
+                let by = if by == caller { "you" } else { by };
+                let tgt = if owner.is_empty() { "a new session".to_string() } else { format!("{owner} \"{title}\"") };
+                let state = match (it.get("missed").and_then(Value::as_bool), it.get("error").and_then(Value::as_str)) {
+                    (Some(true), Some(e)) => format!(" [not sent: {e}]"),
+                    (Some(true), None) => " [missed]".into(),
+                    _ => String::new(),
+                };
+                out.push_str(&format!(
+                    "\n- id {} · {} · {} · to {} · created by {}{}\n  {}",
+                    item_id(it), sched_kind(it), persist::describe_when(at, now, offset), tgt, by, state, sched_preview(it)
+                ));
+            }
+            Ok(out)
+        }
+        "cancel" => {
+            let (list, _) = sched_load(db).await;
+            let it = find(&list, &arg("id"))?;
+            if !may(sched_owner(&it)) {
+                return Err(lead_only.into());
+            }
+            schedule_remove(st, vec![item_id(&it).to_string()]).await?;
+            Ok(format!("Cancelled scheduled item {} ({}). It will not be sent.", item_id(&it), sched_preview(&it)))
+        }
+        "update" => {
+            let (list, _) = sched_load(db).await;
+            let mut it = find(&list, &arg("id"))?;
+            if !may(sched_owner(&it)) {
+                return Err(lead_only.into());
+            }
+            let at = resolve()?;
+            let msg = arg("message");
+            if at.is_none() && msg.is_empty() {
+                return Err("give a new time (`in_minutes` or `at`) and/or a new `message`".into());
+            }
+            if let Some(t) = at {
+                it["at"] = json!(t);
+                if let Some(o) = it.as_object_mut() {
+                    o.remove("missed");
+                    o.remove("error");
+                }
+            }
+            if !msg.is_empty() {
+                it["text"] = json!(if sched_kind(&it) == "wakeup" { persist::wake_message(&msg) } else { msg });
+            }
+            let id = item_id(&it).to_string();
+            let saved = schedule_put(st, vec![it.clone()]).await?;
+            if !saved.as_array().is_some_and(|l| l.iter().any(|x| item_id(x) == id)) {
+                return Err("it was sent or cancelled meanwhile".into());
+            }
+            let when = it.get("at").and_then(Value::as_i64).unwrap_or(0);
+            Ok(format!("Updated scheduled item {id}: {} · {}", persist::describe_when(when, now, offset), sched_preview(&it)))
+        }
+        "create" => {
+            let msg = arg("message");
+            if msg.is_empty() {
+                return Err("`message` is required".into());
+            }
+            let at = resolve()?.ok_or("give `in_minutes` (relative) or `at` (local time)")?;
+            let target = arg("session_id");
+            let target = if target.is_empty() { caller.to_string() } else { target };
+            if !may(&target) {
+                return Err(lead_only.into());
+            }
+            let chat = crate::server_store::load_chat(db, &target).await?.ok_or(format!("no session {target}"))?;
+            if chat.get("mode").and_then(Value::as_str) != Some("work") {
+                return Err("scheduled items can only target Work sessions".into());
+            }
+            let s = |k: &str| chat.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let id = uuid();
+            let item = json!({
+                "id": id, "chatId": target, "title": s("title"), "workspace": s("workspace"),
+                "text": persist::wake_message(&msg), "at": at, "createdAt": now,
+                "kind": "wakeup", "createdBy": caller,
+            });
+            schedule_put(st, vec![item]).await?;
+            Ok(format!("Scheduled item {id} for session {target}: {}. The server delivers it even with no app window open.", persist::describe_when(at, now, offset)))
+        }
+        other => Err(format!("unknown action {other}; use list, create, update or cancel")),
     }
 }
 
@@ -1018,9 +1222,12 @@ async fn handle_wakeup(st: &Arc<BridgeState>, turn: &Arc<TurnState>, chat_id: &s
                 "text": persist::wake_message(ev.get("message").and_then(Value::as_str).unwrap_or("")),
                 "at": at,
                 "createdAt": now,
+                "kind": "wakeup",
+                "createdBy": chat_id,
             });
+            let id = item["id"].clone();
             match schedule_put(st, vec![item]).await {
-                Ok(_) => json!({ "ok": true, "when": persist::describe_when(at, now, offset), "server": true }),
+                Ok(_) => json!({ "ok": true, "id": id, "when": persist::describe_when(at, now, offset), "server": true }),
                 Err(e) => json!({ "ok": false, "error": e }),
             }
         }
@@ -1042,6 +1249,74 @@ pub fn spawn_scheduler(st: Arc<BridgeState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn sched_state() -> Arc<BridgeState> {
+        let dir = std::env::temp_dir().join(format!("vicuna-sched-{}", uuid()));
+        let db = crate::server_store::open(&dir.join("test.db")).await.unwrap();
+        for id in ["me", "other"] {
+            crate::server_store::create_chat(&db, &json!({"id": id, "title": id, "createdAt": 1, "mode": "work", "workspace": "/tmp", "messages": []})).await.unwrap();
+        }
+        Arc::new(BridgeState { db: Some(db), ..Default::default() })
+    }
+
+    fn new_id(text: &str) -> String {
+        text.split("item ").nth(1).unwrap().split(' ').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn manage_schedule_list_update_cancel_own_item_without_a_window() {
+        let st = sched_state().await;
+        let made = schedule_control(&st, "me", false, "create", &json!({"message": "upgrade", "in_minutes": 30})).await.unwrap();
+        let id = new_id(&made);
+        let list = schedule_control(&st, "me", false, "list", &json!({})).await.unwrap();
+        assert!(list.contains(&id) && list.contains("wakeup") && list.contains("upgrade") && list.contains("created by you"), "{list}");
+        let before = schedule_list(&st).await.unwrap()[0]["at"].as_i64().unwrap();
+        schedule_control(&st, "me", false, "update", &json!({"id": &id[..8], "in_minutes": 90, "message": "later"})).await.unwrap();
+        let it = schedule_list(&st).await.unwrap()[0].clone();
+        assert!(it["at"].as_i64().unwrap() > before + 50 * 60_000);
+        assert_eq!(it["text"], persist::wake_message("later"));
+        schedule_control(&st, "me", false, "cancel", &json!({"id": id})).await.unwrap();
+        assert_eq!(schedule_list(&st).await.unwrap(), json!([]));
+        // a window with a stale list can't bring it back
+        schedule_put(&st, vec![it]).await.unwrap();
+        assert_eq!(schedule_list(&st).await.unwrap(), json!([]));
+    }
+
+    #[tokio::test]
+    async fn manage_schedule_other_sessions_need_the_lead() {
+        let st = sched_state().await;
+        let made = schedule_control(&st, "other", false, "create", &json!({"message": "x", "in_minutes": 5})).await.unwrap();
+        let id = new_id(&made);
+        for (action, args) in [
+            ("cancel", json!({"id": id})),
+            ("update", json!({"id": id, "in_minutes": 9})),
+            ("list", json!({"session_id": "other"})),
+            ("list", json!({"all": true})),
+            ("create", json!({"session_id": "other", "message": "y", "in_minutes": 5})),
+        ] {
+            let e = schedule_control(&st, "me", false, action, &args).await.unwrap_err();
+            assert!(e.contains("lead"), "{action}: {e}");
+        }
+        assert!(schedule_control(&st, "me", false, "list", &json!({})).await.unwrap().contains("No scheduled"));
+        assert!(schedule_control(&st, "me", true, "list", &json!({"all": true})).await.unwrap().contains(&id));
+        schedule_control(&st, "me", true, "cancel", &json!({"id": id})).await.unwrap();
+        assert_eq!(schedule_list(&st).await.unwrap(), json!([]));
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_moved_item_is_never_claimed() {
+        let st = sched_state().await;
+        let due = json!({"id": "a", "chatId": "me", "text": "t", "at": now_ms() - 1});
+        schedule_put(&st, vec![due.clone()]).await.unwrap();
+        schedule_control(&st, "me", false, "cancel", &json!({"id": "a"})).await.unwrap();
+        assert!(schedule_claim(&st, "a").await.is_none());
+        // rescheduled into the future after the tick's scan: not claimed either
+        schedule_put(&st, vec![json!({"id": "b", "chatId": "me", "text": "t", "at": now_ms() + 600_000})]).await.unwrap();
+        assert!(schedule_claim(&st, "b").await.is_none());
+        schedule_put(&st, vec![json!({"id": "c", "chatId": "me", "text": "t", "at": now_ms() - 1})]).await.unwrap();
+        assert!(schedule_claim(&st, "c").await.is_some());
+        assert!(schedule_claim(&st, "c").await.is_none());
+    }
 
     async fn recording() -> (Arc<BridgeState>, Arc<Mutex<RecState>>, Arc<TurnState>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vicuna-recording-{}", uuid()));

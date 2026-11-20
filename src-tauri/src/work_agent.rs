@@ -52,6 +52,10 @@ pub enum WorkAgentEvent {
     /// vicuna-mcp `manage_sessions` (lead sessions only): the window owns the
     /// sessions, so it performs `action` and answers `req_id` with
     /// `{ok, text}` or `{ok:false, error}`.
+    /// vicuna-mcp `manage_schedule`: list/create/update/cancel Scheduled
+    /// items. `lead` = the calling turn may touch other sessions' items.
+    #[serde(rename = "schedulecontrol")]
+    ScheduleControl { req_id: String, action: String, args: serde_json::Value, lead: bool },
     #[serde(rename = "sessioncontrol")]
     SessionControl { req_id: String, action: String, args: serde_json::Value },
     Done { stopped: bool },
