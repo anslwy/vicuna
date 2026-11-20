@@ -44,8 +44,10 @@ pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
 pub const SCHEDULE_TOOL: &str = "schedule_wakeup";
 /// Lead sessions create/start/stop/remove other sessions (refused elsewhere).
 pub const MANAGE_SESSIONS_TOOL: &str = "manage_sessions";
+pub const OVERVIEW_TOOL: &str = "session_overview";
+pub const SEARCH_TOOL: &str = "search_sessions";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 7;
+pub const TOOL_COUNT: usize = 9;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -55,6 +57,8 @@ pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
 pub const CLAUDE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__schedule_wakeup";
 pub const CLAUDE_MANAGE_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_sessions";
+pub const CLAUDE_OVERVIEW_TOOL_ID: &str = "mcp__vicuna-mcp__session_overview";
+pub const CLAUDE_SEARCH_TOOL_ID: &str = "mcp__vicuna-mcp__search_sessions";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -82,7 +86,7 @@ const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the 
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
 using a built-in question tool; it waits for the answer and returns it. Run commands with your own shell tool \
-(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated), \
+(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
 custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedule_wakeup` to have Vicuna send you a \
@@ -282,6 +286,31 @@ fn target_for(registry: &SharedRegistry, token: &str) -> Option<Option<Target>> 
     r.tokens.values().any(|t| t == token).then_some(None)
 }
 
+/// Running / asking state of every session with a live turn on this process.
+fn live_sessions() -> crate::session_insight::LiveMap {
+    match SERVER.get() {
+        Some(Ok(srv)) => live_from(&srv.registry),
+        _ => Default::default(),
+    }
+}
+
+fn live_from(registry: &SharedRegistry) -> crate::session_insight::LiveMap {
+    let mut m = crate::session_insight::LiveMap::new();
+    let Ok(r) = registry.lock() else { return m };
+    for t in r.targets.values().flatten() {
+        let Some(sid) = t.session_id.clone() else { continue };
+        if t.turn.done.load(Ordering::Relaxed) {
+            continue;
+        }
+        let asking = t.turn.ask_pending.lock().map(|p| p.keys().any(|k| k.starts_with("ask-") || k.starts_with("perm-"))).unwrap_or(false)
+            || t.turn.ask_parked.lock().map(|p| !p.is_empty()).unwrap_or(false);
+        let e = m.entry(sid).or_default();
+        e.running = true;
+        e.asking |= asking;
+    }
+    m
+}
+
 /// Optional argument on every session-scoped vicuna-mcp tool: the Vicuna
 /// session the calling agent belongs to (it is in the workspace rules).
 pub(crate) const CALLER_ARG: &str = "caller_session_id";
@@ -382,11 +411,17 @@ fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
         "title": "Manage worker sessions (lead only; set_workspace on your own session works anywhere)",
-        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine, model, plus the installed engines), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` tags archived sessions `[archived]`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
+        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace"] },
+                "include_archived": { "type": "boolean", "description": "list: include archived sessions, tagged [archived] (default false)." },
+                "status": { "type": "string", "enum": ["running", "idle", "any"], "description": "list: only running or idle sessions." },
+                "sort": { "type": "string", "enum": ["recent", "created", "title"], "description": "list: order (default recent = last activity, newest first)." },
+                "since": { "type": "string", "description": "list: only sessions active since then: `2h`, `3d`, `2026-11-19 14:30` (local) or epoch ms." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "list: max rows (default 20)." },
+                "offset": { "type": "integer", "minimum": 0, "description": "list: rows to skip." },
                 "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status/set_workspace; set_workspace defaults to your own)." },
                 "title": { "type": "string", "description": "create: sidebar title for the worker." },
                 "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's). set_workspace: the new folder (required)." },
@@ -418,6 +453,20 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     }
     if turn.stop.load(Ordering::Relaxed) {
         return text_result("The user stopped the turn; nothing was done.", true);
+    }
+    if action == "list" {
+        // read-only: straight from the database, no window needed
+        let pool = match db_pool().await {
+            Ok(p) => p,
+            Err(e) => return text_result(&e, true),
+        };
+        return match crate::session_insight::list(&pool, args, &live_sessions()).await {
+            Ok(v) => {
+                let engines: Vec<&str> = crate::work_engine::Engine::ALL.iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
+                text_result(&format!("{}\nInstalled harnesses: {}", crate::session_insight::list_text(&v), engines.join(", ")), false)
+            }
+            Err(e) => text_result(&e, true),
+        };
     }
     let req_id = format!("sess-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = oneshot::channel::<String>();
@@ -472,7 +521,7 @@ fn read_session_schema() -> Value {
     json!({
         "name": READ_SESSION_TOOL,
         "title": "Read Vicuna session history (paginated)",
-        "description": "Read messages from a Vicuna session stored in vicuna.db. Useful when the workspace or harness/engine changed mid-conversation, when earlier messages were truncated from the prompt, or when inspecting another session. Paginated with `offset` and `limit` (or `tail: true` for the latest page).",
+        "description": "Read messages from a Vicuna session stored in vicuna.db. Useful when the workspace or harness/engine changed mid-conversation, when earlier messages were truncated from the prompt, or when inspecting another session. Paginated with `offset` and `limit` (or `tail: true` for the latest page; with `tail`, long messages keep their END, which is cheap even for 150 KB replies). Each message reports its full `chars`. `plain: true` returns readable text without tool-card HTML.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -481,7 +530,8 @@ fn read_session_schema() -> Value {
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of messages to return (default 20, max 100)." },
                 "tail": { "type": "boolean", "description": "When true and `offset` is omitted, return the last `limit` messages (default false)." },
                 "max_chars_per_message": { "type": "integer", "minimum": 0, "maximum": 50000, "description": "Truncate each message's content to this many characters (default 8000; 0 = no truncation)." },
-                "include_thinking": { "type": "boolean", "description": "Include model thinking/reasoning text for assistant messages (default false)." }
+                "include_thinking": { "type": "boolean", "description": "Include model thinking/reasoning text for assistant messages (default false)." },
+                "plain": { "type": "boolean", "description": "Plain text: tool-result cards collapse to one `▸ tool: args` line each, no HTML (default false)." }
             }
         }
     })
@@ -491,14 +541,55 @@ fn list_sessions_schema() -> Value {
     json!({
         "name": LIST_SESSIONS_TOOL,
         "title": "List Vicuna sessions",
-        "description": "List recent Vicuna chat/work sessions from vicuna.db with pagination and optional search filter.",
+        "description": "List Vicuna sessions straight from vicuna.db (works with no app window open). Each row: full session id, title, status (running/idle), waiting_on_question (an ask_user/permission card is up), mode, engine/model, workspace, last_activity (server local time), archived, lead, lead_id (the lead that runs this worker), message_count. Archived sessions are hidden unless `include_archived: true` (`hidden_archived` counts them). Use `session_overview` for what sessions are doing and `search_sessions` to find one by content.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Optional case-insensitive substring filter matched against session title or workspace." },
+                "query": { "type": "string", "description": "Case-insensitive substring of title or workspace, or an id prefix." },
+                "status": { "type": "string", "enum": ["running", "idle", "any"], "description": "Only running or idle sessions (default any)." },
+                "mode": { "type": "string", "enum": ["work", "chat"], "description": "Only Work or Chat sessions (default both)." },
+                "include_archived": { "type": "boolean", "description": "Include archived sessions (default false)." },
+                "sort": { "type": "string", "enum": ["recent", "created", "title"], "description": "recent = last activity, newest first (default)." },
+                "since": { "type": "string", "description": "Only sessions active since: `30m`, `2h`, `3d`, `1w`, a local `2026-11-19 14:30`, ISO 8601, or epoch ms." },
                 "offset": { "type": "integer", "minimum": 0, "description": "0-based offset (default 0)." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum number of sessions to return (default 20, max 50)." }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum rows (default 20)." }
             }
+        }
+    })
+}
+
+fn overview_schema() -> Value {
+    json!({
+        "name": OVERVIEW_TOOL,
+        "title": "What are the Vicuna sessions doing?",
+        "description": "One-call overview of the most recently active Work sessions (read from vicuna.db, no app window needed): for each, the list_sessions row (status, waiting_on_question, engine/model, workspace, last activity, lead_id) plus the first user request, the latest user message, and the tail of the latest assistant reply as plain text (tool calls collapsed to `▸ tool: args` lines). Use it to answer \"what is everyone doing?\"; then `read_session` for details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "How many sessions (default 5)." },
+                "status": { "type": "string", "enum": ["running", "idle", "any"], "description": "Only running or idle sessions." },
+                "mode": { "type": "string", "enum": ["work", "chat", "any"], "description": "Default work." },
+                "include_archived": { "type": "boolean", "description": "Include archived sessions (default false)." },
+                "since": { "type": "string", "description": "Only sessions active since (`2h`, `1d`, a local date/time)." },
+                "reply_chars": { "type": "integer", "minimum": 100, "maximum": 8000, "description": "Characters of each reply tail (default 800)." }
+            }
+        }
+    })
+}
+
+fn search_schema() -> Value {
+    json!({
+        "name": SEARCH_TOOL,
+        "title": "Search Vicuna sessions",
+        "description": "Full-text search over session titles and message text in vicuna.db (no app window needed). Returns session id, title, a plain-text snippet around the match, last activity (local time), status and workspace, newest first. Archived sessions are skipped unless `include_archived: true`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Text to find (case-insensitive substring)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 10)." },
+                "include_archived": { "type": "boolean", "description": "Include archived sessions (default false)." }
+            },
+            "required": ["query"]
         }
     })
 }
@@ -890,12 +981,22 @@ async fn read_session_from_pool(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let rows = sqlx::query(
-        "SELECT idx, role, content, thinking, model FROM messages WHERE chat_id = $1 ORDER BY idx ASC LIMIT $2 OFFSET $3",
-    )
+    let plain = args.get("plain").and_then(Value::as_bool).unwrap_or(false);
+    // Only a window of each message leaves sqlite: plain text shrinks cards,
+    // so it reads more than it returns. 0 = no truncation = whole message.
+    let window: i64 = if max_chars == 0 { -1 } else if plain { (max_chars as i64 * 8).max(20_000) } else { max_chars as i64 + 1 };
+    let content_sql = match (window < 0, tail) {
+        (true, _) => "content",
+        (false, true) => "substr(content, -$4)",
+        (false, false) => "substr(content, 1, $4)",
+    };
+    let rows = sqlx::query(&format!(
+        "SELECT idx, role, {content_sql} AS content, length(content) AS chars, thinking, model FROM messages WHERE chat_id = $1 ORDER BY idx ASC LIMIT $2 OFFSET $3",
+    ))
     .bind(session_id)
     .bind(limit)
     .bind(offset)
+    .bind(window)
     .fetch_all(pool)
     .await
     .map_err(|e| format!("read_session query failed: {e}"))?;
@@ -906,11 +1007,21 @@ async fn read_session_from_pool(
         let role: String = r.try_get("role").unwrap_or_default();
         let raw_content: String = r.try_get("content").unwrap_or_default();
         let model: Option<String> = r.try_get("model").ok().flatten();
-        let (content, truncated) = truncate_chars(&raw_content, max_chars);
+        let chars: i64 = r.try_get("chars").unwrap_or(0);
+        let windowed = window >= 0 && chars > window;
+        let text = if plain && role == "assistant" { crate::session_insight::plain_text(&raw_content) } else { raw_content };
+        let (content, truncated) = if tail && max_chars > 0 {
+            let n = text.chars().count();
+            if n > max_chars { (format!("…{}", text.chars().skip(n - max_chars).collect::<String>()), true) } else { (text, windowed) }
+        } else {
+            let (c, t) = truncate_chars(&text, max_chars);
+            (c, t || windowed)
+        };
         let mut msg = json!({
             "idx": idx,
             "role": role,
             "model": model,
+            "chars": chars,
             "content": content,
             "truncated": truncated,
         });
@@ -946,14 +1057,14 @@ async fn read_session_from_pool(
     }))
 }
 
-async fn read_session(target: &Target, args: &Value) -> Value {
+async fn read_session(target: Option<&Target>, args: &Value) -> Value {
     let requested = args
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| target.session_id.clone());
+        .or_else(|| target.and_then(|t| t.session_id.clone()));
     let Some(session_id) = requested else {
         return text_result("No `session_id` provided and current turn has no session_id.", true);
     };
@@ -968,91 +1079,7 @@ async fn read_session(target: &Target, args: &Value) -> Value {
 }
 
 async fn list_sessions_from_pool(pool: &sqlx::SqlitePool, args: &Value) -> Result<Value, String> {
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_i64)
-        .unwrap_or(20)
-        .clamp(1, 50);
-    let offset = args
-        .get("offset")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0);
-    let query_str = args
-        .get("query")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("%{}%", s.to_lowercase()));
-
-    let total: i64 = if let Some(ref pat) = query_str {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chats WHERE LOWER(title) LIKE $1 OR LOWER(COALESCE(workspace, '')) LIKE $1",
-        )
-        .bind(pat)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("list_sessions count failed: {e}"))?
-    } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM chats")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("list_sessions count failed: {e}"))?
-    };
-
-    let rows = if let Some(ref pat) = query_str {
-        sqlx::query(
-            "SELECT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at, \
-             (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
-             FROM chats c \
-             WHERE LOWER(c.title) LIKE $1 OR LOWER(COALESCE(c.workspace, '')) LIKE $1 \
-             ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $2 OFFSET $3",
-        )
-        .bind(pat)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("list_sessions query failed: {e}"))?
-    } else {
-        sqlx::query(
-            "SELECT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at, \
-             (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
-             FROM chats c \
-             ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $1 OFFSET $2",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("list_sessions query failed: {e}"))?
-    };
-
-    let mut sessions = Vec::with_capacity(rows.len());
-    for r in rows {
-        sessions.push(json!({
-            "id": r.try_get::<String, _>("id").unwrap_or_default(),
-            "title": r.try_get::<String, _>("title").unwrap_or_default(),
-            "mode": r.try_get::<Option<String>, _>("mode").ok().flatten(),
-            "workspace": r.try_get::<Option<String>, _>("workspace").ok().flatten(),
-            "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
-            "updated_at": r.try_get::<Option<i64>, _>("updated_at").ok().flatten(),
-            "message_count": r.try_get::<i64, _>("message_count").unwrap_or(0),
-        }));
-    }
-
-    let returned = sessions.len() as i64;
-    let next_offset = offset + returned;
-    let has_more = next_offset < total;
-
-    Ok(json!({
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "has_more": has_more,
-        "next_offset": if has_more { json!(next_offset) } else { Value::Null },
-        "sessions": sessions,
-    }))
+    crate::session_insight::list(pool, args, &live_sessions()).await
 }
 
 async fn list_sessions(args: &Value) -> Value {
@@ -1061,6 +1088,28 @@ async fn list_sessions(args: &Value) -> Value {
         Err(e) => return text_result(&e, true),
     };
     match list_sessions_from_pool(&pool, args).await {
+        Ok(v) => text_result(&v.to_string(), false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
+async fn session_overview(args: &Value) -> Value {
+    let pool = match db_pool().await {
+        Ok(p) => p,
+        Err(e) => return text_result(&e, true),
+    };
+    match crate::session_insight::overview(&pool, args, &live_sessions()).await {
+        Ok(v) => text_result(&serde_json::to_string_pretty(&v).unwrap_or_default(), false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
+async fn search_sessions(args: &Value) -> Value {
+    let pool = match db_pool().await {
+        Ok(p) => p,
+        Err(e) => return text_result(&e, true),
+    };
+    match crate::session_insight::search(&pool, args, &live_sessions()).await {
         Ok(v) => text_result(&v.to_string(), false),
         Err(e) => text_result(&e, true),
     }
@@ -1574,7 +1623,9 @@ async fn handle_rpc(
             with_caller_arg(tool_schema()),
             with_caller_arg(get_session_schema()),
             with_caller_arg(read_session_schema()),
-            list_sessions_schema(),
+            with_caller_arg(list_sessions_schema()),
+            with_caller_arg(overview_schema()),
+            with_caller_arg(search_schema()),
             manage_mcp_schema(),
             with_caller_arg(schedule_schema()),
             with_caller_arg(manage_sessions_schema()),
@@ -1585,13 +1636,15 @@ async fn handle_rpc(
             match (target, name) {
                 (Some(t), TOOL_NAME) => ask(t, &args, client_gone).await,
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
-                (Some(t), READ_SESSION_TOOL) => read_session(t, &args).await,
+                (t, READ_SESSION_TOOL) => read_session(t, &args).await,
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
+                (_, OVERVIEW_TOOL) => session_overview(&args).await,
+                (_, SEARCH_TOOL) => search_sessions(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
-                (None, GET_SESSION_TOOL | READ_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
@@ -2117,7 +2170,7 @@ mod tests {
         let turn = Arc::new(TurnState::new());
         turn.lead.store(true, Ordering::Relaxed);
         let target = Target { seq: 0, workspace: ws(), session_id: Some("lead".into()), turn: turn.clone(), on_event: ch };
-        let result = manage_sessions(&target, &json!({ "action": "list" }), std::future::pending()).await;
+        let result = manage_sessions(&target, &json!({ "action": "status", "session_id": "w" }), std::future::pending()).await;
         assert!(turn.stop.load(Ordering::Relaxed));
         assert!(turn.ask_pending.lock().unwrap().is_empty());
         assert!(result["content"][0]["text"].as_str().unwrap().contains("not dispatched"));
@@ -2241,7 +2294,7 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL]);
         assert!(!names.contains(&"run"), "the run tool was removed");
         // a stale client calling it gets a protocol error, not a crash
         let (_, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run", "arguments": { "command": "true" } } })).await;
@@ -2393,7 +2446,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_sessions_paginate_cleanly() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL, forked_from TEXT, fork_from_index INTEGER, mode TEXT, workspace TEXT, goal TEXT, updated_at INTEGER)")
+        sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL, forked_from TEXT, fork_from_index INTEGER, mode TEXT, workspace TEXT, goal TEXT, updated_at INTEGER, extra TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -2435,6 +2488,19 @@ mod tests {
         assert_eq!(listed["total"], 1);
         assert_eq!(listed["sessions"][0]["id"], "s1");
         assert_eq!(listed["sessions"][0]["message_count"], 5);
+
+        // a huge reply: tail keeps the end and reads only a window; plain drops card HTML
+        let huge = format!("{}<details class=\"tool-result\"><summary>Bash — ls</summary><pre><code>x</code></pre></details>\n\nFINAL", "a".repeat(150_000));
+        sqlx::query("INSERT INTO messages (chat_id, role, content, thinking, model, idx) VALUES ('s1', 'assistant', $1, '', 'm1', 5)")
+            .bind(&huge)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let t = read_session_from_pool(&pool, "s1", &json!({ "tail": true, "limit": 1, "max_chars_per_message": 40, "plain": true })).await.unwrap();
+        let c = t["messages"][0]["content"].as_str().unwrap();
+        assert!(c.ends_with("▸ Bash: ls\n\nFINAL") && c.starts_with('…') && !c.contains('<'), "{c}");
+        assert_eq!(t["messages"][0]["chars"], huge.chars().count() as i64);
+        assert_eq!(t["messages"][0]["truncated"], true);
     }
 
     #[tokio::test]
