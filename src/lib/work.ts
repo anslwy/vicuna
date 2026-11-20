@@ -489,6 +489,7 @@ export type WorkAgentEvent =
   | { type: "toolend"; name: string; output: string }
   | { type: "askrequest"; ask_id: string; question: string; options: string[]; multi?: boolean }
   | { type: "schedulewakeup"; req_id: string; message: string; at: string | null; in_minutes: number | null }
+  | { type: "schedulecontrol"; req_id: string; action: string; args: unknown; lead: boolean }
   | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "contextcompacted"; note: string }

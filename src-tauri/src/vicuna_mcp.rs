@@ -44,10 +44,12 @@ pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
 pub const SCHEDULE_TOOL: &str = "schedule_wakeup";
 /// Lead sessions create/start/stop/remove other sessions (refused elsewhere).
 pub const MANAGE_SESSIONS_TOOL: &str = "manage_sessions";
+/// List/create/update/cancel Scheduled items (own session; leads: any).
+pub const MANAGE_SCHEDULE_TOOL: &str = "manage_schedule";
 pub const OVERVIEW_TOOL: &str = "session_overview";
 pub const SEARCH_TOOL: &str = "search_sessions";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 9;
+pub const TOOL_COUNT: usize = 10;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -57,6 +59,7 @@ pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
 pub const CLAUDE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__schedule_wakeup";
 pub const CLAUDE_MANAGE_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_sessions";
+pub const CLAUDE_MANAGE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__manage_schedule";
 pub const CLAUDE_OVERVIEW_TOOL_ID: &str = "mcp__vicuna-mcp__session_overview";
 pub const CLAUDE_SEARCH_TOOL_ID: &str = "mcp__vicuna-mcp__search_sessions";
 
@@ -90,7 +93,8 @@ using a built-in question tool; it waits for the answer and returns it. Run comm
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
 custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedule_wakeup` to have Vicuna send you a \
-message in this session later (check back on slow work, follow up at a time the user names). In the user's lead session, \
+message in this session later (check back on slow work, follow up at a time the user names); `manage_schedule` lists, reschedules or cancels scheduled items \
+(your own session's; the lead can manage every session's). In the user's lead session, \
 `manage_sessions` creates, messages, stops and removes worker sessions (each on its own harness/model); a worker's reply \
 reaches the lead as a message when its turn ends.";
 
@@ -405,6 +409,68 @@ fn schedule_schema() -> Value {
             "required": ["message"]
         }
     })
+}
+
+fn manage_schedule_schema() -> Value {
+    json!({
+        "name": MANAGE_SCHEDULE_TOOL,
+        "title": "See, change or cancel scheduled messages",
+        "description": "Manage Vicuna's Scheduled items (wake-ups from `schedule_wakeup` and messages the user scheduled). Any session can manage items aimed at itself; only the user's lead session can manage other sessions' items. Actions: `list` (default: this session's pending items; `session_id` for another session, `all: true` for every session — both lead only; `include_past: true` adds missed/failed ones; each row has id, kind wakeup/send, local fire time, target session + title, who created it and a message preview), `cancel` (`id`: it will not be sent), `update` (`id` plus a new time — `in_minutes` or local `at` — and/or a new `message`), `create` (like schedule_wakeup, but `session_id` may name another session; defaults to yours). Ids may be shortened to a unique prefix. Use it when plans change, e.g. cancel a wake-up whose task the user already did.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "create", "update", "cancel"] },
+                "id": { "type": "string", "description": "cancel/update: the item id from `list` (or a unique prefix)." },
+                "session_id": { "type": "string", "description": "list/create: target session (default: yours; others need the lead)." },
+                "all": { "type": "boolean", "description": "list: every session's items (lead only)." },
+                "include_past": { "type": "boolean", "description": "list: include missed / failed items." },
+                "message": { "type": "string", "description": "create: the message; update: replacement message." },
+                "in_minutes": { "type": "number", "description": "create/update: fire this many minutes from now." },
+                "at": { "type": "string", "description": "create/update: local time `HH:MM` or `YYYY-MM-DD HH:MM` (or ISO 8601 with an offset)." }
+            },
+            "required": ["action"]
+        }
+    })
+}
+
+/// Scheduled items live in the server's store: the server answers this
+/// (no window needed). The lead flag rides along; ownership is checked there.
+async fn manage_schedule(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if !["list", "create", "update", "cancel"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, update, cancel.", true);
+    }
+    if target.session_id.is_none() {
+        return text_result("This turn has no Vicuna session.", true);
+    }
+    let turn = &target.turn;
+    if turn.stop.load(Ordering::Relaxed) {
+        return text_result("The user stopped the turn; nothing was done.", true);
+    }
+    let lead = turn.lead.load(Ordering::Relaxed);
+    let req_id = format!("sched-{}", turn.ask_seq.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = oneshot::channel::<String>();
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.insert(req_id.clone(), tx);
+    }
+    emit_ev(&target.on_event, &turn.stop, WorkAgentEvent::ScheduleControl { req_id: req_id.clone(), action, args: args.clone(), lead });
+    let reply = tokio::select! {
+        a = rx => a.ok(),
+        _ = client_gone => None,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => None,
+    };
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        m.remove(&req_id);
+    }
+    let Some(reply) = reply else {
+        return text_result("No answer from the Vicuna server (scheduled items are managed by `vicuna serve` / the desktop's embedded server). Check `list` before retrying.", true);
+    };
+    let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        text_result(v.get("text").and_then(Value::as_str).unwrap_or("Done."), false)
+    } else {
+        text_result(&format!("Not done: {}", v.get("error").and_then(Value::as_str).unwrap_or("refused")), true)
+    }
 }
 
 fn manage_sessions_schema() -> Value {
@@ -874,6 +940,7 @@ async fn schedule_wakeup(target: &Target, args: &Value, client_gone: impl std::f
     let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
         let when = v.get("when").and_then(Value::as_str).unwrap_or("the requested time");
+        let idnote = v.get("id").and_then(Value::as_str).map(|i| format!(" (id {i}; see/change/cancel it with manage_schedule)")).unwrap_or_default();
         // a headless server stores and delivers it itself (no window needed)
         let delivery = if v.get("server").and_then(Value::as_bool) == Some(true) {
             "The Vicuna server delivers it even when no app window is open"
@@ -881,7 +948,7 @@ async fn schedule_wakeup(target: &Target, args: &Value, client_gone: impl std::f
             "It is delivered while the user's Vicuna app is open"
         };
         text_result(
-            &format!("Scheduled: Vicuna will send your message into this session at {when}. {delivery}, and the user can see or cancel it under Scheduled. End your turn now unless there is other work to do."),
+            &format!("Scheduled: Vicuna will send your message into this session at {when}{idnote}. {delivery}, and the user can see or cancel it under Scheduled. End your turn now unless there is other work to do."),
             false,
         )
     } else {
@@ -1629,6 +1696,7 @@ async fn handle_rpc(
             manage_mcp_schema(),
             with_caller_arg(schedule_schema()),
             with_caller_arg(manage_sessions_schema()),
+            with_caller_arg(manage_schedule_schema()),
         ] }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1639,12 +1707,13 @@ async fn handle_rpc(
                 (t, READ_SESSION_TOOL) => read_session(t, &args).await,
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
+                (Some(t), MANAGE_SCHEDULE_TOOL) => manage_schedule(t, &args, client_gone).await,
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
                 (_, OVERVIEW_TOOL) => session_overview(&args).await,
                 (_, SEARCH_TOOL) => search_sessions(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
-                (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
@@ -2294,7 +2363,7 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
         assert!(!names.contains(&"run"), "the run tool was removed");
         // a stale client calling it gets a protocol error, not a crash
         let (_, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run", "arguments": { "command": "true" } } })).await;
