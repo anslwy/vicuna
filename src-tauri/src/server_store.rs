@@ -395,6 +395,44 @@ pub(crate) async fn write_title_and_extra(db: &Pool, id: &str, chat: &Value) -> 
     Ok(())
 }
 
+/// Demote any session other than `keep_id` that currently holds `role: "lead"`,
+/// bumping each demoted row's `rev` so connected windows sync the change.
+pub(crate) async fn clear_other_leads(db: &Pool, keep_id: &str) -> Result<Vec<String>, String> {
+    let err = |e: sqlx::Error| format!("clear other leads: {e}");
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
+    let rows = sqlx::query("SELECT id, extra FROM chats WHERE id != $1 AND extra LIKE '%\"role\"%'")
+        .bind(keep_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+    let mut demoted = Vec::new();
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let raw: Option<String> = r.try_get("extra").ok().flatten();
+        let Some(mut obj) = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.as_object().cloned())
+        else {
+            continue;
+        };
+        if obj.get("role").and_then(Value::as_str) != Some("lead") {
+            continue;
+        }
+        obj.remove("role");
+        let next = (!obj.is_empty()).then(|| Value::Object(obj).to_string());
+        sqlx::query("UPDATE chats SET extra = $2, rev = COALESCE(rev, 0) + 1 WHERE id = $1")
+            .bind(&id)
+            .bind(next)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        demoted.push(id);
+    }
+    tx.commit().await.map_err(err)?;
+    Ok(demoted)
+}
+
 /// Create a chat the server starts on its own (a scheduled send into a new
 /// session). Same payload shape as a client save row.
 pub async fn create_chat(pool: &SqlitePool, chat: &Value) -> Result<(), String> {
@@ -784,6 +822,42 @@ mod tests {
         assert_eq!(c["messages"][1]["content"], "half way");
         assert_eq!(c["messages"][1]["thinking"], "hmm");
         assert_eq!(c["updatedAt"], 99);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clear_other_leads_demotes_existing_leads_and_bumps_rev() {
+        let dir = std::env::temp_dir().join(format!("vicuna-server-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = open(&dir.join("vicuna.db")).await.unwrap();
+        let mut l1 = row("lead-1", "First lead", &[("user", "hi")]);
+        l1["extra"] = json!(r#"{"role":"lead","pinned":true}"#);
+        let mut l2 = row("lead-2", "Second lead", &[("user", "hi")]);
+        l2["extra"] = json!(r#"{"role":"lead"}"#);
+        let mut target = row("next", "Next lead", &[("user", "hi")]);
+        target["extra"] = json!(r#"{"pinned":true}"#);
+        merge_chats(&pool, parse_rows(&json!([l1, l2, target])).unwrap(), vec![], &Default::default())
+            .await
+            .unwrap();
+
+        let mut demoted = clear_other_leads(&pool, "next").await.unwrap();
+        demoted.sort();
+        assert_eq!(demoted, vec!["lead-1", "lead-2"]);
+
+        let c1 = load_chat(&pool, "lead-1").await.unwrap().unwrap();
+        assert_eq!(c1["rev"], 2);
+        let e1: Value = serde_json::from_str(c1["extra"].as_str().unwrap()).unwrap();
+        assert!(e1.get("role").is_none(), "lead-1 role must be cleared: {e1}");
+        assert_eq!(e1["pinned"], true, "lead-1 keeps pinned flag");
+
+        let c2 = load_chat(&pool, "lead-2").await.unwrap().unwrap();
+        assert_eq!(c2["rev"], 2);
+        assert!(c2["extra"].is_null(), "empty extra becomes NULL: {}", c2["extra"]);
+
+        let ct = load_chat(&pool, "next").await.unwrap().unwrap();
+        assert_eq!(ct["rev"], 1, "kept session is untouched");
+
+        assert!(clear_other_leads(&pool, "next").await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
