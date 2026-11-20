@@ -238,6 +238,11 @@ fn cache() -> &'static Mutex<Cached> {
 /// Transcribe an OGG/Opus voice memo with the installed model.
 /// `Ok(None)` when no model is installed (or the build lacks the feature).
 pub async fn transcribe_ogg(bytes: Vec<u8>) -> Result<Option<String>, String> {
+    transcribe_ogg_partial(bytes, |_| {}).await
+}
+
+/// Same, calling `on_partial` with the text so far after each 30 s window.
+pub async fn transcribe_ogg_partial(bytes: Vec<u8>, on_partial: impl FnMut(&str) + Send + 'static) -> Result<Option<String>, String> {
     #[cfg(feature = "whisper")]
     {
         let Some(id) = installed_model() else { return Ok(None) };
@@ -250,14 +255,15 @@ pub async fn transcribe_ogg(bytes: Vec<u8>) -> Result<Option<String>, String> {
                 *g = Some((id.clone(), engine::Loaded::load(&dir)?));
             }
             let (_, m) = g.as_mut().ok_or("model not loaded")?;
-            m.transcribe(&pcm).map(Some)
+            let mut on_partial = on_partial;
+            m.transcribe(&pcm, &mut on_partial).map(Some)
         })
         .await
         .map_err(|e| e.to_string())?;
     }
     #[cfg(not(feature = "whisper"))]
     {
-        let _ = bytes;
+        let _ = (bytes, on_partial);
         Ok(None)
     }
 }
@@ -372,7 +378,7 @@ mod engine {
             String::from_utf8_lossy(&bytes).trim().to_string()
         }
 
-        pub fn transcribe(&mut self, pcm: &[f32]) -> Result<String, String> {
+        pub fn transcribe(&mut self, pcm: &[f32], on_partial: &mut dyn FnMut(&str)) -> Result<String, String> {
             let e = |e: candle_core::Error| e.to_string();
             let mel = audio::pcm_to_mel(&self.cfg, pcm, &self.filters);
             let n_mels = self.cfg.num_mel_bins;
@@ -430,6 +436,9 @@ mod engine {
                 let seg_text = self.text(&tokens[start..]);
                 if !seg_text.is_empty() {
                     out.push(seg_text);
+                    if seek < content_frames {
+                        on_partial(&out.join(" "));
+                    }
                 }
             }
             Ok(out.join(" "))
