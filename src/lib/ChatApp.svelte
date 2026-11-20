@@ -41,7 +41,7 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
-  import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, type SessionRow } from "$lib/leadSessions";
+  import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, demoteOtherLeads, type SessionRow } from "$lib/leadSessions";
   import { mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
@@ -4145,21 +4145,41 @@
     let c = chats.find((x) => x.id === id);
     ctxMenu = null;
     if (!c) return;
-    const r = await serverAction("session_update", { id, role: c.role === "lead" ? null : "lead" });
+    const makingLead = c.role !== "lead";
+    const prevLeadIds = makingLead ? chats.filter((x) => x.id !== id && x.role === "lead").map((x) => x.id) : [];
+    const r = await serverAction("session_update", { id, role: makingLead ? "lead" : null });
     if (r === null) return;
     if (r) {
       c = r;
+      if (makingLead && prevLeadIds.length > 0) {
+        for (const prevId of prevLeadIds) {
+          const raw = await invokeOrBridge<any>("chats_get", { id: prevId }).catch(() => null);
+          if (raw && typeof raw.id === "string") {
+            const fresh = adoptServerChat(raw);
+            if (serverChatFeeds.has(fresh.id) || workRunningIds.includes(fresh.id)) {
+              const live = chats.find((x) => x.id === fresh.id);
+              if (live) fresh.messages = live.messages;
+            }
+            chats = chats.map((x) => (x.id === fresh.id ? fresh : x));
+          } else {
+            const prev = chats.find((x) => x.id === prevId);
+            if (prev) prev.role = null;
+            chats = [...chats];
+          }
+        }
+      }
     } else {
       if (c.role === "lead") {
         c.role = null;
       } else {
+        demoteOtherLeads(chats, c.id);
         c.role = "lead";
         c.pinned = true;
       }
       chats = [...chats];
       save();
     }
-    flashNotice(c.role === "lead" ? `"${c.title}" is now a lead: from its next turn it can create, message, stop and remove sessions.` : `"${c.title}" is no longer a lead.`);
+    flashNotice(c.role === "lead" ? `"${c.title}" is now the lead: from its next turn it can create, message, stop and remove sessions.` : `"${c.title}" is no longer the lead.`);
   }
 
   /** Choose the sidebar scope. Picking a workspace also makes it where New
@@ -9249,11 +9269,11 @@
           {#each items as c (c.id)}
             {@const live = isSessionStreaming(c.id)}
             <button
-              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''} {c.archived ? 'archived' : ''}"
+              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''} {c.archived ? 'archived' : ''} {c.role === 'lead' ? 'lead-row' : ''}"
               data-testid="chat-item"
               data-archived={c.archived ? "true" : null}
               data-streaming={live ? "true" : null}
-              title={live ? liveTitle(c.id) : undefined}
+              title={live ? liveTitle(c.id) : c.role === "lead" ? c.title : undefined}
               onclick={() => selectChat(c.id)}
               oncontextmenu={(e) => openMenu(e, c.id)}
             >
@@ -9272,12 +9292,14 @@
                 />
               {:else}
                 {#if live}<span class="stream-dot" aria-hidden="true"></span>{/if}
-                <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
+                {#if c.role === "lead"}
+                  <span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>
+                {:else}
+                  <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
+                {/if}
                 {@const liveMs = live ? liveElapsedMs(c.id) : null}
                 {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
                 {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
-                {#if c.role === "lead"}<span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>{/if}
-                {#if c.engine && c.mode === "work"}<span class="work-badge engine-tag" data-testid="session-engine" title={c.workModel ? `${c.engine}/${c.workModel}` : c.engine}>{c.engine}</span>{/if}
                 {#if c.mode === "work"}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
@@ -9305,7 +9327,7 @@
         {/snippet}
         {#if pinnedChats.length > 0}
           <div class="group-label" data-testid="pinned-label">Pinned</div>
-          <div data-testid="pinned-list">{@render chatList(pinnedChats)}</div>
+          <div class="pinned-list" data-testid="pinned-list">{@render chatList(pinnedChats)}</div>
         {/if}
         {#if grouped.today.length > 0}
           <div class="group-label">Today</div>
@@ -12206,22 +12228,24 @@
   .scope-select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 9px; font-size: 12px; font-family: inherit; line-height: 1.5; color: var(--text-dim); cursor: pointer; text-overflow: ellipsis; }
   .scope-select:hover { background: var(--hover-2); }
   .scope-select:focus { outline: none; border-color: var(--accent); }
-  .history { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .history { overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 2px; }
+  .pinned-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .group-label { font-size: 12px; color: var(--muted); margin: 12px 4px 6px 4px; }
-  .chat-item { display: flex; justify-content: space-between; align-items: center; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
+  .chat-item { display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box; min-width: 0; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
   .chat-item:hover { background: var(--hover-3); }
   .chat-item.active { background: var(--active-item); }
-  .chat-item.archived .title { opacity: .55; }
+  .chat-item.archived .title, .chat-item.archived .lead-badge { opacity: .55; }
   .archived-badge { opacity: .75; }
   .archive-toggle { flex: none; display: inline-flex; align-items: center; gap: 3px; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 7px; font-size: 11px; color: var(--muted); cursor: pointer; }
   .archive-toggle:hover { background: var(--hover-2); }
   .archive-toggle.on { color: var(--accent); border-color: var(--accent); }
-  .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .chat-item .work-badge { margin-left: 0; }
   .chat-item.streaming { background: var(--hover-3); }
   .chat-item.streaming.active { background: var(--active-item); }
-  .stream-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; margin-right: 7px; animation: stream-pulse 1.2s ease-in-out infinite; }
+  .stream-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; animation: stream-pulse 1.2s ease-in-out infinite; }
   @keyframes stream-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
-  .live-elapsed { flex-shrink: 0; margin-left: 8px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
+  .live-elapsed { flex-shrink: 0; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
   .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
   .cli-oneliner { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; padding: 6px 8px; border: 1px solid var(--border-2); border-radius: 8px; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
   .srv-pick { position: relative; width: 100%; }
@@ -12260,11 +12284,11 @@
   .srv-cmd-copy { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-2); border-radius: 8px; background: var(--card); color: var(--text-dim); cursor: pointer; }
   .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
-  .lead-badge { background: var(--text); color: var(--bg); }
+  .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
+  .chat-item .work-badge.lead-badge { margin-right: auto; }
   .work-badge.tg-badge { display: inline-flex; align-items: center; align-self: center; padding: 3px 7px; background: #2aabee; color: #fff; cursor: pointer; line-height: 0; }
   .work-badge.tg-badge:hover { filter: brightness(1.08); }
   .work-badge.tg-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .engine-tag { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 600; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
@@ -12746,8 +12770,10 @@
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
-  .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; }
-  .ws-badge span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; min-width: 0; }
+  .chat-item .work-badge.ws-badge { flex-shrink: 1; }
+  .ws-badge svg { flex-shrink: 0; }
+  .ws-badge span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }

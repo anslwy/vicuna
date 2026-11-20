@@ -216,13 +216,19 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                     extra[k] = json!(b);
                 }
             }
+            let mut promoting_lead = false;
+            let mut demoting_self = false;
             if let Some(r) = args.get("role") {
                 if r.as_str() == Some("lead") {
+                    promoting_lead = true;
                     extra["role"] = json!("lead");
-                    // making a session the lead also pins it (the sidebar rule)
+                    // only one session may be the lead; making one the lead also pins it
                     extra["pinned"] = json!(true);
-                } else if let Some(o) = extra.as_object_mut() {
-                    o.remove("role");
+                } else {
+                    demoting_self = extra.get("role").and_then(Value::as_str) == Some("lead");
+                    if let Some(o) = extra.as_object_mut() {
+                        o.remove("role");
+                    }
                 }
             }
             if let Some(workspace) = args.get("workspace") {
@@ -234,6 +240,19 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                     Some(path) => json!(crate::work_validate_root_logic(path.to_owned()).await?),
                     None => Value::Null,
                 };
+            }
+            if promoting_lead {
+                let db = st.db.as_ref().ok_or("this bridge stores no sessions")?;
+                let demoted = crate::server_store::clear_other_leads(db, &id).await?;
+                for old_id in demoted {
+                    if let Some((_, turn)) = live_turn(st, &old_id) {
+                        turn.lead.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            } else if demoting_self {
+                if let Some((_, turn)) = live_turn(st, &id) {
+                    turn.lead.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             chat["extra"] = json!(extra.to_string());
             if live_turn(st, &id).is_some() || super::chat::is_running(st, &id) {
@@ -352,5 +371,36 @@ mod tests {
         assert_eq!(retitle("New session", "hello"), Some("hello".into()));
         assert_eq!(retitle("New Session", &"x".repeat(40)), Some(format!("{}..", "x".repeat(32))));
         assert_eq!(retitle("My chat", "hello"), None);
+    }
+
+    #[tokio::test]
+    async fn session_update_enforces_single_lead() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::server_store::init_schema(&db).await.unwrap();
+        let st = Arc::new(BridgeState { db: Some(db), ..Default::default() });
+        dispatch(&st, "session_create", &json!({"id": "a", "title": "First", "mode": "work"})).await.unwrap();
+        dispatch(&st, "session_create", &json!({"id": "b", "title": "Second", "mode": "work"})).await.unwrap();
+
+        let a1 = dispatch(&st, "session_update", &json!({"id": "a", "role": "lead"})).await.unwrap();
+        assert_eq!(extra_of(&a1)["role"], "lead");
+        assert_eq!(extra_of(&a1)["pinned"], true);
+
+        let b1 = dispatch(&st, "session_update", &json!({"id": "b", "role": "lead"})).await.unwrap();
+        assert_eq!(extra_of(&b1)["role"], "lead");
+        assert_eq!(extra_of(&b1)["pinned"], true);
+
+        let a2 = load(&st, "a").await.unwrap();
+        assert!(extra_of(&a2).get("role").is_none(), "previous lead must be demoted: {}", a2["extra"]);
+        assert_eq!(extra_of(&a2)["pinned"], true, "previous lead keeps its pin");
+        assert!(a2["rev"].as_i64().unwrap() > a1["rev"].as_i64().unwrap(), "demoted lead bumps rev");
+
+        // A failing update must not demote the current lead.
+        assert!(dispatch(&st, "session_update", &json!({"id": "a", "title": "   ", "role": "lead"})).await.is_err());
+        let b2 = load(&st, "b").await.unwrap();
+        assert_eq!(extra_of(&b2)["role"], "lead");
     }
 }

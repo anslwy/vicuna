@@ -1,7 +1,7 @@
 // Lead session helpers + per-session extra fields (run: `npm test`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chatExtraJson, parseChatExtra, parseWorkerDone, sessionListText, tailText, workerDoneMessage } from "../src/lib/leadSessions.ts";
+import { chatExtraJson, demoteOtherLeads, parseChatExtra, parseWorkerDone, sessionListText, tailText, workerDoneMessage } from "../src/lib/leadSessions.ts";
 
 test("worker-done messages round-trip and carry the reply", () => {
   const msg = workerDoneMessage({ id: "abc-1", title: 'Fix "tests"', engine: "codex", model: "gpt-6-luna" }, "All green.", false);
@@ -45,4 +45,19 @@ test("extra column keeps only set fields and survives a round trip", () => {
   assert.deepEqual(parseChatExtra({ archived: "yes" }), {});
   assert.deepEqual(parseChatExtra("not json"), {});
   assert.deepEqual(parseChatExtra({ role: "boss", pinned: "yes" }), {});
+});
+
+test("demoteOtherLeads enforces a single lead session", () => {
+  const chats: Array<{ id: string; role?: "lead" | null; pinned?: boolean }> = [
+    { id: "a", role: "lead", pinned: true },
+    { id: "b", role: null, pinned: false },
+    { id: "c", role: "lead", pinned: true }
+  ];
+  assert.deepEqual(demoteOtherLeads(chats, "b"), ["a", "c"]);
+  assert.equal(chats[0].role, null);
+  assert.equal(chats[0].pinned, true);
+  assert.equal(chats[2].role, null);
+  chats[1].role = "lead";
+  assert.deepEqual(demoteOtherLeads(chats, "b"), []);
+  assert.equal(chats[1].role, "lead");
 });

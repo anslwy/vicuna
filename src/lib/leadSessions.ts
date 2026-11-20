@@ -99,3 +99,16 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (o.archived === true) out.archived = true;
   return out;
 }
+
+/** Enforce a single lead session in memory: clears `role` on every other chat
+ *  currently marked `"lead"` and returns their ids. */
+export function demoteOtherLeads<T extends { id: string; role?: "lead" | null }>(chats: T[], keepId: string): string[] {
+  const demoted: string[] = [];
+  for (const c of chats) {
+    if (c.id !== keepId && c.role === "lead") {
+      c.role = null;
+      demoted.push(c.id);
+    }
+  }
+  return demoted;
+}
