@@ -1,0 +1,86 @@
+// Plugin themes (pure; node-tested in node-tests/pluginTheme.test.ts).
+// The active plugin theme is cached whole in localStorage so it applies
+// before the server answers (and pre-paint in app.html), and survives a
+// server that is temporarily unreachable.
+
+export type PluginAccent = { bg: string; hover?: string | null; fg?: string | null };
+export type PluginThemeDef = { id: string; name: string; base: "light" | "dark"; vars: Record<string, string>; accent?: PluginAccent | null };
+export type InstalledPlugin = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  source: string;
+  installedAt: number;
+  themes: PluginThemeDef[];
+};
+/** What we cache: the theme plus its plugin-qualified key. */
+export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };
+
+export const ACTIVE_THEME_KEY = "vicuna-plugin-theme";
+
+export const themeKey = (pluginId: string, themeId: string) => `${pluginId}/${themeId}`;
+
+/** Same rules as the server's `valid_color`/`valid_var` (defense in depth:
+ *  the cache is local and could be edited by hand). */
+export function safeColor(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const s = v.trim();
+  return /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s) || /^(rgb|rgba|hsl|hsla)\([0-9 .,%/deg]+\)$/i.test(s);
+}
+export const safeVar = (n: string) => /^--[a-z0-9-]{1,62}$/i.test(n);
+
+/** Every theme across installed plugins, as cacheable entries. */
+export function allThemes(plugins: InstalledPlugin[]): ActivePluginTheme[] {
+  return plugins.flatMap((p) => p.themes.map((t) => ({ ...t, key: themeKey(p.id, t.id), pluginName: p.name })));
+}
+
+/** The CSS properties a theme sets (accent included), unsafe entries dropped. */
+export function themeProperties(t: PluginThemeDef, withAccent = true): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(t.vars ?? {})) if (safeVar(k) && safeColor(v)) out[k] = v.trim();
+  const a = withAccent ? t.accent : null;
+  if (a && safeColor(a.bg)) {
+    out["--accent"] = a.bg;
+    out["--accent-hover"] = safeColor(a.hover) ? a.hover : a.bg;
+    out["--accent-fg"] = safeColor(a.fg) ? a.fg : "#ffffff";
+  }
+  return out;
+}
+
+/** After a list refresh: the fresh copy of the active theme, or null when
+ *  its plugin (or the theme) is gone. */
+export function reconcileActive(active: ActivePluginTheme | null, plugins: InstalledPlugin[]): ActivePluginTheme | null {
+  if (!active) return null;
+  return allThemes(plugins).find((t) => t.key === active.key) ?? null;
+}
+
+export function readActiveTheme(storage: Pick<Storage, "getItem"> | undefined): ActivePluginTheme | null {
+  try {
+    const v = JSON.parse(storage?.getItem(ACTIVE_THEME_KEY) ?? "null");
+    if (v && typeof v.key === "string" && (v.base === "light" || v.base === "dark") && v.vars && typeof v.vars === "object") return v;
+  } catch {}
+  return null;
+}
+
+export function writeActiveTheme(storage: Pick<Storage, "setItem" | "removeItem"> | undefined, t: ActivePluginTheme | null) {
+  try {
+    if (t) storage?.setItem(ACTIVE_THEME_KEY, JSON.stringify(t));
+    else storage?.removeItem(ACTIVE_THEME_KEY);
+  } catch {}
+}
+
+/** The theme's own accent, when it brings a usable one. */
+export function themeAccent(t: PluginThemeDef | null): { bg: string; hover: string; fg: string } | null {
+  const a = t?.accent;
+  if (!a || !safeColor(a.bg)) return null;
+  return { bg: a.bg, hover: safeColor(a.hover) ? a.hover : a.bg, fg: safeColor(a.fg) ? a.fg : "#ffffff" };
+}
+
+/** Which accent swatch is selected: the theme's own ("theme") unless the
+ *  user picked a built-in swatch while this theme was active (muted). */
+export function selectedAccent(t: PluginThemeDef | null, muted: boolean, builtin: string): string {
+  return themeAccent(t) && !muted ? "theme" : builtin;
+}
+
+export const ACCENT_MUTED_KEY = "vicuna-plugin-accent-muted";

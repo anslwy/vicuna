@@ -31,6 +31,14 @@
       try {
         var p = JSON.parse(localStorage.getItem("vicuna-prefs") || localStorage.getItem("ollama-min-prefs") || "{}");
         if (p.theme === "dark") document.documentElement.dataset.theme = "dark";
+        // active plugin theme (src/lib/pluginTheme.ts), same color-only rules
+        var t = JSON.parse(localStorage.getItem("vicuna-plugin-theme") || "null");
+        if (t && (t.base === "light" || t.base === "dark")) {
+          var r = document.documentElement, c = /^(#[0-9a-f]{3,8}|(rgb|rgba|hsl|hsla)\([0-9 .,%/deg]+\))$/i;
+          r.dataset.theme = t.base;
+          for (var k in t.vars || {}) if (/^--[a-z0-9-]{1,62}$/i.test(k) && c.test(String(t.vars[k]).trim())) r.style.setProperty(k, String(t.vars[k]).trim());
+          if (t.vars && c.test(String(t.vars["--bg"]).trim())) document.write("<style>#vicuna-splash{background:" + String(t.vars["--bg"]).trim() + " !important}</style>");
+        }
       } catch (e) {}
     </script>
     %sveltekit.head%

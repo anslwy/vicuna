@@ -679,6 +679,7 @@ async fn dispatch(
             telegram::action(st, cmd, args).await
         }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
+        "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" => crate::plugins::action(cmd, &args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
         // session + message actions (server/actions.rs)
         "session_create" | "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
@@ -1347,6 +1348,10 @@ pub const API_ACTIONS: &[&str] = &[
     "ollama_warm_model",
     "opencode_models",
     "opencode_set_model",
+    "plugin_install",
+    "plugin_list",
+    "plugin_uninstall",
+    "plugin_upgrade",
     "schedule_list",
     "schedule_put",
     "schedule_remove",
