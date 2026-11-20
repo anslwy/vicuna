@@ -641,6 +641,7 @@ async fn dispatch(
         })),
         "server_upgrade_check" => self_upgrade::check().await,
         "server_upgrade" => self_upgrade::start(),
+        "server_upgrade_status" => self_upgrade::status(),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
             let mut chats = crate::server_store::load_chats(db).await?;
@@ -1352,6 +1353,7 @@ pub const API_ACTIONS: &[&str] = &[
     "server_search_chats",
     "server_upgrade",
     "server_upgrade_check",
+    "server_upgrade_status",
     "telegram_remove",
     "telegram_save",
     "telegram_set",

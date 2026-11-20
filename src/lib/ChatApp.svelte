@@ -2724,16 +2724,36 @@
     }
   });
 
+  /** live progress of a server upgrade (`server_upgrade_status`) */
+  let srvUpgradeStage = $state<string | null>(null);
+  let srvUpgradePct = $state<number | null>(null);
+  let srvUpgradeDetail = $state<string | null>(null);
+
   async function upgradeServer() {
     if (srvUpgrading || !srvLatest) return;
     const from = srvVersion;
     srvUpgrading = true;
+    srvUpgradeStage = "Starting upgrade…";
+    srvUpgradePct = null;
+    srvUpgradeDetail = null;
+    type St = { running?: boolean; failed?: boolean; error?: string; stage?: string | null; step?: number; steps?: number; percent?: number | null; detail?: string | null };
     try {
       await invokeOrBridge("server_upgrade", {});
-      flashNotice(`Upgrading ${srvLabel} to v${srvLatest}… it restarts in a few seconds.`);
-      // wait for the restarted server to answer with a new version
-      for (let i = 0; i < 60; i++) {
-        await new Promise((r) => setTimeout(r, 3000));
+      // ~3 minutes: progress from the upgrade log, then the restart
+      for (let i = 0; i < 180; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const st = await invokeOrBridge<St>("server_upgrade_status", {}).catch(() => null);
+        if (st?.failed) throw new Error(st.error || "upgrade failed");
+        if (st?.stage && st.running !== false) {
+          srvUpgradeStage = st.steps && st.step ? `${st.stage} (${st.step}/${st.steps})` : st.stage;
+          srvUpgradePct = st.percent ?? null;
+          srvUpgradeDetail = st.detail ?? null;
+          continue;
+        }
+        // upgrader finished (or the server is down / restarted): wait for the new version
+        srvUpgradeStage = "Restarting the server…";
+        srvUpgradePct = null;
+        srvUpgradeDetail = null;
         const info = await invokeOrBridge<{ version?: string }>("server_info", {}).catch(() => null);
         if (info?.version && info.version !== from) {
           srvVersion = info.version;
@@ -2746,6 +2766,9 @@
       error = `Server upgrade failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       srvUpgrading = false;
+      srvUpgradeStage = null;
+      srvUpgradePct = null;
+      srvUpgradeDetail = null;
     }
   }
 
@@ -9383,7 +9406,16 @@
                   </div>
                   {#if srvUpgradeAvailable && srvCanUpgrade}
                     <button class="srv-item srv-upgrade" data-testid="server-upgrade" role="menuitem" disabled={srvUpgrading} onclick={upgradeServer}>
-                      <span class="srv-check">↑</span><span class="srv-item-name">{srvUpgrading ? "Upgrading server…" : `Upgrade server to v${srvLatest}`}</span>
+                      {#if srvUpgrading}
+                        <span class="srv-check"><span class="srv-spin" aria-hidden="true"></span></span>
+                        <span class="srv-item-name srv-upgrade-prog" data-testid="server-upgrade-progress">
+                          <span class="shimmer">{srvUpgradeStage ?? "Upgrading server…"}</span>
+                          {#if srvUpgradePct != null}<span class="srv-upgrade-bar"><span style="width:{srvUpgradePct}%"></span></span>{/if}
+                          {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
+                        </span>
+                      {:else}
+                        <span class="srv-check">↑</span><span class="srv-item-name">Upgrade server to v{srvLatest}</span>
+                      {/if}
                     </button>
                   {/if}
                   <div class="srv-sep"></div>
@@ -12263,6 +12295,13 @@
   .srv-version { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 4px 10px; }
   .srv-skew { font-size: 10.5px; font-weight: 600; color: var(--accent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
   .srv-upgrade { color: var(--accent); }
+  .srv-spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: srv-spin 0.8s linear infinite; vertical-align: -1px; }
+  @keyframes srv-spin { to { transform: rotate(360deg); } }
+  .srv-upgrade-prog { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .srv-upgrade-bar { display: block; height: 3px; border-radius: 2px; background: var(--hover-3, rgba(127,127,127,0.25)); overflow: hidden; }
+  .srv-upgrade-bar > span { display: block; height: 100%; background: var(--accent); transition: width 0.4s ease; }
+  .srv-upgrade-detail { font-size: 11px; color: var(--muted, inherit); opacity: 0.8; }
+  @media (prefers-reduced-motion: reduce) { .srv-spin { animation-duration: 2.4s; } }
   .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }

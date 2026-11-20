@@ -107,6 +107,35 @@ async fn fetch(url: &str) -> Result<Vec<u8>, String> {
     r.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("{url}: {e}"))
 }
 
+/// `fetch` that prints `    downloaded A / B MB (N%)` lines (at most every
+/// ~700 ms) — the app's upgrade spinner reads them from upgrade.log.
+async fn fetch_with_progress(url: &str) -> Result<Vec<u8>, String> {
+    let mut r = client()?.get(url).send().await.map_err(|e| format!("{url}: {e}"))?;
+    if !r.status().is_success() {
+        return Err(format!("{url}: HTTP {}", r.status()));
+    }
+    let total = r.content_length();
+    let mut buf = Vec::with_capacity(total.unwrap_or(0) as usize);
+    let mut last = std::time::Instant::now();
+    while let Some(chunk) = r.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+        buf.extend_from_slice(&chunk);
+        if last.elapsed() >= std::time::Duration::from_millis(700) {
+            last = std::time::Instant::now();
+            println!("{}", progress_line(buf.len() as u64, total));
+        }
+    }
+    println!("{}", progress_line(buf.len() as u64, total));
+    Ok(buf)
+}
+
+pub fn progress_line(got: u64, total: Option<u64>) -> String {
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    match total.filter(|t| *t > 0) {
+        Some(t) => format!("    downloaded {:.1} / {:.1} MB ({}%)", mb(got), mb(t), (got * 100 / t).min(100)),
+        None => format!("    downloaded {:.1} MB", mb(got)),
+    }
+}
+
 /// Latest stable release tag (`releases/latest` skips the rolling `latest`
 /// prerelease). `VICUNA_RELEASE_API` overrides the URL for tests/mirrors.
 async fn latest_tag() -> Result<String, String> {
@@ -202,7 +231,7 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
     }
 
     println!("==> Downloading {asset}");
-    let archive = rt.block_on(fetch(&format!("{base}/{asset}")))?;
+    let archive = rt.block_on(fetch_with_progress(&format!("{base}/{asset}")))?;
     let sum = rt.block_on(fetch(&format!("{base}/{asset}.sha256")))?;
     let want = parse_sha256(&String::from_utf8_lossy(&sum)).ok_or("bad .sha256 file")?;
     let got = sha256_hex(&archive);
