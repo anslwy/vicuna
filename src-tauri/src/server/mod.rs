@@ -680,6 +680,8 @@ async fn dispatch(
         }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
         "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" => crate::plugins::action(cmd, &args).await,
+        "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" => crate::plugins::action(cmd, &args).await,
+        "plugin_storage_remove" => crate::plugins::action(cmd, &args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
         // session + message actions (server/actions.rs)
         "session_create" | "session_update" | "session_delete" | "session_fork" | "message_edit" | "message_delete" => {
@@ -1110,6 +1112,22 @@ async fn maybe_gzip(resp: hyper::Response<BoxBody>) -> hyper::Response<BoxBody> 
     }
 }
 
+/// A plugin panel file with the locked-down headers (see plugins::PANEL_CSP).
+fn panel_resp(path: &str) -> hyper::Response<BoxBody> {
+    let (status, ctype, body) = crate::plugins::serve_panel(path);
+    hyper::Response::builder()
+        .status(status)
+        .header("Content-Type", ctype)
+        .header("Content-Security-Policy", crate::plugins::PANEL_CSP)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Referrer-Policy", "no-referrer")
+        .header("Cache-Control", "no-store")
+        .header("Cross-Origin-Resource-Policy", "cross-origin")
+        .header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), clipboard-read=(), usb=(), serial=(), payment=()")
+        .body(full_body(body))
+        .unwrap()
+}
+
 async fn handle(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
     let gzip = accepts_gzip(req.headers()) && !req.uri().path().starts_with("/lb");
     let resp = handle_inner(st, req).await;
@@ -1126,6 +1144,11 @@ async fn handle_inner(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Inc
     if *req.method() == Method::GET && path == "/health" {
         let body = if st.token.is_some() { r#"{"ok":true,"bridge":1,"server":true}"# } else { r#"{"ok":true,"bridge":1}"# };
         return json_resp(200, body);
+    }
+    // Plugin panel files: no bearer token (an iframe can't send one); the
+    // per-plugin capability in the path gates them (plugins::serve_panel).
+    if *req.method() == Method::GET && path.starts_with("/plugin-panel/") {
+        return panel_resp(&path);
     }
     if let Some(want) = &st.token {
         let given = req
@@ -1350,6 +1373,10 @@ pub const API_ACTIONS: &[&str] = &[
     "opencode_set_model",
     "plugin_install",
     "plugin_list",
+    "plugin_storage_get",
+    "plugin_storage_keys",
+    "plugin_storage_remove",
+    "plugin_storage_set",
     "plugin_uninstall",
     "plugin_upgrade",
     "schedule_list",
@@ -1545,6 +1572,24 @@ mod api_registry_tests {
         let mut reg: Vec<String> = super::API_ACTIONS.iter().map(|s| s.to_string()).collect();
         reg.sort();
         assert_eq!(arms, reg, "API_ACTIONS out of sync with dispatch");
+    }
+}
+
+#[cfg(test)]
+mod plugin_panel_route_tests {
+    /// Every panel response (found or not) carries the sandboxing CSP and the
+    /// no-sniff / no-referrer / no-store headers, and needs no bearer token.
+    #[test]
+    fn panel_responses_carry_the_lockdown_headers() {
+        let r = super::panel_resp("/plugin-panel/nope/0123/x.html");
+        assert_eq!(r.status(), 404);
+        let h = r.headers();
+        assert_eq!(h["content-security-policy"], crate::plugins::PANEL_CSP);
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["referrer-policy"], "no-referrer");
+        assert_eq!(h["cache-control"], "no-store");
+        assert!(h.get("access-control-allow-origin").is_none());
+        assert!(h.get("x-frame-options").is_none(), "panels must stay frameable");
     }
 }
 

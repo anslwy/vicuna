@@ -4,29 +4,33 @@
   // so a remote server window manages that server's plugins.
   import { onMount } from "svelte";
   import { invokeOrBridge } from "./bridge";
-  import type { InstalledPlugin } from "./pluginTheme";
+  import { installBlocked, type InstalledPlugin } from "./pluginTheme";
 
-  let { plugins, activeThemeKey, onChanged, onUseTheme }: {
+  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel }: {
     plugins: InstalledPlugin[];
     activeThemeKey: string | null;
     onChanged: (list: InstalledPlugin[]) => void;
     onUseTheme: (pluginId: string, themeId: string) => void;
+    onOpenPanel?: (key: string) => void;
   } = $props();
 
   let source = $state("");
-  let busy = $state<string | null>(null); // "install" | "upgrade:<id>" | "uninstall:<id>" | "list"
+  let busy = $state<string | null>(null); // "install" | "upgrade:<id>" | "uninstall:<id>"
   let error = $state("");
   let notice = $state("");
   let confirmRemove = $state<string | null>(null);
 
+  /** the first list load: shown as "Loading…", never blocks Install */
+  let listing = $state(false);
+
   async function refresh() {
-    busy = "list";
+    listing = true;
     try {
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
     } catch (e: any) {
       error = e?.message ?? String(e);
     } finally {
-      busy = null;
+      listing = false;
     }
   }
 
@@ -36,7 +40,7 @@
 
   async function install() {
     const s = source.trim();
-    if (!s || busy) return;
+    if (installBlocked(s, busy)) return;
     busy = "install";
     error = notice = "";
     try {
@@ -88,17 +92,17 @@
 </script>
 
 <div class="pl" data-testid="plugins-panel">
-  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes for now.</p>
+  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes and side panels.</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
     <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
-    <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={!source.trim() || !!busy}>{busy === "install" ? "Installing…" : "Install"}</button>
+    <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={installBlocked(source, busy)}>{busy === "install" ? "Installing…" : "Install"}</button>
   </form>
   {#if error}<div class="pl-err" data-testid="plugin-error">{error}</div>{/if}
   {#if notice}<div class="pl-note" data-testid="plugin-notice">{notice}</div>{/if}
 
   <div class="pl-head">Installed</div>
   {#if plugins.length === 0}
-    <div class="pl-muted" data-testid="plugins-empty">{busy === "list" ? "Loading…" : "No plugins installed."}</div>
+    <div class="pl-muted" data-testid="plugins-empty">{listing ? "Loading…" : "No plugins installed."}</div>
   {:else}
     {#each plugins as p (p.id)}
       <div class="pl-item" data-testid="plugin-row-{p.id}">
@@ -112,6 +116,12 @@
         {#if p.description}<div class="pl-muted">{p.description}</div>{/if}
         <div class="pl-src" title={p.source}>{p.source}</div>
         <div class="pl-themes">
+          {#each p.panels ?? [] as pn (pn.id)}
+            <button class="pl-theme" data-testid="plugin-panel-{p.id}-{pn.id}" title="Open this panel in the side bar" onclick={() => onOpenPanel?.(`plugin:${p.id}:${pn.id}`)}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
+              {pn.title}
+            </button>
+          {/each}
           {#each p.themes as t (t.id)}
             {@const key = `${p.id}/${t.id}`}
             <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-theme-{p.id}-{t.id}" onclick={() => onUseTheme(p.id, t.id)} title="Use this theme">

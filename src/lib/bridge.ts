@@ -143,6 +143,7 @@ export const DESKTOP_CMDS = new Set([
   "server_call",
   "server_download_file",
   "server_lb_proxy_url",
+  "server_base_url",
   // Local Ollama process controls and legacy frontend-owned streams
   "ollama_chat_stream",
   "ollama_generate_stream",
@@ -184,6 +185,18 @@ function bridgePort(): number {
 
 function bridgeBase(): string {
   return `http://127.0.0.1:${bridgePort()}`;
+}
+
+/** Base URL this window's iframes load server routes from (plugin panels).
+ *  Desktop windows ask Rust (embedded backend for "local", the saved URL for
+ *  a remote server); a bridged browser uses its loopback bridge. */
+export async function backendBaseUrl(): Promise<string | null> {
+  if (TRANSPORT && TRANSPORT !== "bridge" && isTauriRuntime()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<string>("server_base_url", { id: TRANSPORT });
+  }
+  if (await bridgeAvailable()) return bridgeBase();
+  return null;
 }
 
 let healthCache: { ok: boolean; at: number } | null = null;

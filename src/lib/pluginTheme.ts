@@ -13,6 +13,9 @@ export type InstalledPlugin = {
   source: string;
   installedAt: number;
   themes: PluginThemeDef[];
+  /** Side panels (plugins.rs `Panel`) and their server path prefix. */
+  panels?: { id: string; title: string; icon?: string | null; entry: string }[];
+  panelBase?: string;
 };
 /** What we cache: the theme plus its plugin-qualified key. */
 export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };
@@ -84,3 +87,9 @@ export function selectedAccent(t: PluginThemeDef | null, muted: boolean, builtin
 }
 
 export const ACCENT_MUTED_KEY = "vicuna-plugin-accent-muted";
+
+/** Settings → Plugins: Install works as soon as a source is typed; only an
+ *  install/upgrade/uninstall in flight blocks it (loading the list does not). */
+export function installBlocked(source: string, busy: string | null): boolean {
+  return !source.trim() || (busy !== null && busy !== "list");
+}

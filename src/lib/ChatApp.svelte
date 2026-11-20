@@ -49,7 +49,7 @@
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { BridgeChannel, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -57,6 +57,7 @@
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
+  import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, ACCENT_MUTED_KEY, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { hideSplash } from "$lib/splash";
@@ -236,8 +237,11 @@
   /** side-panel tabs: one Files view max, one Browser max, one Git max, any number of terminals */
   interface SideTab {
     key: string;
-    kind: "files" | "terminal" | "browser" | "git";
+    kind: "files" | "terminal" | "browser" | "git" | "plugin";
     title: string;
+    /** plugin panels: owning plugin + panel id (key is `plugin:<id>:<panel>`) */
+    pluginId?: string;
+    panelId?: string;
     termId?: string;
     dead?: boolean;
     error?: string | null;
@@ -3292,7 +3296,123 @@
     } catch {
       // no server (plain browser without a bridge): keep the cached theme
     }
+    try {
+      backendBase = await backendBaseUrl();
+    } catch {
+      backendBase = null;
+    }
   }
+
+  // ---- plugin side panels (sandboxed iframes + src/lib/pluginBridge.ts) ----
+  /** base URL the panel iframes load from (this window's backend) */
+  let backendBase = $state<string | null>(null);
+  const pluginPanels = $derived(
+    plugins.flatMap((p) =>
+      (p.panels ?? []).map((pn) => ({
+        key: `plugin:${p.id}:${pn.id}`,
+        pluginId: p.id,
+        pluginName: p.name,
+        title: pn.title,
+        // the version + install time re-key the iframe so an upgrade reloads it
+        rev: `${p.version}:${p.installedAt}`,
+        url: panelUrl(backendBase, p.panelBase, pn.entry),
+        icon: pn.icon ? panelUrl(backendBase, p.panelBase, pn.icon) : null
+      }))
+    )
+  );
+  /** live panel iframes by tab key, to match message sources and push events */
+  const panelFrames = new Map<string, { el: HTMLIFrameElement; pluginId: string }>();
+
+  function openSidePanel(key: string) {
+    newTabMenu = false;
+    const pn = pluginPanels.find((x) => x.key === key);
+    if (!pn) return;
+    if (!sideTabs.some((t) => t.key === key)) {
+      const [, , panelId] = key.split(":");
+      sideTabs = [...sideTabs, { key, kind: "plugin", title: pn.title, pluginId: pn.pluginId, panelId }];
+    }
+    explorerOpen = true;
+    activeSideTab = key;
+  }
+
+  /** an uninstalled plugin's (or removed panel's) tabs close with it */
+  $effect(() => {
+    const live = new Set(pluginPanels.map((p) => p.key));
+    const stale = sideTabs.filter((t) => t.kind === "plugin" && !live.has(t.key));
+    if (stale.length && ready) for (const t of stale) closeSideTab(t.key);
+  });
+
+  function panelTheme(): PanelTheme {
+    const cs = getComputedStyle(document.documentElement);
+    const vars: Record<string, string> = {};
+    for (const v of THEME_VARS) {
+      const val = cs.getPropertyValue(v).trim();
+      if (val) vars[v] = val;
+    }
+    vars["--font-family"] = getComputedStyle(document.body).fontFamily;
+    return { base: themeBase, vars };
+  }
+
+  function panelContext(): PanelContext {
+    const c = activeChat;
+    return {
+      sessionId: c?.id ?? null,
+      title: c?.title ?? null,
+      workspace: (c?.workspace || explorerRoot.trim()) || null,
+      mode: c ? (c.mode === "work" ? "work" : "chat") : null
+    };
+  }
+
+  function panelHost(pluginId: string): PanelHost {
+    return {
+      theme: panelTheme,
+      context: panelContext,
+      // the plugin id comes from the frame that asked, never the message
+      storage: (cmd, key, value) => invokeOrBridge(cmd, { id: pluginId, key, value })
+    };
+  }
+
+  function onPanelMessage(e: MessageEvent) {
+    for (const f of panelFrames.values()) {
+      if (!f.el.contentWindow || e.source !== f.el.contentWindow) continue;
+      const req = parsePanelRequest(e.data);
+      if (!req) return;
+      const target = f.el.contentWindow;
+      void handlePanelRequest(req, panelHost(f.pluginId)).then((reply) => target.postMessage(reply, "*"));
+      return;
+    }
+  }
+
+  function postToPanels(event: "theme" | "context", data: unknown) {
+    // opaque-origin frames can't be targeted by origin; the window is the target
+    for (const f of panelFrames.values()) f.el.contentWindow?.postMessage({ vicuna: 1, event, data }, "*");
+  }
+
+  /** Svelte action: track a panel iframe while it is mounted. */
+  function panelFrame(el: HTMLIFrameElement, arg: { key: string; pluginId: string }) {
+    panelFrames.set(arg.key, { el, pluginId: arg.pluginId });
+    return {
+      destroy() {
+        if (panelFrames.get(arg.key)?.el === el) panelFrames.delete(arg.key);
+      }
+    };
+  }
+
+  $effect(() => {
+    themeBase;
+    accent;
+    fontSize;
+    pluginTheme;
+    pluginAccentMuted;
+    // after applyAppearance has written the variables
+    void tick().then(() => postToPanels("theme", panelTheme()));
+  });
+
+  $effect(() => {
+    const ctx = { id: activeChat?.id, title: activeChat?.title, ws: activeChat?.workspace, root: explorerRoot, mode: activeChat?.mode };
+    void ctx;
+    void tick().then(() => postToPanels("context", panelContext()));
+  });
 
   function setTheme(t: "light" | "dark") {
     theme = t;
@@ -8814,6 +8934,7 @@
     window.addEventListener("keydown", unlock);
     window.addEventListener("beforeunload", handleUnload);
     window.addEventListener("message", onBrowserFrameMessage);
+    window.addEventListener("message", onPanelMessage);
     window.addEventListener("pointerup", onMessagesPointerUp);
     window.addEventListener("pointercancel", onMessagesPointerUp);
     window.addEventListener("keydown", onMessagesKeyDown);
@@ -8913,6 +9034,7 @@
     return () => {
       window.removeEventListener("beforeunload", handleUnload);
       window.removeEventListener("message", onBrowserFrameMessage);
+      window.removeEventListener("message", onPanelMessage);
       window.removeEventListener("pointerup", onMessagesPointerUp);
       window.removeEventListener("pointercancel", onMessagesPointerUp);
       window.removeEventListener("keydown", onMessagesKeyDown);
@@ -10954,7 +11076,7 @@
       ></div>
       <div class="side-tabs" data-testid="side-tabs" role="tablist" aria-label="Side panel tabs">
         {#each sideTabs as t (t.key)}
-          {@const tabTitle = t.kind === "files" || t.kind === "git" ? explorerRootBase || t.title : t.title}
+          {@const tabTitle = t.kind === "files" || t.kind === "git" || t.kind === "plugin" ? explorerRootBase || t.title : t.title}
           <!-- Files / Git follow the workspace: titled by its folder name, like terminal tabs -->
           <div
             class="side-tab {t.key === activeSideTab ? 'sel' : ''}"
@@ -10985,11 +11107,19 @@
           >
             <button
               class="side-tab-label"
-              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : `${t.title} tab`}
+              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : t.kind === "plugin" ? `${t.title} tab` : `${t.title} tab`}
+              title={t.kind === "plugin" ? t.title : undefined}
               onclick={() => switchSideTab(t.key)}
             >
               {#if t.kind === "files"}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              {:else if t.kind === "plugin"}
+                {@const pn = pluginPanels.find((x) => x.key === t.key)}
+                {#if pn?.icon}
+                  <img class="plugin-tab-icon" src={pn.icon} width="13" height="13" alt="" referrerpolicy="no-referrer" />
+                {:else}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
+                {/if}
               {:else if t.kind === "git"}
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
               {:else if t.kind === "browser"}
@@ -11071,6 +11201,16 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
               <span>Git Diff</span>
             </button>
+            {#each pluginPanels as pn (pn.key)}
+              <button class="ctx-item" data-testid="new-tab-plugin-{pn.key.replaceAll(':', '-')}" title="From the {pn.pluginName} plugin" onclick={() => openSidePanel(pn.key)}>
+                {#if pn.icon}
+                  <img class="plugin-tab-icon" src={pn.icon} width="14" height="14" alt="" referrerpolicy="no-referrer" />
+                {:else}
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
+                {/if}
+                <span>{pn.title}</span>
+              </button>
+            {/each}
           </div>
         {/if}
       </div>
@@ -11168,6 +11308,25 @@
           {/each}
         {/if}
       </div>
+          {:else if t.kind === "plugin"}
+            {@const pn = pluginPanels.find((x) => x.key === t.key)}
+            {#if pn?.url}
+              {#key pn.rev}
+                <!-- opaque origin: NO allow-same-origin; the server adds a CSP sandbox too -->
+                <iframe
+                  class="plugin-frame"
+                  data-testid="plugin-frame-{t.key.replaceAll(':', '-')}"
+                  title="{pn.title} ({pn.pluginName} plugin)"
+                  src={pn.url}
+                  sandbox="allow-scripts"
+                  referrerpolicy="no-referrer"
+                  allow=""
+                  use:panelFrame={{ key: t.key, pluginId: pn.pluginId }}
+                ></iframe>
+              {/key}
+            {:else}
+              <div class="exp-empty">This panel needs a Vicuna server to load from (desktop app, a connected server, or a bridged browser).</div>
+            {/if}
           {:else if t.kind === "git"}
             <GitPanel
               root={explorerRoot.trim()}
@@ -11740,7 +11899,7 @@
       <button class="seg-btn {settingsTab === 'plugins' ? 'sel' : ''}" data-testid="settings-tab-plugins" role="tab" onclick={() => (settingsTab = "plugins")}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg></span>Plugins</button>
     </div>
     {#if settingsTab === "plugins"}
-      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onUseTheme={usePluginTheme} />
+      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onUseTheme={usePluginTheme} onOpenPanel={(k) => { settingsOpen = false; openSidePanel(k); }} />
     {:else if settingsTab === "general"}
     <div class="setting-row">
       <span class="setting-label">Theme</span>
@@ -12979,6 +13138,8 @@
   .side-tab:hover { background: var(--hover-3); }
   .side-tab.sel { background: var(--hover-3); color: var(--text); }
   .side-tab-label { display: flex; align-items: center; gap: 6px; min-width: 0; border: none; background: transparent; color: inherit; font: inherit; font-size: 13px; padding: 2px 0; cursor: pointer; }
+  .plugin-frame { flex: 1; width: 100%; height: 100%; border: 0; display: block; background: var(--bg); }
+  .plugin-tab-icon { display: block; flex-shrink: 0; }
   .side-tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .side-tab-x { flex-shrink: 0; border: none; background: transparent; color: var(--faint); font-size: 14px; line-height: 1; width: 20px; height: 20px; border-radius: 6px; cursor: pointer; padding: 0; }
   .side-tab-x:hover { background: var(--hover); color: var(--text); }
