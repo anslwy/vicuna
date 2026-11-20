@@ -1904,7 +1904,6 @@
   function onScheduleEscape(e: KeyboardEvent) {
     if (e.key !== "Escape") return;
     if (scheduleCustom) scheduleCustom = null;
-    else if (leadConfirm) leadConfirm = null;
     else if (quitPromptOpen) quitPromptOpen = false;
     else if (usageOpen) closeUsageModal();
     else if (scheduleListOpen) scheduleListOpen = false;
@@ -4239,23 +4238,8 @@
     return () => clearInterval(t);
   });
 
-  /** Make `id` the lead; when another session already is, confirm the
-   *  replacement first. `withTelegram` opens the Telegram setup afterwards. */
-  let leadConfirm = $state<{ id: string; prevTitle: string; withTelegram: boolean } | null>(null);
-  async function requestLead(id: string, withTelegram: boolean) {
-    ctxMenu = null;
-    const prev = chats.find((x) => x.role === "lead" && x.id !== id);
-    if (prev) {
-      leadConfirm = { id, prevTitle: prev.title, withTelegram };
-      return;
-    }
-    await applyLead(id, withTelegram);
-  }
-  async function applyLead(id: string, withTelegram: boolean) {
-    leadConfirm = null;
-    await toggleLead(id);
-    if (withTelegram && chats.find((x) => x.id === id)?.role === "lead") telegramFor = id;
-  }
+  /** Make/Replace lead prompt (explainer + optional Telegram setup). */
+  let leadPrompt = $state<{ id: string; prevTitle: string | null } | null>(null);
 
   async function toggleLead(id: string) {
     let c = chats.find((x) => x.id === id);
@@ -9552,18 +9536,14 @@
               <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>Remove lead</button>
             {:else}
               {@const hasLead = chats.some((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)}
-              <div class="ctx-lead-row">
-                <button
-                  class="ctx-lead-tg"
-                  data-testid="lead-telegram-item"
-                  title={(hasLead ? "Replace lead" : "Make lead") + " and set up Telegram"}
-                  aria-label={(hasLead ? "Replace lead" : "Make lead") + " and set up Telegram"}
-                  onclick={() => requestLead(ctxMenu!.chatId, true)}
-                >
-                  <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
-                </button>
-                <button class="ctx-item" data-testid="lead-item" onclick={() => requestLead(ctxMenu!.chatId, false)}>{hasLead ? "Replace lead" : "Make lead"}</button>
-              </div>
+              <button
+                class="ctx-item ctx-telegram"
+                data-testid="lead-item"
+                onclick={() => { leadPrompt = { id: ctxMenu!.chatId, prevTitle: chats.find((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)?.title ?? null }; ctxMenu = null; }}
+              >
+                <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
+                <span class="ctx-tg-label">{hasLead ? "Replace lead" : "Make lead"}</span>
+              </button>
             {/if}
             {#if ctxChat?.role === "lead"}
               <button
@@ -11367,6 +11347,14 @@
     onClose={() => (folderPicker = null)}
   />
 {/if}
+{#if leadPrompt}
+  {@const lp = leadPrompt}
+  <TelegramModal
+    leadTitle={chats.find((c) => c.id === lp.id)?.title ?? ""}
+    lead={{ prevTitle: lp.prevTitle, onConfirm: () => { leadPrompt = null; void toggleLead(lp.id).then(refreshTelegramStatus); } }}
+    onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
+  />
+{/if}
 {#if telegramFor}
   <TelegramModal leadTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""} onClose={() => { telegramFor = null; void refreshTelegramStatus(); }} />
 {/if}
@@ -11607,17 +11595,6 @@
     <div class="confirm-actions sched-actions">
       <button class="confirm-cancel" data-testid="quit-prompt-cancel" onclick={() => (quitPromptOpen = false)}>Keep running</button>
       <button class="confirm-ok sched-quit" data-testid="quit-prompt-confirm" onclick={() => void quitVicuna(true)}>Quit anyway</button>
-    </div>
-  </div>
-{/if}
-{#if leadConfirm}
-  {@const lc = leadConfirm}
-  <button class="confirm-backdrop" data-testid="lead-confirm-backdrop" aria-label="Cancel" onclick={() => (leadConfirm = null)} tabindex="-1"></button>
-  <div class="confirm-card" data-testid="lead-confirm" role="alertdialog" aria-modal="true" aria-label="Replace lead">
-    <p class="confirm-text">Replace the lead? "{lc.prevTitle}" stops being the lead (it stays pinned) and "{chats.find((c) => c.id === lc.id)?.title ?? ""}" takes over managing sessions{lc.withTelegram ? " and the Telegram bridge" : ""}.</p>
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="lead-confirm-cancel" onclick={() => (leadConfirm = null)}>Cancel</button>
-      <button class="confirm-ok" data-testid="lead-confirm-ok" onclick={() => void applyLead(lc.id, lc.withTelegram)}>Replace lead</button>
     </div>
   </div>
 {/if}
@@ -12465,10 +12442,6 @@
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
-  .ctx-lead-row { display: flex; align-items: center; }
-  .ctx-lead-row .ctx-item { flex: 1; padding-left: 4px; }
-  .ctx-lead-tg { flex: none; display: inline-flex; align-items: center; justify-content: center; margin-left: 6px; padding: 3px; border: none; background: transparent; border-radius: 6px; cursor: pointer; }
-  .ctx-lead-tg:hover { background: var(--hover-3, rgba(127,127,127,.18)); }
   .ctx-item.ctx-telegram { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
   .ctx-tg-label { flex: 1; min-width: 0; }
   .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }

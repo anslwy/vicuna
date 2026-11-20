@@ -37,7 +37,18 @@
     error: string;
   }
 
-  let { leadTitle = "", onClose }: { leadTitle?: string; onClose: () => void } = $props();
+  /** `lead` turns the dialog into the Make/Replace lead prompt: an explainer,
+   *  the Telegram setup as an optional section, and Cancel + confirm. */
+  let {
+    leadTitle = "",
+    lead = null,
+    onClose,
+  }: {
+    leadTitle?: string;
+    lead?: { prevTitle: string | null; onConfirm: () => void } | null;
+    onClose: () => void;
+  } = $props();
+  let showTelegram = $state(false);
 
   let st = $state<Status | null>(null);
   let token = $state("");
@@ -115,12 +126,30 @@
 <svelte:window onkeydown={onKey} />
 
 <button class="tg-backdrop" aria-label="Close" tabindex="-1" onclick={onClose}></button>
-<div class="tg-card" role="dialog" aria-modal="true" aria-label="Telegram" data-testid="telegram-dialog">
+<div class="tg-card" role="dialog" aria-modal="true" aria-label={lead ? "Lead session" : "Telegram"} data-testid={lead ? "lead-dialog" : "telegram-dialog"}>
+  {#if lead}
+    <div class="tg-title">{lead.prevTitle ? "Replace lead" : "Make lead"}{#if leadTitle}<span class="tg-muted">· “{leadTitle}”</span>{/if}</div>
+    <div class="tg-box" data-testid="lead-explainer">
+      <div>The lead is the one session you talk to that manages the others. From its next turn it can create worker sessions (each on its own harness and model), message, stop and archive them, and it gets each worker's reply when that worker finishes.</div>
+      <div class="tg-muted small">Use it as your home base: hand it a big task and let it split the work across sessions. It's pinned to the top of the sidebar. Deleting a session always asks you first.</div>
+    </div>
+    {#if lead.prevTitle}
+      <div class="tg-warn" data-testid="lead-replace-note">Only one session can be the lead. “{lead.prevTitle}” stops being the lead (it stays pinned) and this session takes over{st?.configured ? ", including the Telegram bridge" : ""}.</div>
+    {/if}
+    <button class="tg-toggle" data-testid="lead-telegram-toggle" aria-expanded={showTelegram} onclick={() => (showTelegram = !showTelegram)}>
+      <span class="tg-chev" class:open={showTelegram}>›</span>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="#2aabee" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
+      Talk to the lead from Telegram <span class="tg-muted">(optional{st?.paired ? ` · paired with ${st.paired.name}` : st?.configured ? " · bot set up" : ""})</span>
+    </button>
+  {/if}
+  {#if !lead || showTelegram}
+  {#if !lead}
   <div class="tg-title">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
     Telegram
     {#if leadTitle}<span class="tg-muted">· talk to “{leadTitle}” from your phone</span>{/if}
   </div>
+  {/if}
 
   {#if !st}
     <div class="tg-muted">Loading…</div>
@@ -213,11 +242,20 @@
     <div class="tg-muted small">Runs on this Vicuna server while it's up. Use one server per bot: Telegram lets only one server receive a bot's messages.</div>
   {/if}
 
-  {#if err || st?.lastError}
+  {/if}
+
+  {#if (!lead || showTelegram) && (err || st?.lastError)}
     <div class="tg-err" data-testid="telegram-error">{err || st?.lastError}</div>
   {/if}
 
-  <div class="tg-foot"><button class="tg-btn" onclick={onClose}>Done</button></div>
+  <div class="tg-foot">
+    {#if lead}
+      <button class="tg-btn" data-testid="lead-cancel" onclick={onClose}>Cancel</button>
+      <button class="tg-btn primary" data-testid="lead-confirm" onclick={lead.onConfirm}>{lead.prevTitle ? "Replace lead" : "Make lead"}</button>
+    {:else}
+      <button class="tg-btn" onclick={onClose}>Done</button>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -246,6 +284,11 @@
   .tg-foot { display: flex; justify-content: flex-end; }
   a { color: var(--accent); }
   code { font-size: 12.5px; }
+  .tg-warn { font-size: 13px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, #e0a100 14%, transparent); }
+  .tg-toggle { display: flex; align-items: center; gap: 8px; border: none; background: transparent; color: var(--text); font: inherit; font-size: 14px; padding: 4px 0; cursor: pointer; text-align: left; }
+  .tg-chev { display: inline-block; width: 10px; transition: transform .15s; }
+  .tg-chev.open { transform: rotate(90deg); }
+  .tg-foot { gap: 8px; }
   .tg-btn { border: 1px solid var(--border-2); border-radius: 10px; padding: 8px 14px; font: inherit; font-size: 14px; background: transparent; color: var(--text); cursor: pointer; }
   .tg-btn.small { padding: 4px 10px; font-size: 12.5px; }
   .tg-btn:hover:not(:disabled) { background: var(--hover-2); }
