@@ -36,10 +36,10 @@ export function allThemes(plugins: InstalledPlugin[]): ActivePluginTheme[] {
 }
 
 /** The CSS properties a theme sets (accent included), unsafe entries dropped. */
-export function themeProperties(t: PluginThemeDef): Record<string, string> {
+export function themeProperties(t: PluginThemeDef, withAccent = true): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(t.vars ?? {})) if (safeVar(k) && safeColor(v)) out[k] = v.trim();
-  const a = t.accent;
+  const a = withAccent ? t.accent : null;
   if (a && safeColor(a.bg)) {
     out["--accent"] = a.bg;
     out["--accent-hover"] = safeColor(a.hover) ? a.hover : a.bg;
@@ -69,3 +69,18 @@ export function writeActiveTheme(storage: Pick<Storage, "setItem" | "removeItem"
     else storage?.removeItem(ACTIVE_THEME_KEY);
   } catch {}
 }
+
+/** The theme's own accent, when it brings a usable one. */
+export function themeAccent(t: PluginThemeDef | null): { bg: string; hover: string; fg: string } | null {
+  const a = t?.accent;
+  if (!a || !safeColor(a.bg)) return null;
+  return { bg: a.bg, hover: safeColor(a.hover) ? a.hover : a.bg, fg: safeColor(a.fg) ? a.fg : "#ffffff" };
+}
+
+/** Which accent swatch is selected: the theme's own ("theme") unless the
+ *  user picked a built-in swatch while this theme was active (muted). */
+export function selectedAccent(t: PluginThemeDef | null, muted: boolean, builtin: string): string {
+  return themeAccent(t) && !muted ? "theme" : builtin;
+}
+
+export const ACCENT_MUTED_KEY = "vicuna-plugin-accent-muted";

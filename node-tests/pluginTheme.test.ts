@@ -36,3 +36,14 @@ test("the active theme round-trips through storage", () => {
   m.set("vicuna-plugin-theme", "{bad");
   assert.equal(readActiveTheme(st), null);
 });
+
+test("the swatch row follows the theme accent until a built-in swatch mutes it", async () => {
+  const { selectedAccent, themeAccent, themeProperties } = await import("../src/lib/pluginTheme.ts");
+  const t = plugin().themes[0];
+  assert.deepEqual(themeAccent(t), { bg: "#88c0d0", hover: "#88c0d0", fg: "#2e3440" });
+  assert.equal(selectedAccent(t, false, "orange"), "theme");
+  assert.equal(selectedAccent(t, true, "blue"), "blue");
+  assert.equal(selectedAccent(null, false, "orange"), "orange");
+  assert.equal(selectedAccent({ ...t, accent: null }, false, "green"), "green");
+  assert.equal(themeProperties(t, false)["--accent"], undefined);
+});

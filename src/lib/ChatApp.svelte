@@ -56,6 +56,8 @@
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
+  import PluginsPanel from "$lib/PluginsPanel.svelte";
+  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, ACCENT_MUTED_KEY, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { hideSplash } from "$lib/splash";
   import {
@@ -2131,7 +2133,7 @@
   let gotoError = $state<string | null>(null);
   let gotoSel = $state(0);
   let settingsOpen = $state(false);
-  let settingsTab = $state<"general" | "models" | "openrouter">("general");
+  let settingsTab = $state<"general" | "models" | "openrouter" | "plugins">("general");
   const CLI_INSTALL_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh";
   let cliCopied = $state(false);
   async function copyCliInstall() {
@@ -3213,32 +3215,100 @@
     green: { label: "Green", light: { bg: "#16a34a", hover: "#15803d", fg: "#ffffff" }, dark: { bg: "#22c55e", hover: "#16a34a", fg: "#111111" } }
   };
 
+  // plugin themes (Settings → Plugins): the active one is cached whole in
+  // localStorage (src/lib/pluginTheme.ts) and overrides the built-in palette.
+  let plugins = $state<InstalledPlugin[]>([]);
+  let pluginTheme = $state<ActivePluginTheme | null>(typeof window !== "undefined" ? readActiveTheme(localStorage) : null);
+  /** The user picked a built-in swatch over the active theme's own accent
+   *  (key of that theme; cleared whenever the theme changes). */
+  let pluginAccentMutedFor = $state<string | null>(typeof window !== "undefined" ? localStorage.getItem(ACCENT_MUTED_KEY) : null);
+  let pluginThemeProps: string[] = [];
+  const pluginThemeChoices = $derived(allThemes(plugins));
+  /** The effective light/dark base (a plugin theme brings its own). */
+  const themeBase = $derived<"light" | "dark">(pluginTheme?.base ?? theme);
+  const pluginAccent = $derived(themeAccent(pluginTheme));
+  const pluginAccentMuted = $derived(!!pluginTheme && pluginAccentMutedFor === pluginTheme.key);
+  /** Swatch row selection: "theme" while the theme's own accent is in use. */
+  const accentSel = $derived(selectedAccent(pluginTheme, pluginAccentMuted, accent));
+
   function applyAppearance() {
     const root = document.documentElement;
-    root.dataset.theme = theme;
+    for (const k of pluginThemeProps) root.style.removeProperty(k);
+    pluginThemeProps = [];
+    root.dataset.theme = themeBase;
     const a = ACCENTS[accent] ?? ACCENTS.orange;
-    const v = theme === "dark" ? a.dark : a.light;
+    const v = themeBase === "dark" ? a.dark : a.light;
     root.style.setProperty("--accent", v.bg);
     root.style.setProperty("--accent-hover", v.hover);
     root.style.setProperty("--accent-fg", v.fg);
     root.style.setProperty("--msg-font-size", `${fontSize}px`);
+    if (pluginTheme) {
+      for (const [k, val] of Object.entries(themeProperties(pluginTheme, !pluginAccentMuted))) {
+        root.style.setProperty(k, val);
+        pluginThemeProps.push(k);
+      }
+    }
   }
 
   $effect(() => {
-    theme;
+    themeBase;
     accent;
     fontSize;
+    pluginTheme;
+    pluginAccentMuted;
     applyAppearance();
   });
 
+  function setAccentMuted(key: string | null) {
+    pluginAccentMutedFor = key;
+    try {
+      if (key) localStorage.setItem(ACCENT_MUTED_KEY, key);
+      else localStorage.removeItem(ACCENT_MUTED_KEY);
+    } catch {}
+  }
+
+  function setPluginTheme(t: ActivePluginTheme | null) {
+    if (t?.key !== pluginTheme?.key) setAccentMuted(null);
+    pluginTheme = t;
+    writeActiveTheme(localStorage, t);
+  }
+
+  function usePluginTheme(pluginId: string, themeId: string) {
+    const t = pluginThemeChoices.find((c) => c.key === themeKey(pluginId, themeId));
+    if (t) setPluginTheme(t);
+  }
+
+  /** Fresh list from the server: refresh the cached active theme (upgrade)
+   *  or drop it when its plugin was uninstalled. */
+  function onPluginsChanged(list: InstalledPlugin[]) {
+    plugins = list;
+    const next = reconcileActive(pluginTheme, list);
+    if (JSON.stringify(next) !== JSON.stringify(pluginTheme)) setPluginTheme(next);
+  }
+
+  async function loadPlugins() {
+    try {
+      onPluginsChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+    } catch {
+      // no server (plain browser without a bridge): keep the cached theme
+    }
+  }
+
   function setTheme(t: "light" | "dark") {
     theme = t;
+    setPluginTheme(null);
     persistPrefs();
   }
 
   function setAccent(a: string) {
+    if (a === "theme") {
+      setAccentMuted(null);
+      return;
+    }
     if (!ACCENTS[a]) return;
     accent = a;
+    // picking a built-in swatch overrides the active theme's own accent
+    if (pluginTheme && pluginAccent) setAccentMuted(pluginTheme.key);
     persistPrefs();
   }
 
@@ -6461,9 +6531,9 @@
     const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
     if (!base) return "about:blank";
     const a = ACCENTS[accent] ?? ACCENTS.orange;
-    const v = theme === "dark" ? a.dark : a.light;
+    const v = pluginAccent && !pluginAccentMuted ? pluginAccent : themeBase === "dark" ? a.dark : a.light;
     const hex = (c: string) => c.replace(/^#/, "");
-    return `${base}/?theme=${theme}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
+    return `${base}/?theme=${themeBase}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
   });
 
   /** status → start when down. Throws on failure (callers surface it).
@@ -6787,7 +6857,7 @@
     // console (yellow prompt segments, white text), so the defaults that
     // ship with xterm go unreadable on a light background. Both palettes
     // keep the app's chrome bg/fg but remap every ANSI slot to stay legible.
-    if (theme === "dark") {
+    if (themeBase === "dark") {
       return {
         background: "#161616",
         foreground: "#e8e8e8",
@@ -8790,6 +8860,7 @@
         .catch(() => {});
     }
     void initApp();
+    void loadPlugins();
     void refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
     initializeAppUpdatePreference();
@@ -11643,27 +11714,43 @@
       <button class="seg-btn {settingsTab === 'general' ? 'sel' : ''}" data-testid="settings-tab-general" role="tab" onclick={() => (settingsTab = "general")}>General</button>
       <button class="seg-btn {settingsTab === 'models' ? 'sel' : ''}" data-testid="settings-tab-ollama" role="tab" onclick={openModelsTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg></span>Ollama</button>
       <button class="seg-btn {settingsTab === 'openrouter' ? 'sel' : ''}" data-testid="settings-tab-openrouter" role="tab" onclick={openOpenRouterTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg></span>OpenRouter</button>
+      <button class="seg-btn {settingsTab === 'plugins' ? 'sel' : ''}" data-testid="settings-tab-plugins" role="tab" onclick={() => (settingsTab = "plugins")}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg></span>Plugins</button>
     </div>
-    {#if settingsTab === "general"}
+    {#if settingsTab === "plugins"}
+      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onUseTheme={usePluginTheme} />
+    {:else if settingsTab === "general"}
     <div class="setting-row">
       <span class="setting-label">Theme</span>
       <div class="seg">
-        <button class="seg-btn {theme === 'light' ? 'sel' : ''}" data-testid="theme-light-btn" onclick={() => setTheme("light")}>Light</button>
-        <button class="seg-btn {theme === 'dark' ? 'sel' : ''}" data-testid="theme-dark-btn" onclick={() => setTheme("dark")}>Dark</button>
+        <button class="seg-btn {!pluginTheme && theme === 'light' ? 'sel' : ''}" data-testid="theme-light-btn" onclick={() => setTheme("light")}>Light</button>
+        <button class="seg-btn {!pluginTheme && theme === 'dark' ? 'sel' : ''}" data-testid="theme-dark-btn" onclick={() => setTheme("dark")}>Dark</button>
+        {#each pluginThemeChoices as t (t.key)}
+          <button class="seg-btn {pluginTheme?.key === t.key ? 'sel' : ''}" data-testid="theme-plugin-{t.key.replace('/', '-')}" title="From the {t.pluginName} plugin" onclick={() => setPluginTheme(t)}>{t.name}</button>
+        {/each}
       </div>
     </div>
     <div class="setting-row">
       <span class="setting-label">Accent color</span>
       <div class="swatches">
+        {#if pluginTheme && pluginAccent}
+          <button
+            class="swatch {accentSel === 'theme' ? 'sel' : ''}"
+            data-testid="accent-theme"
+            aria-label="{pluginTheme.name} accent"
+            title="{pluginTheme.name} accent (from the theme)"
+            style="background: {pluginAccent.bg}"
+            onclick={() => setAccent("theme")}
+          >{#if accentSel === "theme"}<span class="swatch-check" style="color: {pluginAccent.fg}">✓</span>{/if}</button>
+        {/if}
         {#each Object.entries(ACCENTS) as [key, a]}
           <button
-            class="swatch {accent === key ? 'sel' : ''}"
+            class="swatch {accentSel === key ? 'sel' : ''}"
             data-testid="accent-{key}"
             aria-label={a.label}
             title={a.label}
-            style="background: {theme === 'dark' ? a.dark.bg : a.light.bg}"
+            style="background: {themeBase === 'dark' ? a.dark.bg : a.light.bg}"
             onclick={() => setAccent(key)}
-          >{#if accent === key}<span class="swatch-check">✓</span>{/if}</button>
+          >{#if accentSel === key}<span class="swatch-check">✓</span>{/if}</button>
         {/each}
       </div>
     </div>
