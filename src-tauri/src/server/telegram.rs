@@ -228,9 +228,11 @@ pub fn phone_text(content: &str) -> String {
             .find("<summary>")
             .and_then(|a| tail[a + 9..].find("</summary>").map(|b| tail[a + 9..a + 9 + b].to_string()))
             .unwrap_or_default();
-        let summary = remove_tags(&summary);
+        let summary = strip_tags(&summary);
         if !summary.trim().is_empty() {
-            out.push_str(&format!("\n▸ {}\n", summary.trim()));
+            // re-escaped: the final strip_tags pass decodes entities once
+            let line = tool_line(summary.trim()).replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            out.push_str(&format!("\n▸ {line}\n"));
         }
         match tail.find("</details>") {
             Some(e) => rest = &tail[e + "</details>".len()..],
@@ -240,6 +242,7 @@ pub fn phone_text(content: &str) -> String {
         }
     }
     out.push_str(rest);
+    let out = fold_tool_runs(&out);
     let out = persist::strip_harness_markup(&out);
     let out = strip_tags(&out);
     let mut s = String::new();
@@ -257,6 +260,153 @@ pub fn phone_text(content: &str) -> String {
         s.push('\n');
     }
     s.trim().to_string()
+}
+
+/// `mcp__vicuna-mcp__manage_sessions — {"action":"archive","session_id":"1db0…"}`
+/// → `manage_sessions: archive · 1db06ccf`. The JSON is often cut off, so
+/// key/value pairs are scanned rather than parsed.
+pub fn tool_line(summary: &str) -> String {
+    let (name, detail) = match summary.split_once(" — ") {
+        Some((n, d)) => (n.trim(), d.trim()),
+        None => (summary.trim(), ""),
+    };
+    let name = match name.strip_prefix("mcp__") {
+        Some(r) => r.split_once("__").map(|(_, t)| t).unwrap_or(r),
+        None => name,
+    };
+    if !detail.starts_with('{') {
+        return if detail.is_empty() { name.to_string() } else { format!("{name}: {}", clip(detail, 120)) };
+    }
+    let vals: Vec<String> = json_pairs(detail)
+        .into_iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "caller_session_id" | "description" | "timeout" | "timeout_ms"))
+        .map(|(_, v)| clip(&short_ids(&v), 60))
+        .filter(|v| !v.is_empty())
+        .collect();
+    if vals.is_empty() { name.to_string() } else { format!("{name}: {}", clip(&vals.join(" · "), 120)) }
+}
+
+/// (key, value) pairs of a possibly truncated flat JSON object; string
+/// values unescaped, others kept as written.
+fn json_pairs(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let c: Vec<char> = s.chars().collect();
+    let mut i = 1;
+    let read_str = |i: &mut usize| -> String {
+        let mut v = String::new();
+        *i += 1;
+        while *i < c.len() && c[*i] != '"' {
+            if c[*i] == '\\' && *i + 1 < c.len() {
+                *i += 1;
+                v.push(match c[*i] { 'n' => ' ', 't' => ' ', x => x });
+            } else {
+                v.push(c[*i]);
+            }
+            *i += 1;
+        }
+        *i += 1;
+        v
+    };
+    while i < c.len() {
+        while i < c.len() && c[i] != '"' {
+            i += 1;
+        }
+        if i >= c.len() {
+            break;
+        }
+        let k = read_str(&mut i);
+        while i < c.len() && (c[i] == ':' || c[i] == ' ') {
+            i += 1;
+        }
+        if i >= c.len() {
+            break;
+        }
+        let v = if c[i] == '"' {
+            read_str(&mut i)
+        } else {
+            // number/bool/nested: up to the next top-level comma
+            let start = i;
+            let mut depth = 0i32;
+            while i < c.len() && !(depth == 0 && (c[i] == ',' || c[i] == '}')) {
+                match c[i] { '{' | '[' => depth += 1, '}' | ']' => depth -= 1, _ => {} }
+                i += 1;
+            }
+            c[start..i].iter().collect::<String>().trim().to_string()
+        };
+        out.push((k, v));
+        while i < c.len() && c[i] != ',' {
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// UUID-ish ids → their first 8 characters.
+fn short_ids(v: &str) -> String {
+    v.split(' ').map(|w| {
+        let hexish = w.len() >= 13 && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-') && w.matches('-').count() >= 1;
+        if hexish { w.chars().take(8).collect() } else { w.to_string() }
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n - 1).collect::<String>()) }
+}
+
+/// Consecutive `▸ tool: a` / `▸ tool: b` lines of one tool → `▸ tool ×2: a, b`.
+pub fn fold_tool_runs(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Option<(String, Vec<String>)> = None;
+    let flush = |run: &mut Option<(String, Vec<String>)>, out: &mut Vec<String>| {
+        if let Some((name, ds)) = run.take() {
+            let ds: Vec<String> = ds.into_iter().filter(|d| !d.is_empty()).collect();
+            let n = ds.len().max(1);
+            let line = match (n, ds.is_empty()) {
+                (_, true) => format!("▸ {name}"),
+                (1, _) => format!("▸ {name}: {}", ds[0]),
+                _ => {
+                    // shared leading words (e.g. the action) said once
+                    let first: Vec<&str> = ds[0].split(" · ").collect();
+                    let common = (0..first.len())
+                        .take_while(|&k| ds.iter().all(|d| d.split(" · ").nth(k) == Some(first[k])))
+                        .count();
+                    let head = first[..common].join(" · ");
+                    let tails: Vec<String> = ds.iter().map(|d| d.split(" · ").skip(common).collect::<Vec<_>>().join(" · ")).filter(|t| !t.is_empty()).collect();
+                    let body = match (head.is_empty(), tails.is_empty()) {
+                        (true, _) => tails.join(", "),
+                        (false, true) => head,
+                        (false, false) => format!("{head} · {}", tails.join(", ")),
+                    };
+                    format!("▸ {name} ×{n}: {}", clip(&body, 300))
+                }
+            };
+            out.push(line);
+        }
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("▸ ") {
+            let (name, d) = match rest.split_once(": ") {
+                Some((n, d)) => (n.to_string(), d.to_string()),
+                None => (rest.to_string(), String::new()),
+            };
+            match &mut run {
+                Some((n, ds)) if *n == name => ds.push(d),
+                _ => {
+                    flush(&mut run, &mut out);
+                    run = Some((name, vec![d]));
+                }
+            }
+        } else if line.trim().is_empty() && run.is_some() {
+            continue; // blank lines between cards don't break a run
+        } else {
+            flush(&mut run, &mut out);
+            out.push(line.to_string());
+        }
+    }
+    flush(&mut run, &mut out);
+    out.join("\n")
 }
 
 fn strip_tags(s: &str) -> String {
@@ -337,6 +487,9 @@ pub async fn action(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Va
             set_error("");
             Ok(status())
         }
+        "whisper_status" => Ok(crate::whisper::status()),
+        "whisper_install" => crate::whisper::start_install(args.get("model").and_then(Value::as_str).unwrap_or("tiny")),
+        "whisper_uninstall" => crate::whisper::uninstall(args.get("model").and_then(Value::as_str).unwrap_or("tiny")),
         _ => Err(format!("unknown telegram action {cmd}")),
     }
 }
@@ -466,6 +619,14 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
         let data = cb.get("data").and_then(Value::as_str).unwrap_or("");
         let chat = c.chat_id.unwrap_or_default();
         let msg_id = cb.pointer("/message/message_id").and_then(Value::as_i64);
+        if data == "sn" {
+            if let (Some(m), Some(t)) = (msg_id, cb.pointer("/message/text").and_then(Value::as_str)) {
+                // drop the button so it can't be tapped twice
+                let _ = call(&token, "editMessageText", json!({"chat_id": chat, "message_id": m, "text": t})).await;
+            }
+            send_now_reply(st, &token, chat).await;
+            return Ok(());
+        }
         if let Some(e) = data.strip_prefix("e:") {
             let out = pick_engine(st, e).await;
             reply_or_edit(&token, chat, msg_id, out).await;
@@ -520,7 +681,7 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
     }
     let t = text.trim();
     if t == "/help" || t == "/start" {
-        send_text(&token, chat, "Send any message to talk to your lead session. Photos work too.\n/status: what the lead is doing\n/model: switch the lead's harness and model (/model claude haiku)\n/stop: stop the lead's running turn", None).await;
+        send_text(&token, chat, "Send any message to talk to your lead session. Photos, files and voice memos work too.\n/status: what the lead is doing\n/model: switch the lead's harness and model (/model claude haiku)\n/send_now: interrupt the running turn and send your queued messages now\n/stop: stop the lead's running turn", None).await;
         return Ok(());
     }
     let Some(lead) = lead_id(st).await else {
@@ -549,6 +710,10 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
         send_text(&token, chat, &format!("Lead \"{title}\" is {state} · {engine}/{model}"), None).await;
         return Ok(());
     }
+    if t == "/send_now" || t.starts_with("/send_now@") {
+        send_now_reply(st, &token, chat).await;
+        return Ok(());
+    }
     if t == "/stop" {
         match live_turn(st, &lead) {
             Some((tid, _)) => {
@@ -571,11 +736,73 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
             }
         }
     }
+    let mut text_out = t.to_string();
+    // voice memos: transcribe on the server (if a Whisper model is installed),
+    // show the transcript on the phone first, then send it to the lead as text
+    if let Some(v) = msg.get("voice") {
+        let fid = v.get("file_id").and_then(Value::as_str).unwrap_or("");
+        if crate::whisper::installed_model().is_some() {
+            let _ = call(&token, "sendChatAction", json!({"chat_id": chat, "action": "typing"})).await;
+            let res = match download_file(&token, fid, MAX_FILE).await {
+                Ok(b) => crate::whisper::transcribe_ogg(b).await,
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(Some(tx)) if !tx.trim().is_empty() => {
+                    send_text(&token, chat, &format!("🎙 {}", tx.trim()), None).await;
+                    text_out = if text_out.is_empty() { tx.trim().to_string() } else { format!("{text_out}\n\n{}", tx.trim()) };
+                }
+                Ok(_) => {
+                    send_text(&token, chat, "🎙 (no speech recognized)", None).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    send_text(&token, chat, &format!("⚠️ Couldn't transcribe the voice memo: {e}. Sending the audio file instead."), None).await;
+                }
+            }
+            if !text_out.is_empty() && text_out != t {
+                // transcript ready: a waiting free-form question takes it as the answer
+                if pending_ask_for(st, &lead).is_some() {
+                    if let Err(e) = answer_ask(st, &lead, Answer::Text(text_out.clone())).await {
+                        send_text(&token, chat, &format!("⚠️ {e}"), None).await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let transcribed = text_out != t;
     let mut images = Vec::new();
+    let mut staged: Vec<String> = Vec::new();
+    for (kind, name) in attachment_files(msg, transcribed) {
+        let fid = kind;
+        match download_file(&token, &fid, MAX_FILE).await {
+            Ok(bytes) if is_image_name(&name) && bytes.len() <= 10 * 1024 * 1024 => {
+                images.push(json!(format!("data:{};base64,{}", image_mime(&name), base64::engine::general_purpose::STANDARD.encode(&bytes))));
+            }
+            Ok(bytes) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                match crate::upload_stage_file_logic(lead.clone(), name.clone(), b64).await {
+                    Ok(p) => staged.push(p),
+                    Err(e) => {
+                        send_text(&token, chat, &format!("⚠️ Couldn't save {name}: {e}"), None).await;
+                    }
+                }
+            }
+            Err(e) => {
+                send_text(&token, chat, &format!("⚠️ Couldn't fetch {name}: {e}"), None).await;
+            }
+        }
+    }
+    if !staged.is_empty() {
+        text_out.push_str(&upload_note(&staged));
+    }
+    let t = text_out.trim().to_string();
+    let t = t.as_str();
     if let Some(photos) = msg.get("photo").and_then(Value::as_array) {
         if let Some(fid) = photos.last().and_then(|p| p.get("file_id")).and_then(Value::as_str) {
-            match download_photo(&token, fid).await {
-                Ok(d) => images.push(json!(d)),
+            match download_file(&token, fid, 10 * 1024 * 1024).await {
+                Ok(b) => images.push(json!(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&b)))),
                 Err(e) => {
                     send_text(&token, chat, &format!("⚠️ Couldn't fetch the photo: {e}"), None).await;
                 }
@@ -595,7 +822,8 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
         return Ok(());
     }
     if queued {
-        send_text(&token, chat, "📨 Queued for the lead's running turn.", None).await;
+        let kb = json!({"inline_keyboard": [[{"text": "⚡ Send now", "callback_data": "sn"}]]});
+        send_text(&token, chat, "📨 Queued for the lead's running turn. Tap Send now (or /send_now) to interrupt it and send right away.", Some(kb)).await;
     }
     if let Some((tid, _)) = live_turn(st, &lead) {
         follow(st.clone(), token, chat, lead, tid);
@@ -603,11 +831,41 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
     Ok(())
 }
 
+async fn send_now_reply(st: &Arc<BridgeState>, token: &str, chat: i64) {
+    let Some(lead) = lead_id(st).await else {
+        send_text(token, chat, "No lead session.", None).await;
+        return;
+    };
+    if live_turn(st, &lead).is_none() {
+        send_text(token, chat, "The lead is idle, nothing is waiting.", None).await;
+        return;
+    }
+    send_text(token, chat, "⚡ Interrupting the lead…", None).await;
+    // the stop + restart can take a while: don't hold up the update loop
+    let (st, token) = (st.clone(), token.to_string());
+    tokio::spawn(async move {
+        match turns::send_now(&st, &lead).await {
+            Ok(0) => {
+                send_text(&token, chat, "Nothing is queued: your messages already reached the lead.", None).await;
+            }
+            Ok(_) => {
+                if let Some((tid, _)) = live_turn(&st, &lead) {
+                    follow(st.clone(), token, chat, lead, tid);
+                }
+            }
+            Err(e) => {
+                send_text(&token, chat, &format!("⚠️ {e}"), None).await;
+            }
+        }
+    });
+}
+
 // ---------- /model ----------
 
 const COMMANDS: &[(&str, &str)] = &[
     ("status", "What the lead is doing, harness and model"),
     ("model", "Switch the lead's harness and model"),
+    ("send_now", "Interrupt the lead and send queued messages now"),
     ("stop", "Stop the lead's running turn"),
     ("help", "How this bot works"),
 ];
@@ -709,16 +967,76 @@ async fn set_lead(st: &Arc<BridgeState>, lead: &str, engine: &str, model: &str) 
     Ok(format!("✅ Lead now runs {engine}/{model}{note}."))
 }
 
-async fn download_photo(token: &str, file_id: &str) -> Result<String, String> {
+/// Telegram's getFile serves files up to 20 MB to bots.
+const MAX_FILE: usize = 20 * 1024 * 1024;
+
+async fn download_file(token: &str, file_id: &str, cap: usize) -> Result<Vec<u8>, String> {
+    if file_id.is_empty() {
+        return Err("no file id".into());
+    }
     let f = call(token, "getFile", json!({"file_id": file_id})).await?;
-    let path = f.get("file_path").and_then(Value::as_str).ok_or("no file path")?;
+    if f.get("file_size").and_then(Value::as_u64).is_some_and(|n| n as usize > cap) {
+        return Err(format!("file is over {} MB", cap / 1024 / 1024));
+    }
+    let path = f.get("file_path").and_then(Value::as_str).ok_or("file is too big for a bot to download (20 MB limit)")?;
     let url = format!("{}/file/bot{}/{}", api_base(), token, path);
     let bytes = client().get(&url).send().await.map_err(|e| e.without_url().to_string())?
         .bytes().await.map_err(|e| e.without_url().to_string())?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err("photo is over 10 MB".into());
+    if bytes.len() > cap {
+        return Err(format!("file is over {} MB", cap / 1024 / 1024));
     }
-    Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
+    Ok(bytes.to_vec())
+}
+
+/// (file_id, file name) of every non-photo attachment in a message. A voice
+/// memo that was already transcribed is left out.
+pub fn attachment_files(msg: &Value, voice_transcribed: bool) -> Vec<(String, String)> {
+    let uid = |v: &Value| v.get("file_unique_id").and_then(Value::as_str).unwrap_or("file").to_string();
+    let mut out = Vec::new();
+    for (key, default_ext) in [("document", ""), ("audio", "mp3"), ("video", "mp4"), ("video_note", "mp4"), ("voice", "ogg"), ("animation", "mp4")] {
+        if key == "voice" && voice_transcribed {
+            continue;
+        }
+        let Some(v) = msg.get(key) else { continue };
+        let Some(fid) = v.get("file_id").and_then(Value::as_str) else { continue };
+        let name = v.get("file_name").and_then(Value::as_str).map(str::to_string)
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| {
+                let ext = v.get("mime_type").and_then(Value::as_str)
+                    .and_then(|m| m.rsplit('/').next())
+                    .map(|e| if e == "mpeg" { "mp3" } else { e })
+                    .filter(|_| default_ext.is_empty())
+                    .unwrap_or(if default_ext.is_empty() { "bin" } else { default_ext });
+                format!("{key}-{}.{ext}", uid(v))
+            });
+        out.push((fid.to_string(), sanitize_name(&name)));
+    }
+    out
+}
+
+fn sanitize_name(n: &str) -> String {
+    let base = n.rsplit(['/', '\\']).next().unwrap_or(n).trim();
+    let s: String = base.chars().map(|c| if c.is_control() { '_' } else { c }).collect();
+    if s.is_empty() || s == "." || s == ".." { "file".into() } else { s.chars().take(200).collect() }
+}
+
+fn is_image_name(n: &str) -> bool {
+    let l = n.to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".webp", ".gif"].iter().any(|e| l.ends_with(e))
+}
+
+fn image_mime(n: &str) -> &'static str {
+    let l = n.to_ascii_lowercase();
+    if l.ends_with(".png") { "image/png" } else if l.ends_with(".webp") { "image/webp" } else if l.ends_with(".gif") { "image/gif" } else { "image/jpeg" }
+}
+
+/// Same note the composer appends for attached files (agents read them from there).
+pub fn upload_note(paths: &[String]) -> String {
+    let dir = std::path::Path::new(&paths[0]).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let names: Vec<String> = paths.iter()
+        .map(|p| format!(" - {}", std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()))
+        .collect();
+    format!("\n\n[Attached files saved to {dir} (use the read_upload tool with the file NAME to read them):\n{}]", names.join("\n"))
 }
 
 // ---------- ask cards ----------
@@ -868,10 +1186,34 @@ mod tests {
     fn phone_text_flattens_tool_cards() {
         let c = "Looking.\n\n<details class=\"tool-result\"><summary>Bash — ls &lt;dir&gt;</summary><pre><code>a\nb</code></pre></details>\n\nDone: 2 files.";
         let t = phone_text(c);
-        assert!(t.contains("▸ Bash — ls <dir>"), "{t}");
+        assert!(t.contains("▸ Bash: ls <dir>"), "{t}");
         assert!(t.contains("Done: 2 files."));
         assert!(!t.contains("<pre>") && !t.contains("a\nb"));
         assert_eq!(phone_text("a < b"), "a < b");
+    }
+
+    #[test]
+    fn attachments_name_files_and_skip_transcribed_voice() {
+        let msg = json!({
+            "document": {"file_id": "D", "file_unique_id": "u1", "file_name": "../report.pdf"},
+            "voice": {"file_id": "V", "file_unique_id": "u2", "mime_type": "audio/ogg"},
+            "audio": {"file_id": "A", "file_unique_id": "u3", "mime_type": "audio/mpeg"},
+        });
+        let all = attachment_files(&msg, false);
+        assert_eq!(all, vec![("D".into(), "report.pdf".into()), ("A".into(), "audio-u3.mp3".into()), ("V".into(), "voice-u2.ogg".into())]);
+        assert!(attachment_files(&msg, true).iter().all(|(id, _)| id != "V"));
+        let note = upload_note(&["/h/vicuna/uploads/s/report.pdf".into()]);
+        assert!(note.contains("[Attached files saved to /h/vicuna/uploads/s (use the read_upload tool") && note.contains(" - report.pdf]"));
+    }
+
+    #[test]
+    fn tool_lines_are_compact_and_folded() {
+        let a = r#"mcp__vicuna-mcp__manage_sessions — {"action":"archive","caller_session_id":"c19ce8f0-02c5-49e6-9744-10bf9d321fa5","session_id":"1db06ccf-38a9-4c64-9b35-13d"#;
+        assert_eq!(tool_line(a), "manage_sessions: archive · 1db06ccf");
+        assert_eq!(tool_line("Bash — ls -la"), "Bash: ls -la");
+        let b = a.replace("1db06ccf", "fbf7a937");
+        let t = fold_tool_runs(&format!("Archiving.\n▸ {}\n\n▸ {}\nDone.", tool_line(a), tool_line(&b)));
+        assert_eq!(t, "Archiving.\n▸ manage_sessions ×2: archive · 1db06ccf, fbf7a937\nDone.");
     }
 
     #[test]
