@@ -8,7 +8,7 @@ edition = "2024"
 [dependencies]
 # headless: no `desktop` feature (and no `tauri`), so no WebKit/GTK at build or
 # runtime; rustls instead of system OpenSSL — builds statically against musl
-vicuna_lib = { package = "vicuna", path = "../src-tauri", default-features = false, features = ["rustls"] }
+vicuna_lib = { package = "vicuna", path = "../src-tauri", default-features = false, features = ["rustls", "whisper"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

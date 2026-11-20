@@ -17,6 +17,15 @@
     lastError: string;
   }
 
+  interface WhisperModel { id: string; label: string; sizeMb: number; minRamMb: number; installed: boolean; fits: boolean }
+  interface WhisperStatus {
+    available: boolean;
+    ramMb: number | null;
+    models: WhisperModel[];
+    installing: { model: string; done: number; total: number } | null;
+    error: string;
+  }
+
   let { leadTitle = "", onClose }: { leadTitle?: string; onClose: () => void } = $props();
 
   let st = $state<Status | null>(null);
@@ -24,6 +33,8 @@
   let editing = $state(false);
   let busy = $state(false);
   let err = $state("");
+  let ws = $state<WhisperStatus | null>(null);
+  let wsBusy = $state(false);
   let timer: ReturnType<typeof setInterval> | null = null;
 
   async function refresh() {
@@ -31,6 +42,11 @@
       st = await invokeOrBridge<Status>("telegram_status", {});
     } catch (e) {
       err = String(e);
+    }
+    try {
+      ws = await invokeOrBridge<WhisperStatus>("whisper_status", {});
+    } catch {
+      ws = null; // older server without voice transcription
     }
   }
 
@@ -55,6 +71,20 @@
       editing = false;
     }
   }
+
+  async function whisper(cmd: "whisper_install" | "whisper_uninstall", model: string) {
+    wsBusy = true;
+    err = "";
+    try {
+      ws = await invokeOrBridge<WhisperStatus>(cmd, { model });
+    } catch (e) {
+      err = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      wsBusy = false;
+    }
+  }
+
+  const gb = (mb: number) => `${(mb / 1024).toFixed(mb % 1024 ? 1 : 0)} GB`;
 
   onMount(() => {
     void refresh();
@@ -113,7 +143,7 @@
 
     {#if st.paired}
       <div class="tg-box" data-testid="telegram-paired">
-        Paired with <b>{st.paired.name}</b>. Messages they send to the bot go to your lead session; its replies, questions and worker reports come back.
+        <div>Paired with <b>{st.paired.name}</b>. Messages they send to the bot go to your lead session; its replies, questions and worker reports come back.</div>
       </div>
     {:else}
       <div class="tg-box" data-testid="telegram-pairing">
@@ -132,6 +162,40 @@
       {#if st.paired}<button class="tg-btn" data-testid="telegram-unpair" disabled={busy} onclick={() => run("telegram_unpair")}>Unpair</button>{/if}
       <button class="tg-btn danger" data-testid="telegram-remove" disabled={busy} onclick={() => run("telegram_remove")}>Remove bot</button>
     </div>
+    {#if ws}
+      <div class="tg-box" data-testid="whisper-section">
+        <div><b>Voice memos</b> <span class="tg-muted small">· transcribed on this server, shown on your phone, then sent to the lead</span></div>
+        {#if !ws.available}
+          <div class="tg-muted small">This Vicuna build has no voice transcription. Voice memos still arrive as audio files.</div>
+        {:else}
+          {#each ws.models as m (m.id)}
+            {@const dl = ws.installing?.model === m.id ? ws.installing : null}
+            <div class="tg-row" data-testid={"whisper-" + m.id}>
+              <div class="tg-wm">
+                <div>{m.label} <span class="tg-muted small">· {m.sizeMb} MB</span></div>
+                {#if dl}
+                  <div class="tg-bar"><div style:width={dl.total ? `${Math.min(100, (dl.done / dl.total) * 100)}%` : "4%"}></div></div>
+                {:else if !m.installed && !m.fits}
+                  <div class="tg-muted small">Needs {gb(m.minRamMb)} RAM{ws.ramMb ? `; this server has ${gb(ws.ramMb)}` : ""}.</div>
+                {/if}
+              </div>
+              {#if dl}
+                <span class="tg-muted small">{dl.total ? Math.round((dl.done / dl.total) * 100) : 0}%</span>
+              {:else if m.installed}
+                <button class="tg-btn small" data-testid={"whisper-uninstall-" + m.id} disabled={wsBusy} onclick={() => whisper("whisper_uninstall", m.id)}>Uninstall</button>
+              {:else}
+                <button class="tg-btn small" data-testid={"whisper-install-" + m.id} disabled={wsBusy || !!ws.installing || !m.fits} onclick={() => whisper("whisper_install", m.id)}>Install</button>
+              {/if}
+            </div>
+          {/each}
+          {#if !ws.models.some((m) => m.installed)}
+            <div class="tg-muted small">Optional. Without a model, voice memos arrive as audio files.</div>
+          {/if}
+          {#if ws.error}<div class="tg-err">{ws.error}</div>{/if}
+        {/if}
+      </div>
+    {/if}
+
     <div class="tg-muted small">Runs on this Vicuna server while it's up. Use one server per bot: Telegram lets only one server receive a bot's messages.</div>
   {/if}
 
@@ -161,6 +225,9 @@
   .tg-dot.off { background: var(--border-2); }
   .tg-check { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
   .tg-err { color: var(--danger); font-size: 13px; overflow-wrap: anywhere; }
+  .tg-wm { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .tg-bar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+  .tg-bar > div { height: 100%; background: var(--accent); transition: width 0.3s; }
   .tg-foot { display: flex; justify-content: flex-end; }
   a { color: var(--accent); }
   code { font-size: 12.5px; }

@@ -48,6 +48,7 @@ pub mod git_panel;
 pub mod server_store;
 pub mod servers;
 pub mod server;
+pub mod whisper;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 

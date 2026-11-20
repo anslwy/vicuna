@@ -374,6 +374,40 @@ pub async fn deliver(st: &Arc<BridgeState>, chat_id: &str, msg: Value) -> Result
     start_server_turn(st, chat_id, vec![msg], None).await.map(|_| ())
 }
 
+/// Interrupt a session's running turn so its queued messages go now: the
+/// queue is taken off the turn (a stopped turn would leave it to a window),
+/// the turn is stopped, and once it has ended the messages start a new turn.
+/// Returns how many messages were sent (0 = nothing queued / idle).
+pub async fn send_now(st: &Arc<BridgeState>, chat_id: &str) -> Result<usize, String> {
+    let Some((_, turn)) = live_turn(st, chat_id) else { return Ok(0) };
+    let msgs: Vec<Value> = turn.queue.lock().map(|mut q| q.drain(..).collect::<Vec<_>>()).unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, m)| serde_json::to_value(m).ok())
+        .collect();
+    if msgs.is_empty() {
+        return Ok(0);
+    }
+    crate::work_agent::agent_stop(&turn);
+    // engines can take ~20 s to honor a cancel
+    let until = Instant::now() + Duration::from_secs(45);
+    while live_turn(st, chat_id).is_some() && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let n = msgs.len();
+    match live_turn(st, chat_id) {
+        // still winding down: put them back so they aren't lost
+        Some((_, t)) => {
+            for m in msgs {
+                if let Some(cm) = chat_message(&m) {
+                    agent_queue_msg(&t, uuid(), cm)?;
+                }
+            }
+            Err("the running turn didn't stop in time; your message stays queued".into())
+        }
+        None => start_server_turn(st, chat_id, msgs, None).await.map(|_| n),
+    }
+}
+
 /// Start a turn the server decided on (no window involved): append the user
 /// message(s) and a placeholder to the stored session, then run it with the
 /// session's own harness/model (or the server's saved pick).
