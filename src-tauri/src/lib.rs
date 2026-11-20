@@ -2241,6 +2241,11 @@ async fn server_lb_proxy_url(id: String) -> Result<String, String> {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
+async fn server_base_url(id: String) -> Result<String, String> {
+    servers::base_url(&id).await
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_exec(root: String, command: String, timeout_ms: Option<u64>) -> Result<WorkExecResult, String> {
     work_exec_logic(root, command, timeout_ms).await
 }
@@ -5688,6 +5693,7 @@ pub fn run() {
             server_call,
             server_download_file,
             server_lb_proxy_url,
+            server_base_url,
             work_exec,
             work_fetch_url,
             work_exec_start,

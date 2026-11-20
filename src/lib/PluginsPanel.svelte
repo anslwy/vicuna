@@ -6,11 +6,12 @@
   import { invokeOrBridge } from "./bridge";
   import type { InstalledPlugin } from "./pluginTheme";
 
-  let { plugins, activeThemeKey, onChanged, onUseTheme }: {
+  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel }: {
     plugins: InstalledPlugin[];
     activeThemeKey: string | null;
     onChanged: (list: InstalledPlugin[]) => void;
     onUseTheme: (pluginId: string, themeId: string) => void;
+    onOpenPanel?: (key: string) => void;
   } = $props();
 
   let source = $state("");
@@ -88,7 +89,7 @@
 </script>
 
 <div class="pl" data-testid="plugins-panel">
-  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes for now.</p>
+  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes and side panels.</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
     <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
     <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={!source.trim() || !!busy}>{busy === "install" ? "Installing…" : "Install"}</button>
@@ -112,6 +113,12 @@
         {#if p.description}<div class="pl-muted">{p.description}</div>{/if}
         <div class="pl-src" title={p.source}>{p.source}</div>
         <div class="pl-themes">
+          {#each p.panels ?? [] as pn (pn.id)}
+            <button class="pl-theme" data-testid="plugin-panel-{p.id}-{pn.id}" title="Open this panel in the side bar" onclick={() => onOpenPanel?.(`plugin:${p.id}:${pn.id}`)}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
+              {pn.title}
+            </button>
+          {/each}
           {#each p.themes as t (t.id)}
             {@const key = `${p.id}/${t.id}`}
             <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-theme-{p.id}-{t.id}" onclick={() => onUseTheme(p.id, t.id)} title="Use this theme">

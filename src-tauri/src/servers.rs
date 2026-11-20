@@ -228,6 +228,18 @@ pub async fn call(id: &str, path: &str, body: Option<Value>, timeout_ms: Option<
 /// Reserved server id of this machine's own backend (the main window).
 pub const LOCAL_ID: &str = "local";
 
+/// Base URL of a server's HTTP routes as this machine reaches them (the
+/// embedded/adopted backend for "local"). Webviews load plugin panels from
+/// it directly; those routes are capability-gated, so no token is attached.
+pub async fn base_url(id: &str) -> Result<String, String> {
+    if id == LOCAL_ID {
+        let b = crate::server::embedded::wait_local(Duration::from_secs(120)).await?;
+        return Ok(b.url.trim_end_matches('/').to_string());
+    }
+    let s = load().into_iter().find(|s| s.id == id).ok_or("That server is no longer in your list.")?;
+    Ok(s.url.trim_end_matches('/').to_string())
+}
+
 /// Copy a file from a server's workspace into `dest_dir` (~/Downloads) in
 /// 4MB base64 chunks over `/invoke work_read_chunk`. A clashing name gets
 /// ` (N)` appended; a failed transfer removes the partial file.

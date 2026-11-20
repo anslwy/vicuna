@@ -13,6 +13,9 @@ export type InstalledPlugin = {
   source: string;
   installedAt: number;
   themes: PluginThemeDef[];
+  /** Side panels (plugins.rs `Panel`) and their server path prefix. */
+  panels?: { id: string; title: string; icon?: string | null; entry: string }[];
+  panelBase?: string;
 };
 /** What we cache: the theme plus its plugin-qualified key. */
 export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };
