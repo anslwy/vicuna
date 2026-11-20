@@ -11076,7 +11076,7 @@
       ></div>
       <div class="side-tabs" data-testid="side-tabs" role="tablist" aria-label="Side panel tabs">
         {#each sideTabs as t (t.key)}
-          {@const tabTitle = t.kind === "files" || t.kind === "git" ? explorerRootBase || t.title : t.title}
+          {@const tabTitle = t.kind === "files" || t.kind === "git" || t.kind === "plugin" ? explorerRootBase || t.title : t.title}
           <!-- Files / Git follow the workspace: titled by its folder name, like terminal tabs -->
           <div
             class="side-tab {t.key === activeSideTab ? 'sel' : ''}"
@@ -11107,7 +11107,8 @@
           >
             <button
               class="side-tab-label"
-              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : `${t.title} tab`}
+              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : t.kind === "plugin" ? `${t.title} tab` : `${t.title} tab`}
+              title={t.kind === "plugin" ? t.title : undefined}
               onclick={() => switchSideTab(t.key)}
             >
               {#if t.kind === "files"}

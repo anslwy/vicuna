@@ -4,7 +4,7 @@
   // so a remote server window manages that server's plugins.
   import { onMount } from "svelte";
   import { invokeOrBridge } from "./bridge";
-  import type { InstalledPlugin } from "./pluginTheme";
+  import { installBlocked, type InstalledPlugin } from "./pluginTheme";
 
   let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel }: {
     plugins: InstalledPlugin[];
@@ -15,19 +15,22 @@
   } = $props();
 
   let source = $state("");
-  let busy = $state<string | null>(null); // "install" | "upgrade:<id>" | "uninstall:<id>" | "list"
+  let busy = $state<string | null>(null); // "install" | "upgrade:<id>" | "uninstall:<id>"
   let error = $state("");
   let notice = $state("");
   let confirmRemove = $state<string | null>(null);
 
+  /** the first list load: shown as "Loading…", never blocks Install */
+  let listing = $state(false);
+
   async function refresh() {
-    busy = "list";
+    listing = true;
     try {
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
     } catch (e: any) {
       error = e?.message ?? String(e);
     } finally {
-      busy = null;
+      listing = false;
     }
   }
 
@@ -37,7 +40,7 @@
 
   async function install() {
     const s = source.trim();
-    if (!s || busy) return;
+    if (installBlocked(s, busy)) return;
     busy = "install";
     error = notice = "";
     try {
@@ -92,14 +95,14 @@
   <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes and side panels.</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
     <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
-    <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={!source.trim() || !!busy}>{busy === "install" ? "Installing…" : "Install"}</button>
+    <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={installBlocked(source, busy)}>{busy === "install" ? "Installing…" : "Install"}</button>
   </form>
   {#if error}<div class="pl-err" data-testid="plugin-error">{error}</div>{/if}
   {#if notice}<div class="pl-note" data-testid="plugin-notice">{notice}</div>{/if}
 
   <div class="pl-head">Installed</div>
   {#if plugins.length === 0}
-    <div class="pl-muted" data-testid="plugins-empty">{busy === "list" ? "Loading…" : "No plugins installed."}</div>
+    <div class="pl-muted" data-testid="plugins-empty">{listing ? "Loading…" : "No plugins installed."}</div>
   {:else}
     {#each plugins as p (p.id)}
       <div class="pl-item" data-testid="plugin-row-{p.id}">

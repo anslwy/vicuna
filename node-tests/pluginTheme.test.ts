@@ -47,3 +47,12 @@ test("the swatch row follows the theme accent until a built-in swatch mutes it",
   assert.equal(selectedAccent({ ...t, accent: null }, false, "green"), "green");
   assert.equal(themeProperties(t, false)["--accent"], undefined);
 });
+
+test("Install is usable while the plugin list is still loading", async () => {
+  const { installBlocked } = await import("../src/lib/pluginTheme.ts");
+  assert.equal(installBlocked("me/repo", null), false);
+  assert.equal(installBlocked("me/repo", "list"), false, "a list load never blocks Install");
+  assert.equal(installBlocked("  ", null), true);
+  assert.equal(installBlocked("me/repo", "install"), true);
+  assert.equal(installBlocked("me/repo", "upgrade:x"), true);
+});
