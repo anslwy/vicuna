@@ -61,7 +61,7 @@
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, readAccentMuted, writeAccentMuted, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
-  import { telegramConnLabel, telegramConnState, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
+  import { telegramConnLabel, telegramConnState, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { hideSplash } from "$lib/splash";
   import {
     APP_UPDATE_RELEASES_URL,
@@ -3835,9 +3835,9 @@
     ctxMenu = {
       chatId: id,
       x: Math.min(e.clientX, window.innerWidth - 280),
-      y: Math.min(e.clientY, window.innerHeight - 160)
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 360))
     };
-    if (chats.find((x) => x.id === id)?.role === "lead") {
+    if ((chats.find((x) => x.id === id)?.mode ?? "chat") === "work") {
       void refreshTelegramStatus();
     }
   }
@@ -4423,16 +4423,30 @@
   }
 
   /** the lead may manage other sessions; making one the lead also pins it */
-  // Telegram bridge dialog (lead session menu); the session it was opened for
+  // Per-session Telegram bridge dialog; the session it was opened for
   let telegramFor = $state<string | null>(null);
-  // connection status for the dot next to the Telegram icon in the lead menu
-  let telegramState = $state<TelegramConnState>("unconfigured");
+  // Per-session Telegram statuses keyed by session ID (for sidebar badges & context menu dots)
+  let telegramStatuses = $state<Record<string, TelegramStatusSnapshot>>({});
+  function telegramStateFor(id: string | undefined): TelegramConnState {
+    return telegramConnState(id ? telegramStatuses[id] : null);
+  }
   async function refreshTelegramStatus() {
     try {
-      const s = await invokeOrBridge<TelegramStatusSnapshot>("telegram_status", {});
-      telegramState = telegramConnState(s);
+      const res = await invokeOrBridge<{ bridges?: Record<string, TelegramStatusSnapshot> }>("telegram_list", {});
+      telegramStatuses = res?.bridges ?? {};
     } catch {
-      telegramState = "unconfigured"; // older server without the bridge
+      // Fallback for older servers that only expose single-lead telegram_status
+      try {
+        const lead = chats.find((c) => c.role === "lead");
+        if (!lead) {
+          telegramStatuses = {};
+          return;
+        }
+        const s = await invokeOrBridge<TelegramStatusSnapshot>("telegram_status", {});
+        telegramStatuses = s?.configured ? { [lead.id]: s } : {};
+      } catch {
+        telegramStatuses = {};
+      }
     }
   }
   $effect(() => {
@@ -9685,6 +9699,19 @@
                 {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
                 {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
                 {#if c.mode === "work"}
+                  {@const tgSnap = telegramStatuses[c.id]}
+                  {@const tgState = telegramConnState(tgSnap)}
+                  {#if tgState !== "unconfigured"}
+                    <span
+                      class="tg-row-badge {tgState}"
+                      data-testid="telegram-row-badge"
+                      data-status={tgState}
+                      title={telegramConnTitle(tgSnap)}
+                      aria-label={telegramConnTitle(tgSnap)}
+                    >
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
+                    </span>
+                  {/if}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
                     <span class="work-badge ws-badge" title={displayWorkspace(c.workspace ?? "")}>
@@ -9818,32 +9845,31 @@
           <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
           <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
           <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
+          <div class="ctx-sep" role="separator"></div>
           {#if (ctxChat?.mode ?? "chat") === "work"}
+            {@const tgSnap = ctxChat ? telegramStatuses[ctxChat.id] : null}
+            {@const tgState = telegramStateFor(ctxChat?.id)}
             {#if ctxChat?.role === "lead"}
               <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>Remove lead</button>
             {:else}
               {@const hasLead = chats.some((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)}
               <button
-                class="ctx-item ctx-telegram"
+                class="ctx-item"
                 data-testid="lead-item"
                 onclick={() => { leadPrompt = { id: ctxMenu!.chatId, prevTitle: chats.find((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)?.title ?? null }; ctxMenu = null; }}
-              >
-                <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
-                <span class="ctx-tg-label">{hasLead ? "Replace lead" : "Make lead"}</span>
-              </button>
+              >{hasLead ? "Replace lead" : "Make lead"}</button>
             {/if}
-            {#if ctxChat?.role === "lead"}
-              <button
-                class="ctx-item ctx-telegram"
-                data-testid="telegram-item"
-                title={telegramConnLabel(telegramState)}
-                onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}
-              >
-                <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
-                <span class="ctx-tg-label">Telegram</span>
-                <span class="ctx-tg-dot {telegramState}" data-testid="telegram-status-dot" data-status={telegramState} aria-label={telegramConnLabel(telegramState)}></span>
-              </button>
-            {/if}
+            <button
+              class="ctx-item ctx-telegram"
+              data-testid="telegram-item"
+              title={telegramConnTitle(tgSnap)}
+              onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}
+            >
+              <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
+              <span class="ctx-tg-label">Telegram</span>
+              {#if tgSnap?.botUsername}<span class="ctx-tg-bot">@{tgSnap.botUsername}</span>{/if}
+              <span class="ctx-tg-dot {tgState}" data-testid="telegram-status-dot" data-status={tgState} aria-label={telegramConnLabel(tgState)}></span>
+            </button>
           {/if}
           <div class="ctx-continue-row">
             <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
@@ -9886,6 +9912,7 @@
               {/if}
             </form>
           {/if}
+          <div class="ctx-sep" role="separator"></div>
           <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
         </div>
       {/if}
@@ -11685,13 +11712,21 @@
 {#if leadPrompt}
   {@const lp = leadPrompt}
   <TelegramModal
-    leadTitle={chats.find((c) => c.id === lp.id)?.title ?? ""}
+    sessionId={lp.id}
+    sessionTitle={chats.find((c) => c.id === lp.id)?.title ?? ""}
     lead={{ prevTitle: lp.prevTitle, onConfirm: () => { leadPrompt = null; void toggleLead(lp.id).then(refreshTelegramStatus); } }}
     onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
   />
 {/if}
 {#if telegramFor}
-  <TelegramModal leadTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""} onClose={() => { telegramFor = null; void refreshTelegramStatus(); }} />
+  <TelegramModal
+    sessionId={telegramFor}
+    sessionTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""}
+    allStatuses={telegramStatuses}
+    sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
+    onSelectSession={(id) => { telegramFor = id; void refreshTelegramStatus(); }}
+    onClose={() => { telegramFor = null; void refreshTelegramStatus(); }}
+  />
 {/if}
 {#if srvDialogOpen}
   <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
@@ -12798,12 +12833,17 @@
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
   .ctx-item.ctx-telegram { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
+  .ctx-sep { height: 1px; background: var(--border); margin: 4px 8px; }
   .ctx-tg-label { flex: 1; min-width: 0; }
+  .ctx-tg-bot { font-size: 12px; color: var(--muted); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }
   .ctx-tg-dot { flex: none; margin-left: auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
   .ctx-tg-dot.connected { background: #22c55e; }
   .ctx-tg-dot.disconnected { background: #ef4444; }
   .ctx-tg-dot.unconfigured { background: transparent; border: 1.5px solid var(--muted-2); }
+  .tg-row-badge { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; color: #fff; line-height: 0; }
+  .tg-row-badge.connected { background: #2aabee; }
+  .tg-row-badge.disconnected { background: #ef4444; opacity: 0.85; }
   .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
   .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
   .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }

@@ -1,16 +1,18 @@
-//! Telegram bridge: talk to the lead session from a phone.
+//! Telegram bridge: talk to any Work session from a phone, each with its own
+//! bot token.
 //!
-//! One long-poll loop per server (`getUpdates`, no webhook, so it works on a
-//! tailnet-only box). The bot is public, so nothing reaches the lead until a
-//! Telegram user proves they can see Vicuna: the app shows a pairing code and
-//! only the user who sends it is accepted (one paired user). The token lives
-//! in a 0600 `~/vicuna/config/telegram.json` and never goes back to a window.
+//! One long-poll loop per configured & enabled session (`getUpdates`, no
+//! webhook, so it works on a tailnet-only box). Each bot is public, so nothing
+//! reaches its session until a Telegram user proves they can see Vicuna: the
+//! app shows a pairing code and only the user who sends it is accepted (one
+//! paired user per bot). Tokens live in a 0600 `~/vicuna/config/telegram.json`
+//! and never go back to a window.
 //!
-//! Text/photos from the paired user go to the session marked lead (queued
-//! into its running turn, else a new server-started turn). Every lead turn,
-//! whoever started it (the phone, a window, a worker report), is mirrored:
-//! a progress message edited while it runs, then the final reply. Agent
-//! questions and permission cards become inline-keyboard buttons; a plain
+//! Text/photos/files/voice from the paired user go to the bound Work session
+//! (queued into its running turn, else a new server-started turn). Every turn
+//! of that session, whoever started it (the phone, a window, a worker report),
+//! is mirrored: a progress message edited while it runs, then the final reply.
+//! Agent questions and permission cards become inline-keyboard buttons; a plain
 //! text reply answers a free-form question.
 
 use std::collections::{HashMap, HashSet};
@@ -27,11 +29,15 @@ use super::BridgeState;
 
 const MAX_MSG: usize = 3900;
 
+/// Placeholder key used while migrating a legacy single-bot `telegram.json`
+/// before a lead session ID is resolved from the DB.
+const LEGACY_LEAD_KEY: &str = "__legacy_lead__";
+
 // ---------- config ----------
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Config {
+pub struct BridgeConfig {
     #[serde(default)]
     pub token: String,
     #[serde(default)]
@@ -50,6 +56,13 @@ pub struct Config {
     pub pair_code: String,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Store {
+    #[serde(default)]
+    pub bridges: HashMap<String, BridgeConfig>,
+}
+
 fn config_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("VICUNA_TELEGRAM_CONFIG") {
         return Some(PathBuf::from(p));
@@ -57,28 +70,62 @@ fn config_path() -> Option<PathBuf> {
     Some(crate::opencode::home_dir()?.join("vicuna").join("config").join("telegram.json"))
 }
 
-pub fn load_config() -> Config {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+pub fn load_store() -> Store {
+    let Some(raw) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Store::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return Store::default();
+    };
+    if v.get("bridges").is_some() {
+        return serde_json::from_value(v).unwrap_or_default();
+    }
+    // Legacy flat single-bot config: stage under LEGACY_LEAD_KEY until migrated.
+    if let Ok(c) = serde_json::from_value::<BridgeConfig>(v) {
+        if !c.token.is_empty() {
+            let mut bridges = HashMap::new();
+            bridges.insert(LEGACY_LEAD_KEY.to_string(), c);
+            return Store { bridges };
+        }
+    }
+    Store::default()
 }
 
-fn save_config(c: &Config) -> Result<(), String> {
+fn save_store(s: &Store) -> Result<(), String> {
     let p = config_path().ok_or("no home directory")?;
+    if s.bridges.is_empty() {
+        let _ = std::fs::remove_file(&p);
+        bump_all();
+        return Ok(());
+    }
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(c).unwrap_or_default()).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, serde_json::to_string_pretty(s).unwrap_or_default()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
-    bump();
+    bump_all();
     Ok(())
+}
+
+/// If a legacy flat config was loaded under `LEGACY_LEAD_KEY`, attach it to
+/// the current lead session in the DB so existing setups keep working.
+async fn maybe_migrate_legacy(st: &BridgeState) {
+    let mut s = load_store();
+    if !s.bridges.contains_key(LEGACY_LEAD_KEY) {
+        return;
+    }
+    let Some(lead) = lead_id(st).await else { return };
+    if let Some(cfg) = s.bridges.remove(LEGACY_LEAD_KEY) {
+        s.bridges.entry(lead.clone()).or_insert(cfg);
+        let _ = save_store(&s);
+        bump_session(&lead);
+    }
 }
 
 fn new_pair_code() -> String {
@@ -115,18 +162,22 @@ pub fn is_pair_attempt(text: &str, code: &str) -> bool {
 
 // ---------- runtime state ----------
 
-#[derive(Default)]
-struct Runtime {
-    /// bumped on every config change so the poller restarts its request
+#[derive(Default, Clone)]
+struct BridgeRt {
     generation: u64,
     last_error: String,
     polling: bool,
-    /// lead turns being mirrored (turn id)
-    following: HashSet<String>,
-    /// the ask card shown on the phone: (session, ask_id, options, multi)
-    asks: HashMap<String, (String, Vec<String>, bool)>,
-    /// the model list last offered by /model: (engine, model ids)
+    /// the model list last offered by /model for this bot: (engine, model ids)
     model_menu: Option<(String, Vec<String>)>,
+}
+
+#[derive(Default)]
+struct Runtime {
+    /// bumped on every config change so the supervisor reconciles pollers
+    store_gen: u64,
+    bridges: HashMap<String, BridgeRt>,
+    /// turns being mirrored (turn id)
+    following: HashSet<String>,
 }
 
 fn rt() -> &'static Mutex<Runtime> {
@@ -134,15 +185,44 @@ fn rt() -> &'static Mutex<Runtime> {
     R.get_or_init(Default::default)
 }
 
-fn bump() {
+fn bump_all() {
     if let Ok(mut r) = rt().lock() {
-        r.generation += 1;
+        r.store_gen += 1;
     }
 }
 
-fn set_error(e: impl Into<String>) {
+fn bump_session(sid: &str) {
     if let Ok(mut r) = rt().lock() {
-        r.last_error = e.into();
+        r.store_gen += 1;
+        r.bridges.entry(sid.to_string()).or_default().generation += 1;
+    }
+}
+
+fn set_error(sid: &str, e: impl Into<String>) {
+    if let Ok(mut r) = rt().lock() {
+        r.bridges.entry(sid.to_string()).or_default().last_error = e.into();
+    }
+}
+
+fn set_polling(sid: &str, polling: bool, clear_err: bool) {
+    if let Ok(mut r) = rt().lock() {
+        let b = r.bridges.entry(sid.to_string()).or_default();
+        b.polling = polling;
+        if clear_err {
+            b.last_error.clear();
+        }
+    }
+}
+
+/// Remove a deleted session's Telegram bridge and stop its poller.
+pub fn drop_for(sid: &str) {
+    let mut s = load_store();
+    if s.bridges.remove(sid).is_some() {
+        let _ = save_store(&s);
+    }
+    if let Ok(mut r) = rt().lock() {
+        r.store_gen += 1;
+        r.bridges.remove(sid);
     }
 }
 
@@ -432,17 +512,58 @@ fn remove_tags(s: &str) -> String {
 
 // ---------- API actions ----------
 
+async fn resolve_session_id(st: &BridgeState, args: &Value) -> Result<String, String> {
+    if let Some(s) = args.get("sessionId").or_else(|| args.get("session_id")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    lead_id(st).await.ok_or_else(|| "missing sessionId".into())
+}
+
+async fn session_title(st: &BridgeState, sid: &str) -> String {
+    let Some(db) = st.db.as_ref() else { return "This session".into() };
+    crate::server_store::load_chat(db, sid)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c.get("title").and_then(Value::as_str).map(str::to_string))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "This session".into())
+}
+
 pub async fn action(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Value, String> {
-    let _ = st;
+    maybe_migrate_legacy(st).await;
     match cmd {
-        "telegram_status" => Ok(status()),
+        "telegram_list" => Ok(status_all()),
+        "telegram_status" => {
+            if let Some(sid) = args.get("sessionId").or_else(|| args.get("session_id")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                Ok(status_for(sid))
+            } else if let Some(lead) = lead_id(st).await {
+                Ok(status_for(&lead))
+            } else {
+                Ok(status_from_cfg("", None))
+            }
+        }
         "telegram_save" => {
+            let sid = resolve_session_id(st, args).await?;
             let token = args.get("token").and_then(Value::as_str).unwrap_or("").trim().to_string();
             if !valid_token_shape(&token) {
                 return Err("That doesn't look like a bot token (123456789:AA…). Copy it from @BotFather.".into());
             }
+            let mut s = load_store();
+            // Reject duplicate tokens across sessions: Telegram only allows one poller per bot token.
+            if let Some((other_sid, other_cfg)) = s.bridges.iter().find(|(k, v)| k.as_str() != sid && v.token == token) {
+                let other_title = session_title(st, other_sid).await;
+                let bot_label = if other_cfg.bot_username.is_empty() {
+                    "This bot".to_string()
+                } else {
+                    format!("This bot (@{})", other_cfg.bot_username)
+                };
+                return Err(format!(
+                    "{bot_label} is already connected to \"{other_title}\". Remove it there first or create a new bot with @BotFather."
+                ));
+            }
             let me = call(&token, "getMe", json!({})).await?;
-            let mut c = load_config();
+            let c = s.bridges.entry(sid.clone()).or_default();
             if c.token != token {
                 // a new bot: the old pairing belonged to the old bot's chat
                 c.user_id = None;
@@ -455,37 +576,41 @@ pub async fn action(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Va
             if c.user_id.is_none() {
                 c.pair_code = new_pair_code();
             }
-            save_config(&c)?;
-            set_error("");
-            Ok(status())
+            save_store(&s)?;
+            bump_session(&sid);
+            set_error(&sid, "");
+            Ok(status_for(&sid))
         }
         "telegram_set" => {
-            let mut c = load_config();
+            let sid = resolve_session_id(st, args).await?;
+            let mut s = load_store();
+            let c = s.bridges.get_mut(&sid).ok_or("no bot token saved for this session")?;
             if c.token.is_empty() {
-                return Err("no bot token saved".into());
+                return Err("no bot token saved for this session".into());
             }
             if let Some(e) = args.get("enabled").and_then(Value::as_bool) {
                 c.enabled = e;
             }
-            save_config(&c)?;
-            Ok(status())
+            save_store(&s)?;
+            bump_session(&sid);
+            Ok(status_for(&sid))
         }
         "telegram_unpair" => {
-            let mut c = load_config();
+            let sid = resolve_session_id(st, args).await?;
+            let mut s = load_store();
+            let c = s.bridges.get_mut(&sid).ok_or("no bot token saved for this session")?;
             c.user_id = None;
             c.chat_id = None;
             c.user_name.clear();
             c.pair_code = new_pair_code();
-            save_config(&c)?;
-            Ok(status())
+            save_store(&s)?;
+            bump_session(&sid);
+            Ok(status_for(&sid))
         }
         "telegram_remove" => {
-            if let Some(p) = config_path() {
-                let _ = std::fs::remove_file(p);
-            }
-            bump();
-            set_error("");
-            Ok(status())
+            let sid = resolve_session_id(st, args).await?;
+            drop_for(&sid);
+            Ok(status_for(&sid))
         }
         "whisper_status" => Ok(crate::whisper::status()),
         "whisper_install" => crate::whisper::start_install(args.get("model").and_then(Value::as_str).unwrap_or("tiny")),
@@ -494,10 +619,16 @@ pub async fn action(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<Va
     }
 }
 
-pub fn status() -> Value {
-    let c = load_config();
-    let (err, polling) = rt().lock().map(|r| (r.last_error.clone(), r.polling)).unwrap_or_default();
+fn status_from_cfg(sid: &str, c: Option<&BridgeConfig>) -> Value {
+    let empty = BridgeConfig::default();
+    let c = c.unwrap_or(&empty);
+    let (err, polling) = rt()
+        .lock()
+        .ok()
+        .and_then(|r| r.bridges.get(sid).map(|b| (b.last_error.clone(), b.polling)))
+        .unwrap_or_default();
     json!({
+        "sessionId": sid,
         "configured": !c.token.is_empty(),
         "enabled": c.enabled,
         "botUsername": c.bot_username,
@@ -509,74 +640,137 @@ pub fn status() -> Value {
     })
 }
 
-// ---------- the loop ----------
+pub fn status_for(sid: &str) -> Value {
+    let s = load_store();
+    status_from_cfg(sid, s.bridges.get(sid))
+}
+
+pub fn status_all() -> Value {
+    let s = load_store();
+    let mut map = serde_json::Map::new();
+    for (sid, cfg) in &s.bridges {
+        if sid == LEGACY_LEAD_KEY || cfg.token.is_empty() {
+            continue;
+        }
+        map.insert(sid.clone(), status_from_cfg(sid, Some(cfg)));
+    }
+    json!({ "bridges": map })
+}
+
+// ---------- the supervisor & per-session loops ----------
 
 pub fn spawn(st: Arc<BridgeState>) {
     tokio::spawn(async move {
-        let mut offset: i64 = 0;
-        let mut last_token = String::new();
+        let mut active: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
-            let c = load_config();
-            if c.token.is_empty() || !c.enabled {
-                if let Ok(mut r) = rt().lock() {
-                    r.polling = false;
+            maybe_migrate_legacy(&st).await;
+            let s = load_store();
+            let store_gen = rt().lock().map(|r| r.store_gen).unwrap_or(0);
+
+            // Stop pollers for removed or disabled bridges
+            let to_stop: Vec<String> = active
+                .keys()
+                .filter(|sid| {
+                    s.bridges
+                        .get(sid.as_str())
+                        .map(|c| c.token.is_empty() || !c.enabled)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            for sid in to_stop {
+                if let Some(h) = active.remove(&sid) {
+                    h.abort();
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
+                set_polling(&sid, false, false);
             }
-            if c.token != last_token {
-                offset = 0;
-                last_token = c.token.clone();
-                register_commands(&c.token).await;
-            }
-            // mirror lead turns nobody started from here (window, worker report)
-            if let Some(chat) = c.chat_id {
-                watch_lead(&st, &c.token, chat).await;
-            }
-            let generation = rt().lock().map(|r| r.generation).unwrap_or(0);
-            let req = call(&c.token, "getUpdates", json!({"offset": offset, "timeout": 20, "allowed_updates": ["message", "callback_query"]}));
-            // a config change (new token, disable) cancels the long poll
-            let changed = async {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if rt().lock().map(|r| r.generation).unwrap_or(0) != generation {
-                        break;
-                    }
-                    if c.chat_id.is_some() && lead_has_unfollowed_turn(&st).await {
-                        break;
-                    }
+
+            // Spawn pollers for enabled bridges
+            for (sid, cfg) in &s.bridges {
+                if sid == LEGACY_LEAD_KEY || cfg.token.is_empty() || !cfg.enabled {
+                    continue;
                 }
-            };
-            let res = tokio::select! {
-                r = req => Some(r),
-                _ = changed => None,
-            };
-            let Some(res) = res else { continue };
-            match res {
-                Ok(updates) => {
-                    if let Ok(mut r) = rt().lock() {
-                        r.polling = true;
-                        r.last_error.clear();
-                    }
-                    for u in updates.as_array().cloned().unwrap_or_default() {
-                        if let Some(id) = u.get("update_id").and_then(Value::as_i64) {
-                            offset = offset.max(id + 1);
-                        }
-                        if let Err(e) = handle_update(&st, &u).await {
-                            set_error(e);
-                        }
-                    }
+                let needs_spawn = match active.get(sid) {
+                    Some(h) => h.is_finished(),
+                    None => true,
+                };
+                if needs_spawn {
+                    let h = tokio::spawn(poll_bridge(st.clone(), sid.clone()));
+                    active.insert(sid.clone(), h);
                 }
-                Err(e) => {
-                    if let Ok(mut r) = rt().lock() {
-                        r.polling = false;
-                    }
-                    set_error(e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            // Wait for a config change or periodic check
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if rt().lock().map(|r| r.store_gen).unwrap_or(0) != store_gen {
+                    break;
                 }
             }
         }
     });
+}
+
+async fn poll_bridge(st: Arc<BridgeState>, sid: String) {
+    let mut offset: i64 = 0;
+    let mut last_token = String::new();
+    loop {
+        let Some(c) = load_store().bridges.remove(&sid) else {
+            set_polling(&sid, false, false);
+            return;
+        };
+        if c.token.is_empty() || !c.enabled {
+            set_polling(&sid, false, false);
+            return;
+        }
+        if c.token != last_token {
+            offset = 0;
+            last_token = c.token.clone();
+            register_commands(&sid, &c.token).await;
+        }
+        // Mirror turns nobody started from Telegram (window, worker report, schedule)
+        if let Some(chat) = c.chat_id {
+            watch_session(&st, &sid, &c.token, chat).await;
+        }
+        let generation = rt().lock().ok().and_then(|r| r.bridges.get(&sid).map(|b| b.generation)).unwrap_or(0);
+        let req = call(&c.token, "getUpdates", json!({"offset": offset, "timeout": 20, "allowed_updates": ["message", "callback_query"]}));
+        // A config change (new token, disable, remove) cancels the long poll
+        let changed = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let cur_gen = rt().lock().ok().and_then(|r| r.bridges.get(&sid).map(|b| b.generation)).unwrap_or(0);
+                if cur_gen != generation {
+                    break;
+                }
+                if c.chat_id.is_some() && session_has_unfollowed_turn(&st, &sid) {
+                    break;
+                }
+            }
+        };
+        let res = tokio::select! {
+            r = req => Some(r),
+            _ = changed => None,
+        };
+        let Some(res) = res else { continue };
+        match res {
+            Ok(updates) => {
+                set_polling(&sid, true, true);
+                for u in updates.as_array().cloned().unwrap_or_default() {
+                    if let Some(id) = u.get("update_id").and_then(Value::as_i64) {
+                        offset = offset.max(id + 1);
+                    }
+                    if let Err(e) = handle_update(&st, &sid, &u).await {
+                        set_error(&sid, e);
+                    }
+                }
+            }
+            Err(e) => {
+                set_polling(&sid, false, false);
+                set_error(&sid, e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }
 
 async fn lead_id(st: &BridgeState) -> Option<String> {
@@ -591,24 +785,22 @@ async fn lead_id(st: &BridgeState) -> Option<String> {
     })
 }
 
-async fn lead_has_unfollowed_turn(st: &BridgeState) -> bool {
-    let Some(id) = lead_id(st).await else { return false };
-    match live_turn(st, &id) {
+fn session_has_unfollowed_turn(st: &BridgeState, sid: &str) -> bool {
+    match live_turn(st, sid) {
         Some((tid, _)) => !rt().lock().map(|r| r.following.contains(&tid)).unwrap_or(true),
         None => false,
     }
 }
 
-async fn watch_lead(st: &Arc<BridgeState>, token: &str, chat: i64) {
-    if let Some(id) = lead_id(st).await {
-        if let Some((tid, _)) = live_turn(st, &id) {
-            follow(st.clone(), token.to_string(), chat, id, tid);
-        }
+async fn watch_session(st: &Arc<BridgeState>, sid: &str, token: &str, chat: i64) {
+    if let Some((tid, _)) = live_turn(st, sid) {
+        follow(st.clone(), token.to_string(), chat, sid.to_string(), tid);
     }
 }
 
-async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
-    let mut c = load_config();
+async fn handle_update(st: &Arc<BridgeState>, sid: &str, u: &Value) -> Result<(), String> {
+    let mut s = load_store();
+    let Some(c) = s.bridges.get_mut(sid) else { return Ok(()) };
     let token = c.token.clone();
     if let Some(cb) = u.get("callback_query") {
         let from = cb.pointer("/from/id").and_then(Value::as_i64);
@@ -624,23 +816,22 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
                 // drop the button so it can't be tapped twice
                 let _ = call(&token, "editMessageText", json!({"chat_id": chat, "message_id": m, "text": t})).await;
             }
-            send_now_reply(st, &token, chat).await;
+            send_now_reply(st, sid, &token, chat).await;
             return Ok(());
         }
         if let Some(e) = data.strip_prefix("e:") {
-            let out = pick_engine(st, e).await;
+            let out = pick_engine(st, sid, e).await;
             reply_or_edit(&token, chat, msg_id, out).await;
             return Ok(());
         }
         if let Some(i) = data.strip_prefix("m:") {
-            let out = pick_model(st, i.parse().unwrap_or(usize::MAX)).await;
+            let out = pick_model(st, sid, i.parse().unwrap_or(usize::MAX)).await;
             reply_or_edit(&token, chat, msg_id, (out, None)).await;
             return Ok(());
         }
-        if let Some((sid, idx)) = data.strip_prefix("a:").and_then(|d| d.rsplit_once(':')) {
+        if let Some((ask_sid, idx)) = data.strip_prefix("a:").and_then(|d| d.rsplit_once(':')) {
             let idx: usize = idx.parse().unwrap_or(usize::MAX);
-            let chat = c.chat_id.unwrap_or_default();
-            match answer_ask(st, sid, Answer::Choice(idx)).await {
+            match answer_ask(st, ask_sid, Answer::Choice(idx)).await {
                 Ok(shown) => {
                     if let (Some(m), Some(t)) = (cb.pointer("/message/message_id").and_then(Value::as_i64), cb.pointer("/message/text").and_then(Value::as_str)) {
                         edit_text(&token, chat, m, &format!("{t}\n\n→ {shown}")).await;
@@ -669,10 +860,12 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
             c.chat_id = Some(chat);
             c.user_name = name;
             c.pair_code.clear();
-            save_config(&c)?;
-            send_text(&token, chat, "✅ Paired with Vicuna. Messages you send here go to your lead session.\n\n/status · /stop · /help", None).await;
+            save_store(&s)?;
+            bump_session(sid);
+            let title = session_title(st, sid).await;
+            send_text(&token, chat, &format!("✅ Paired with Vicuna. Messages you send here go to \"{title}\".\n\n/status · /model · /send_now · /stop · /help"), None).await;
         } else if private {
-            send_text(&token, chat, "This bot is private. Open Vicuna → right-click the lead session → Telegram, and send the pairing code shown there.", None).await;
+            send_text(&token, chat, "This bot is private. Open Vicuna → right-click the session → Telegram, and send the pairing code shown there.", None).await;
         }
         return Ok(());
     }
@@ -680,20 +873,25 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
         return Ok(()); // strangers are ignored once paired
     }
     let t = text.trim();
+    let title = session_title(st, sid).await;
     if t == "/help" || t == "/start" {
-        send_text(&token, chat, "Send any message to talk to your lead session. Photos, files and voice memos work too.\n/status: what the lead is doing\n/model: switch the lead's harness and model (/model claude haiku)\n/send_now: interrupt the running turn and send your queued messages now\n/stop: stop the lead's running turn", None).await;
+        send_text(&token, chat, &format!("Send any message to talk to \"{title}\". Photos, files and voice memos work too.\n/status: what this session is doing\n/model: switch harness and model (/model claude haiku)\n/send_now: interrupt the running turn and send your queued messages now\n/stop: stop the running turn"), None).await;
         return Ok(());
     }
-    let Some(lead) = lead_id(st).await else {
-        send_text(&token, chat, "No lead session. In Vicuna, right-click a Work session → Make lead.", None).await;
+    // Verify the bound session still exists
+    let Some(db) = st.db.as_ref() else {
+        return Err("no server db".into());
+    };
+    let Some(ch) = crate::server_store::load_chat(db, sid).await? else {
+        send_text(&token, chat, "⚠️ The session bound to this bot no longer exists in Vicuna.", None).await;
         return Ok(());
     };
     if t == "/model" || t.starts_with("/model ") || t.starts_with("/model@") {
         let rest: Vec<&str> = t.split_whitespace().skip(1).collect();
         let (text, kb) = match rest.as_slice() {
-            [] => model_overview(st, &lead).await,
-            [e] => pick_engine(st, e).await,
-            [e, m, ..] => match set_lead(st, &lead, e, m).await {
+            [] => model_overview(st, sid, &ch).await,
+            [e] => pick_engine(st, sid, e).await,
+            [e, m, ..] => match set_session_model(st, sid, e, m).await {
                 Ok(s) => (s, None),
                 Err(e) => (format!("⚠️ {e}"), None),
             },
@@ -702,33 +900,30 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
         return Ok(());
     }
     if t == "/status" {
-        let db = st.db.as_ref().ok_or("no server db")?;
-        let ch = crate::server_store::load_chat(db, &lead).await?.unwrap_or(Value::Null);
-        let title = ch.get("title").and_then(Value::as_str).unwrap_or("Lead");
-        let state = if live_turn(st, &lead).is_some() { "working" } else { "idle" };
-        let (engine, model) = lead_engine_model(&ch);
-        send_text(&token, chat, &format!("Lead \"{title}\" is {state} · {engine}/{model}"), None).await;
+        let state = if live_turn(st, sid).is_some() { "working" } else { "idle" };
+        let (engine, model) = session_engine_model(&ch);
+        send_text(&token, chat, &format!("\"{title}\" is {state} · {engine}/{model}"), None).await;
         return Ok(());
     }
     if t == "/send_now" || t.starts_with("/send_now@") {
-        send_now_reply(st, &token, chat).await;
+        send_now_reply(st, sid, &token, chat).await;
         return Ok(());
     }
     if t == "/stop" {
-        match live_turn(st, &lead) {
+        match live_turn(st, sid) {
             Some((tid, _)) => {
                 if let Some(t) = st.agent.get_turn(&tid) { crate::work_agent::agent_stop(&t); }
-                send_text(&token, chat, "⏹ Stopping the lead's turn…", None).await;
+                send_text(&token, chat, &format!("⏹ Stopping \"{title}\"…"), None).await;
             }
             None => {
-                send_text(&token, chat, "The lead is idle.", None).await;
+                send_text(&token, chat, &format!("\"{title}\" is idle."), None).await;
             }
         }
         return Ok(());
     }
     // a text reply answers a waiting free-form question
-    if !t.is_empty() && pending_ask_for(st, &lead).is_some() {
-        match answer_ask(st, &lead, Answer::Text(t.to_string())).await {
+    if !t.is_empty() && pending_ask_for(st, sid).is_some() {
+        match answer_ask(st, sid, Answer::Text(t.to_string())).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 send_text(&token, chat, &format!("⚠️ {e}"), None).await;
@@ -738,7 +933,7 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
     }
     let mut text_out = t.to_string();
     // voice memos: transcribe on the server (if a Whisper model is installed),
-    // show the transcript on the phone first, then send it to the lead as text
+    // show the transcript on the phone first, then send it to the session as text
     if let Some(v) = msg.get("voice") {
         let fid = v.get("file_id").and_then(Value::as_str).unwrap_or("").to_string();
         if crate::whisper::installed_model().is_some() {
@@ -754,19 +949,19 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
                     text_out = if text_out.is_empty() { tx } else { format!("{text_out}\n\n{tx}") };
                 }
                 VoiceOutcome::Empty => return Ok(()),
-                VoiceOutcome::Failed => {} // the audio file goes to the lead below
+                VoiceOutcome::Failed => {} // the audio file goes to the session below
             }
             if !text_out.is_empty() && text_out != t {
                 // transcript ready: a waiting free-form question takes it as the answer
-                if pending_ask_for(st, &lead).is_some() {
-                    if let Err(e) = answer_ask(st, &lead, Answer::Text(text_out.clone())).await {
+                if pending_ask_for(st, sid).is_some() {
+                    if let Err(e) = answer_ask(st, sid, Answer::Text(text_out.clone())).await {
                         send_text(&token, chat, &format!("⚠️ {e}"), None).await;
                     }
                     return Ok(());
                 }
             }
         } else {
-            send_text(&token, chat, "🎙 Got your voice memo. No transcription model is installed on the server, so it goes to the lead as an audio file.", None).await;
+            send_text(&token, chat, "🎙 Got your voice memo. No transcription model is installed on the server, so it goes to this session as an audio file.", None).await;
         }
     }
     let transcribed = text_out != t;
@@ -780,7 +975,7 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
             }
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                match crate::upload_stage_file_logic(lead.clone(), name.clone(), b64).await {
+                match crate::upload_stage_file_logic(sid.to_string(), name.clone(), b64).await {
                     Ok(p) => staged.push(p),
                     Err(e) => {
                         send_text(&token, chat, &format!("⚠️ Couldn't save {name}: {e}"), None).await;
@@ -814,41 +1009,37 @@ async fn handle_update(st: &Arc<BridgeState>, u: &Value) -> Result<(), String> {
     if !images.is_empty() {
         m["images"] = json!(images);
     }
-    let queued = live_turn(st, &lead).is_some();
-    if let Err(e) = turns::deliver(st, &lead, m).await {
+    let queued = live_turn(st, sid).is_some();
+    if let Err(e) = turns::deliver(st, sid, m).await {
         send_text(&token, chat, &format!("⚠️ {e}"), None).await;
         return Ok(());
     }
     if queued {
         let kb = json!({"inline_keyboard": [[{"text": "⚡ Send now", "callback_data": "sn"}]]});
-        send_text(&token, chat, "📨 Queued for the lead's running turn. Tap Send now (or /send_now) to interrupt it and send right away.", Some(kb)).await;
+        send_text(&token, chat, "📨 Queued for the running turn. Tap Send now (or /send_now) to interrupt it and send right away.", Some(kb)).await;
     }
-    if let Some((tid, _)) = live_turn(st, &lead) {
-        follow(st.clone(), token, chat, lead, tid);
+    if let Some((tid, _)) = live_turn(st, sid) {
+        follow(st.clone(), token, chat, sid.to_string(), tid);
     }
     Ok(())
 }
 
-async fn send_now_reply(st: &Arc<BridgeState>, token: &str, chat: i64) {
-    let Some(lead) = lead_id(st).await else {
-        send_text(token, chat, "No lead session.", None).await;
-        return;
-    };
-    if live_turn(st, &lead).is_none() {
-        send_text(token, chat, "The lead is idle, nothing is waiting.", None).await;
+async fn send_now_reply(st: &Arc<BridgeState>, sid: &str, token: &str, chat: i64) {
+    if live_turn(st, sid).is_none() {
+        send_text(token, chat, "This session is idle, nothing is waiting.", None).await;
         return;
     }
-    send_text(token, chat, "⚡ Interrupting the lead…", None).await;
+    send_text(token, chat, "⚡ Interrupting the running turn…", None).await;
     // the stop + restart can take a while: don't hold up the update loop
-    let (st, token) = (st.clone(), token.to_string());
+    let (st, sid, token) = (st.clone(), sid.to_string(), token.to_string());
     tokio::spawn(async move {
-        match turns::send_now(&st, &lead).await {
+        match turns::send_now(&st, &sid).await {
             Ok(0) => {
-                send_text(&token, chat, "Nothing is queued: your messages already reached the lead.", None).await;
+                send_text(&token, chat, "Nothing is queued: your messages already reached the session.", None).await;
             }
             Ok(_) => {
-                if let Some((tid, _)) = live_turn(&st, &lead) {
-                    follow(st.clone(), token, chat, lead, tid);
+                if let Some((tid, _)) = live_turn(&st, &sid) {
+                    follow(st.clone(), token, chat, sid, tid);
                 }
             }
             Err(e) => {
@@ -861,17 +1052,17 @@ async fn send_now_reply(st: &Arc<BridgeState>, token: &str, chat: i64) {
 // ---------- /model ----------
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("status", "What the lead is doing, harness and model"),
-    ("model", "Switch the lead's harness and model"),
-    ("send_now", "Interrupt the lead and send queued messages now"),
-    ("stop", "Stop the lead's running turn"),
+    ("status", "What this session is doing, harness and model"),
+    ("model", "Switch this session's harness and model"),
+    ("send_now", "Interrupt the running turn and send queued messages now"),
+    ("stop", "Stop the running turn"),
     ("help", "How this bot works"),
 ];
 
-async fn register_commands(token: &str) {
+async fn register_commands(sid: &str, token: &str) {
     let cmds: Vec<Value> = COMMANDS.iter().map(|(c, d)| json!({"command": c, "description": d})).collect();
     if let Err(e) = call(token, "setMyCommands", json!({"commands": cmds})).await {
-        set_error(e);
+        set_error(sid, e);
     }
 }
 
@@ -891,7 +1082,7 @@ async fn reply_or_edit(token: &str, chat: i64, msg: Option<i64>, (text, kb): (St
 }
 
 /// (harness, model) a session runs with: its own pick, else the server's.
-fn lead_engine_model(chat: &Value) -> (String, String) {
+fn session_engine_model(chat: &Value) -> (String, String) {
     let x = turns::parse_extra(chat);
     let Ok((engine, model)) = crate::work_engine::session_engine(x.engine.as_deref(), x.work_model.as_deref()) else {
         return (format!("{} (not installed)", x.engine.unwrap_or_default()), "default".into());
@@ -899,12 +1090,8 @@ fn lead_engine_model(chat: &Value) -> (String, String) {
     (engine.id().to_string(), model.filter(|m| !m.is_empty()).unwrap_or_else(|| "default".into()))
 }
 
-async fn model_overview(st: &Arc<BridgeState>, lead: &str) -> (String, Option<Value>) {
-    let ch = match st.db.as_ref() {
-        Some(db) => crate::server_store::load_chat(db, lead).await.ok().flatten().unwrap_or(Value::Null),
-        None => Value::Null,
-    };
-    let (engine, model) = lead_engine_model(&ch);
+async fn model_overview(_st: &Arc<BridgeState>, _sid: &str, ch: &Value) -> (String, Option<Value>) {
+    let (engine, model) = session_engine_model(ch);
     let info = serde_json::to_value(crate::work_engine::engines_info().await).unwrap_or(Value::Null);
     let rows: Vec<Value> = info["engines"].as_array().into_iter().flatten()
         .filter(|e| e["installed"] == json!(true))
@@ -914,7 +1101,7 @@ async fn model_overview(st: &Arc<BridgeState>, lead: &str) -> (String, Option<Va
             json!([{"text": format!("{mark}{}", e["label"].as_str().unwrap_or(id)), "callback_data": format!("e:{id}")}])
         })
         .collect();
-    (format!("Lead runs {engine}/{model}.\nPick a harness:"), (!rows.is_empty()).then(|| json!({"inline_keyboard": rows})))
+    (format!("This session runs {engine}/{model}.\nPick a harness:"), (!rows.is_empty()).then(|| json!({"inline_keyboard": rows})))
 }
 
 async fn model_ids(st: &Arc<BridgeState>, engine: crate::work_engine::Engine) -> Result<Vec<String>, String> {
@@ -927,7 +1114,7 @@ async fn model_ids(st: &Arc<BridgeState>, engine: crate::work_engine::Engine) ->
 }
 
 /// Offer the models of a harness as buttons.
-async fn pick_engine(st: &Arc<BridgeState>, e: &str) -> (String, Option<Value>) {
+async fn pick_engine(st: &Arc<BridgeState>, sid: &str, e: &str) -> (String, Option<Value>) {
     let Some(engine) = crate::work_engine::Engine::parse(e) else { return (format!("⚠️ Unknown harness \"{e}\"."), None) };
     if !engine.is_present() {
         return (format!("⚠️ {}", engine.missing_message()), None);
@@ -944,26 +1131,25 @@ async fn pick_engine(st: &Arc<BridgeState>, e: &str) -> (String, Option<Value>) 
     let mut ids = vec!["default".to_string()];
     ids.extend(shown);
     if let Ok(mut r) = rt().lock() {
-        r.model_menu = Some((engine.id().to_string(), ids));
+        r.bridges.entry(sid.to_string()).or_default().model_menu = Some((engine.id().to_string(), ids));
     }
     (format!("{} models:", engine.id()), Some(json!({"inline_keyboard": rows})))
 }
 
-async fn pick_model(st: &Arc<BridgeState>, i: usize) -> String {
-    let pick = rt().lock().ok().and_then(|r| r.model_menu.clone());
+async fn pick_model(st: &Arc<BridgeState>, sid: &str, i: usize) -> String {
+    let pick = rt().lock().ok().and_then(|r| r.bridges.get(sid).and_then(|b| b.model_menu.clone()));
     let Some((engine, ids)) = pick else { return "⚠️ That menu expired, send /model again.".into() };
     let Some(model) = ids.get(i).cloned() else { return "⚠️ Unknown model.".into() };
-    let Some(lead) = lead_id(st).await else { return "No lead session.".into() };
-    match set_lead(st, &lead, &engine, &model).await {
+    match set_session_model(st, sid, &engine, &model).await {
         Ok(s) => s,
         Err(e) => format!("⚠️ {e}"),
     }
 }
 
-async fn set_lead(st: &Arc<BridgeState>, lead: &str, engine: &str, model: &str) -> Result<String, String> {
-    turns::cli_session(st, "update", &json!({"id": lead, "engine": engine, "model": model})).await?;
-    let note = if live_turn(st, lead).is_some() { " (from the next turn; one is running now)" } else { "" };
-    Ok(format!("✅ Lead now runs {engine}/{model}{note}."))
+async fn set_session_model(st: &Arc<BridgeState>, sid: &str, engine: &str, model: &str) -> Result<String, String> {
+    turns::cli_session(st, "update", &json!({"id": sid, "engine": engine, "model": model})).await?;
+    let note = if live_turn(st, sid).is_some() { " (from the next turn; one is running now)" } else { "" };
+    Ok(format!("✅ Now runs {engine}/{model}{note}."))
 }
 
 /// Minimum gap between edits of the voice placeholder (Telegram rate limits).
@@ -972,7 +1158,7 @@ const PARTIAL_EDIT_EVERY: Duration = Duration::from_millis(1500);
 #[derive(Debug, PartialEq)]
 pub enum VoiceOutcome {
     Text(String),
-    /// no speech: nothing goes to the lead
+    /// no speech: nothing goes to the session
     Empty,
     /// download/transcription failed: send the audio file instead
     Failed,
@@ -1047,7 +1233,7 @@ where
             VoiceOutcome::Empty
         }
         Err(e) => {
-            show(format!("⚠️ Couldn't transcribe the voice memo ({e}). Sending the audio file to the lead instead.")).await;
+            show(format!("⚠️ Couldn't transcribe the voice memo ({e}). Sending the audio file instead.")).await;
             VoiceOutcome::Failed
         }
     }
@@ -1158,12 +1344,9 @@ async fn answer_ask(st: &Arc<BridgeState>, session: &str, a: Answer) -> Result<S
         Answer::Choice(i) => options.get(i).cloned().ok_or("unknown choice")?,
         Answer::Text(t) => t,
     };
-    let (tid, turn) = live_turn(st, session).ok_or("The lead's turn already ended.")?;
+    let (tid, turn) = live_turn(st, session).ok_or("That turn already ended.")?;
     let wire = if multi { json!([text]).to_string() } else { text.clone() };
     turns::record_answer(st, &turn, &tid, &ask_id, wire, Some(&text), false)?;
-    if let Ok(mut r) = rt().lock() {
-        r.asks.remove(session);
-    }
     Ok(text)
 }
 
@@ -1179,7 +1362,7 @@ fn ask_keyboard(session: &str, options: &[String]) -> Option<Value> {
     Some(json!({"inline_keyboard": rows}))
 }
 
-// ---------- mirroring a lead turn ----------
+// ---------- mirroring a session turn ----------
 
 fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_id: String) {
     {
@@ -1189,7 +1372,7 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
         }
     }
     tokio::spawn(async move {
-        let progress = send_text(&token, chat, "⏳ Lead is working…", None).await;
+        let progress = send_text(&token, chat, "⏳ Working…", None).await;
         let mut shown = String::new();
         let mut last_edit = std::time::Instant::now();
         let mut asked: Option<String> = None;
@@ -1203,7 +1386,7 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
                 if let Some(a) = ask {
                     let id = a.get("ask_id").and_then(Value::as_str).unwrap_or("").to_string();
                     if asked.as_deref() != Some(id.as_str()) {
-                        let q = a.get("question").and_then(Value::as_str).unwrap_or("The lead has a question");
+                        let q = a.get("question").and_then(Value::as_str).unwrap_or("This session has a question");
                         let opts: Vec<String> = a.get("options").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
                         let hint = if id.starts_with("ask-") { "\n\n(Tap a choice or reply with text.)" } else { "" };
                         send_text(&token, chat, &format!("❓ {q}{hint}"), ask_keyboard(&session, &opts)).await;
@@ -1300,6 +1483,58 @@ mod tests {
         let b = a.replace("1db06ccf", "fbf7a937");
         let t = fold_tool_runs(&format!("Archiving.\n▸ {}\n\n▸ {}\nDone.", tool_line(a), tool_line(&b)));
         assert_eq!(t, "Archiving.\n▸ manage_sessions ×2: archive · 1db06ccf, fbf7a937\nDone.");
+    }
+
+    #[test]
+    fn legacy_flat_config_loads_for_migration_and_multi_session_store_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("vicuna-tg-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("telegram.json");
+        unsafe { std::env::set_var("VICUNA_TELEGRAM_CONFIG", &cfg_path) };
+
+        // 1. Legacy single-bot flat JSON loads under LEGACY_LEAD_KEY
+        std::fs::write(&cfg_path, r#"{"token":"111:AAHxhuW3JCGIl5uO99DJS5S1e8zcTWkJkdo","enabled":true,"botUsername":"old_bot","userId":7,"chatId":7,"userName":"@me"}"#).unwrap();
+        let s = load_store();
+        assert_eq!(s.bridges.len(), 1);
+        assert_eq!(s.bridges[LEGACY_LEAD_KEY].bot_username, "old_bot");
+
+        // 2. Multi-session store saves and reloads independently
+        let mut s2 = Store::default();
+        s2.bridges.insert("sess-a".into(), BridgeConfig {
+            token: "111:AAHxhuW3JCGIl5uO99DJS5S1e8zcTWkJkdo".into(),
+            enabled: true,
+            bot_username: "bot_a".into(),
+            user_id: Some(10),
+            chat_id: Some(10),
+            user_name: "@alice".into(),
+            pair_code: String::new(),
+        });
+        s2.bridges.insert("sess-b".into(), BridgeConfig {
+            token: "222:BBHxhuW3JCGIl5uO99DJS5S1e8zcTWkJkdo".into(),
+            enabled: false,
+            bot_username: "bot_b".into(),
+            user_id: None,
+            chat_id: None,
+            user_name: String::new(),
+            pair_code: "654321".into(),
+        });
+        save_store(&s2).unwrap();
+        let loaded = load_store();
+        assert_eq!(loaded.bridges.len(), 2);
+        assert_eq!(loaded.bridges["sess-a"].bot_username, "bot_a");
+        assert_eq!(loaded.bridges["sess-b"].pair_code, "654321");
+
+        // 3. status_all returns both, drop_for removes only sess-a
+        let all = status_all();
+        assert_eq!(all["bridges"]["sess-a"]["botUsername"], "bot_a");
+        assert_eq!(all["bridges"]["sess-b"]["botUsername"], "bot_b");
+        drop_for("sess-a");
+        let after = load_store();
+        assert!(!after.bridges.contains_key("sess-a"));
+        assert!(after.bridges.contains_key("sess-b"));
+
+        unsafe { std::env::remove_var("VICUNA_TELEGRAM_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
