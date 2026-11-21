@@ -612,6 +612,7 @@ export type WorkTurnSnapshot = {
     index: number;
     pendingHead: { name: string; args: Record<string, any> } | null;
     pendingAsk: WorkAgentEvent | null;
+    pendingAskRecords?: string[];
   };
 };
 

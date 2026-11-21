@@ -149,6 +149,9 @@ pub struct Recorder {
     pending_head: Option<(String, Value, String)>,
     /// the ask card still waiting for an answer (the askrequest event)
     pub pending_ask: Option<Value>,
+    /// ask-log records answered while a tool-result <details> card is open,
+    /// flushed right after </details> on toolend
+    pending_ask_records: Vec<String>,
     /// messages changed since the last write
     pub dirty: bool,
     /// a user message was added (bumps the session's activity time)
@@ -172,6 +175,7 @@ impl Recorder {
             engine: engine.to_string(),
             pending_head: None,
             pending_ask: None,
+            pending_ask_records: Vec::new(),
             dirty: false,
             touched: false,
         }
@@ -303,6 +307,10 @@ impl Recorder {
                     // the window answers (see record_answer)
                 } else {
                     self.append(&tool_call_tail(&output));
+                    let recs: Vec<String> = self.pending_ask_records.drain(..).collect();
+                    for rec in recs {
+                        self.append(&rec);
+                    }
                 }
             }
             "bgcompleted" => {
@@ -329,7 +337,13 @@ impl Recorder {
         self.pending_ask = None;
         if let Some(d) = display {
             if ask_id.starts_with("ask-") {
-                self.append(&ask_record(&question, d, dismissed));
+                let rec = ask_record(&question, d, dismissed);
+                let in_card = self.pending_head.as_ref().is_some_and(|(n, _, _)| n != "ask" && n != "say");
+                if in_card {
+                    self.pending_ask_records.push(rec);
+                } else {
+                    self.append(&rec);
+                }
             }
         }
     }
@@ -342,6 +356,7 @@ impl Recorder {
             "index": self.cur,
             "pendingHead": self.pending_head.as_ref().map(|(n, a, _)| json!({ "name": n, "args": a })),
             "pendingAsk": self.pending_ask,
+            "pendingAskRecords": self.pending_ask_records,
         })
     }
 }
@@ -673,6 +688,25 @@ mod tests {
         r.apply(&json!({"type": "askrequest", "ask_id": "perm-4", "question": "Run rm?", "options": ["Allow"], "multi": false}), "");
         r.record_answer("perm-4", Some("Allow"), false);
         assert!(r.messages[3]["content"].as_str().unwrap().ends_with("</div>\n\n"));
+
+        // agent question answered while its ask_user tool card is open:
+        // the ask-log record must land AFTER </details>, never inside the
+        // collapsed tool-result block
+        let ask_start = r#"{"type":"toolstart","name":"mcp_vicuna-mcp_ask_user","args":{"question":"Proceed?"}}"#;
+        r.apply(&serde_json::from_str(ask_start).unwrap(), ask_start);
+        r.apply(&json!({"type": "askrequest", "ask_id": "ask-5", "question": "Proceed?", "options": ["Yes", "No"], "multi": false}), "");
+        r.record_answer("ask-5", Some("Yes"), false);
+        assert_eq!(r.snapshot()["pendingAskRecords"].as_array().unwrap().len(), 1);
+        assert!(!r.messages[3]["content"].as_str().unwrap().contains("Proceed?</div>"), "must wait for </details>");
+        r.apply(&json!({"type": "toolend", "name": "mcp_vicuna-mcp_ask_user", "output": "The user answered: Yes"}), "");
+        assert!(r.snapshot()["pendingAskRecords"].as_array().unwrap().is_empty());
+        assert!(
+            r.messages[3]["content"].as_str().unwrap().ends_with(
+                "The user answered: Yes</code></pre></details>\n\n<div class=\"ask-log\"><div class=\"ask-log-q\">Proceed?</div><div class=\"ask-log-a\"><strong>Answer:</strong> Yes</div></div>\n\n"
+            ),
+            "ask-log must sit right after </details>: {}",
+            r.messages[3]["content"]
+        );
 
         // background completion block
         r.apply(&json!({"type": "bgcompleted", "job_id": "bg-1", "command": "make", "output": "ok"}), "");
