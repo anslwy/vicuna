@@ -1,6 +1,6 @@
 [package]
 name = "vicuna-bridge"
-version = "0.0.50"
+version = "0.0.51"
 description = "vicuna — the Vicuna CLI: `vicuna serve` (headless server for the desktop app), `vicuna open`, and the dev bridge"
 authors = ["you"]
 edition = "2024"
