@@ -58,10 +58,12 @@
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
+  import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
-  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, readAccentMuted, writeAccentMuted, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
+  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
+  import { bridgeConnLabel, bridgeConnState, bridgeConnTitle, bridgeDisplayName, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
   import { hideSplash } from "$lib/splash";
   import {
     APP_UPDATE_RELEASES_URL,
@@ -4449,10 +4451,34 @@
       }
     }
   }
+  // Per-session bridge plugin dialog & statuses
+  const bridgePlugins = $derived(plugins.filter((p) => !!p.bridge));
+  let bridgeModal = $state<{ pluginId: string; sessionId: string } | null>(null);
+  let bridgeStatuses = $state<Record<string, Record<string, BridgeStatusSnapshot>>>({});
+  async function refreshBridgeStatuses() {
+    if (bridgePlugins.length === 0) {
+      bridgeStatuses = {};
+      return;
+    }
+    try {
+      const res = await invokeOrBridge<{ plugins?: Record<string, Record<string, BridgeStatusSnapshot>> }>("bridge_list", {});
+      bridgeStatuses = res?.plugins ?? {};
+    } catch {
+      bridgeStatuses = {};
+    }
+  }
   $effect(() => {
     if (!ready) return;
     void refreshTelegramStatus();
     const t = setInterval(refreshTelegramStatus, 15000);
+    return () => clearInterval(t);
+  });
+  $effect(() => {
+    if (!ready) return;
+    void bridgePlugins.length;
+    void refreshBridgeStatuses();
+    if (bridgePlugins.length === 0) return;
+    const t = setInterval(refreshBridgeStatuses, 15000);
     return () => clearInterval(t);
   });
 
@@ -9712,6 +9738,22 @@
                       <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
                     </span>
                   {/if}
+                  {#each bridgePlugins as bp (bp.id)}
+                    {@const bSnap = bridgeStatuses[bp.id]?.[c.id]}
+                    {@const bState = bridgeConnState(bSnap)}
+                    {#if bState !== "unconfigured"}
+                      {@const bName = bridgeDisplayName(bp)}
+                      <span
+                        class="tg-row-badge {bState}"
+                        data-testid="bridge-row-badge-{bp.id}"
+                        data-status={bState}
+                        title={bridgeConnTitle(bName, bSnap)}
+                        aria-label={bridgeConnTitle(bName, bSnap)}
+                      >
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
+                      </span>
+                    {/if}
+                  {/each}
                   {@const wsBase = workspaceBase(c.workspace ?? "")}
                   {#if wsBase}
                     <span class="work-badge ws-badge" title={displayWorkspace(c.workspace ?? "")}>
@@ -9870,6 +9912,23 @@
               {#if tgSnap?.botUsername}<span class="ctx-tg-bot">@{tgSnap.botUsername}</span>{/if}
               <span class="ctx-tg-dot {tgState}" data-testid="telegram-status-dot" data-status={tgState} aria-label={telegramConnLabel(tgState)}></span>
             </button>
+            {#each bridgePlugins as bp (bp.id)}
+              {@const bSnap = ctxChat ? bridgeStatuses[bp.id]?.[ctxChat.id] : null}
+              {@const bState = bridgeConnState(bSnap)}
+              {@const bName = bridgeDisplayName(bp)}
+              {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
+              <button
+                class="ctx-item ctx-telegram"
+                data-testid="bridge-item-{bp.id}"
+                title={bridgeConnTitle(bName, bSnap)}
+                onclick={() => { bridgeModal = { pluginId: bp.id, sessionId: ctxMenu!.chatId }; ctxMenu = null; }}
+              >
+                <span class="ctx-tg-icon" style:color={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
+                <span class="ctx-tg-label">{bName}</span>
+                {#if bSnap?.botUsername}<span class="ctx-tg-bot">@{bSnap.botUsername}</span>{/if}
+                <span class="ctx-tg-dot {bState}" data-testid="bridge-status-dot-{bp.id}" data-status={bState} aria-label={bridgeConnLabel(bName, bState)}></span>
+              </button>
+            {/each}
           {/if}
           <div class="ctx-continue-row">
             <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
@@ -11727,6 +11786,20 @@
     onSelectSession={(id) => { telegramFor = id; void refreshTelegramStatus(); }}
     onClose={() => { telegramFor = null; void refreshTelegramStatus(); }}
   />
+{/if}
+{#if bridgeModal}
+  {@const activeBridgePlugin = bridgePlugins.find((p) => p.id === bridgeModal!.pluginId)}
+  {#if activeBridgePlugin}
+    <BridgeModal
+      plugin={activeBridgePlugin}
+      sessionId={bridgeModal.sessionId}
+      sessionTitle={chats.find((c) => c.id === bridgeModal!.sessionId)?.title ?? ""}
+      allStatuses={bridgeStatuses[activeBridgePlugin.id] ?? {}}
+      sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
+      onSelectSession={(id) => { bridgeModal = { pluginId: activeBridgePlugin.id, sessionId: id }; void refreshBridgeStatuses(); }}
+      onClose={() => { bridgeModal = null; void refreshBridgeStatuses(); }}
+    />
+  {/if}
 {/if}
 {#if srvDialogOpen}
   <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>

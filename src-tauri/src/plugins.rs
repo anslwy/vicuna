@@ -23,11 +23,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 pub const MANIFEST: &str = "vicuna-plugin.json";
 const GITHUB_API: &str = "https://api.github.com";
 const MAX_MANIFEST: usize = 256 * 1024;
+const MAX_BINARY: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Accent {
@@ -62,6 +64,48 @@ pub struct Panel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStep {
+    pub text: String,
+    #[serde(default)]
+    pub link_text: Option<String>,
+    #[serde(default)]
+    pub link_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeSpec {
+    /// Display name shown in menus/modals (defaults to plugin name if empty).
+    #[serde(default)]
+    pub name: String,
+    /// Brand accent color for the bridge icon (validated with `valid_color`).
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Safe SVG `<path d="...">` for a 24x24 viewBox.
+    #[serde(default)]
+    pub icon_path: Option<String>,
+    /// Placeholder text for the token input field.
+    #[serde(default)]
+    pub token_placeholder: String,
+    /// Short setup instructions shown before saving a token.
+    #[serde(default)]
+    pub setup_steps: Vec<SetupStep>,
+    /// Command prefix shown in the pairing box (e.g. "!pair", "/start").
+    #[serde(default)]
+    pub pair_command: String,
+    /// Whether this bridge supports voice memos (shows shared Whisper settings).
+    #[serde(default)]
+    pub supports_voice: bool,
+    /// Platform -> release asset filename (e.g. "linux-x86_64" -> "vicuna-bridge-...").
+    #[serde(default)]
+    pub binaries: BTreeMap<String, String>,
+    /// Optional relative path to the executable inside a local plugin folder.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub id: String,
     pub name: String,
@@ -77,6 +121,9 @@ pub struct Manifest {
     /// Work harnesses (ACP agents); see `plugin_harness.rs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub harnesses: Vec<crate::plugin_harness::Harness>,
+    /// Messaging bridge (out-of-process binary speaking JSON-RPC over stdio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeSpec>,
 }
 
 /// Per-file and total caps for files a plugin ships (panel HTML + icons).
@@ -174,6 +221,42 @@ fn valid_var(name: &str) -> bool {
         && name.strip_prefix("--").is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
+pub fn valid_icon_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && p.len() <= 2048
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b" .,-".contains(&b))
+}
+
+fn valid_rel_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('\\')
+        && !p.contains("..")
+        && !p.contains(':')
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
+}
+
+fn valid_asset_name(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.contains('/')
+        && !p.contains('\\')
+        && !p.contains("..")
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+pub fn current_platform() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        other => other,
+    };
+    let arch = std::env::consts::ARCH;
+    format!("{os}-{arch}")
+}
+
 pub fn validate(m: &Manifest) -> Result<(), String> {
     if !valid_id(&m.id) {
         return Err(format!("invalid plugin id {:?} (lowercase letters, digits, dashes)", m.id));
@@ -181,8 +264,8 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
     if m.name.trim().is_empty() || m.version.trim().is_empty() {
         return Err("manifest needs a name and a version".into());
     }
-    if m.themes.is_empty() && m.panels.is_empty() && m.harnesses.is_empty() {
-        return Err("this plugin contributes nothing Vicuna supports yet (themes, panels or harnesses)".into());
+    if m.themes.is_empty() && m.panels.is_empty() && m.harnesses.is_empty() && m.bridge.is_none() {
+        return Err("this plugin contributes nothing Vicuna supports yet (themes, panels, harnesses or bridge)".into());
     }
     crate::plugin_harness::validate(&m.harnesses)?;
     if m.panels.len() > MAX_PANELS {
@@ -232,6 +315,41 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
             }
         }
     }
+    if let Some(b) = &m.bridge {
+        if let Some(c) = &b.color {
+            if !valid_color(c) {
+                return Err(format!("bridge: color must be a color, got {c:?}"));
+            }
+        }
+        if let Some(p) = &b.icon_path {
+            if !valid_icon_path(p) {
+                return Err("bridge: iconPath contains disallowed characters".into());
+            }
+        }
+        for step in &b.setup_steps {
+            if let Some(u) = &step.link_url {
+                if !u.starts_with("https://") {
+                    return Err(format!("bridge: setup step link must be https://, got {u:?}"));
+                }
+            }
+        }
+        if b.binaries.is_empty() && b.entrypoint.as_deref().unwrap_or("").trim().is_empty() {
+            return Err("bridge: needs at least one binary or entrypoint".into());
+        }
+        for (plat, asset) in &b.binaries {
+            if !valid_id(plat) && !plat.bytes().all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || x == b'-' || x == b'_') {
+                return Err(format!("bridge: invalid platform key {plat:?}"));
+            }
+            if !valid_asset_name(asset) {
+                return Err(format!("bridge: invalid binary asset name {asset:?}"));
+            }
+        }
+        if let Some(ep) = &b.entrypoint {
+            if !valid_rel_path(ep) {
+                return Err(format!("bridge: invalid entrypoint {ep:?}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -239,10 +357,21 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
 enum Source {
     Repo { owner: String, repo: String },
     Url(String),
+    Local(PathBuf),
 }
 
 fn parse_source(s: &str) -> Result<Source, String> {
-    let s = s.trim().trim_end_matches('/');
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("file://") {
+        let p = PathBuf::from(rest);
+        if p.is_absolute() {
+            return Ok(Source::Local(p));
+        }
+    }
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || (s.len() >= 3 && s.as_bytes()[1] == b':' && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')) {
+        return Ok(Source::Local(PathBuf::from(s)));
+    }
+    let s = s.trim_end_matches('/');
     let repo_part = s
         .strip_prefix("https://github.com/")
         .or_else(|| s.strip_prefix("http://github.com/"))
@@ -332,19 +461,36 @@ enum FileSrc {
     Branch { api: String, owner: String, repo: String, token: Option<String> },
     /// Beside a direct manifest URL.
     BaseUrl(String),
+    /// A local folder on disk.
+    Local(PathBuf),
 }
 
 /// Fetch the manifest for a source (see module docs for the order).
 async fn fetch_manifest(source: &str) -> Result<(Manifest, FileSrc), String> {
     let api = std::env::var("VICUNA_PLUGINS_GITHUB_API").unwrap_or_else(|_| GITHUB_API.into());
-    let c = client()?;
     let (bytes, src) = match parse_source(source)? {
+        Source::Local(dir) => {
+            let manifest_path = if dir.is_file() { dir.clone() } else { dir.join(MANIFEST) };
+            let root = if dir.is_file() {
+                dir.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+            } else {
+                dir.clone()
+            };
+            let b = std::fs::read(&manifest_path)
+                .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+            if b.len() > MAX_MANIFEST {
+                return Err("manifest is too large".into());
+            }
+            (b, FileSrc::Local(root))
+        }
         Source::Url(u) => {
+            let c = client()?;
             let b = get(&c, &u, "application/json", None).await?.ok_or(format!("{u}: not found"))?;
             let base = u.rsplit_once('/').map(|(b, _)| b.to_string()).unwrap_or(u.clone());
             (b, FileSrc::BaseUrl(base))
         }
         Source::Repo { owner, repo } => {
+            let c = client()?;
             let token = github_token();
             let tok = token.as_deref();
             let mut found = None;
@@ -386,6 +532,14 @@ async fn fetch_files(m: &Manifest, src: &FileSrc) -> Result<Vec<(String, Vec<u8>
     let mut total = 0usize;
     for name in m.files() {
         let bytes = match src {
+            FileSrc::Local(root) => {
+                let p = root.join(&name);
+                let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                if b.len() > MAX_FILE {
+                    return Err(format!("{name}: file is larger than {} KB", MAX_FILE / 1024));
+                }
+                Some(b)
+            }
             FileSrc::Release { assets, token } => {
                 let url = assets
                     .iter()
@@ -409,10 +563,55 @@ async fn fetch_files(m: &Manifest, src: &FileSrc) -> Result<Vec<(String, Vec<u8>
     Ok(out)
 }
 
+/// Fetch the bridge plugin executable for this platform (if the manifest defines a bridge).
+async fn fetch_bridge_binary(m: &Manifest, src: &FileSrc) -> Result<Option<(String, Vec<u8>)>, String> {
+    let Some(b) = &m.bridge else { return Ok(None) };
+    let plat = current_platform();
+    match src {
+        FileSrc::Local(root) => {
+            let candidate = b.binaries.get(&plat).map(|n| root.join(n))
+                .filter(|p| p.is_file())
+                .or_else(|| b.entrypoint.as_deref().map(|ep| root.join(ep)).filter(|p| p.is_file()));
+            let bin_path = candidate.ok_or_else(|| {
+                let tried = b.entrypoint.as_deref().or_else(|| b.binaries.get(&plat).map(String::as_str)).unwrap_or("(none)");
+                format!("bridge binary not found in {} (expected {tried}; build it first)", root.display())
+            })?;
+            let bytes = std::fs::read(&bin_path)
+                .map_err(|e| format!("cannot read bridge binary {}: {e}", bin_path.display()))?;
+            if bytes.len() > MAX_BINARY {
+                return Err("bridge binary exceeds 64 MB limit".into());
+            }
+            let fname = bin_path.file_name().and_then(|f| f.to_str()).unwrap_or("bridge").to_string();
+            Ok(Some((fname, bytes)))
+        }
+        FileSrc::Release { assets, token } => {
+            let asset_name = b.binaries.get(&plat).ok_or_else(|| {
+                format!("this bridge plugin does not publish a binary for {plat}")
+            })?;
+            let url = assets
+                .iter()
+                .find(|(n, _)| n == asset_name)
+                .map(|(_, u)| u.clone())
+                .ok_or_else(|| format!("release asset {asset_name} not found"))?;
+            let c = client()?;
+            let bytes = get_capped(&c, &url, "application/octet-stream", token.as_deref(), MAX_BINARY)
+                .await?
+                .ok_or_else(|| format!("release asset {asset_name} returned 404"))?;
+            Ok(Some((asset_name.clone(), bytes)))
+        }
+        FileSrc::Branch { .. } => {
+            Err("bridge plugins require a GitHub release with platform binaries (or a local folder install)".into())
+        }
+        FileSrc::BaseUrl(_) => {
+            Err("bridge plugins must be installed from a GitHub repo (owner/repo) or a local folder".into())
+        }
+    }
+}
+
 /// Install a plugin as a whole: build it in a staging folder, then swap it
 /// in, so an upgrade never leaves old and new files mixed. The plugin's own
 /// storage (`data.json`) carries over.
-fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)], binary: Option<&(String, Vec<u8>)>) -> Result<(), String> {
     let root = plugins_dir()?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let dir = root.join(&m.id);
@@ -431,6 +630,17 @@ fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)]) -> Resu
             let target = stage.join("files").join(name);
             std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(target, bytes).map_err(|e| e.to_string())?;
+        }
+        if let Some((fname, bytes)) = binary {
+            let bin_dir = stage.join("bin");
+            std::fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+            let target = bin_dir.join(fname);
+            std::fs::write(&target, bytes).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+            }
         }
         // plugin storage + harness consent carry over; consent is bound to
         // the exact command, so a changed command is disabled until approved
@@ -495,9 +705,53 @@ pub fn installed_manifests() -> Vec<(Manifest, PathBuf)> {
     out
 }
 
+/// Resolve the staged executable path for an installed bridge plugin.
+pub fn bridge_binary_path(id: &str, spec: &BridgeSpec) -> Option<PathBuf> {
+    let dir = plugins_dir().ok()?.join(id);
+    let bin_dir = dir.join("bin");
+    let plat = current_platform();
+    if let Some(asset) = spec.binaries.get(&plat) {
+        let p = bin_dir.join(asset);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(ep) = &spec.entrypoint {
+        if let Some(fname) = Path::new(ep).file_name() {
+            let p = bin_dir.join(fname);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(&bin_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// List every installed bridge plugin along with its resolved executable path.
+pub fn list_installed_bridges() -> Vec<(Manifest, PathBuf)> {
+    let mut out = Vec::new();
+    for (m, _) in installed_manifests() {
+        if let Some(spec) = &m.bridge {
+            if let Some(bin) = bridge_binary_path(&m.id, spec) {
+                out.push((m, bin));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    out
+}
+
 fn entry(m: &Manifest, i: &InstallInfo) -> Value {
     let mut e = json!({ "id": m.id, "name": m.name, "version": m.version, "description": m.description,
-            "source": i.source, "installedAt": i.installed_at, "themes": m.themes, "panels": m.panels });
+            "source": i.source, "installedAt": i.installed_at, "themes": m.themes, "panels": m.panels, "bridge": m.bridge });
     if !m.harnesses.is_empty() {
         let dir = plugins_dir().map(|d| d.join(&m.id)).unwrap_or_default();
         let consent = crate::plugin_harness::read_consent(&dir);
@@ -580,7 +834,8 @@ pub async fn install(source: &str) -> Result<Value, String> {
         }
     }
     let files = fetch_files(&m, &src).await?;
-    write_plugin(&m, source, &files)?;
+    let binary = fetch_bridge_binary(&m, &src).await?;
+    write_plugin(&m, source, &files, binary.as_ref())?;
     let (m, i) = read_installed(&m.id).ok_or("install failed")?;
     Ok(entry(&m, &i))
 }
@@ -592,11 +847,12 @@ pub async fn upgrade(id: &str) -> Result<Value, String> {
         return Err(format!("the source now publishes plugin {:?}, not {:?}", m.id, old.id));
     }
     let files = fetch_files(&m, &src).await?;
+    let binary = fetch_bridge_binary(&m, &src).await?;
     let dir = plugins_dir()?.join(id).join("files");
     let files_changed = files.iter().any(|(n, b)| std::fs::read(dir.join(n)).ok().as_deref() != Some(b.as_slice()));
-    let changed = m != old || files_changed;
+    let changed = m != old || files_changed || binary.is_some();
     if changed {
-        write_plugin(&m, &info.source, &files)?;
+        write_plugin(&m, &info.source, &files, binary.as_ref())?;
     }
     let (m, i) = read_installed(id).ok_or("upgrade failed")?;
     let mut e = entry(&m, &i);
@@ -739,7 +995,7 @@ fn parse_entry(v: &Value) -> Result<CatalogEntry, String> {
     }
     let mut kinds: Vec<String> = Vec::new();
     for k in v["kinds"].as_array().ok_or("missing kinds")? {
-        let k = k.as_str().filter(|k| matches!(*k, "theme" | "panel" | "harness")).ok_or("unknown kind")?;
+        let k = k.as_str().filter(|k| matches!(*k, "theme" | "panel" | "harness" | "bridge")).ok_or("unknown kind")?;
         if !kinds.iter().any(|x| x == k) {
             kinds.push(k.to_string());
         }
@@ -1182,5 +1438,32 @@ mod tests {
         assert_eq!(serve_panel(&format!("{base}notes.html")).0, 404);
         assert!(action("plugin_uninstall", &json!({"id": "nord"})).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_manifest_validation() {
+        let mut m: Manifest = serde_json::from_value(json!({
+            "id": "demo-bridge",
+            "name": "Demo Bridge",
+            "version": "0.1.0",
+            "bridge": {
+                "name": "Demo",
+                "color": "#5865f2",
+                "iconPath": "M12 2L2 22h20L12 2z",
+                "entrypoint": "bin/demo"
+            }
+        })).unwrap();
+        assert!(validate(&m).is_ok());
+
+        m.bridge.as_mut().unwrap().icon_path = Some("M0 0\"><script>".into());
+        assert!(validate(&m).is_err());
+
+        m.bridge.as_mut().unwrap().icon_path = Some("M0 0".into());
+        m.bridge.as_mut().unwrap().entrypoint = Some("../escape".into());
+        assert!(validate(&m).is_err());
+
+        m.bridge.as_mut().unwrap().entrypoint = Some("bin/demo".into());
+        m.bridge.as_mut().unwrap().color = Some("url(evil)".into());
+        assert!(validate(&m).is_err());
     }
 }

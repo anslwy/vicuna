@@ -267,9 +267,9 @@
       <p class="pl-muted pl-foot">From the <a href="https://github.com/anslwy/vicuna-plugins" target="_blank" rel="noopener noreferrer">Vicuna plugin index</a>{#if catalog.skipped} · {catalog.skipped} invalid {catalog.skipped === 1 ? "entry" : "entries"} hidden{/if}. Plugins are made by their authors; install only what you trust.</p>
     {/if}
   {:else}
-  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes, side panels and Work harnesses (coding agents).</p>
+  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in), a local folder path, or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes, side panels, Work harnesses, and messaging bridges.</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
-    <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
+    <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo, /path/to/plugin, or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
     <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={installBlocked(source, busy)}>{busy === "install" ? "Installing…" : "Install"}</button>
   </form>
   {#if error}<div class="pl-err" data-testid="plugin-error">{error}</div>{/if}
@@ -291,6 +291,9 @@
         {#if p.description}<div class="pl-muted">{p.description}</div>{/if}
         <div class="pl-src" title={p.source}>{p.source}</div>
         <div class="pl-themes">
+          {#if p.bridge}
+            <span class="pl-theme" data-testid="plugin-bridge-{p.id}">Bridge · {p.bridge.name || p.name} (right-click a Work session to configure)</span>
+          {/if}
           {#each p.panels ?? [] as pn (pn.id)}
             <button class="pl-theme" data-testid="plugin-panel-{p.id}-{pn.id}" title="Open this panel in the side bar" onclick={() => onOpenPanel?.(`plugin:${p.id}:${pn.id}`)}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>

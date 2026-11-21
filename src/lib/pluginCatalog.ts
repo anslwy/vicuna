@@ -9,7 +9,7 @@ export type CatalogEntry = {
   description: string;
   author: string;
   source: string;
-  kinds: ("theme" | "panel")[];
+  kinds: ("theme" | "panel" | "harness" | "bridge")[];
   icon?: string;
   screenshot?: string;
   tags: string[];
@@ -48,4 +48,4 @@ export function cardAction(e: CatalogEntry): CardAction {
   return "install";
 }
 
-export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel", harness: "Harness" };
+export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel", harness: "Harness", bridge: "Bridge" };

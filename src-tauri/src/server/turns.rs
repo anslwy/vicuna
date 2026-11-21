@@ -728,6 +728,7 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
             st.redo_history.clear(&id);
             schedule_drop_for(st, &id).await;
             super::telegram::drop_for(&id);
+            super::bridge_plugins::drop_for(&id);
             Ok(json!({ "id": id, "deleted": true }))
         }
         "update" | "archive" | "unarchive" => {

@@ -31,6 +31,7 @@ pub mod turns;
 mod session_tools;
 mod self_upgrade;
 pub mod telegram;
+pub mod bridge_plugins;
 
 
 use std::collections::{HashMap, VecDeque};
@@ -678,8 +679,17 @@ async fn dispatch(
         "telegram_list" | "telegram_status" | "telegram_save" | "telegram_set" | "telegram_unpair" | "telegram_remove" => {
             telegram::action(st, cmd, args).await
         }
+        "bridge_list" | "bridge_status" | "bridge_save" | "bridge_set" | "bridge_unpair" | "bridge_remove" => {
+            bridge_plugins::action(st, cmd, args).await
+        }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
-        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" | "plugin_harness_consent" | "plugin_harness_revoke" => crate::plugins::action(cmd, &args).await,
+        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" | "plugin_harness_consent" | "plugin_harness_revoke" => {
+            let res = crate::plugins::action(cmd, &args).await;
+            if res.is_ok() && matches!(cmd, "plugin_install" | "plugin_upgrade" | "plugin_uninstall") {
+                bridge_plugins::notify_plugins_changed();
+            }
+            res
+        }
         "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" => crate::plugins::action(cmd, &args).await,
         "plugin_storage_remove" => crate::plugins::action(cmd, &args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
@@ -1371,6 +1381,12 @@ pub const API_ACTIONS: &[&str] = &[
     "ollama_warm_model",
     "opencode_models",
     "opencode_set_model",
+    "bridge_list",
+    "bridge_remove",
+    "bridge_save",
+    "bridge_set",
+    "bridge_status",
+    "bridge_unpair",
     "plugin_catalog",
     "plugin_install",
     "plugin_list",
@@ -1475,6 +1491,7 @@ pub async fn bind(cfg: &Config) -> Result<Bound, String> {
         // server mode: scheduled sends and MCP wake-ups run with no window
         turns::spawn_scheduler(state.clone());
         telegram::spawn(state.clone());
+        bridge_plugins::spawn(state.clone());
         let wakes = state.mcp_wakes.clone();
         crate::vicuna_mcp::set_mcp_wake_hook(move |sid, name, tools| {
             if let Ok(mut m) = wakes.lock() {
