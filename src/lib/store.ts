@@ -2,6 +2,13 @@ import type { ChatMsg } from "./ollama";
 import { validateOverride, type CatalogOverride } from "./library";
 import { normalizeContinueMode, type ContinueMode, type PromptStyle } from "./continue";
 import { activeServerId, invokeOrBridge, isServerBacked } from "./bridge";
+import {
+  deleteCachedChats,
+  pruneCachedChats,
+  readCachedChats,
+  resolveCachedChatRow,
+  writeCachedChat
+} from "./chatCache";
 
 export interface Chat {
   id: string;
@@ -660,6 +667,7 @@ export async function loadServerChatList(): Promise<any[]> {
 /** `keyScope`: the remote server id that scopes this window's local keys
  *  (model, active chat); null = This computer, which keeps its old keys. */
 function createServerBackend(keyScope: string | null): Backend {
+  const cacheScope = keyScope ?? "local";
   const sent = new Map<string, string>(); // chat id -> last payload JSON the server has
   // chat id -> server revision this window last saw. Sent as baseRev: the
   // server refuses a save whose base moved on (it recorded a Work turn while
@@ -675,6 +683,7 @@ function createServerBackend(keyScope: string | null): Backend {
 
   async function push(chats: Chat[]): Promise<void> {
     const items = toSavePayload(chats);
+    const byId = new Map(chats.map((c) => [c.id, c]));
     const partialIds = new Set(chats.filter((c) => c.partial).map((c) => c.id));
     const current = new Set(items.map((i) => i.id));
     const changed: typeof items = [];
@@ -695,13 +704,23 @@ function createServerBackend(keyScope: string | null): Backend {
       // older servers answer null (everything written, no revisions)
       if (!hasRevs || it.id in written) {
         sent.set(it.id, json.get(it.id)!);
-        if (hasRevs) revs.set(it.id, written[it.id]);
+        if (hasRevs) {
+          revs.set(it.id, written[it.id]);
+          const orig = byId.get(it.id);
+          writeCachedChat(cacheScope, {
+            ...it,
+            forkedFrom: orig?.forkedFrom ?? null,
+            canRedo: orig?.canRedo === true,
+            rev: written[it.id]
+          });
+        }
       }
     }
     for (const id of deleted) {
       sent.delete(id);
       revs.delete(id);
     }
+    if (deleted.length) deleteCachedChats(cacheScope, deleted);
     const conflicts: Chat[] = (Array.isArray(out?.conflicts) ? out.conflicts : []).map((raw: any) => adopt(raw));
     if (conflicts.length) {
       // A save requested during this request may still hold the rejected
@@ -716,6 +735,7 @@ function createServerBackend(keyScope: string | null): Backend {
     const chat = normalizeServerChat(raw);
     if (typeof raw?.rev === "number") revs.set(chat.id, raw.rev);
     sent.set(chat.id, JSON.stringify(toSavePayload([chat])[0]));
+    writeCachedChat(cacheScope, raw);
     return chat;
   }
 
@@ -728,11 +748,15 @@ function createServerBackend(keyScope: string | null): Backend {
   const ls = (base: string) => (keyScope ? serverKey(base, keyScope) : base);
   return {
     async loadChats(): Promise<Chat[]> {
-      const raw = await loadServerChatList();
+      const [raw, cached] = await Promise.all([loadServerChatList(), readCachedChats(cacheScope)]);
       // what the server already has: the first save sends nothing unchanged
       sent.clear();
       revs.clear();
-      const chats: Chat[] = (Array.isArray(raw) ? raw : []).map((c: any) => adopt(c));
+      const chats: Chat[] = (Array.isArray(raw) ? raw : []).map((c: any) => {
+        const { row } = resolveCachedChatRow(c, cached);
+        return adopt(row);
+      });
+      pruneCachedChats(cacheScope, new Set(chats.map((c) => c.id)));
       return chats;
     },
     async saveChats(chats: Chat[]): Promise<void> {

@@ -53,7 +53,7 @@
   import GitPanel from "$lib/GitPanel.svelte";
   import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
-  import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "$lib/palette";
+  import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError, mergeLocalServerHits } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
   import UpdatePromptModal from "$lib/UpdatePromptModal.svelte";
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
@@ -3557,6 +3557,8 @@
     remoteSearching = false;
     remoteFailures = [];
     remoteNotices = [];
+    localServerHits = [];
+    localServerSearching = false;
   }
 
   // search modal: filter sessions by title, message text, or id substring.
@@ -3583,7 +3585,10 @@
   });
   /** connected hosts whose chats are NOT loaded in this window */
   const remoteTargets = $derived(srvList.filter((s) => s.id !== activeServer));
+  const hasPartialChats = $derived(isServerBacked() && chats.some((c) => c.partial));
   type RemoteHit = ServerChatHit & { serverId: string; serverName: string };
+  let localServerHits = $state<ServerChatHit[]>([]);
+  let localServerSearching = $state(false);
   let remoteHits = $state<RemoteHit[]>([]);
   let remoteSearching = $state(false);
   let remoteFailures = $state<{ serverName: string; message: string }[]>([]);
@@ -3594,7 +3599,7 @@
   let remoteResolve: (() => void) | null = null;
   type SearchItem =
     | { kind: "new" }
-    | { kind: "chat"; chat: Chat }
+    | { kind: "chat"; chat: Chat; snippet?: string }
     | { kind: "remote"; hit: RemoteHit };
   const searchItems = $derived.by((): SearchItem[] => {
     const rows: SearchItem[] = [];
@@ -3605,9 +3610,13 @@
       rows.push({ kind: "chat", chat: gotoIdHit.chat });
       seen.add(gotoIdHit.chat.id);
     }
-    for (const c of searchResults) {
-      if (seen.has(c.id)) continue;
-      rows.push({ kind: "chat", chat: c });
+    const merged: Array<{ chat: Chat; snippet?: string }> = searchQuery
+      ? mergeLocalServerHits(searchResults, localServerHits, chats, 20)
+      : searchResults.map((chat) => ({ chat }));
+    for (const m of merged) {
+      if (seen.has(m.chat.id)) continue;
+      seen.add(m.chat.id);
+      rows.push(m.snippet ? { kind: "chat", chat: m.chat, snippet: m.snippet } : { kind: "chat", chat: m.chat });
     }
     for (const h of remoteHits) rows.push({ kind: "remote", hit: h });
     // matches first: the keyboard cursor starts at 0, so a query needs no
@@ -3616,13 +3625,15 @@
   });
   const searchShowHosts = $derived(showHostLabels(onServer, remoteHits.length));
 
-  // ask the other connected hosts on every query change (debounced), and by
+  // ask the current server (when some sessions are still `partial` previews)
+  // AND any other connected hosts on every query change (debounced), and by
   // session id alone when a link was pasted into the box
   $effect(() => {
     if (!gotoOpen) return;
     const { ids, text } = remoteQueryFor(searchQuery, gotoSessionId);
     const targets = remoteTargets;
-    const key = `${ids.join(",")}|${text}|${targets.map((t) => t.id).join(",")}`;
+    const searchHere = hasPartialChats;
+    const key = `${ids.join(",")}|${text}|${targets.map((t) => t.id).join(",")}|${searchHere ? 1 : 0}`;
     if (key === remoteKey) return;
     remoteKey = key;
     if (remoteTimer) {
@@ -3632,20 +3643,28 @@
     // a superseded lookup answers at once so an Enter waiting on it moves on
     remoteResolve?.();
     remoteResolve = null;
+    localServerHits = [];
+    localServerSearching = false;
     remoteHits = [];
     remoteSearching = false;
     remoteFailures = [];
     remoteNotices = [];
     remotePending = null;
-    if (!targets.length || (!ids.length && !text)) return;
-    remoteSearching = true;
-    const wait = ids.length ? 0 : 260;
+    if ((!targets.length && !searchHere) || (!ids.length && !text)) return;
+    remoteSearching = targets.length > 0;
+    localServerSearching = searchHere;
+    const wait = ids.length ? 0 : 200;
     remotePending = new Promise<void>((resolve) => {
       remoteResolve = resolve;
       remoteTimer = setTimeout(async () => {
         const failures: { serverName: string; message: string }[] = [];
         const notices: string[] = [];
-        const found = await Promise.all(
+        const localPromise = searchHere
+          ? invokeOrBridge<ServerChatHit[]>("server_search_chats", { query: text, ids, limit: 20 })
+              .then((res) => (Array.isArray(res) ? res : []))
+              .catch(() => [] as ServerChatHit[])
+          : Promise.resolve([] as ServerChatHit[]);
+        const remotePromise = Promise.all(
           targets.map(async (sv) => {
             try {
               const { hits, degraded } = await searchServerChats(sv.id, text, ids, 6);
@@ -3664,12 +3683,15 @@
             }
           })
         );
+        const [localFound, found] = await Promise.all([localPromise, remotePromise]);
         remoteTimer = null;
         remoteResolve = null;
         if (remoteKey !== key) {
           resolve();
           return;
         }
+        localServerHits = localFound;
+        localServerSearching = false;
         remoteHits = found.flat();
         remoteFailures = failures;
         remoteNotices = notices;
@@ -8092,7 +8114,12 @@
    *  the full session, in place so callers holding the object keep it.
    *  Messages added locally past the server's copy are kept. */
   const fullLoads = new Map<string, Promise<void>>();
-  function ensureChatFull(chat: Chat | null | undefined): Promise<void> {
+  let hoverPrefetchTimer: ReturnType<typeof setTimeout> | null = null;
+  let warmCancelled = false;
+  let warmStarted = false;
+  const WARM_RECENT_COUNT = 12;
+
+  function ensureChatFull(chat: Chat | null | undefined, opts: { silent?: boolean } = {}): Promise<void> {
     if (!chat?.partial) return Promise.resolve();
     const id = chat.id;
     let p = fullLoads.get(id);
@@ -8102,7 +8129,7 @@
         const local = chats.find((x) => x.id === id);
         if (!local?.partial) return;
         if (!raw || typeof raw.id !== "string") {
-          error = "Couldn't load this session from the server.";
+          if (!opts.silent) error = "Couldn't load this session from the server.";
           return;
         }
         const fresh = adoptServerChat(raw);
@@ -8115,8 +8142,53 @@
     }
     return p;
   }
+
+  function scheduleHoverPrefetch(chat: Chat) {
+    if (!chat.partial) return;
+    if (hoverPrefetchTimer) clearTimeout(hoverPrefetchTimer);
+    hoverPrefetchTimer = setTimeout(() => {
+      hoverPrefetchTimer = null;
+      if (chat.partial) void ensureChatFull(chat, { silent: true });
+    }, 80);
+  }
+
+  function cancelHoverPrefetch() {
+    if (hoverPrefetchTimer) {
+      clearTimeout(hoverPrefetchTimer);
+      hoverPrefetchTimer = null;
+    }
+  }
+
+  async function warmRecentPartialChats() {
+    if (!isServerBacked() || warmStarted || warmCancelled) return;
+    warmStarted = true;
+    // Wait for the active session (if any) to hydrate first so user-visible
+    // content always gets first priority on the connection.
+    if (activeChat?.partial) await ensureChatFull(activeChat);
+    const targets = chats
+      .filter((c) => c.partial && !c.archived)
+      .slice(0, WARM_RECENT_COUNT)
+      .map((c) => c.id);
+    for (const id of targets) {
+      if (warmCancelled) return;
+      // Pause briefly if an explicit user load is in flight.
+      while (fullLoads.size > 0 && !warmCancelled) {
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      if (warmCancelled) return;
+      const c = chats.find((x) => x.id === id);
+      if (c?.partial) {
+        await ensureChatFull(c, { silent: true });
+        await new Promise((r) => setTimeout(r, 40));
+      }
+    }
+  }
+
   $effect(() => {
     if (ready && activeChat?.partial) void ensureChatFull(activeChat);
+  });
+  $effect(() => {
+    if (ready && isServerBacked() && !warmStarted) void warmRecentPartialChats();
   });
 
   /** Server mode: take the server's transcript of a session (after its turn
@@ -9113,6 +9185,8 @@
   });
 
   onDestroy(() => {
+    warmCancelled = true;
+    cancelHoverPrefetch();
     if (scrollFrame) cancelAnimationFrame(scrollFrame);
     for (const c of aborters.values()) c.abort();
     for (const feed of serverChatFeeds.values()) feed.close();
@@ -9565,6 +9639,9 @@
               data-streaming={live ? "true" : null}
               title={live ? liveTitle(c.id) : c.role === "lead" ? c.title : undefined}
               onclick={() => selectChat(c.id)}
+              onpointerdown={() => { if (c.partial) void ensureChatFull(c, { silent: true }); }}
+              onpointerenter={() => scheduleHoverPrefetch(c)}
+              onpointerleave={cancelHoverPrefetch}
               oncontextmenu={(e) => openMenu(e, c.id)}
             >
               {#if renamingId === c.id}
@@ -11910,6 +11987,7 @@
             data-host={it.kind === "remote" ? it.hit.serverName : srvLabel}
             data-remote={it.kind === "remote" ? "true" : undefined}
             onclick={() => openSearchItem(it)}
+            onpointerdown={() => { if (it.kind === "chat" && it.chat.partial) void ensureChatFull(it.chat, { silent: true }); }}
             onmousemove={() => (gotoSel = idx)}
           >
             <span class="search-ico">
@@ -11926,7 +12004,7 @@
                   <span class="search-host" data-testid="search-host">{it.kind === "remote" ? it.hit.serverName : srvLabel}</span>
                 {/if}
               </span>
-              <span class="search-snippet">{@html highlightHtml(it.kind === "chat" ? searchSnippet(it.chat, searchQuery) : it.hit.snippet, searchQuery)}</span>
+              <span class="search-snippet">{@html highlightHtml(it.kind === "chat" ? (it.snippet ?? searchSnippet(it.chat, searchQuery)) : it.hit.snippet, searchQuery)}</span>
             </span>
           </button>
         {/if}
@@ -11936,6 +12014,8 @@
     </div>
     {#if remoteSearching}
       <p class="search-note" data-testid="search-remote-note">Searching connected servers…</p>
+    {:else if localServerSearching}
+      <p class="search-note" data-testid="search-local-note">Searching all messages…</p>
     {/if}
     {#each remoteFailures as f (f.serverName + f.message)}
       <p class="search-note search-fail" data-testid="search-remote-error">{f.serverName}: {f.message}</p>
