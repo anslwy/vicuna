@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError } from "../src/lib/palette.ts";
+import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError, mergeLocalServerHits } from "../src/lib/palette.ts";
 
 const chat = (id: string) => ({ kind: "chat" as const, chat: { id } });
 
@@ -49,4 +49,28 @@ test("an old server's unknown-command error becomes an update hint", () => {
   // real transport problems keep their own text
   assert.equal(describeServerSearchError("https://h:8443 did not answer in time."), "https://h:8443 did not answer in time.");
   assert.equal(describeServerSearchError("  "), "search failed on that server");
+});
+
+test("mergeLocalServerHits appends partial chats matched on the server and enriches partial snippets", () => {
+  const full = { id: "full-1", partial: false };
+  const partialTitle = { id: "part-1", partial: true };
+  const partialBodyOnly = { id: "part-2", partial: true };
+  const all = [full, partialTitle, partialBodyOnly];
+
+  const merged = mergeLocalServerHits(
+    [full, partialTitle],
+    [
+      { id: "full-1", snippet: "server full snippet" },
+      { id: "part-1", snippet: "…matched deep in part-1…" },
+      { id: "part-2", snippet: "…matched deep in part-2…" },
+      { id: "unknown-id", snippet: "ignored" }
+    ],
+    all
+  );
+
+  assert.deepEqual(merged, [
+    { chat: full },
+    { chat: partialTitle, snippet: "…matched deep in part-1…" },
+    { chat: partialBodyOnly, snippet: "…matched deep in part-2…" }
+  ]);
 });
