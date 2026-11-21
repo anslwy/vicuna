@@ -10,7 +10,7 @@ import type { Chat } from "./store";
 import type { OpencodeModels, WorkEngineInfo } from "./workGate";
 // pure formatters live in toolFormat.ts (node-testable; the server ports them)
 export { toolLabel, formatAskRecord, formatToolCallHead, formatToolCallTail, formatToolResult, formatDisplayNote } from "./toolFormat";
-export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, workEngineMenuItems, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac } from "./workGate";
+export { workSendGate, opencodeModelChoices, workReplyModel, engineId, engineLabel, workEngineChoices, workEngineMenuItems, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, USAGE_CACHE_MAX_AGE_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache } from "./workGate";
 export type { WorkEngineInfo, OpencodeModel, OpencodeModels, EngineSummary } from "./workGate";
 
 async function invokeCmd<T>(cmd: string, args: Record<string, any>): Promise<T> {

@@ -48,7 +48,7 @@
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness } from "$lib/sessionEngine";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
@@ -1826,88 +1826,145 @@
     if (scheduled.length && Math.floor(at / 60000) !== Math.floor(scheduleNow / 60000)) scheduleNow = at;
     for (const it of dueItems(scheduled, at)) void deliverScheduled(it.id);
   }
+  type UsageCacheEntry = { report: WorkUsageReport | null; error: string | null; at: number };
+  const USAGE_CACHE_KEY = "vicuna-usage-cache";
   let usageOpen = $state(false);
-  let usageLoading = $state(false);
   let usageEngine = $state("agy");
-  let usageReport = $state<WorkUsageReport | null>(null);
-  let usageError = $state<string | null>(null);
-  let usageCache = $state<Record<string, WorkUsageReport>>({});
-  let usageReqId = 0;
-  /** last report per engine for the header meter's hover text (kept across
-   *  modal opens, which wipe `usageCache`); refetched on hover after 60s */
-  let usageHoverCache = $state<Record<string, { report: WorkUsageReport | null; error: string | null; at: number }>>({});
-  let usageHoverLoading = $state<string | null>(null);
+  let usageNoEngineError = $state<string | null>(null);
+  /** Unified per-engine usage snapshot shared by the header badge, hover popover, and modal. */
+  let usageStore = $state<Record<string, UsageCacheEntry>>({});
+  /** Per-engine in-flight flags so hover, background poll, and modal refreshes deduplicate. */
+  let usageFetching = $state<Record<string, boolean>>({});
+  /** Ticks every 30s so "Updated Xm ago" labels stay fresh without extra fetches. */
+  let usageNow = $state(Date.now());
+  const usageInFlight = new Map<string, Promise<void>>();
+  let usagePollRunning = false;
 
-  function rememberUsageHover(engine: string, report: WorkUsageReport | null, error: string | null) {
-    usageHoverCache = { ...usageHoverCache, [engine]: { report, error, at: Date.now() } };
+  const usageEntry = $derived(usageStore[usageEngine] ?? null);
+  const usageReport = $derived(usageEntry?.report ?? null);
+  const usageError = $derived(usageNoEngineError ?? usageEntry?.error ?? null);
+  const usageUpdatedAt = $derived(usageEntry?.at ?? null);
+  const usageLoading = $derived(!!usageFetching[usageEngine]);
+
+  function persistUsageStore() {
+    try {
+      const toSave: Record<string, { report: WorkUsageReport; at: number }> = {};
+      for (const [k, v] of Object.entries(usageStore)) {
+        if (v.report) toSave[k] = { report: v.report, at: v.at };
+      }
+      localStorage.setItem(USAGE_CACHE_KEY, JSON.stringify(toSave));
+    } catch {}
   }
 
-  async function primeUsageHover() {
-    const engine = usageHoverEngine;
-    if (!engine || usageHoverLoading === engine || usageLoading) return;
-    const hit = usageHoverCache[engine];
-    if (hit && Date.now() - hit.at < 60_000) return;
-    usageHoverLoading = engine;
+  function hydrateUsageStore() {
     try {
-      const res = await fetchWorkUsage(engine);
-      rememberUsageHover(engine, res, res.error);
-    } catch (e) {
-      rememberUsageHover(engine, null, e instanceof Error ? e.message : String(e));
-    } finally {
-      if (usageHoverLoading === engine) usageHoverLoading = null;
+      const loaded = parseUsageCache<WorkUsageReport>(localStorage.getItem(USAGE_CACHE_KEY));
+      if (Object.keys(loaded).length) usageStore = loaded;
+    } catch {}
+  }
+
+  function fetchUsageEngine(engine: string, opts?: { force?: boolean; background?: boolean }): Promise<void> {
+    if (!engine) return Promise.resolve();
+    const force = opts?.force ?? false;
+    const background = opts?.background ?? false;
+    const existing = usageStore[engine];
+    if (!force && existing?.report && !isUsageStale(existing.at, Date.now(), USAGE_POLL_INTERVAL_MS)) {
+      return Promise.resolve();
     }
+    const inflight = usageInFlight.get(engine);
+    if (inflight) return inflight;
+
+    usageFetching = { ...usageFetching, [engine]: true };
+    const p = (async () => {
+      try {
+        const res = await fetchWorkUsage(engine);
+        const now = Date.now();
+        const prev = usageStore[engine];
+        if (!res.error) {
+          usageStore = { ...usageStore, [engine]: { report: res, error: null, at: now } };
+          persistUsageStore();
+        } else if (background && prev?.report) {
+          // keep last good snapshot on transient background poll failures
+        } else {
+          usageStore = {
+            ...usageStore,
+            [engine]: { report: prev?.report ?? null, error: res.error, at: prev?.report ? prev.at : now },
+          };
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const prev = usageStore[engine];
+        if (!(background && prev?.report)) {
+          usageStore = {
+            ...usageStore,
+            [engine]: { report: prev?.report ?? null, error: msg, at: prev?.report ? prev.at : Date.now() },
+          };
+        }
+      } finally {
+        usageInFlight.delete(engine);
+        const { [engine]: _, ...rest } = usageFetching;
+        usageFetching = rest;
+        usageNow = Date.now();
+      }
+    })();
+    usageInFlight.set(engine, p);
+    return p;
+  }
+
+  async function pollUsageBackground() {
+    if (usagePollRunning) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    const order = usagePollOrder(workEngines, engineId(workEngineInfo));
+    if (!order.length) return;
+    usagePollRunning = true;
+    try {
+      for (const eng of order) {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") break;
+        await fetchUsageEngine(eng, { background: true });
+      }
+    } finally {
+      usagePollRunning = false;
+    }
+  }
+
+  function primeUsageHover() {
+    usageNow = Date.now();
+    const engine = usageHoverEngine;
+    if (!engine) return;
+    void fetchUsageEngine(engine, { background: true });
   }
 
   function closeUsageModal() {
     usageOpen = false;
-    usageLoading = false;
-    usageReqId += 1;
   }
 
-  async function loadUsage(engine: string, force = false) {
-    const reqId = ++usageReqId;
+  function selectUsageTab(engine: string) {
+    usageNoEngineError = null;
     usageEngine = engine;
-    usageError = null;
-    if (!force && usageCache[engine]) {
-      usageReport = usageCache[engine];
-      usageError = usageReport.error;
-      usageLoading = false;
-      return;
-    }
-    usageLoading = true;
-    try {
-      const res = await fetchWorkUsage(engine);
-      usageCache = { ...usageCache, [engine]: res };
-      rememberUsageHover(engine, res, res.error);
-      if (!usageOpen || usageReqId !== reqId) return;
-      usageReport = res;
-      if (res.error) usageError = res.error;
-    } catch (e) {
-      if (!usageOpen || usageReqId !== reqId) return;
-      usageReport = null;
-      usageError = e instanceof Error ? e.message : String(e);
-    } finally {
-      if (usageReqId === reqId) usageLoading = false;
-    }
+    usageNow = Date.now();
+    void fetchUsageEngine(engine, { background: true });
   }
 
   async function openUsageModal(engine?: string) {
-    const reqId = ++usageReqId;
     usageOpen = true;
-    usageReport = null;
-    usageError = null;
-    usageCache = {};
-    usageLoading = true;
+    usageNoEngineError = null;
+    usageNow = Date.now();
     if (!engine && !workEngineInfo) await refreshWorkEngine();
-    if (!usageOpen || usageReqId !== reqId) return;
+    if (!usageOpen) return;
     const target = engine ?? usageTabs(workEngines, engineId(workEngineInfo)).initial;
     if (!target) {
-      usageLoading = false;
-      usageError = "Usage is available for Claude Code, Codex and Antigravity; none of them is installed.";
+      usageNoEngineError = "Usage is available for Claude Code, Codex and Antigravity; none of them is installed.";
       return;
     }
-    await loadUsage(target, true);
+    usageEngine = target;
+    void fetchUsageEngine(target, { background: true });
   }
+
+  $effect(() => {
+    const key = usagePollOrder(workEngines, engineId(workEngineInfo)).join(",");
+    if (!key) return;
+    void pollUsageBackground();
+  });
 
   /** Esc closes the top schedule/usage overlay before any other handler sees it */
   function onScheduleEscape(e: KeyboardEvent) {
@@ -9142,6 +9199,16 @@
       }
     }
     const scheduleTimer = setInterval(scheduleTick, 5000);
+    hydrateUsageStore();
+    const usagePollTimer = setInterval(() => void pollUsageBackground(), USAGE_POLL_INTERVAL_MS);
+    const usageTickTimer = setInterval(() => { usageNow = Date.now(); }, 30_000);
+    const onUsageVisibility = () => {
+      if (document.visibilityState === "visible") {
+        usageNow = Date.now();
+        void pollUsageBackground();
+      }
+    };
+    document.addEventListener("visibilitychange", onUsageVisibility);
     window.addEventListener("keydown", onScheduleEscape, true);
     // tray Quit / Cmd+Q with scheduled messages pending: the backend shows
     // the window and asks here instead of quitting
@@ -9233,6 +9300,9 @@
       unlistenMcpChanged?.();
       unlistenMcpWake?.();
       clearInterval(scheduleTimer);
+      clearInterval(usagePollTimer);
+      clearInterval(usageTickTimer);
+      document.removeEventListener("visibilitychange", onUsageVisibility);
       window.removeEventListener("keydown", onScheduleEscape, true);
       if (updateCheckTimer) clearTimeout(updateCheckTimer);
     };
@@ -10060,13 +10130,14 @@
           <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{#if workEngineInfo && !sessionEngineMissing}{@render engineIcon(engineId(workEngineInfo))}{/if}{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           <span class="hdr-meters">
           {#if usageHoverEngine}
-            {@const hov = usageHoverCache[usageHoverEngine]}
+            {@const hov = usageStore[usageHoverEngine]}
+            {@const hovLoading = !!usageFetching[usageHoverEngine]}
             {@const hovLabel = workEngines.find((e) => e.id === usageHoverEngine)?.label ?? usageHoverEngine}
-            {@const hovRows = hov?.report && !hov.error ? usageHoverRows(hov.report) : []}
+            {@const hovRows = hov?.report ? usageHoverRows(hov.report) : []}
             {@const gauge = usageGaugeFrac(hovRows)}
             <span class="ctx-wrap usage-wrap">
               <!-- same 18px / r=7 / 2.5 stroke as the context ring, but a 270° gauge arc (gap at the bottom) filled by the most-used quota -->
-              <button class="usage-meter-btn" data-testid="usage-meter-btn" aria-label={`${hovLabel} usage${hovRows.length ? ` ${Math.round(gauge * 100)}%` : ""}`} onmouseenter={() => void primeUsageHover()} onfocus={() => void primeUsageHover()} onclick={() => void openUsageModal()}>
+              <button class="usage-meter-btn" data-testid="usage-meter-btn" aria-label={`${hovLabel} usage${hovRows.length ? ` ${Math.round(gauge * 100)}%` : ""}`} onmouseenter={() => primeUsageHover()} onfocus={() => primeUsageHover()} onclick={() => void openUsageModal()}>
                 <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
                   <circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-2)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="33 44" transform="rotate(135 9 9)" />
                   {#if gauge > 0}
@@ -10075,8 +10146,20 @@
                 </svg>
               </button>
               <span class="ctx-popup usage-hover" data-testid="usage-hover">
-                <span class="usage-hover-head">{hovLabel}{hov?.report?.plan ? ` · ${hov.report.plan}` : ""}</span>
-                {#if hov?.report && !hov.error}
+                <span class="usage-hover-head">
+                  <span class="usage-hover-title">{hovLabel}{hov?.report?.plan ? ` · ${hov.report.plan}` : ""}</span>
+                  <button
+                    class="usage-hover-refresh"
+                    data-testid="usage-hover-refresh"
+                    disabled={hovLoading}
+                    onclick={(e) => { e.stopPropagation(); void fetchUsageEngine(usageHoverEngine, { force: true }); }}
+                    title="Refresh usage"
+                  >{hovLoading ? "Refreshing…" : "Refresh"}</button>
+                </span>
+                {#if hov?.report}
+                  {#if hov.error}
+                    <span class="usage-hover-note usage-tone-low">{hov.error}</span>
+                  {/if}
                   {#each hovRows as r}
                     <span class="usage-hover-row">
                       <span class="usage-hover-line"><span class="usage-hover-label" title={r.label}>{r.label}</span><span class="usage-hover-val {r.tone ? `usage-tone-${r.tone}` : ''}">{r.value}</span></span>
@@ -10088,14 +10171,25 @@
                   {:else}
                     <span class="usage-hover-note">{hov.report.note ?? "No usage reported"}</span>
                   {/each}
-                {:else if usageHoverLoading === usageHoverEngine}
+                {:else if hovLoading}
                   <span class="usage-hover-note">Fetching usage…</span>
                 {:else if hov?.error}
                   <span class="usage-hover-note">{hov.error}</span>
                 {:else}
                   <span class="usage-hover-note">Hover to load usage</span>
                 {/if}
-                <span class="usage-hover-hint">Click for details</span>
+                <span class="usage-hover-hint">
+                  <span data-testid="usage-hover-updated">
+                    {#if hov?.report}
+                      Updated {formatUsageAge(hov.at, usageNow)}{hovLoading ? " · updating…" : ""}
+                    {:else if hovLoading}
+                      Updating…
+                    {:else}
+                      Not updated yet
+                    {/if}
+                  </span>
+                  <span>Click for details</span>
+                </span>
               </span>
             </span>
           {/if}
@@ -11928,9 +12022,14 @@
         {#if usageReport?.plan}
           <span class="usage-plan">{usageReport.plan}</span>
         {/if}
-        <button class="usage-refresh" data-testid="usage-refresh" disabled={usageLoading} onclick={() => void loadUsage(usageEngine, true)} title="Refresh usage">
-          {usageLoading ? "Refreshing…" : "Refresh"}
-        </button>
+        <span class="usage-title-right">
+          {#if usageUpdatedAt && usageReport}
+            <span class="usage-updated" data-testid="usage-updated">Updated {formatUsageAge(usageUpdatedAt, usageNow)}</span>
+          {/if}
+          <button class="usage-refresh" data-testid="usage-refresh" disabled={usageLoading} onclick={() => void fetchUsageEngine(usageEngine, { force: true })} title="Refresh usage">
+            {usageLoading ? "Refreshing…" : "Refresh"}
+          </button>
+        </span>
       </div>
       {#if usageReport?.account}
         <p class="usage-account" data-testid="usage-account">{usageReport.account}</p>
@@ -11943,18 +12042,17 @@
               data-testid="usage-tab-{eng.id}"
               role="tab"
               aria-selected={usageEngine === eng.id}
-              onclick={() => void loadUsage(eng.id)}
+              onclick={() => selectUsageTab(eng.id)}
             >{@render engineIcon(eng.id)}{eng.label}</button>
           {/each}
         </div>
       {/if}
     </div>
     <div class="usage-body">
-      {#if usageLoading}
-        <p class="usage-loading" data-testid="usage-loading">Fetching usage from {installedEngines.find((e) => e.id === usageEngine)?.label ?? usageEngine}…</p>
-      {:else if usageError}
-        <p class="sched-warn" data-testid="usage-error">{usageError}</p>
-      {:else if usageReport}
+      {#if usageReport}
+        {#if usageError}
+          <p class="sched-warn" data-testid="usage-error">{usageError}</p>
+        {/if}
         {#if usageReport.groups.length}
           <div class="usage-groups">
             {#each usageReport.groups as grp}
@@ -12006,6 +12104,10 @@
             <pre>{usageReport.raw}</pre>
           </details>
         {/if}
+      {:else if usageLoading}
+        <p class="usage-loading" data-testid="usage-loading">Fetching usage from {installedEngines.find((e) => e.id === usageEngine)?.label ?? usageEngine}…</p>
+      {:else if usageError}
+        <p class="sched-warn" data-testid="usage-error">{usageError}</p>
       {/if}
     </div>
   </div>
@@ -13337,7 +13439,9 @@
   .usage-title-row { display: flex; align-items: center; gap: 8px; padding-right: 28px; }
   .usage-title-row .sched-title { margin-bottom: 0; }
   .usage-plan { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--hover); color: var(--text-dim); }
-  .usage-refresh { margin-left: auto; border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  .usage-title-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+  .usage-updated { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .usage-refresh { border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   .usage-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
   .usage-refresh:disabled { opacity: .55; cursor: default; }
   .usage-account { font-size: 12.5px; color: var(--muted); margin: 0; }
@@ -13556,7 +13660,12 @@
   .usage-meter-btn { display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; background: none; cursor: pointer; }
   .usage-meter-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 50%; }
   .usage-hover { width: 320px; padding: 12px 16px; }
-  .usage-hover-head { display: block; font-size: 13px; font-weight: 600; color: var(--text); padding-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .usage-hover::before { content: ""; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
+  .usage-hover-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text); padding-bottom: 8px; }
+  .usage-hover-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .usage-hover-refresh { flex-shrink: 0; border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 6px; padding: 2px 7px; font: inherit; font-size: 11px; font-weight: 500; cursor: pointer; }
+  .usage-hover-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+  .usage-hover-refresh:disabled { opacity: .55; cursor: default; }
   .usage-hover-row { display: block; padding: 6px 0; }
   .usage-hover-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 13px; }
   .usage-hover-label { color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -13568,7 +13677,7 @@
   .usage-hover-fill.low { background: var(--danger); }
   .usage-hover-reset { display: block; font-size: 11px; color: var(--muted-2); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .usage-hover-note { display: block; font-size: 12px; color: var(--muted-2); padding: 2px 0; max-width: 280px; }
-  .usage-hover-hint { display: block; font-size: 11px; color: var(--muted-2); border-top: 1px solid var(--border-2); margin-top: 6px; padding-top: 6px; }
+  .usage-hover-hint { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted-2); border-top: 1px solid var(--border-2); margin-top: 6px; padding-top: 6px; }
   .usage-tone-ok { color: #15803d; }
   .usage-tone-warn { color: #b45309; }
   .usage-tone-low { color: var(--danger); }

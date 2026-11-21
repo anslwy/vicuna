@@ -3,7 +3,7 @@
 // which has no Node typings here; Node runs this file directly (type stripping).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workSendGate, opencodeModelChoices, workReplyModel, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
+import { workSendGate, opencodeModelChoices, workReplyModel, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkEngineInfo, type OpencodeModels } from "../src/lib/workGate.ts";
 
 const base: WorkEngineInfo = {
   installed: true,
@@ -261,4 +261,54 @@ test("usageTabs includes plugin harnesses that report usage", () => {
   ];
   assert.deepEqual(usageTabs(engines, "plugin:muse/muse").tabs.map((e) => e.id), ["claude", "plugin:muse/muse"]);
   assert.equal(usageTabs(engines, "plugin:muse/muse").initial, "plugin:muse/muse");
+});
+
+test("formatUsageAge formats relative timestamps cleanly", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(formatUsageAge(now, now), "just now");
+  assert.equal(formatUsageAge(now - 59_000, now), "just now");
+  assert.equal(formatUsageAge(now + 5_000, now), "just now");
+  assert.equal(formatUsageAge(now - 60_000, now), "1m ago");
+  assert.equal(formatUsageAge(now - 12 * 60_000, now), "12m ago");
+  assert.equal(formatUsageAge(now - 2 * 60 * 60_000, now), "2h ago");
+  assert.equal(formatUsageAge(now - 3 * 24 * 60 * 60_000, now), "3d ago");
+});
+
+test("isUsageStale checks missing and expired timestamps", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(isUsageStale(undefined, now), true);
+  assert.equal(isUsageStale(null, now), true);
+  assert.equal(isUsageStale(now - USAGE_POLL_INTERVAL_MS + 1, now), false);
+  assert.equal(isUsageStale(now - USAGE_POLL_INTERVAL_MS, now), true);
+});
+
+test("usagePollOrder puts the active quota harness first including plugins", () => {
+  const engines = [
+    { id: "claude", installed: true },
+    { id: "codex", installed: true },
+    { id: "agy", installed: true },
+    { id: "plugin:muse/muse", installed: true, usage: true },
+    { id: "pi", installed: true },
+  ];
+  assert.deepEqual(usagePollOrder(engines, "agy"), ["agy", "claude", "codex", "plugin:muse/muse"]);
+  assert.deepEqual(usagePollOrder(engines, "plugin:muse/muse"), ["plugin:muse/muse", "claude", "codex", "agy"]);
+  assert.deepEqual(usagePollOrder(engines, "opencode"), ["claude", "codex", "agy", "plugin:muse/muse"]);
+  assert.deepEqual(usagePollOrder([{ id: "pi", installed: true }], "pi"), []);
+});
+
+test("parseUsageCache restores fresh reports and drops expired or malformed entries", () => {
+  const now = 1_700_000_000_000;
+  const raw = JSON.stringify({
+    agy: { report: { engine: "agy", groups: [] }, at: now - 120_000 },
+    claude: { report: { engine: "claude", groups: [] }, at: now - 48 * 60 * 60_000 },
+    codex: { report: null, error: "timeout", at: now - 10_000 },
+    bad: "nope",
+  });
+  const parsed = parseUsageCache<{ engine: string; groups: unknown[] }>(raw, now);
+  assert.deepEqual(Object.keys(parsed), ["agy"]);
+  assert.equal(parsed.agy.report?.engine, "agy");
+  assert.equal(parsed.agy.error, null);
+  assert.equal(parsed.agy.at, now - 120_000);
+  assert.deepEqual(parseUsageCache("not json", now), {});
+  assert.deepEqual(parseUsageCache(null, now), {});
 });
