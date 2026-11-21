@@ -675,7 +675,7 @@ async fn dispatch(
         "session_undo" => session_tools::change_turn(st, args, false).await,
         "session_redo" => session_tools::change_turn(st, args, true).await,
         "schedule_list" => turns::schedule_list(st).await,
-        "telegram_status" | "telegram_save" | "telegram_set" | "telegram_unpair" | "telegram_remove" => {
+        "telegram_list" | "telegram_status" | "telegram_save" | "telegram_set" | "telegram_unpair" | "telegram_remove" => {
             telegram::action(st, cmd, args).await
         }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
@@ -1390,6 +1390,7 @@ pub const API_ACTIONS: &[&str] = &[
     "server_upgrade",
     "server_upgrade_check",
     "server_upgrade_status",
+    "telegram_list",
     "telegram_remove",
     "telegram_save",
     "telegram_set",

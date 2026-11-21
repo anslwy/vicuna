@@ -727,6 +727,7 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
             crate::server_store::merge_json(db, &json!([]), vec![id.clone()], &Default::default()).await?;
             st.redo_history.clear(&id);
             schedule_drop_for(st, &id).await;
+            super::telegram::drop_for(&id);
             Ok(json!({ "id": id, "deleted": true }))
         }
         "update" | "archive" | "unarchive" => {
