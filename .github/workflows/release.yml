@@ -132,19 +132,79 @@ jobs:
       - name: Fetch lb browser sidecar (pinned)
         run: sh scripts/fetch-lb-sidecar.sh
 
+      - name: Import Apple signing certificate & sign sidecars
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "Apple signing secrets not configured — skipping macOS signing."
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 32)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+          # Tauri only auto-signs Contents/MacOS, Frameworks, and externalBin,
+          # so sign the bundled lb-sidecar executables before bundling/notarizing.
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" \
+            src-tauri/lb-sidecar/lb-arm64 src-tauri/lb-sidecar/lb-x64
+          codesign --verify --verbose=2 src-tauri/lb-sidecar/lb-arm64 src-tauri/lb-sidecar/lb-x64
+          echo "APPLE_SIGNED=1" >> "$GITHUB_ENV"
+
       # `app` must be built alongside `dmg`: the bundler only creates signed
       # updater artifacts (.app.tar.gz + .sig) for updater-enabled targets
       # (app, appimage, nsis, msi). Without the signing secret the updater
       # artifacts are switched off so dev builds keep working.
       - name: Build universal app + DMG
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          if [ "${APPLE_SIGNED:-}" = "1" ] && [ -n "${APPLE_SIGNING_IDENTITY_SECRET:-}" ]; then
+            export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_SECRET"
+            if [ -n "${APPLE_ID_SECRET:-}" ] && [ -n "${APPLE_PASSWORD_SECRET:-}" ] && [ -n "${APPLE_TEAM_ID_SECRET:-}" ]; then
+              export APPLE_ID="$APPLE_ID_SECRET"
+              export APPLE_PASSWORD="$APPLE_PASSWORD_SECRET"
+              export APPLE_TEAM_ID="$APPLE_TEAM_ID_SECRET"
+            fi
+          fi
           args=(--target universal-apple-darwin --bundles dmg,app)
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: building without updater artifacts"
             args+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
           fi
           npx tauri build "${args[@]}"
+
+      - name: Verify macOS signature & notarization
+        if: ${{ env.APPLE_SIGNED == '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="src-tauri/target/universal-apple-darwin/release/bundle/macos/Vicuna.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute -vv "$APP_PATH"
+
+      - name: Clean up signing keychain
+        if: always()
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
 
       - name: List bundle outputs (debug updater artifacts)
         shell: bash
@@ -384,6 +444,76 @@ jobs:
           # put it in <prefix>/share/vicuna/lb-sidecar)
           sh ../scripts/fetch-lb-sidecar.sh
           cp -R ../src-tauri/lb-sidecar target/release/lb-sidecar
+
+      - name: Sign & notarize macOS CLI
+        if: ${{ matrix.target == 'macos-universal' }}
+        working-directory: bridge
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "Apple signing secrets not configured — skipping macOS CLI signing."
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/cli-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 32)"
+          CERT_PATH="$RUNNER_TEMP/cli-certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" \
+            target/release/vicuna \
+            target/release/lb-sidecar/lb-arm64 \
+            target/release/lb-sidecar/lb-x64
+          codesign --verify --verbose=2 \
+            target/release/vicuna \
+            target/release/lb-sidecar/lb-arm64 \
+            target/release/lb-sidecar/lb-x64
+
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            NOTARY_ZIP="$RUNNER_TEMP/vicuna-cli-notary.zip"
+            zip -j "$NOTARY_ZIP" \
+              target/release/vicuna \
+              target/release/lb-sidecar/lb-arm64 \
+              target/release/lb-sidecar/lb-x64
+            OUT="$(xcrun notarytool submit "$NOTARY_ZIP" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --output-format json)"
+            echo "$OUT"
+            STATUS="$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            SUB_ID="$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            rm -f "$NOTARY_ZIP"
+            if [ "$STATUS" != "Accepted" ]; then
+              echo "::error::CLI notarization failed with status: $STATUS"
+              [ -n "$SUB_ID" ] && xcrun notarytool log "$SUB_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+              exit 1
+            fi
+          fi
+
+      - name: Clean up CLI signing keychain
+        if: ${{ always() && matrix.target == 'macos-universal' }}
+        run: security delete-keychain "$RUNNER_TEMP/cli-signing.keychain-db" 2>/dev/null || true
+
+      - name: Package vicuna CLI
+        working-directory: bridge
+        run: |
+          set -euo pipefail
           mkdir -p ../dist
           tar -C target/release -czf ../dist/vicuna-${{ matrix.target }}.tar.gz vicuna lb-sidecar
           cd ../dist
