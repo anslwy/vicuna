@@ -11,6 +11,8 @@ export type PluginHarness = {
   models?: { id: string; label?: string | null }[];
   installHint?: string;
   installUrl?: string | null;
+  /** Usage command (runs only after consent, shown in the dialog). */
+  usage?: { command: string; args: string[] } | null;
   enabled: boolean;
   installed: boolean;
 };
@@ -35,7 +37,7 @@ export function commandLine(h: Pick<PluginHarness, "command" | "args">): string 
 /** What the window echoes back on Accept: exactly what it displayed. The
  *  server refuses a grant that doesn't match the installed manifest. */
 export function consentPayload(pluginId: string, harnesses: PluginHarness[]) {
-  return { id: pluginId, harnesses: harnesses.map((h) => ({ id: h.id, command: h.command, args: [...h.args] })) };
+  return { id: pluginId, harnesses: harnesses.map((h) => ({ id: h.id, command: h.command, args: [...h.args], ...(h.usage ? { usage: { command: h.usage.command, args: [...h.usage.args] } } : {}) })) };
 }
 
 export function pendingConsent(p: { pendingConsent?: PluginHarness[] } | null | undefined): PluginHarness[] {

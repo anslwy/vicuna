@@ -99,6 +99,7 @@ pub fn summary(info: &WorkEngineInfo) -> EngineSummary {
         installed: info.installed,
         version: info.version.clone(),
         missing: info.missing.clone(),
+        usage: crate::work_usage::reports_usage(&info.id),
     }
 }
 

@@ -251,3 +251,14 @@ test("usageHoverRows lists meters, prefixes multi-group titles, falls back to st
   const stats = usageHoverRows({ groups: [], stats: [{ label: "Tokens", value: "1.2M" }] });
   assert.deepEqual(stats, [{ label: "Tokens", value: "1.2M", reset: null, tone: null, usedPct: null }]);
 });
+
+test("usageTabs includes plugin harnesses that report usage", () => {
+  const engines = [
+    { id: "claude", installed: true },
+    { id: "plugin:muse/muse", installed: true, usage: true },
+    { id: "plugin:x/y", installed: true, usage: false },
+    { id: "plugin:z/z", installed: false, usage: true },
+  ];
+  assert.deepEqual(usageTabs(engines, "plugin:muse/muse").tabs.map((e) => e.id), ["claude", "plugin:muse/muse"]);
+  assert.equal(usageTabs(engines, "plugin:muse/muse").initial, "plugin:muse/muse");
+});

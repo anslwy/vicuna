@@ -19,3 +19,10 @@ test("consent echoes exactly what was shown", () => {
   assert.deepEqual(pendingConsent({ pendingConsent: [h] }), [h]);
   assert.deepEqual(pendingConsent(null), []);
 });
+
+test("consent echoes the usage command too", () => {
+  const u = { ...h, usage: { command: "muse", args: ["usage", "--json"] } };
+  assert.deepEqual(consentPayload("muse-acp", [u]).harnesses[0].usage, { command: "muse", args: ["usage", "--json"] });
+  assert.equal(commandLine(u.usage), "muse usage --json");
+  assert.ok(!("usage" in consentPayload("muse-acp", [h]).harnesses[0]));
+});

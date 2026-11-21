@@ -1286,11 +1286,19 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                 };
                 fetch_codex_usage(&bin)?
             }
-            Engine::Plugin(_) => {
-                let mut r = WorkUsageReport::base(eng);
-                r.note = Some(format!("{}: usage unknown (plugin harness).", eng.label()));
-                r
-            }
+            Engine::Plugin(key) => match crate::plugin_harness::run_usage(key) {
+                Ok((map, out)) => map_plugin_usage(eng, &map, &out, now_epoch()),
+                Err(e) if crate::plugin_harness::lookup(key).is_some_and(|r| r.harness.usage.is_none()) => {
+                    let mut r = WorkUsageReport::base(eng);
+                    r.note = Some(e);
+                    r
+                }
+                Err(e) => {
+                    let mut r = WorkUsageReport::base(eng);
+                    r.error = Some(e);
+                    r
+                }
+            },
             Engine::Opencode | Engine::Pi | Engine::Fx => {
                 let mut r = WorkUsageReport::base(eng);
                 r.note = Some(format!(
@@ -1336,6 +1344,138 @@ pub async fn work_usage(engine: Option<String>) -> Result<WorkUsageReport, Strin
 
 /// Harnesses whose subscription usage can be read (the Usage view's tabs).
 pub const QUOTA_ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::Agy];
+
+/// Built-in quota harnesses plus enabled plugin harnesses with a usage map.
+pub fn quota_engines() -> Vec<Engine> {
+    let mut v = QUOTA_ENGINES.to_vec();
+    v.extend(
+        crate::plugin_harness::all_keys()
+            .into_iter()
+            .filter(|k| crate::plugin_harness::reports_usage(k))
+            .map(Engine::Plugin),
+    );
+    v
+}
+
+/// Whether the Usage view offers a tab for this engine id.
+pub fn reports_usage(id: &str) -> bool {
+    match Engine::parse(id) {
+        Some(Engine::Plugin(k)) => crate::plugin_harness::reports_usage(k),
+        Some(e) => QUOTA_ENGINES.contains(&e),
+        None => false,
+    }
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// A JSON number, or a numeric string.
+fn json_num(v: Option<&Value>) -> Option<f64> {
+    match v? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().trim_end_matches('%').trim().parse().ok(),
+        _ => None,
+    }
+    .filter(|x: &f64| x.is_finite())
+}
+
+fn json_text(v: Option<&Value>) -> Option<String> {
+    let s = match v? {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    (!s.is_empty()).then(|| s.chars().take(80).collect())
+}
+
+/// Epoch seconds from an ISO 8601 string or an epoch number (seconds, or
+/// milliseconds when it is too large to be seconds).
+pub fn plugin_reset_epoch(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::String(s) => parse_rfc3339_utc(s.trim()).or_else(|| s.trim().parse::<f64>().ok().map(epoch_from_number)),
+        Value::Number(n) => n.as_f64().map(epoch_from_number),
+        _ => None,
+    }
+    .filter(|e| *e > 0)
+}
+
+fn epoch_from_number(x: f64) -> i64 {
+    if x > 1e11 { (x / 1000.0) as i64 } else { x as i64 }
+}
+
+fn reset_from_epoch(epoch: i64, now: i64) -> String {
+    let diff = epoch - now;
+    if diff <= 0 {
+        return "Resets soon".to_string();
+    }
+    let (mins, hours) = (diff / 60, diff / 3600);
+    if hours >= 24 {
+        format!("Resets in {}d {}h", hours / 24, hours % 24)
+    } else if hours > 0 {
+        format!("Resets in {hours}h {}m", mins % 60)
+    } else {
+        format!("Resets in {}m", mins.max(1))
+    }
+}
+
+/// Apply a plugin's declarative usage map to its command's JSON output.
+/// Missing values skip that meter; no meters at all = usage unknown.
+pub fn map_plugin_usage(engine: Engine, map: &crate::plugin_harness::UsageMap, out: &Value, now: i64) -> WorkUsageReport {
+    let mut report = WorkUsageReport::base(engine);
+    let at = |base: &Value, p: &Option<String>| p.as_deref().and_then(|p| base.pointer(p)).filter(|v| !v.is_null()).cloned();
+    report.plan = json_text(at(out, &map.plan).as_ref());
+    let mut groups: Vec<UsageGroup> = Vec::new();
+    for spec in &map.meters {
+        let items: Vec<Value> = match &spec.each {
+            Some(p) => out.pointer(p).and_then(Value::as_array).cloned().unwrap_or_default(),
+            None => vec![out.clone()],
+        };
+        for item in items.iter().take(32) {
+            let label = spec
+                .label_path
+                .as_ref()
+                .and_then(|_| json_text(at(item, &spec.label_path).as_ref()))
+                .or_else(|| spec.label.clone());
+            let Some(label) = label else { continue };
+            let (percent, kind, value_text) = if let Some(u) = json_num(at(item, &spec.used_percent).as_ref()) {
+                let u = u.clamp(0.0, 100.0);
+                (u, "used", format!("{}% used", fmt_pct(u)))
+            } else if let Some(r) = json_num(at(item, &spec.remaining_percent).as_ref()) {
+                let r = r.clamp(0.0, 100.0);
+                (r, "remaining", format!("{}% left", fmt_pct(r)))
+            } else if let (Some(u), Some(l)) =
+                (json_num(at(item, &spec.used).as_ref()), json_num(at(item, &spec.limit).as_ref()).filter(|l| *l > 0.0))
+            {
+                ((u / l * 100.0).clamp(0.0, 100.0), "used", format!("{} / {} used", fmt_num(u), fmt_num(l)))
+            } else {
+                continue;
+            };
+            let reset_text = plugin_reset_epoch(at(item, &spec.resets_at).as_ref()).map(|e| reset_from_epoch(e, now));
+            let title = spec.group.clone().unwrap_or_default();
+            let meter = UsageMeter { label, percent, kind: kind.to_string(), value_text, reset_text };
+            match groups.iter_mut().find(|g| g.title == title) {
+                Some(g) => g.meters.push(meter),
+                None => groups.push(UsageGroup { title, subtitle: None, meters: vec![meter] }),
+            }
+        }
+    }
+    report.groups = groups;
+    let note = json_text(at(out, &map.note).as_ref());
+    if report.groups.is_empty() {
+        report.note = Some(match note {
+            Some(n) => format!("{}: usage unknown ({n}).", engine.label()),
+            None => format!("{}: usage unknown (its usage command reported no allowance).", engine.label()),
+        });
+    } else {
+        report.note = note;
+    }
+    report
+}
+
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v:.2}") }
+}
 
 /// How long a fetched report is reused by `usage_status`.
 const STATUS_TTL: Duration = Duration::from_secs(60);
@@ -1576,13 +1716,13 @@ pub async fn usage_status_text(harness: Option<&str>, local_offset_min: Option<i
     let explicit = match harness.map(str::trim).filter(|h| !h.is_empty()) {
         Some(h) => Some(
             Engine::parse(h)
-                .ok_or_else(|| format!("unknown harness `{h}` (use claude, codex, agy, opencode, pi or fx)"))?,
+                .ok_or_else(|| format!("unknown harness `{h}` (use claude, codex, agy, opencode, pi, fx or plugin:<plugin>/<harness>)"))?,
         ),
         None => None,
     };
     let targets: Vec<Engine> = match explicit {
         Some(engine) => vec![engine],
-        None => QUOTA_ENGINES.iter().copied().filter(|e| e.is_present()).collect(),
+        None => quota_engines().into_iter().filter(|e| e.is_present()).collect(),
     };
     if targets.is_empty() {
         let installed: Vec<&str> = Engine::all().into_iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
@@ -1630,6 +1770,68 @@ pub async fn usage_status_text(harness: Option<&str>, local_offset_min: Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn umap(v: Value) -> crate::plugin_harness::UsageMap {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn plugin_usage_map_reads_used_remaining_and_counts() {
+        let now = 1_800_000_000;
+        let map = umap(json!({
+            "plan": "/tier", "note": "/hint",
+            "meters": [
+                {"label": "Session", "usedPercent": "/a/window/usedPercent", "resetsAt": "/a/window/resetsAtMs"},
+                {"label": "Weekly", "remainingPercent": "/a/weekly/left", "resetsAt": "/a/weekly/resetsAt"},
+                {"each": "/models", "labelPath": "/name", "group": "Models", "used": "/n", "limit": "/max", "resetsAt": "/reset"}
+            ]
+        }));
+        let out = json!({
+            "tier": "Pro", "hint": null,
+            "a": {
+                "window": {"usedPercent": 25.5, "resetsAtMs": (now + 2 * 3600 + 600) * 1000},
+                "weekly": {"left": "10", "resetsAt": "2028-01-15T08:00:00Z"}
+            },
+            "models": [{"name": "big", "n": 3, "max": 4, "reset": now + 90}, {"name": "nolimit", "n": 3}]
+        });
+        let r = map_plugin_usage(Engine::Claude, &map, &out, now);
+        assert_eq!(r.plan.as_deref(), Some("Pro"));
+        assert!(r.note.is_none());
+        let m = &r.groups[0].meters;
+        assert_eq!((m[0].label.as_str(), m[0].kind.as_str(), m[0].percent), ("Session", "used", 25.5));
+        assert_eq!(m[0].reset_text.as_deref(), Some("Resets in 2h 10m")); // epoch ms
+        assert_eq!((m[1].kind.as_str(), m[1].percent, m[1].value_text.as_str()), ("remaining", 10.0, "10% left"));
+        assert!(m[1].reset_text.as_deref().unwrap().starts_with("Resets in")); // ISO
+        assert_eq!(r.groups[1].title, "Models");
+        assert_eq!(r.groups[1].meters.len(), 1); // missing limit -> skipped
+        assert_eq!((r.groups[1].meters[0].percent, r.groups[1].meters[0].value_text.as_str()), (75.0, "3 / 4 used"));
+        assert_eq!(r.groups[1].meters[0].reset_text.as_deref(), Some("Resets in 1m")); // epoch s
+        assert_eq!(usage_verdict(&r).0, UsageVerdict::Low);
+    }
+
+    #[test]
+    fn plugin_usage_missing_fields_are_unknown() {
+        let map = umap(json!({"note": "/reason", "meters": [{"label": "Weekly", "usedPercent": "/allowance/weekly/usedPercent"}]}));
+        let r = map_plugin_usage(Engine::Claude, &map, &json!({"allowance": null, "reason": "no_allowance"}), 0);
+        assert!(r.groups.is_empty());
+        assert!(r.note.as_deref().unwrap().contains("usage unknown (no_allowance)"));
+        assert_eq!(usage_verdict(&r).0, UsageVerdict::Unknown);
+        assert!(format_usage_status(&[r], 0, None).contains("verdict: unknown"));
+        let r = map_plugin_usage(Engine::Claude, &map, &json!({"allowance": {"weekly": {"usedPercent": "n/a"}}}), 0);
+        assert!(r.groups.is_empty());
+        assert!(r.note.as_deref().unwrap().contains("usage unknown"));
+    }
+
+    #[test]
+    fn plugin_reset_epoch_handles_iso_seconds_and_millis() {
+        assert_eq!(plugin_reset_epoch(Some(&json!(1_800_000_000))), Some(1_800_000_000));
+        assert_eq!(plugin_reset_epoch(Some(&json!(1_800_000_000_000i64))), Some(1_800_000_000));
+        assert_eq!(plugin_reset_epoch(Some(&json!("1800000000"))), Some(1_800_000_000));
+        assert_eq!(plugin_reset_epoch(Some(&json!("2027-01-15T08:00:00Z"))), parse_rfc3339_utc("2027-01-15T08:00:00Z"));
+        assert!(plugin_reset_epoch(Some(&json!("2027-01-15T08:00:00Z"))).is_some());
+        assert_eq!(plugin_reset_epoch(Some(&json!("tomorrow"))), None);
+        assert_eq!(plugin_reset_epoch(None), None);
+    }
 
     /// What the PTY loop does with the CLI's output: render it to a screen.
     fn render(stream: &str) -> String {
