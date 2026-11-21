@@ -389,7 +389,7 @@
   .pl-card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
   .pl-card-title { display: flex; flex-direction: column; min-width: 0; }
   .pl-card-title .pl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pl-icon { width: 28px; height: 28px; border-radius: 7px; flex: none; object-fit: contain; }
+  .pl-icon { width: 40px; height: 40px; border-radius: 7px; flex: none; object-fit: contain; }
   .pl-badge { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 8px; white-space: nowrap; }
   .pl-badge.ok { color: var(--accent); border-color: var(--accent); }
   .pl-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }

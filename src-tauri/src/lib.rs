@@ -51,6 +51,7 @@ pub mod server;
 pub mod whisper;
 pub mod plugins;
 pub mod plugin_harness;
+pub mod plugin_icon;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 

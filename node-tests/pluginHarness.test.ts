@@ -26,3 +26,15 @@ test("consent echoes the usage command too", () => {
   assert.equal(commandLine(u.usage), "muse usage --json");
   assert.ok(!("usage" in consentPayload("muse-acp", [h]).harnesses[0]));
 });
+
+test("plugin icons accept only SVG data URIs and otherwise use puzzle fallback", async () => {
+  const { pluginEngineIcon } = await import("../src/lib/pluginHarness.ts");
+  const id = "plugin:sample/agent";
+  const icon = "data:image/svg+xml;base64,PHN2Zy8+";
+  assert.equal(pluginEngineIcon(id, [{ id, icon }]), icon);
+  for (const bad of [undefined, null, "", "https://example.org/icon.svg", "javascript:alert(1)", "data:image/svg+xml,<svg/>", "data:image/png;base64,PHN2Zy8+"]) {
+    assert.equal(pluginEngineIcon(id, [{ id, icon: bad }]), null);
+  }
+  assert.equal(pluginEngineIcon(id, []), null);
+  assert.equal(pluginEngineIcon("claude", [{ id: "claude", icon }]), null);
+});
