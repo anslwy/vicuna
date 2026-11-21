@@ -121,3 +121,149 @@ export function selectedAccent(t: PluginThemeDef | null, muted: boolean, builtin
 export function installBlocked(source: string, busy: string | null): boolean {
   return !source.trim() || (busy !== null && busy !== "list");
 }
+
+/** Built-in Light / Dark base tokens (mirrored from ChatApp.svelte's :root and
+ *  html[data-theme="dark"]). Used by pure helpers (terminal + live-browser) so
+ *  they never depend on DOM timing or stale computed styles. */
+export const BASE_PALETTES: Record<"light" | "dark", Record<string, string>> = {
+  light: {
+    "--bg": "#ffffff",
+    "--text": "#111111",
+    "--card": "#ffffff",
+    "--border": "#ececec",
+    "--composer": "#f4f4f5",
+    "--input-border": "#dddddd",
+    "--hover": "#f0f0f0",
+    "--link": "#0b57d0",
+    "--danger": "#b3261e",
+    "--muted": "#9a9a9a"
+  },
+  dark: {
+    "--bg": "#3d3332",
+    "--text": "#ece4e0",
+    "--card": "#4e4442",
+    "--border": "#665b58",
+    "--composer": "#4e4442",
+    "--input-border": "#756866",
+    "--hover": "#5d4f4d",
+    "--link": "#7ed491",
+    "--danger": "#ff8a80",
+    "--muted": "#b3a6a3"
+  }
+};
+
+function clampByte(n: number): string {
+  return Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+}
+
+/** Convert any CSS color accepted by `safeColor` (`#rgb`, `#rrggbb`,
+ *  `#rrggbbaa`, `rgb(...)`, `rgba(...)`, `hsl(...)`, `hsla(...)`) to lowercase
+ *  hex without a leading `#` (6 or 8 hex digits). Returns null if unparseable. */
+export function colorToHex(color: string | undefined | null): string | null {
+  if (!color) return null;
+  const s = color.trim();
+  const hex = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(s);
+  if (hex) {
+    const h = hex[1].toLowerCase();
+    if (h.length === 3 || h.length === 4) {
+      return h.split("").map((c) => c + c).join("");
+    }
+    return h;
+  }
+  const rgb = /^rgba?\(\s*([0-9.]+%?)\s*[,\s]\s*([0-9.]+%?)\s*[,\s]\s*([0-9.]+%?)(?:\s*[,/]\s*([0-9.]+%?))?\s*\)$/i.exec(s);
+  if (rgb) {
+    const ch = (v: string) => (v.endsWith("%") ? (parseFloat(v) / 100) * 255 : parseFloat(v));
+    const base = clampByte(ch(rgb[1])) + clampByte(ch(rgb[2])) + clampByte(ch(rgb[3]));
+    if (rgb[4] !== undefined) {
+      const a = rgb[4].endsWith("%") ? parseFloat(rgb[4]) / 100 : parseFloat(rgb[4]);
+      if (a < 1) return base + clampByte(a * 255);
+    }
+    return base;
+  }
+  const hsl = /^hsla?\(\s*([0-9.]+)(?:deg)?\s*[,\s]\s*([0-9.]+)%\s*[,\s]\s*([0-9.]+)%(?:\s*[,/]\s*([0-9.]+%?))?\s*\)$/i.exec(s);
+  if (hsl) {
+    const h = (((parseFloat(hsl[1]) % 360) + 360) % 360) / 360;
+    const sat = Math.max(0, Math.min(1, parseFloat(hsl[2]) / 100));
+    const l = Math.max(0, Math.min(1, parseFloat(hsl[3]) / 100));
+    const q = l < 0.5 ? l * (1 + sat) : l + sat - l * sat;
+    const p = 2 * l - q;
+    const hue2rgb = (t: number) => {
+      const u = t < 0 ? t + 1 : t > 1 ? t - 1 : t;
+      if (u < 1 / 6) return p + (q - p) * 6 * u;
+      if (u < 1 / 2) return q;
+      if (u < 2 / 3) return p + (q - p) * (2 / 3 - u) * 6;
+      return p;
+    };
+    const r = sat === 0 ? l : hue2rgb(h + 1 / 3);
+    const g = sat === 0 ? l : hue2rgb(h);
+    const b = sat === 0 ? l : hue2rgb(h - 1 / 3);
+    const base = clampByte(r * 255) + clampByte(g * 255) + clampByte(b * 255);
+    if (hsl[4] !== undefined) {
+      const a = hsl[4].endsWith("%") ? parseFloat(hsl[4]) / 100 : parseFloat(hsl[4]);
+      if (a < 1) return base + clampByte(a * 255);
+    }
+    return base;
+  }
+  return null;
+}
+
+/** Effective chrome colors for xterm.js so the terminal matches the active
+ *  built-in or plugin theme (light, dark, or custom palette). */
+export function resolveTerminalColors(
+  base: "light" | "dark",
+  pluginTheme: PluginThemeDef | null
+): { background: string; foreground: string; cursor: string; cursorAccent: string } {
+  const b = BASE_PALETTES[base];
+  const p = pluginTheme ? themeProperties(pluginTheme, false) : {};
+  const bgHex = colorToHex(p["--bg"]) ?? colorToHex(b["--bg"])!;
+  const fgHex = colorToHex(p["--text"]) ?? colorToHex(b["--text"])!;
+  const background = `#${bgHex}`;
+  const foreground = `#${fgHex}`;
+  return { background, foreground, cursor: foreground, cursorAccent: background };
+}
+
+/** Build the query string parameters for the embedded `live-browser` iframe
+ *  so its entire palette matches Vicuna's active theme (including plugin
+ *  themes) pre-paint. Older `lb` builds ignore the extra palette params and
+ *  keep using `theme`/`accent`/`accentfg`. */
+export function browserThemeParams(
+  base: "light" | "dark",
+  pluginTheme: PluginThemeDef | null,
+  accent: { bg: string; fg: string }
+): URLSearchParams {
+  const b = BASE_PALETTES[base];
+  const p = pluginTheme ? themeProperties(pluginTheme, false) : {};
+  const qs = new URLSearchParams();
+  qs.set("theme", base);
+  const acc = colorToHex(accent.bg);
+  const accFg = colorToHex(accent.fg);
+  if (acc) qs.set("accent", acc);
+  if (accFg) qs.set("accentfg", accFg);
+
+  // When a plugin theme omits secondary surface tokens (e.g. --composer or
+  // --hover), fall back through the plugin's own surfaces before the built-in
+  // base palette so brownish dark defaults never bleed into a custom theme.
+  const pick = (...vals: (string | undefined)[]) => {
+    for (const v of vals) {
+      const h = colorToHex(v);
+      if (h) return h;
+    }
+    return null;
+  };
+  const entries: [string, string | null][] = [
+    ["bg", pick(p["--bg"], b["--bg"])],
+    ["fg", pick(p["--text"], b["--text"])],
+    ["card", pick(p["--card"], p["--item-bg"], p["--bg"], b["--card"])],
+    ["border", pick(p["--border"], b["--border"])],
+    ["inputbg", pick(p["--composer"], p["--item-bg"], p["--card"], b["--composer"])],
+    ["inputborder", pick(p["--input-border"], p["--border-2"], p["--border"], b["--input-border"])],
+    ["ghostbg", pick(p["--hover"], p["--active-item"], p["--item-bg"], p["--card"], b["--hover"])],
+    ["link", pick(p["--link"], b["--link"])],
+    ["danger", pick(p["--danger"], b["--danger"])],
+    ["marker", pick(p["--muted"], p["--text-dim"], b["--muted"])]
+  ];
+  for (const [k, v] of entries) {
+    if (v) qs.set(k, v);
+  }
+  return qs;
+}

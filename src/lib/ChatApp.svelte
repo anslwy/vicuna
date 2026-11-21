@@ -61,7 +61,7 @@
   import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
-  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
+  import { allThemes, browserThemeParams, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, resolveTerminalColors, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { bridgeConnLabel, bridgeConnState, bridgeConnTitle, bridgeDisplayName, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
   import { hideSplash } from "$lib/splash";
@@ -6770,18 +6770,17 @@
    *  so the frame re-navigates instead of sitting on a failed navigation. */
   let browserFrameRev = $state(0);
   let browserProxyUrl = $state<string | null>(null);
-  /** lb UI url + Vicuna theme/accent: lb reads `?theme=`/`?accent=`/
-   *  `?accentfg=` pre-paint (older lb builds ignore unknown params and fall
-   *  back to their saved theme + built-in greens). Derived from
-   *  `theme`/`accent`, so appearance flips re-navigate the frame into the
-   *  matching lb look with no extra wiring. */
+  /** lb UI url + Vicuna theme/palette/accent: lb reads `?theme=`/`?accent=`/
+   *  `?accentfg=` + palette vars (`bg`, `fg`, `card`, `border`, …) pre-paint
+   *  (older lb builds ignore unknown params and fall back to their saved theme
+   *  + built-in greens). Derived from `themeBase`/`pluginTheme`/`accent`, so
+   *  appearance flips re-navigate the frame into the matching lb look. */
   const browserFrameSrc = $derived.by(() => {
     const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
     if (!base) return "about:blank";
     const a = ACCENTS[accent] ?? ACCENTS.orange;
     const v = pluginAccent && !pluginAccentMuted ? pluginAccent : themeBase === "dark" ? a.dark : a.light;
-    const hex = (c: string) => c.replace(/^#/, "");
-    return `${base}/?theme=${themeBase}&accent=${hex(v.bg)}&accentfg=${hex(v.fg)}`;
+    return `${base}/?${browserThemeParams(themeBase, pluginTheme, v).toString()}`;
   });
 
   /** status → start when down. Throws on failure (callers surface it).
@@ -7104,12 +7103,12 @@
     // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
     // console (yellow prompt segments, white text), so the defaults that
     // ship with xterm go unreadable on a light background. Both palettes
-    // keep the app's chrome bg/fg but remap every ANSI slot to stay legible.
+    // follow the active app/plugin theme's bg/fg while remapping every ANSI
+    // slot to stay legible.
+    const chrome = resolveTerminalColors(themeBase, pluginTheme);
     if (themeBase === "dark") {
       return {
-        background: "#161616",
-        foreground: "#e8e8e8",
-        cursor: "#e8e8e8",
+        ...chrome,
         selectionBackground: "rgba(255,255,255,.25)",
         selectionInactiveBackground: "rgba(255,255,255,.16)",
         black: "#000000",
@@ -7131,9 +7130,7 @@
       };
     }
     return {
-      background: "#f4f4f4",
-      foreground: "#1a1a1a",
-      cursor: "#1a1a1a",
+      ...chrome,
       selectionBackground: "rgba(0,0,0,.20)",
       selectionInactiveBackground: "rgba(0,0,0,.12)",
       black: "#000000",
@@ -13612,9 +13609,8 @@
   .new-tab-menu .ctx-item { display: flex; align-items: center; gap: 9px; }
   .side-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .side-view.hidden { display: none; }
-  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: #f4f4f4; }
-  :global(html[data-theme="dark"]) .term-wrap { background: #161616; }
-  .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: #fff; }
+  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: var(--bg); }
+  .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: var(--bg); }
   .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
   .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .browser-start-hint { margin-top: 8px; font-size: 12px; line-height: 1.45; color: var(--muted); opacity: 0.85; }
