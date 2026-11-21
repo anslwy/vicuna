@@ -229,6 +229,63 @@ pub fn effective_engine(requested: Option<&str>) -> Engine {
     requested.and_then(Engine::parse).unwrap_or_else(current_engine)
 }
 
+/// A turn's engine when the caller names one: it must exist (no fallback).
+pub fn requested_engine(requested: Option<&str>) -> Result<Engine, String> {
+    match requested.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(current_engine()),
+        Some(n) => Engine::parse(n).ok_or_else(|| format!(
+            "This session runs on the harness \"{n}\", which is not installed any more. Pick another harness for this session in the model picker."
+        )),
+    }
+}
+
+/// The harness + model a session's turn runs on. A session that stored its
+/// own harness (`chats.extra.engine`) always runs on exactly that one: an
+/// unknown or uninstalled harness is an error, never a silent fallback to the
+/// global pick. Sessions without one use the global pick (`fallback`).
+pub fn resolve_session_engine(
+    stored: Option<&str>,
+    stored_model: Option<&str>,
+    parse: impl Fn(&str) -> Option<Engine>,
+    fallback: impl FnOnce() -> (Engine, Option<String>),
+) -> Result<(Engine, Option<String>), String> {
+    match stored.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(fallback()),
+        Some(name) => match parse(name) {
+            Some(e) => Ok((e, stored_model.map(str::to_string).filter(|m| !m.is_empty()))),
+            None => Err(format!(
+                "This session runs on the harness \"{name}\", which is not installed any more. Pick another harness for this session in the model picker."
+            )),
+        },
+    }
+}
+
+/// [`resolve_session_engine`] with the real parser and global pick.
+pub fn session_engine(stored: Option<&str>, stored_model: Option<&str>) -> Result<(Engine, Option<String>), String> {
+    resolve_session_engine(stored, stored_model, Engine::parse, || {
+        let e = current_engine();
+        (e, e.saved_model())
+    })
+}
+
+#[cfg(test)]
+mod session_engine_tests {
+    use super::*;
+    fn parse(s: &str) -> Option<Engine> {
+        match s { "claude" => Some(Engine::Claude), "agy" => Some(Engine::Agy), _ => None }
+    }
+    #[test]
+    fn stored_harness_wins_and_missing_one_errors() {
+        let global = || (Engine::Agy, Some("gemini".to_string()));
+        assert_eq!(resolve_session_engine(Some("claude"), Some("opus"), parse, global).unwrap(), (Engine::Claude, Some("opus".into())));
+        assert_eq!(resolve_session_engine(Some("claude"), Some(""), parse, global).unwrap(), (Engine::Claude, None));
+        assert_eq!(resolve_session_engine(None, Some("opus"), parse, global).unwrap(), (Engine::Agy, Some("gemini".into())));
+        assert_eq!(resolve_session_engine(Some(" "), None, parse, global).unwrap().0, Engine::Agy);
+        let err = resolve_session_engine(Some("plugin:gone"), None, parse, global).unwrap_err();
+        assert!(err.contains("plugin:gone") && err.contains("not installed"), "{err}");
+    }
+}
+
 /// Detection for the UI: the current engine's info plus a summary of all.
 pub async fn engines_info() -> WorkEngineInfo {
     let mut infos = Vec::new();

@@ -444,11 +444,10 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         return Err(format!("session {chat_id} has no workspace"));
     }
     let extra = parse_extra(&chat);
-    let engine = crate::work_engine::effective_engine(extra.engine.as_deref());
+    let (engine, pick) = crate::work_engine::session_engine(extra.engine.as_deref(), extra.work_model.as_deref())?;
     if !engine.is_present() {
         return Err(engine.missing_message());
     }
-    let pick = if extra.engine.is_some() { extra.work_model.clone() } else { engine.saved_model() };
     let mut messages: Vec<Value> = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     messages.extend(user_msgs);
     messages.push(persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id())));
