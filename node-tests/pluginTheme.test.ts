@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { allThemes, readAccentMuted, readActiveTheme, reconcileActive, safeColor, scopedKey, themeProperties, writeAccentMuted, writeActiveTheme, type InstalledPlugin } from "../src/lib/pluginTheme.ts";
+import {
+  allThemes,
+  browserThemeParams,
+  colorToHex,
+  readAccentMuted,
+  readActiveTheme,
+  reconcileActive,
+  resolveTerminalColors,
+  safeColor,
+  scopedKey,
+  themeProperties,
+  writeAccentMuted,
+  writeActiveTheme,
+  type InstalledPlugin
+} from "../src/lib/pluginTheme.ts";
 
 const plugin = (version = "1.0.0", vars: Record<string, string> = { "--bg": "#2e3440" }): InstalledPlugin => ({
   id: "nord", name: "Nord", version, description: "", source: "me/nord", installedAt: 0,
@@ -91,4 +105,55 @@ test("plugin theme and muted accent are isolated per remote host", () => {
   assert.equal(readActiveTheme(st, "host-a"), null);
   assert.equal(readAccentMuted(st, "host-a"), null);
   assert.equal(readActiveTheme(st, "host-b")?.key, "rose/light");
+});
+
+test("colorToHex normalizes hex, rgb, and hsl colors", () => {
+  assert.equal(colorToHex("#abc"), "aabbcc");
+  assert.equal(colorToHex("#120607"), "120607");
+  assert.equal(colorToHex("#12060780"), "12060780");
+  assert.equal(colorToHex("rgb(18, 6, 7)"), "120607");
+  assert.equal(colorToHex("rgba(255, 0, 0, 0.5)"), "ff000080");
+  assert.equal(colorToHex("hsl(0deg 100% 50%)"), "ff0000");
+  assert.equal(colorToHex("not-a-color"), null);
+});
+
+test("resolveTerminalColors follows built-in and plugin themes", () => {
+  assert.deepEqual(resolveTerminalColors("dark", null), {
+    background: "#3d3332",
+    foreground: "#ece4e0",
+    cursor: "#ece4e0",
+    cursorAccent: "#3d3332"
+  });
+  assert.deepEqual(resolveTerminalColors("light", null), {
+    background: "#ffffff",
+    foreground: "#111111",
+    cursor: "#111111",
+    cursorAccent: "#ffffff"
+  });
+  const crimson = plugin("1.0.0", { "--bg": "#120607", "--text": "#f5e9ea" }).themes[0];
+  assert.deepEqual(resolveTerminalColors("dark", crimson), {
+    background: "#120607",
+    foreground: "#f5e9ea",
+    cursor: "#f5e9ea",
+    cursorAccent: "#120607"
+  });
+});
+
+test("browserThemeParams encodes the full palette and falls back cleanly for minimal plugin themes", () => {
+  const qs = browserThemeParams(
+    "dark",
+    plugin("1.0.0", { "--bg": "#120607", "--card": "#1d0b0d", "--border": "#3b171b", "--text": "#f5e9ea" }).themes[0],
+    { bg: "#ef4444", fg: "#ffffff" }
+  );
+  assert.equal(qs.get("theme"), "dark");
+  assert.equal(qs.get("accent"), "ef4444");
+  assert.equal(qs.get("accentfg"), "ffffff");
+  assert.equal(qs.get("bg"), "120607");
+  assert.equal(qs.get("fg"), "f5e9ea");
+  assert.equal(qs.get("card"), "1d0b0d");
+  assert.equal(qs.get("border"), "3b171b");
+  // omitted secondary surfaces fall back to the plugin's own card/border, not #4e4442/#5d4f4d
+  assert.equal(qs.get("inputbg"), "1d0b0d");
+  assert.equal(qs.get("inputborder"), "3b171b");
+  assert.equal(qs.get("ghostbg"), "1d0b0d");
 });
