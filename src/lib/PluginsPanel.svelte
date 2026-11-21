@@ -366,6 +366,7 @@
   .pl-btn:hover:not(:disabled) { background: var(--hover); }
   .pl-btn:disabled { opacity: 0.5; cursor: default; }
   .pl-btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .pl-btn.primary:hover:not(:disabled) { background: var(--accent-hover, var(--accent)); border-color: var(--accent-hover, var(--accent)); }
   .pl-btn.danger { color: var(--danger); border-color: var(--danger); }
   .pl-err { color: var(--err-text); background: var(--err-bg); border-radius: 10px; padding: 8px 10px; font-size: 12.5px; word-break: break-word; }
   .pl-note { color: var(--text); background: var(--hover); border-radius: 10px; padding: 8px 10px; font-size: 12.5px; }

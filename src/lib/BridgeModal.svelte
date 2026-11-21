@@ -358,6 +358,7 @@
   .br-btn.small { padding: 4px 10px; font-size: 12.5px; }
   .br-btn:hover:not(:disabled) { background: var(--hover-2); }
   .br-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg, #fff); font-weight: 600; }
+  .br-btn.primary:hover:not(:disabled) { background: var(--accent-hover, var(--accent)); border-color: var(--accent-hover, var(--accent)); }
   .br-btn.danger { color: var(--danger); }
   .br-btn:disabled { opacity: 0.55; cursor: default; }
 </style>

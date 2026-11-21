@@ -370,6 +370,7 @@
   .tg-btn.small { padding: 4px 10px; font-size: 12.5px; }
   .tg-btn:hover:not(:disabled) { background: var(--hover-2); }
   .tg-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg, #fff); font-weight: 600; }
+  .tg-btn.primary:hover:not(:disabled) { background: var(--accent-hover, var(--accent)); border-color: var(--accent-hover, var(--accent)); }
   .tg-btn.danger { color: var(--danger); }
   .tg-btn:disabled { opacity: 0.55; cursor: default; }
 </style>
