@@ -865,6 +865,7 @@
   .gp-btn:disabled { opacity: 0.45; cursor: default; }
   .gp-btn.ghost { background: transparent; }
   .gp-btn.danger { background: var(--danger, #cf222e); border-color: transparent; color: #fff; }
+  .gp-btn.danger:hover:not(:disabled) { background: var(--danger, #cf222e); filter: brightness(0.92); }
   .gp-btn.sm { font-size: 11px; padding: 1px 8px; }
 
   .gp-divider { flex-shrink: 0; height: 5px; cursor: row-resize; border-top: 1px solid var(--border); background: transparent; }
