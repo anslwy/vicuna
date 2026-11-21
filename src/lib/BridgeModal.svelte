@@ -58,6 +58,17 @@
   let ws = $state<WhisperStatus | null>(null);
   let wsBusy = $state(false);
   let timer: ReturnType<typeof setInterval> | null = null;
+  let copied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copyCode(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+      clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => (copied = false), 1500);
+    } catch {}
+  }
 
   const otherBots = $derived(
     Object.entries(allStatuses)
@@ -143,7 +154,10 @@
   onMount(() => {
     timer = setInterval(refresh, 2000);
   });
-  onDestroy(() => timer && clearInterval(timer));
+  onDestroy(() => {
+    if (timer) clearInterval(timer);
+    clearTimeout(copiedTimer);
+  });
 
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
@@ -222,7 +236,10 @@
         {:else}
           <div>Send this to <b>@{st.botUsername || "the bot"}</b>:</div>
         {/if}
-        <div class="br-code" data-testid="bridge-code">{pairPrefix}{st.pairCode}</div>
+        <div class="br-code-row">
+          <div class="br-code" data-testid="bridge-code">{pairPrefix}{st.pairCode}</div>
+          <button class="br-btn small" data-testid="bridge-code-copy" onclick={() => copyCode(`${pairPrefix}${st!.pairCode}`)}>{copied ? "Copied" : "Copy"}</button>
+        </div>
         <div class="br-muted small">Only the account that sends the code can use this bot. Waiting…</div>
       </div>
     {/if}
@@ -324,6 +341,7 @@
   .br-other-row { display: flex; align-items: center; gap: 8px; width: 100%; border: none; background: transparent; padding: 6px 8px; border-radius: 8px; font: inherit; color: var(--text); cursor: pointer; text-align: left; }
   .br-other-row:hover:not(:disabled) { background: var(--hover-2); }
   .br-other-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .br-code-row { display: flex; align-items: center; gap: 10px; }
   .br-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 20px; letter-spacing: 1px; user-select: text; }
   .br-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
   .br-dot.on { background: #3fb950; }
