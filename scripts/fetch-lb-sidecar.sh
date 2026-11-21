@@ -16,7 +16,7 @@
 
 set -eu
 
-PINNED_VERSION="v0.4.24"
+PINNED_VERSION="v0.4.25"
 VERSION="${LB_VERSION:-$PINNED_VERSION}"
 PINNED=1
 if [ "$VERSION" != "$PINNED_VERSION" ]; then PINNED=0; fi
@@ -49,14 +49,14 @@ case "$OS" in
   *) echo "fetch-lb-sidecar: unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-# Pinned SHA-256 per asset (v0.4.24, computed from the downloaded release assets).
+# Pinned SHA-256 per asset (v0.4.25, computed from the downloaded release assets).
 sha_for() {
   case "$1" in
-    live-browser-v0.4.24-darwin-arm64.tar.gz) echo "064b3459fe1bf22f8febb1a3c0e60099eeda6ed30edf3ce0cf08b6308eb591de" ;;
-    live-browser-v0.4.24-darwin-x86_64.tar.gz) echo "5c61ae9f4bc22a779ff4a0a0e3f388b237b94e2366ffb4245f753e35b67bdbc4" ;;
-    live-browser-v0.4.24-linux-x86_64.tar.gz) echo "830be5849bbc75a7fbb83bcaf85447998d8eb6f637ffdd4b5c5b9019310905e1" ;;
-    live-browser-v0.4.24-linux-aarch64.tar.gz) echo "db8b6744b7661aa0ee4c471ed90b957a14cc940ce6cbf97c4e65c6e81f75edbe" ;;
-    live-browser-v0.4.24-windows-x86_64.zip) echo "a87b1463bdee95a6fa236c38047d01ee933d22ece5228cc089cb3944332a530f" ;;
+    live-browser-v0.4.25-darwin-arm64.tar.gz) echo "b78635bb134c70246e12c9137651a6f02cca3336ca4bc5eafbc6059ed5786787" ;;
+    live-browser-v0.4.25-darwin-x86_64.tar.gz) echo "337fd76b2abd8d3b590168b08967c2be2ca59db1733bbd5641fdb3a75a07b4a6" ;;
+    live-browser-v0.4.25-linux-x86_64.tar.gz) echo "12d204142e160371e53b2d9a0b08131831461d3ae1660b6fb8fdfb57a99369ad" ;;
+    live-browser-v0.4.25-linux-aarch64.tar.gz) echo "1daeff9867debe8454e0709a141c50f6ec84ae65299357b07c874bf77ea38790" ;;
+    live-browser-v0.4.25-windows-x86_64.zip) echo "9981afda1ec4b92f979c934dffc0ed38239a1743d0a2b000f79486412a5e4437" ;;
     *) echo "" ;;
   esac
 }
