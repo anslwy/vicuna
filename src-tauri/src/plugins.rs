@@ -72,6 +72,9 @@ pub struct Manifest {
     pub themes: Vec<Theme>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panels: Vec<Panel>,
+    /// Work harnesses (ACP agents); see `plugin_harness.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<crate::plugin_harness::Harness>,
 }
 
 /// Per-file and total caps for files a plugin ships (panel HTML + icons).
@@ -171,9 +174,10 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
     if m.name.trim().is_empty() || m.version.trim().is_empty() {
         return Err("manifest needs a name and a version".into());
     }
-    if m.themes.is_empty() && m.panels.is_empty() {
-        return Err("this plugin contributes nothing Vicuna supports yet (themes or panels)".into());
+    if m.themes.is_empty() && m.panels.is_empty() && m.harnesses.is_empty() {
+        return Err("this plugin contributes nothing Vicuna supports yet (themes, panels or harnesses)".into());
     }
+    crate::plugin_harness::validate(&m.harnesses)?;
     if m.panels.len() > MAX_PANELS {
         return Err(format!("at most {MAX_PANELS} panels per plugin"));
     }
@@ -419,8 +423,12 @@ fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)]) -> Resu
             }
             std::fs::write(stage.join("files").join(name), bytes).map_err(|e| e.to_string())?;
         }
-        if let Ok(data) = std::fs::read(dir.join(DATA)) {
-            std::fs::write(stage.join(DATA), data).map_err(|e| e.to_string())?;
+        // plugin storage + harness consent carry over; consent is bound to
+        // the exact command, so a changed command is disabled until approved
+        for keep in [DATA, "consent.json"] {
+            if let Ok(data) = std::fs::read(dir.join(keep)) {
+                std::fs::write(stage.join(keep), data).map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     })();
@@ -453,9 +461,44 @@ fn read_installed(id: &str) -> Option<(Manifest, InstallInfo)> {
     Some((m, i))
 }
 
+pub fn now_ms() -> i64 {
+    chrono_now()
+}
+
+/// An installed plugin's manifest and folder.
+pub fn installed_manifest(id: &str) -> Option<(Manifest, PathBuf)> {
+    if !valid_id(id) {
+        return None;
+    }
+    let (m, _) = read_installed(id)?;
+    Some((m, plugins_dir().ok()?.join(id)))
+}
+
+pub fn installed_manifests() -> Vec<(Manifest, PathBuf)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = plugins_dir().and_then(|d| std::fs::read_dir(d).map_err(|e| e.to_string())) {
+        for e in rd.flatten() {
+            if let Some(x) = installed_manifest(&e.file_name().to_string_lossy()) {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
 fn entry(m: &Manifest, i: &InstallInfo) -> Value {
     let mut e = json!({ "id": m.id, "name": m.name, "version": m.version, "description": m.description,
             "source": i.source, "installedAt": i.installed_at, "themes": m.themes, "panels": m.panels });
+    if !m.harnesses.is_empty() {
+        let dir = plugins_dir().map(|d| d.join(&m.id)).unwrap_or_default();
+        let consent = crate::plugin_harness::read_consent(&dir);
+        e["harnesses"] = json!(m.harnesses.iter().map(|h| crate::plugin_harness::describe(h, &consent, &m.id)).collect::<Vec<_>>());
+        let pending: Vec<Value> = crate::plugin_harness::pending(&consent, &m.harnesses)
+            .iter()
+            .map(|h| crate::plugin_harness::describe(h, &consent, &m.id))
+            .collect();
+        e["pendingConsent"] = json!(pending);
+    }
     if !m.panels.is_empty() {
         // server-relative; the window prefixes its backend's base URL
         e["panelBase"] = json!(format!("/plugin-panel/{}/{}/", m.id, capability(&m.id)));
@@ -687,7 +730,7 @@ fn parse_entry(v: &Value) -> Result<CatalogEntry, String> {
     }
     let mut kinds: Vec<String> = Vec::new();
     for k in v["kinds"].as_array().ok_or("missing kinds")? {
-        let k = k.as_str().filter(|k| *k == "theme" || *k == "panel").ok_or("unknown kind")?;
+        let k = k.as_str().filter(|k| matches!(*k, "theme" | "panel" | "harness")).ok_or("unknown kind")?;
         if !kinds.iter().any(|x| x == k) {
             kinds.push(k.to_string());
         }
@@ -803,6 +846,21 @@ pub async fn action(cmd: &str, args: &Value) -> Result<Value, String> {
         "plugin_install" => install(&s("source")?).await,
         "plugin_upgrade" => upgrade(&s("id")?).await,
         "plugin_uninstall" => uninstall(&s("id")?),
+        "plugin_harness_consent" => {
+            let id = s("id")?;
+            let (m, dir) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
+            let approved = args.get("harnesses").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            crate::plugin_harness::grant(&dir, &m.harnesses, &approved, chrono_now())?;
+            let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
+            Ok(entry(&m, &i))
+        }
+        "plugin_harness_revoke" => {
+            let id = s("id")?;
+            let (_, dir) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
+            crate::plugin_harness::revoke(&dir, args.get("harness").and_then(|v| v.as_str()))?;
+            let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
+            Ok(entry(&m, &i))
+        }
         "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" | "plugin_storage_remove" => {
             let key = args.get("key").and_then(|v| v.as_str());
             storage(cmd, &s("id")?, key, args.get("value"))
@@ -975,6 +1033,16 @@ mod tests {
                     ("200 OK", format!("<p>notes {v}</p>"))
                 } else if req.starts_with("GET /repos/me/nord/contents/notes.svg") {
                     ("200 OK", "<svg/>".to_string())
+                } else if req.starts_with("GET /repos/me/agent/contents/vicuna-plugin.json") {
+                    // a harness plugin whose args change with the version
+                    let args = if v == "1.0.0" { json!(["acp"]) } else { json!(["acp", "--other"]) };
+                    let m = json!({"id": "agent", "name": "Agent", "version": v,
+                        "harnesses": [{"id": "demo", "label": "Demo", "acp": {"command": "true", "args": args}}]});
+                    ("200 OK", m.to_string())
+                } else if req.starts_with("GET /repos/me/evil/contents/vicuna-plugin.json") {
+                    let m = json!({"id": "evil", "name": "Evil", "version": "1",
+                        "harnesses": [{"id": "x", "label": "X", "acp": {"command": "/tmp/x", "args": []}}]});
+                    ("200 OK", m.to_string())
                 } else if req.starts_with("GET /index.json") {
                     let e = |id: &str, src: &str| json!({"id": id, "name": id, "description": "d", "author": "me", "source": src, "kinds": ["panel"], "minVicuna": "999.0.0"});
                     ("200 OK", json!({"version": 1, "plugins": [e("nord", "me/nord"), e("clash", "someone/clash"), {"id": "BAD"}]}).to_string())
@@ -1051,6 +1119,45 @@ mod tests {
         assert!(action("plugin_install", &json!({"source": "me/missing"})).await.is_err());
         action("plugin_uninstall", &json!({"id": "nord"})).await.unwrap();
         assert!(list().as_array().unwrap().is_empty());
+
+        // ---- harness plugins: consent is enforced server-side ----
+        use crate::work_engine::Engine;
+        let err = action("plugin_install", &json!({"source": "me/evil"})).await.unwrap_err();
+        assert!(err.contains("bare program name"), "{err}");
+        *version.lock().unwrap() = "1.0.0".into();
+        let e = action("plugin_install", &json!({"source": "me/agent"})).await.unwrap();
+        assert_eq!(e["pendingConsent"][0]["command"], "true");
+        assert_eq!(e["harnesses"][0]["enabled"], false);
+        let engine = Engine::parse("plugin:agent/demo").unwrap();
+        assert!(!engine.is_present(), "no consent -> disabled");
+        let ws = std::env::temp_dir().display().to_string();
+        let err = crate::plugin_harness::launch("agent/demo", &ws).unwrap_err();
+        assert!(err.contains("not enabled"), "{err}");
+        assert!(Engine::all().contains(&engine));
+        // a grant must echo the exact command
+        assert!(action("plugin_harness_consent", &json!({"id": "agent", "harnesses": [{"id": "demo", "command": "true", "args": ["acp", "--x"]}]})).await.is_err());
+        let e = action("plugin_harness_consent", &json!({"id": "agent", "harnesses": [{"id": "demo", "command": "true", "args": ["acp"]}]})).await.unwrap();
+        assert_eq!((e["harnesses"][0]["enabled"].clone(), e["pendingConsent"].as_array().unwrap().len()), (json!(true), 0));
+        assert!(engine.is_present());
+        assert!(crate::plugin_harness::launch("agent/demo", &ws).is_ok());
+        assert!(dir.join("agent").join("consent.json").exists(), "consent lives next to install.json");
+        // an upgrade with the same command keeps consent ...
+        assert_eq!(action("plugin_upgrade", &json!({"id": "agent"})).await.unwrap()["changed"], false);
+        assert!(engine.is_present());
+        // ... a changed command needs fresh consent
+        *version.lock().unwrap() = "2.0.0".into();
+        let e = action("plugin_upgrade", &json!({"id": "agent"})).await.unwrap();
+        assert_eq!(e["pendingConsent"][0]["args"], json!(["acp", "--other"]));
+        assert!(!engine.is_present());
+        assert!(crate::plugin_harness::launch("agent/demo", &ws).unwrap_err().contains("not enabled"));
+        action("plugin_harness_consent", &json!({"id": "agent", "harnesses": [{"id": "demo", "command": "true", "args": ["acp", "--other"]}]})).await.unwrap();
+        assert!(engine.is_present());
+        action("plugin_harness_revoke", &json!({"id": "agent", "harness": "demo"})).await.unwrap();
+        assert!(!engine.is_present());
+        // uninstall: sessions on it get a clear fallback message
+        action("plugin_uninstall", &json!({"id": "agent"})).await.unwrap();
+        assert!(engine.missing_message().contains("no longer installed"), "{}", engine.missing_message());
+        assert!(!Engine::all().contains(&engine));
         assert_eq!(serve_panel(&format!("{base}notes.html")).0, 404);
         assert!(action("plugin_uninstall", &json!({"id": "nord"})).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);

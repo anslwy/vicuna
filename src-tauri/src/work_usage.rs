@@ -1286,6 +1286,11 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                 };
                 fetch_codex_usage(&bin)?
             }
+            Engine::Plugin(_) => {
+                let mut r = WorkUsageReport::base(eng);
+                r.note = Some(format!("{}: usage unknown (plugin harness).", eng.label()));
+                r
+            }
             Engine::Opencode | Engine::Pi | Engine::Fx => {
                 let mut r = WorkUsageReport::base(eng);
                 r.note = Some(format!(
@@ -1580,7 +1585,7 @@ pub async fn usage_status_text(harness: Option<&str>, local_offset_min: Option<i
         None => QUOTA_ENGINES.iter().copied().filter(|e| e.is_present()).collect(),
     };
     if targets.is_empty() {
-        let installed: Vec<&str> = Engine::ALL.iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
+        let installed: Vec<&str> = Engine::all().into_iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
         return Ok(if installed.is_empty() {
             "No Work harness is installed on this server, so there is no usage to report.".to_string()
         } else {

@@ -106,6 +106,7 @@ export function workReplyModel(
   if (!p) return engine;
   // fx/agy ids that are not already engine-prefixed get the engine prefix to
   // keep them apart from the Codex engine's own `codex/<model>`
+  if (engine.startsWith("plugin:")) return `${engine.slice(7).split("/")[1] || engine}/${p}`;
   return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" || engine === "pi" ? `${engine}/${p}` : p;
 }
 

@@ -46,6 +46,7 @@
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
+  import { isPluginEngine, pluginHarnessName } from "$lib/pluginHarness";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -2213,6 +2214,8 @@
     }
   }
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
+  /** Short engine name for "<name> default" ("muse" for plugin:muse-acp/muse). */
+  const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : engineId(workEngineInfo));
   const workEngines = $derived(workEngineChoices(workEngineInfo));
   const workEngineList = $derived(workEngineMenuItems(workEngineInfo));
   /** quota harness the header meter icon summarizes (null hides the icon) */
@@ -9415,6 +9418,8 @@
     <svg class="engine-ico" data-engine-icon="fx" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={FX_ICON_PATH}/></svg>
   {:else if id === "pi"}
     <svg class="engine-ico" data-engine-icon="pi" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={PI_ICON_PATH}/></svg>
+  {:else if id.startsWith("plugin:")}
+    <svg class="engine-ico" data-engine-icon="plugin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z"/></svg>
   {:else if id === "agy"}
     <svg class="engine-ico" data-engine-icon="agy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={AGY_ICON_PATH}/></svg>
   {:else}
@@ -10457,7 +10462,7 @@
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" data-engine={engineId(workEngineInfo)} title={workModel ? `${workEngineLabel}: ${workModel}` : `${workEngineLabel} default model`} disabled={!workEngineInfo?.installed && workEngines.length === 0} onclick={toggleModel}>
               {#if workEngineList.length > 1}<span class="engine-chip" data-testid="work-engine-chip" title={workEngineLabel}>{@render engineIcon(engineId(workEngineInfo))}</span>{/if}
-              <span class="model-name" data-testid="work-model-name">{workModel ?? `${engineId(workEngineInfo)} default`}</span>
+              <span class="model-name" data-testid="work-model-name">{workModel ?? `${workEngineShort} default`}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
             {#if modelOpen}
@@ -10493,7 +10498,7 @@
                   {/if}
                   <div class="model-opt-row {workModel === null ? 'sel' : ''}">
                     <button class="model-opt" data-testid="model-opt" data-model="" onclick={() => void pickWorkModel(null)}>
-                      <span class="model-opt-top"><span class="model-opt-name">{engineId(workEngineInfo)} default</span></span>
+                      <span class="model-opt-top"><span class="model-opt-name">{workEngineShort} default</span></span>
                       <span class="model-opt-id">whatever {workEngineLabel}'s own config selects</span>
                     </button>
                   </div>
@@ -11899,7 +11904,7 @@
       <button class="seg-btn {settingsTab === 'plugins' ? 'sel' : ''}" data-testid="settings-tab-plugins" role="tab" onclick={() => (settingsTab = "plugins")}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg></span>Plugins</button>
     </div>
     {#if settingsTab === "plugins"}
-      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onUseTheme={usePluginTheme} onOpenPanel={(k) => { settingsOpen = false; openSidePanel(k); }} />
+      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onHarnessesChanged={() => void refreshWorkEngine()} onUseTheme={usePluginTheme} onOpenPanel={(k) => { settingsOpen = false; openSidePanel(k); }} />
     {:else if settingsTab === "general"}
     <div class="setting-row">
       <span class="setting-label">Theme</span>

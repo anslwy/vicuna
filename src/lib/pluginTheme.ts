@@ -16,6 +16,9 @@ export type InstalledPlugin = {
   /** Side panels (plugins.rs `Panel`) and their server path prefix. */
   panels?: { id: string; title: string; icon?: string | null; entry: string }[];
   panelBase?: string;
+  /** Work harnesses (plugin_harness.rs), with consent state. */
+  harnesses?: import("./pluginHarness").PluginHarness[];
+  pendingConsent?: import("./pluginHarness").PluginHarness[];
 };
 /** What we cache: the theme plus its plugin-qualified key. */
 export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };

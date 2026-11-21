@@ -22,13 +22,28 @@ pub enum Engine {
     Agy,
     Fx,
     Pi,
+    /// A harness a plugin adds (`plugin:<plugin-id>/<harness-id>`); holds the
+    /// interned `<plugin-id>/<harness-id>` key. Driven over ACP.
+    Plugin(&'static str),
 }
 
 impl Engine {
     pub const ALL: [Engine; 6] = [Engine::Opencode, Engine::Claude, Engine::Codex, Engine::Agy, Engine::Fx, Engine::Pi];
 
+    /// Built-in engines plus every installed plugin harness.
+    pub fn all() -> Vec<Engine> {
+        let mut v = Engine::ALL.to_vec();
+        v.extend(crate::plugin_harness::all_keys().into_iter().map(Engine::Plugin));
+        v
+    }
+
+    pub fn is_plugin(self) -> bool {
+        matches!(self, Engine::Plugin(_))
+    }
+
     pub fn id(self) -> &'static str {
         match self {
+            Engine::Plugin(k) => crate::plugin_harness::intern(&format!("{}{k}", crate::plugin_harness::ENGINE_PREFIX)),
             Engine::Opencode => "opencode",
             Engine::Claude => "claude",
             Engine::Codex => "codex",
@@ -46,6 +61,7 @@ impl Engine {
             Engine::Agy => "Antigravity",
             Engine::Fx => "fx",
             Engine::Pi => "pi",
+            Engine::Plugin(k) => crate::plugin_harness::label(k),
         }
     }
 
@@ -57,7 +73,7 @@ impl Engine {
             "agy" | "antigravity" => Some(Engine::Agy),
             "fx" => Some(Engine::Fx),
             "pi" | "pi-coding-agent" => Some(Engine::Pi),
-            _ => None,
+            _ => crate::plugin_harness::parse_engine(s).map(Engine::Plugin),
         }
     }
 
@@ -70,6 +86,7 @@ impl Engine {
             Engine::Agy => crate::agy::find_agy().is_some(),
             Engine::Fx => crate::fx::find_fx().is_some(),
             Engine::Pi => crate::pi::find_pi().is_some(),
+            Engine::Plugin(k) => crate::plugin_harness::unavailable(k).is_none(),
         }
     }
 
@@ -81,6 +98,7 @@ impl Engine {
             Engine::Agy => crate::agy::missing_message(),
             Engine::Fx => crate::fx::missing_message(),
             Engine::Pi => crate::pi::missing_message(),
+            Engine::Plugin(k) => crate::plugin_harness::unavailable(k).unwrap_or_default(),
         }
     }
 
@@ -95,6 +113,7 @@ impl Engine {
             Engine::Agy => format!("agy/{model}"),
             Engine::Fx => format!("fx/{model}"),
             Engine::Pi => format!("pi/{model}"),
+            Engine::Plugin(k) => format!("{}/{model}", crate::plugin_harness::split_key(k).1),
         }
     }
 
@@ -106,6 +125,7 @@ impl Engine {
             Engine::Agy => crate::agy::saved_model(),
             Engine::Fx => crate::fx::saved_model(),
             Engine::Pi => crate::pi::saved_model(),
+            Engine::Plugin(k) => crate::plugin_harness::saved_model(k),
         }
     }
 
@@ -117,6 +137,7 @@ impl Engine {
             Engine::Agy => crate::agy::save_model(model),
             Engine::Fx => crate::fx::save_model(model),
             Engine::Pi => crate::pi::save_model(model),
+            Engine::Plugin(k) => crate::plugin_harness::save_model(k, model),
         }
     }
 
@@ -128,6 +149,7 @@ impl Engine {
             Engine::Agy => crate::agy::engine_info().await,
             Engine::Fx => crate::fx::engine_info().await,
             Engine::Pi => crate::pi::engine_info().await,
+            Engine::Plugin(k) => crate::plugin_harness::engine_info(k),
         }
     }
 }
@@ -210,7 +232,7 @@ pub fn effective_engine(requested: Option<&str>) -> Engine {
 /// Detection for the UI: the current engine's info plus a summary of all.
 pub async fn engines_info() -> WorkEngineInfo {
     let mut infos = Vec::new();
-    for e in Engine::ALL {
+    for e in Engine::all() {
         infos.push((e, e.info().await));
     }
     let saved = saved_engine();
@@ -223,6 +245,14 @@ pub async fn engines_info() -> WorkEngineInfo {
         .expect("every engine has info");
     info.engines = summaries;
     info.ask_permission = approval_ask();
+    // a saved plugin harness that was uninstalled (or lost consent): say so
+    // instead of silently running another harness
+    if let Some(Engine::Plugin(k)) = saved.filter(|s| *s != chosen) {
+        if let Some(why) = crate::plugin_harness::unavailable(k) {
+            let why = why.trim_end_matches(" Pick another harness for this session.");
+            info.warning = Some(format!("{why} Work is using {} instead.", chosen.label()));
+        }
+    }
     info
 }
 
@@ -260,6 +290,14 @@ pub async fn list_models(engine: Engine, acp: &crate::acp::AcpState) -> Result<O
             models: crate::pi::list_models().await?,
             current: crate::pi::saved_model(),
         }),
+        Engine::Plugin(k) => {
+            let mut models = crate::plugin_harness::manifest_models(k);
+            if models.is_empty() && engine.is_present() {
+                // none declared: whatever the agent reports over ACP
+                models = acp.plugin_models(engine).await.unwrap_or_default();
+            }
+            Ok(OpencodeModels { models, current: crate::plugin_harness::saved_model(k) })
+        }
     }
 }
 

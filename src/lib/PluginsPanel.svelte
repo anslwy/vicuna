@@ -5,9 +5,11 @@
   import { onMount } from "svelte";
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
+  import { commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
   import { cardAction, filterCatalog, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
-  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel }: {
+  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged }: {
+    onHarnessesChanged?: () => void;
     plugins: InstalledPlugin[];
     activeThemeKey: string | null;
     onChanged: (list: InstalledPlugin[]) => void;
@@ -20,6 +22,57 @@
   let error = $state("");
   let notice = $state("");
   let confirmRemove = $state<string | null>(null);
+
+  // Harness consent: shown after install/upgrade (or "Enable…") for every
+  // harness whose exact command the user hasn't approved. The server enforces
+  // it; declining leaves the harness disabled.
+  let consent = $state<{ plugin: InstalledPlugin; harnesses: PluginHarness[] } | null>(null);
+  let consentBusy = $state(false);
+
+  /** Move the dialog to <body>: the Settings card is transformed, which
+   *  would trap position:fixed inside it (and clip the dialog). */
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return { destroy: () => node.remove() };
+  }
+
+  function askConsent(p: InstalledPlugin, list = pendingConsent(p)) {
+    if (list.length) consent = { plugin: p, harnesses: list };
+  }
+
+  async function acceptConsent() {
+    if (!consent || consentBusy) return;
+    consentBusy = true;
+    try {
+      await invokeOrBridge("plugin_harness_consent", consentPayload(consent.plugin.id, consent.harnesses));
+      notice = `Enabled ${consent.harnesses.map((h) => h.label).join(", ")}.`;
+      consent = null;
+      onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+      onHarnessesChanged?.();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+      consent = null;
+    } finally {
+      consentBusy = false;
+    }
+  }
+
+  function declineConsent() {
+    if (!consent) return;
+    notice = `${consent.harnesses.map((h) => h.label).join(", ")} left disabled. Enable it later from Installed.`;
+    consent = null;
+  }
+
+  async function disableHarness(p: InstalledPlugin, h: PluginHarness) {
+    try {
+      await invokeOrBridge("plugin_harness_revoke", { id: p.id, harness: h.id });
+      notice = `Disabled ${h.label}.`;
+      onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+      onHarnessesChanged?.();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+    }
+  }
 
   /** the first list load: shown as "Loading…", never blocks Install */
   let listing = $state(false);
@@ -72,6 +125,7 @@
     try {
       const p = await invokeOrBridge<InstalledPlugin>("plugin_install", { source: e.source });
       notice = `Installed ${p.name} ${p.version}.`;
+      askConsent(p);
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
       await loadCatalog();
     } catch (err: any) {
@@ -89,6 +143,7 @@
     try {
       const p = await invokeOrBridge<InstalledPlugin>("plugin_install", { source: s });
       notice = `Installed ${p.name} ${p.version}.`;
+      askConsent(p);
       source = "";
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
     } catch (e: any) {
@@ -106,6 +161,8 @@
       notice = r.changed
         ? r.previousVersion === r.version ? `${r.name} updated (still ${r.version}).` : `${r.name} upgraded ${r.previousVersion} → ${r.version}.`
         : `${r.name} is up to date (${r.version}).`;
+      // a changed command loses its consent server-side: ask again
+      askConsent(r);
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
       if (catalog) void loadCatalog();
     } catch (e: any) {
@@ -127,6 +184,7 @@
       await invokeOrBridge("plugin_uninstall", { id: p.id });
       notice = `Uninstalled ${p.name}.`;
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+      if (p.harnesses?.length) onHarnessesChanged?.();
       if (catalog) void loadCatalog();
     } catch (e: any) {
       error = e?.message ?? String(e);
@@ -209,7 +267,7 @@
       <p class="pl-muted pl-foot">From the <a href="https://github.com/anslwy/vicuna-plugins" target="_blank" rel="noopener noreferrer">Vicuna plugin index</a>{#if catalog.skipped} · {catalog.skipped} invalid {catalog.skipped === 1 ? "entry" : "entries"} hidden{/if}. Plugins are made by their authors; install only what you trust.</p>
     {/if}
   {:else}
-  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes and side panels.</p>
+  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in) or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes, side panels and Work harnesses (coding agents).</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
     <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
     <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={installBlocked(source, busy)}>{busy === "install" ? "Installing…" : "Install"}</button>
@@ -239,6 +297,20 @@
               {pn.title}
             </button>
           {/each}
+          {#each p.harnesses ?? [] as h (h.id)}
+            <div class="pl-harness" data-testid="plugin-harness-{p.id}-{h.id}">
+              <span class="pl-name">{h.label}</span>
+              <code class="pl-cmd" title="The command this harness runs">{commandLine(h)}</code>
+              {#if h.enabled}<span class="pl-badge ok">Enabled</span>{:else}<span class="pl-badge">Disabled</span>{/if}
+              {#if !h.installed}<span class="pl-badge" title={h.installHint ?? ""}>`{h.command}` not found</span>{/if}
+              <span class="pl-spacer"></span>
+              {#if h.enabled}
+                <button class="pl-btn" data-testid="plugin-harness-disable-{p.id}-{h.id}" onclick={() => disableHarness(p, h)}>Disable</button>
+              {:else}
+                <button class="pl-btn primary" data-testid="plugin-harness-enable-{p.id}-{h.id}" onclick={() => askConsent(p, [h])}>Enable…</button>
+              {/if}
+            </div>
+          {/each}
           {#each p.themes as t (t.id)}
             {@const key = `${p.id}/${t.id}`}
             <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-theme-{p.id}-{t.id}" onclick={() => onUseTheme(p.id, t.id)} title="Use this theme">
@@ -252,6 +324,28 @@
   {/if}
   {/if}
 </div>
+
+{#if consent}
+  <div use:portal class="pl-portal">
+  <div class="pl-backdrop" role="presentation" onclick={declineConsent}></div>
+  <div class="pl-consent" role="dialog" aria-modal="true" aria-labelledby="pl-consent-title" data-testid="harness-consent">
+    <h3 id="pl-consent-title">Allow {consent.plugin.name} to run a coding agent?</h3>
+    <p class="pl-muted">This plugin adds {consent.harnesses.length === 1 ? "a Work harness" : "Work harnesses"}. When you pick {consent.harnesses.length === 1 ? "it" : "one"} for a session, Vicuna will run exactly:</p>
+    {#each consent.harnesses as h (h.id)}
+      <div class="pl-consent-h">
+        <div class="pl-name">{h.label}</div>
+        <code class="pl-cmd big" data-testid="harness-consent-command-{h.id}">{commandLine(h)}</code>
+        <div class="pl-muted">{h.installed ? `Found \`${h.command}\` on this server's PATH.` : `\`${h.command}\` is not installed on this server yet. ${h.installHint ?? ""}`}</div>
+      </div>
+    {/each}
+    <p class="pl-warn">The agent works in the session's workspace folder with the same powers as the built-in harnesses: it can read and change files and run commands as you. The program comes from your own install, not from the plugin. Only allow plugins you trust. If an upgrade changes this command, Vicuna asks again.</p>
+    <div class="pl-row pl-consent-actions">
+      <button class="pl-btn" data-testid="harness-consent-decline" onclick={declineConsent}>Not now</button>
+      <button class="pl-btn primary" data-testid="harness-consent-accept" disabled={consentBusy} onclick={acceptConsent}>{consentBusy ? "Enabling…" : "Allow and enable"}</button>
+    </div>
+  </div>
+  </div>
+{/if}
 
 <style>
   .pl { display: flex; flex-direction: column; gap: 10px; font-size: 14px; color: var(--text); }
@@ -298,4 +392,13 @@
   .pl-tag { font-size: 11px; color: var(--muted); background: var(--hover); border-radius: 6px; padding: 1px 7px; }
   .pl-tags .pl-src { flex: 1; min-width: 0; text-align: right; }
   .pl-foot a { color: var(--accent); }
+  .pl-harness { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; border: 1px dashed var(--border-2); border-radius: 10px; padding: 6px 10px; }
+  .pl-cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--hover); border-radius: 6px; padding: 2px 6px; word-break: break-all; }
+  .pl-cmd.big { display: block; font-size: 13px; padding: 8px 10px; margin: 4px 0; }
+  .pl-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 1000; }
+  .pl-consent { position: fixed; z-index: 1001; max-height: 90vh; overflow: auto; box-sizing: border-box; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(520px, 92vw); background: var(--bg); color: var(--text); border: 1px solid var(--border-2); border-radius: 14px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3); }
+  .pl-consent h3 { margin: 0; font-size: 16px; }
+  .pl-consent-h { display: flex; flex-direction: column; gap: 2px; }
+  .pl-warn { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--text); background: var(--err-bg); border-radius: 10px; padding: 8px 10px; }
+  .pl-consent-actions { justify-content: flex-end; }
 </style>

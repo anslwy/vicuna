@@ -534,7 +534,7 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
         };
         return match crate::session_insight::list(&pool, args, &live_sessions()).await {
             Ok(v) => {
-                let engines: Vec<&str> = crate::work_engine::Engine::ALL.iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
+                let engines: Vec<&str> = crate::work_engine::Engine::all().into_iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
                 text_result(&format!("{}\nInstalled harnesses: {}", crate::session_insight::list_text(&v), engines.join(", ")), false)
             }
             Err(e) => text_result(&e, true),
@@ -674,7 +674,7 @@ fn usage_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "harness": { "type": "string", "enum": ["claude", "codex", "agy", "opencode", "pi", "fx"], "description": "Only this harness (default: every installed quota harness)." }
+                "harness": { "type": "string", "description": "Only this harness: claude, codex, agy, opencode, pi, fx, or a plugin harness id like plugin:<plugin>/<harness> (default: every installed quota harness)." }
             }
         }
     })
