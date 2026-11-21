@@ -679,7 +679,7 @@ async fn dispatch(
             telegram::action(st, cmd, args).await
         }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
-        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" => crate::plugins::action(cmd, &args).await,
+        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" | "plugin_harness_consent" | "plugin_harness_revoke" => crate::plugins::action(cmd, &args).await,
         "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" => crate::plugins::action(cmd, &args).await,
         "plugin_storage_remove" => crate::plugins::action(cmd, &args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
@@ -1379,6 +1379,8 @@ pub const API_ACTIONS: &[&str] = &[
     "plugin_storage_remove",
     "plugin_storage_set",
     "plugin_uninstall",
+    "plugin_harness_consent",
+    "plugin_harness_revoke",
     "plugin_upgrade",
     "schedule_list",
     "schedule_put",

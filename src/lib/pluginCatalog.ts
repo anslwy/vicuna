@@ -48,4 +48,4 @@ export function cardAction(e: CatalogEntry): CardAction {
   return "install";
 }
 
-export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel" };
+export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel", harness: "Harness" };

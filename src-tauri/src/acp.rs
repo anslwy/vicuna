@@ -135,6 +135,11 @@ impl AcpState {
                 cmd.arg("acp");
                 (bin, cmd, process_workspace(engine, workspace).to_string())
             }
+            Engine::Plugin(k) => {
+                // re-checks consent for the exact command at spawn time
+                let (bin, cmd) = super::plugin_harness::launch(k, workspace)?;
+                (bin, cmd, process_workspace(engine, workspace).to_string())
+            }
             _ => return Err(format!("{} does not run over ACP", engine.label())),
         };
         let key = (engine, ws);
@@ -199,7 +204,9 @@ impl AcpState {
 // per-workspace MCP route; otherwise a second workspace calls the first one's
 // now-idle route. Agy also runs tools in its process cwd.
 fn process_workspace(engine: Engine, workspace: &str) -> &str {
-    if matches!(engine, Engine::Agy | Engine::Fx) { workspace } else { "" }
+    // plugin harnesses: one process per workspace, started in it (an unknown
+    // agent may run tools in its process cwd like agy does)
+    if matches!(engine, Engine::Agy | Engine::Fx | Engine::Plugin(_)) { workspace } else { "" }
 }
 
 /// Spawn an ACP agent and run `initialize`.
@@ -235,6 +242,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Agy => "agy acp",
         Engine::Fx => "fx acp",
         Engine::Pi => "pi --mode rpc",
+        Engine::Plugin(k) => k,
     }
 }
 
@@ -265,6 +273,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Agy => format!("agy|{id}|{workspace}"),
         Engine::Fx => format!("fx|{id}|{workspace}"),
         Engine::Pi => format!("pi|{id}|{workspace}"),
+        Engine::Plugin(k) => format!("plugin|{k}|{id}|{workspace}"),
     })
 }
 
@@ -601,6 +610,47 @@ impl AcpState {
         fx_list_models(&client, &cwd).await
         // _child is killed on drop
     }
+
+    /// A plugin harness that declares no models: the ones its agent offers
+    /// in a throwaway session (`configOptions` model select or
+    /// `models.availableModels`). Only runs a consented harness.
+    pub async fn plugin_models(&self, engine: Engine) -> Result<Vec<crate::opencode::OpencodeModel>, String> {
+        let Engine::Plugin(k) = engine else { return Ok(Vec::new()) };
+        let cwd = home_dir()?.display().to_string();
+        let (bin, cmd) = super::plugin_harness::launch(k, &cwd)?;
+        let (client, _child) = start_initialized(cmd, k, &bin).await?;
+        let r = client.call("session/new", json!({ "cwd": cwd, "mcpServers": [] }), SESSION_TIMEOUT).await?;
+        Ok(acp_offered_models(&r))
+    }
+}
+
+/// Models an ACP `session/new` result offers.
+pub(crate) fn acp_offered_models(r: &Value) -> Vec<crate::opencode::OpencodeModel> {
+    let mut out = Vec::new();
+    let opts = r
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|o| o.get("id").and_then(Value::as_str) == Some("model")))
+        .and_then(|o| o.get("options"))
+        .and_then(Value::as_array);
+    let mut push = |id: Option<&str>, name: Option<&str>| {
+        if let Some(id) = id.filter(|i| !i.is_empty()) {
+            if !out.iter().any(|m: &crate::opencode::OpencodeModel| m.id == id) {
+                out.push(super::plugin_harness::model_entry(id, name));
+            }
+        }
+    };
+    for o in opts.into_iter().flatten() {
+        // flat options, or groups with their own `options`
+        let inner = o.get("options").and_then(Value::as_array);
+        for x in inner.map(|v| v.iter().collect::<Vec<_>>()).unwrap_or_else(|| vec![o]) {
+            push(x.get("value").and_then(Value::as_str), x.get("name").and_then(Value::as_str));
+        }
+    }
+    for m in r.pointer("/models/availableModels").and_then(Value::as_array).into_iter().flatten() {
+        push(m.get("modelId").and_then(Value::as_str), m.get("name").and_then(Value::as_str));
+    }
+    out
 }
 
 /// Provider rejections caused by too many tools in the request (OpenAI-style
@@ -1504,7 +1554,7 @@ pub async fn run_turn(
     if engine == Engine::Agy {
         turn.ask_poll_secs.store(crate::vicuna_mcp::AGY_ASK_POLL_SECS, Ordering::Relaxed);
     }
-    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx | Engine::Plugin(_)).then(|| format!("{}|{workspace}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1678,6 +1728,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
             Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
             Engine::Pi => format!("{e}\npi needs a signed-in provider for this model: run `pi` in a terminal once and /login (or set the provider's API key), or pick another model."),
+            Engine::Plugin(_) => format!("{e}\n{} (plugin harness) needs credentials: sign in to its CLI in a terminal once, or pick another model.", engine.label()),
         }
     } else {
         e
@@ -1770,8 +1821,16 @@ async fn run_turn_inner(
                 json!({ "sessionId": acp_session, "configId": "model", "value": m }),
                 CONFIG_TIMEOUT,
             )
-            .await
-            .map_err(|e| format!("{} could not switch to model {m}: {e}", engine.label()))?;
+            .await;
+        let r = match (r, engine) {
+            // agents differ: some only implement the older session/set_model
+            (Err(_), Engine::Plugin(_)) => client
+                .call("session/set_model", json!({ "sessionId": acp_session, "modelId": m }), CONFIG_TIMEOUT)
+                .await
+                .map(|_| json!({})),
+            (r, _) => r,
+        }
+        .map_err(|e| format!("{} could not switch to model {m}: {e}", engine.label()))?;
         used_model = current_model(&r).or(Some(m));
     }
     // Tell the UI which opencode model this turn really runs on (the reply
