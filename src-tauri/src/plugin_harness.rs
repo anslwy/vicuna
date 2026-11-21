@@ -14,6 +14,12 @@
 //! }]
 //! ```
 //!
+//! Optional `icon: "agent.svg"` on each harness (or top-level `icon` fallback)
+//! ships a relative SVG asset. The installer stores it under `files/`; detection
+//! exposes a validated, at-most-32-KiB SVG as a base64 data URI. Invalid paths,
+//! missing/unsafe files and symlink escapes use the puzzle icon. Icons render
+//! only in image elements; see `plugin_icon.rs` for the supported SVG subset.
+//!
 //! Safety rules (enforced here, on the server, never in a window):
 //! - Plugins never ship binaries. `command` is a bare program name
 //!   (`[A-Za-z0-9._+-]`, no `/` or `\`, no `..`, no leading `-`/`.`) that
@@ -67,6 +73,8 @@ pub struct HarnessModel {
 pub struct Harness {
     pub id: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub acp: AcpLaunch,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<HarnessModel>,
@@ -638,6 +646,7 @@ mod tests {
         Harness {
             id: "demo".into(),
             label: "Demo".into(),
+            icon: None,
             acp: AcpLaunch { command: cmd.into(), args: args.iter().map(|s| s.to_string()).collect() },
             models: vec![],
             install_hint: String::new(),

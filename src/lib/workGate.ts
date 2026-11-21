@@ -5,6 +5,8 @@
 /** One Work engine as detection reports it. */
 export interface EngineSummary {
   id: string;
+  /** Validated SVG data URI, supplied by plugin harnesses. */
+  icon?: string | null;
   label: string;
   installed: boolean;
   version: string | null;

@@ -173,6 +173,8 @@ pub struct WorkEngineInfo {
 #[serde(rename_all = "camelCase")]
 pub struct EngineSummary {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub label: String,
     pub installed: bool,
     pub version: Option<String>,

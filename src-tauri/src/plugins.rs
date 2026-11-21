@@ -66,6 +66,8 @@ pub struct Manifest {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -121,6 +123,11 @@ impl Manifest {
                 if !v.contains(f) {
                     v.push(f.clone());
                 }
+            }
+        }
+        for f in self.icon.iter().chain(self.harnesses.iter().filter_map(|h| h.icon.as_ref())) {
+            if crate::plugin_icon::valid_path(f) && !v.contains(f) {
+                v.push(f.clone());
             }
         }
         v
@@ -421,7 +428,9 @@ fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)]) -> Resu
             if !m.files().contains(name) {
                 return Err(format!("unexpected file {name}"));
             }
-            std::fs::write(stage.join("files").join(name), bytes).map_err(|e| e.to_string())?;
+            let target = stage.join("files").join(name);
+            std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(target, bytes).map_err(|e| e.to_string())?;
         }
         // plugin storage + harness consent carry over; consent is bound to
         // the exact command, so a changed command is disabled until approved
@@ -899,6 +908,18 @@ mod tests {
     fn manifest() -> Manifest {
         serde_json::from_value(json!({"id":"nord","name":"Nord","version":"1.0.0",
             "themes":[{"id":"nord-dark","name":"Nord","base":"dark","vars":{"--bg":"#2e3440"},"accent":{"bg":"#88c0d0"}}]})).unwrap()
+    }
+
+    #[test]
+    fn harness_icons_are_optional_and_shipped() {
+        let mut m = manifest();
+        assert!(m.icon.is_none());
+        let h = serde_json::json!({"id":"agent","label":"Agent","acp":{"command":"agent"},"icon":"icons/agent.svg"});
+        m.harnesses = vec![serde_json::from_value(h).unwrap()];
+        m.icon = Some("fallback.svg".into());
+        assert_eq!(m.files(), vec!["fallback.svg", "icons/agent.svg"]);
+        m.harnesses[0].icon = Some("../outside.svg".into());
+        assert_eq!(m.files(), vec!["fallback.svg"]);
     }
 
     #[test]

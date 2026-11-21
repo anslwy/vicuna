@@ -43,3 +43,10 @@ export function consentPayload(pluginId: string, harnesses: PluginHarness[]) {
 export function pendingConsent(p: { pendingConsent?: PluginHarness[] } | null | undefined): PluginHarness[] {
   return p?.pendingConsent ?? [];
 }
+
+/** Only backend SVG data URIs may reach the image sink; null uses the puzzle icon. */
+export function pluginEngineIcon(id: string, engines: readonly { id: string; icon?: string | null }[]): string | null {
+  if (!isPluginEngine(id)) return null;
+  const icon = engines.find((e) => e.id === id)?.icon;
+  return icon && /^data:image\/svg\+xml;base64,[A-Za-z0-9+/]+={0,2}$/.test(icon) ? icon : null;
+}

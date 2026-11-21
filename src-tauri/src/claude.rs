@@ -93,6 +93,7 @@ pub async fn engine_info() -> WorkEngineInfo {
 
 pub fn summary(info: &WorkEngineInfo) -> EngineSummary {
     EngineSummary {
+        icon: crate::plugin_icon::engine_icon(&info.id),
         id: info.id.clone(),
         label: info.label.clone(),
         installed: info.installed,

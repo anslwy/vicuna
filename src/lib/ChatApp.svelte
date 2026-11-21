@@ -46,7 +46,7 @@
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
-  import { isPluginEngine, pluginHarnessName } from "$lib/pluginHarness";
+  import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness } from "$lib/sessionEngine";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
@@ -9478,6 +9478,8 @@
     <svg class="engine-ico" data-engine-icon="fx" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={FX_ICON_PATH}/></svg>
   {:else if id === "pi"}
     <svg class="engine-ico" data-engine-icon="pi" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={PI_ICON_PATH}/></svg>
+  {:else if id.startsWith("plugin:") && pluginEngineIcon(id, workEngineList)}
+    <img class="engine-ico" src={pluginEngineIcon(id, workEngineList)!} width="14" height="14" alt="" aria-hidden="true" />
   {:else if id.startsWith("plugin:")}
     <svg class="engine-ico" data-engine-icon="plugin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z"/></svg>
   {:else if id === "agy"}
@@ -11734,7 +11736,7 @@
               role="tab"
               aria-selected={usageEngine === eng.id}
               onclick={() => void loadUsage(eng.id)}
-            >{eng.label}</button>
+            >{@render engineIcon(eng.id)}{eng.label}</button>
           {/each}
         </div>
       {/if}
@@ -12986,7 +12988,7 @@
   .usage-refresh:disabled { opacity: .55; cursor: default; }
   .usage-account { font-size: 12.5px; color: var(--muted); margin: 0; }
   .usage-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-  .usage-tab { border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
+  .usage-tab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
   .usage-tab:hover { background: var(--hover); color: var(--text); }
   .usage-tab.sel { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   .usage-body { overflow-y: auto; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
@@ -13152,7 +13154,7 @@
   .approval-row input { margin-top: 2px; }
   .notify-sound-pick { max-width: 320px; padding-left: 21px; }
   .notify-sound-pick :disabled { opacity: 0.5; cursor: default; }
-  .engine-ico { flex: none; display: block; }
+  .engine-ico { flex: none; display: block; width: 14px; height: 14px; object-fit: contain; }
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
