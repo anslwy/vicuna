@@ -60,7 +60,7 @@
   import TelegramModal from "$lib/TelegramModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
-  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, ACCENT_MUTED_KEY, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
+  import { allThemes, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, writeActiveTheme, readAccentMuted, writeAccentMuted, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
   import { hideSplash } from "$lib/splash";
   import {
@@ -3277,12 +3277,12 @@
   };
 
   // plugin themes (Settings → Plugins): the active one is cached whole in
-  // localStorage (src/lib/pluginTheme.ts) and overrides the built-in palette.
+  // localStorage per host (src/lib/pluginTheme.ts) and overrides the built-in palette.
   let plugins = $state<InstalledPlugin[]>([]);
-  let pluginTheme = $state<ActivePluginTheme | null>(typeof window !== "undefined" ? readActiveTheme(localStorage) : null);
+  let pluginTheme = $state<ActivePluginTheme | null>(typeof window !== "undefined" ? readActiveTheme(localStorage, activeServerId()) : null);
   /** The user picked a built-in swatch over the active theme's own accent
    *  (key of that theme; cleared whenever the theme changes). */
-  let pluginAccentMutedFor = $state<string | null>(typeof window !== "undefined" ? localStorage.getItem(ACCENT_MUTED_KEY) : null);
+  let pluginAccentMutedFor = $state<string | null>(typeof window !== "undefined" ? readAccentMuted(localStorage, activeServerId()) : null);
   let pluginThemeProps: string[] = [];
   const pluginThemeChoices = $derived(allThemes(plugins));
   /** The effective light/dark base (a plugin theme brings its own). */
@@ -3322,16 +3322,13 @@
 
   function setAccentMuted(key: string | null) {
     pluginAccentMutedFor = key;
-    try {
-      if (key) localStorage.setItem(ACCENT_MUTED_KEY, key);
-      else localStorage.removeItem(ACCENT_MUTED_KEY);
-    } catch {}
+    writeAccentMuted(localStorage, key, activeServerId());
   }
 
   function setPluginTheme(t: ActivePluginTheme | null) {
     if (t?.key !== pluginTheme?.key) setAccentMuted(null);
     pluginTheme = t;
-    writeActiveTheme(localStorage, t);
+    writeActiveTheme(localStorage, t, activeServerId());
   }
 
   function usePluginTheme(pluginId: string, themeId: string) {

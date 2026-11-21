@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { allThemes, reconcileActive, readActiveTheme, safeColor, themeProperties, writeActiveTheme, type InstalledPlugin } from "../src/lib/pluginTheme.ts";
+import { allThemes, readAccentMuted, readActiveTheme, reconcileActive, safeColor, scopedKey, themeProperties, writeAccentMuted, writeActiveTheme, type InstalledPlugin } from "../src/lib/pluginTheme.ts";
 
 const plugin = (version = "1.0.0", vars: Record<string, string> = { "--bg": "#2e3440" }): InstalledPlugin => ({
   id: "nord", name: "Nord", version, description: "", source: "me/nord", installedAt: 0,
@@ -55,4 +55,40 @@ test("Install is usable while the plugin list is still loading", async () => {
   assert.equal(installBlocked("  ", null), true);
   assert.equal(installBlocked("me/repo", "install"), true);
   assert.equal(installBlocked("me/repo", "upgrade:x"), true);
+});
+
+test("plugin theme and muted accent are isolated per remote host", () => {
+  const m = new Map<string, string>();
+  const st = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), removeItem: (k: string) => void m.delete(k) };
+  const [nord] = allThemes([plugin()]);
+  const [rose] = allThemes([{ ...plugin(), id: "rose", name: "Rose", themes: [{ id: "light", name: "Rose Light", base: "light", vars: { "--bg": "#faf4ed" } }] }]);
+
+  assert.equal(scopedKey("vicuna-plugin-theme", null), "vicuna-plugin-theme");
+  assert.equal(scopedKey("vicuna-plugin-theme", "host-a"), "vicuna-plugin-theme:server:host-a");
+
+  // Host A picks Nord, client stays on built-in (null), Host B picks Rose
+  writeActiveTheme(st, nord, "host-a");
+  writeAccentMuted(st, nord.key, "host-a");
+  writeActiveTheme(st, rose, "host-b");
+
+  assert.equal(readActiveTheme(st, null), null, "client does not inherit host A's plugin theme");
+  assert.equal(readActiveTheme(st, "host-a")?.key, "nord/dark");
+  assert.equal(readActiveTheme(st, "host-b")?.key, "rose/light");
+  assert.equal(readAccentMuted(st, "host-a"), "nord/dark");
+  assert.equal(readAccentMuted(st, null), null);
+  assert.equal(readAccentMuted(st, "host-b"), null);
+
+  // Clearing client's theme (e.g. client has no plugins or switches to Dark) leaves hosts intact
+  writeActiveTheme(st, null, null);
+  writeAccentMuted(st, null, null);
+  assert.equal(readActiveTheme(st, "host-a")?.key, "nord/dark");
+  assert.equal(readAccentMuted(st, "host-a"), "nord/dark");
+  assert.equal(readActiveTheme(st, "host-b")?.key, "rose/light");
+
+  // Clearing Host A leaves Host B intact
+  writeActiveTheme(st, null, "host-a");
+  writeAccentMuted(st, null, "host-a");
+  assert.equal(readActiveTheme(st, "host-a"), null);
+  assert.equal(readAccentMuted(st, "host-a"), null);
+  assert.equal(readActiveTheme(st, "host-b")?.key, "rose/light");
 });

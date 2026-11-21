@@ -29,10 +29,17 @@
     </style>
     <script>
       try {
+        var sid = new URLSearchParams(location.search).get("server") || sessionStorage.getItem("vicuna-window-server");
+        if (sid && !/^[A-Za-z0-9_-]+$/.test(sid)) sid = null;
         var p = JSON.parse(localStorage.getItem("vicuna-prefs") || localStorage.getItem("ollama-min-prefs") || "{}");
+        if (sid) {
+          var sp = JSON.parse(localStorage.getItem("vicuna-prefs:server:" + sid) || "{}");
+          if (sp.theme === "light" || sp.theme === "dark") p.theme = sp.theme;
+        }
         if (p.theme === "dark") document.documentElement.dataset.theme = "dark";
         // active plugin theme (src/lib/pluginTheme.ts), same color-only rules
-        var t = JSON.parse(localStorage.getItem("vicuna-plugin-theme") || "null");
+        var tKey = sid ? "vicuna-plugin-theme:server:" + sid : "vicuna-plugin-theme";
+        var t = JSON.parse(localStorage.getItem(tKey) || "null");
         if (t && (t.base === "light" || t.base === "dark")) {
           var r = document.documentElement, c = /^(#[0-9a-f]{3,8}|(rgb|rgba|hsl|hsla)\([0-9 .,%/deg]+\))$/i;
           r.dataset.theme = t.base;
