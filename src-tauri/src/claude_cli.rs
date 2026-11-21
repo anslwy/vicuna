@@ -41,6 +41,26 @@ use crate::ChatMessage;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CANCEL_GRACE: Duration = Duration::from_secs(20);
+/// After the last background task finished, Claude starts a new round on its
+/// own; if it hasn't produced anything by then, close stdin anyway.
+const BG_RESUME_GRACE: Duration = Duration::from_secs(120);
+
+/// Pending background work (`run_in_background` Bash, subagents) from a
+/// `system/background_tasks_changed` message: the full current task list.
+fn background_task_count(msg: &Value) -> Option<usize> {
+    (msg.get("type").and_then(|t| t.as_str()) == Some("system")
+        && msg.get("subtype").and_then(|s| s.as_str()) == Some("background_tasks_changed"))
+    .then(|| msg.get("tasks").and_then(|t| t.as_array()).map_or(0, |a| a.len()))
+}
+
+/// At a `result` with nothing queued: may stdin close? Not while Claude still
+/// has background tasks: when one finishes, Claude resumes the session by
+/// itself and its tool calls send `can_use_tool` requests that can only be
+/// answered over stdin (a closed stdin fails every one with
+/// "Tool permission request failed: AbortError: Stream closed").
+fn may_close_stdin(background_tasks: usize) -> bool {
+    background_tasks == 0
+}
 const OUTPUT_CAP: usize = 32 * 1024;
 
 // ---------- process ----------
@@ -561,6 +581,10 @@ async fn run_process(
     // one interval for the whole loop: a fresh `sleep` per iteration never
     // fires while the engine streams faster than it, so Stop went unseen
     let mut stop_tick = crate::work_agent::stop_check_interval();
+    let mut bg_tasks = 0usize;
+    // a `result` arrived while background tasks kept stdin open
+    let mut idle_waiting = false;
+    let mut last_activity = Instant::now();
     let outcome: Result<(), RunError> = loop {
         tokio::select! {
             next = lines.next_line() => {
@@ -577,6 +601,10 @@ async fn run_process(
                         if tail.is_empty() { "claude exited unexpectedly".to_string() } else { format!("claude exited unexpectedly:\n{tail}") })));
                 };
                 let Ok(msg) = serde_json::from_str::<Value>(&l) else { continue };
+                last_activity = Instant::now();
+                if let Some(n) = background_task_count(&msg) {
+                    bg_tasks = n;
+                }
                 match msg.get("type").and_then(|t| t.as_str()) {
                     Some("system") if msg.get("subtype").and_then(|s| s.as_str()) == Some("init") => {
                         got_output = true;
@@ -618,9 +646,14 @@ async fn run_process(
                         // queued messages run as the next prompt of this turn
                         let queued = acp::take_queue(turn);
                         if queued.is_empty() {
-                            writer = None; // close stdin: the CLI exits
+                            if may_close_stdin(bg_tasks) {
+                                writer = None; // close stdin: the CLI exits
+                            } else {
+                                idle_waiting = true; // Claude resumes when its job ends
+                            }
                             continue;
                         }
+                        idle_waiting = false;
                         let ids: Vec<String> = queued.iter().map(|(id, _)| id.clone()).collect();
                         let drained: Vec<ChatMessage> = queued.into_iter().map(|(_, m)| m).collect();
                         emit_ev(on_event, stop, WorkAgentEvent::QueueDrained { ids, messages: drained.clone() });
@@ -647,6 +680,9 @@ async fn run_process(
                         let _ = w.send(line(&control_request("vicuna-stop", json!({ "subtype": "interrupt" }))));
                     }
                 }
+                if idle_waiting && bg_tasks == 0 && writer.is_some() && last_activity.elapsed() > BG_RESUME_GRACE {
+                    writer = None; // jobs done but Claude never resumed
+                }
                 if interrupted_at.is_some_and(|t| t.elapsed() > CANCEL_GRACE) {
                     let _ = child.start_kill();
                     break Ok(());
@@ -664,6 +700,18 @@ async fn run_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_stays_open_while_background_tasks_run() {
+        let started = json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash"}]});
+        let ended = json!({"type":"system","subtype":"background_tasks_changed","tasks":[]});
+        assert_eq!(background_task_count(&started), Some(1));
+        assert_eq!(background_task_count(&ended), Some(0));
+        assert_eq!(background_task_count(&json!({"type":"system","subtype":"init"})), None);
+        // the regression: a result while a job runs must not close stdin
+        assert!(!may_close_stdin(1));
+        assert!(may_close_stdin(0));
+    }
 
     #[test]
     fn models_come_from_initialize_response() {
