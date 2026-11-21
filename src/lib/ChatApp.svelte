@@ -9871,7 +9871,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{#if workEngineInfo && !sessionEngineMissing}{@render engineIcon(engineId(workEngineInfo))}{/if}{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           <span class="hdr-meters">
           {#if usageHoverEngine}
             {@const hov = usageHoverCache[usageHoverEngine]}
@@ -13132,7 +13132,7 @@
   .workspace-picker-drop { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
   .workspace-picker-label { font-size: 12px; color: var(--muted); }
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
-  .work-badge.engine-badge { background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
+  .work-badge.engine-badge { display: inline-flex; align-items: center; gap: 4px; background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
   .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
   .engine-switch { display: flex; gap: 4px; padding: 8px 8px 0; }
   .engine-switch.settings-engines { padding: 4px 0; }
