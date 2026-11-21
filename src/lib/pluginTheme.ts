@@ -24,6 +24,14 @@ export type InstalledPlugin = {
 export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };
 
 export const ACTIVE_THEME_KEY = "vicuna-plugin-theme";
+export const ACCENT_MUTED_KEY = "vicuna-plugin-accent-muted";
+
+/** Scope a localStorage key to a remote server when `serverId` is set,
+ *  matching `serverKey` in src/lib/store.ts and the pre-paint script in
+ *  src/app.html. Null/undefined keeps the local-client key. */
+export function scopedKey(base: string, serverId?: string | null): string {
+  return serverId ? `${base}:server:${serverId}` : base;
+}
 
 export const themeKey = (pluginId: string, themeId: string) => `${pluginId}/${themeId}`;
 
@@ -61,18 +69,35 @@ export function reconcileActive(active: ActivePluginTheme | null, plugins: Insta
   return allThemes(plugins).find((t) => t.key === active.key) ?? null;
 }
 
-export function readActiveTheme(storage: Pick<Storage, "getItem"> | undefined): ActivePluginTheme | null {
+export function readActiveTheme(storage: Pick<Storage, "getItem"> | undefined, serverId?: string | null): ActivePluginTheme | null {
   try {
-    const v = JSON.parse(storage?.getItem(ACTIVE_THEME_KEY) ?? "null");
+    const v = JSON.parse(storage?.getItem(scopedKey(ACTIVE_THEME_KEY, serverId)) ?? "null");
     if (v && typeof v.key === "string" && (v.base === "light" || v.base === "dark") && v.vars && typeof v.vars === "object") return v;
   } catch {}
   return null;
 }
 
-export function writeActiveTheme(storage: Pick<Storage, "setItem" | "removeItem"> | undefined, t: ActivePluginTheme | null) {
+export function writeActiveTheme(storage: Pick<Storage, "setItem" | "removeItem"> | undefined, t: ActivePluginTheme | null, serverId?: string | null) {
   try {
-    if (t) storage?.setItem(ACTIVE_THEME_KEY, JSON.stringify(t));
-    else storage?.removeItem(ACTIVE_THEME_KEY);
+    const key = scopedKey(ACTIVE_THEME_KEY, serverId);
+    if (t) storage?.setItem(key, JSON.stringify(t));
+    else storage?.removeItem(key);
+  } catch {}
+}
+
+export function readAccentMuted(storage: Pick<Storage, "getItem"> | undefined, serverId?: string | null): string | null {
+  try {
+    return storage?.getItem(scopedKey(ACCENT_MUTED_KEY, serverId)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeAccentMuted(storage: Pick<Storage, "setItem" | "removeItem"> | undefined, mutedFor: string | null, serverId?: string | null) {
+  try {
+    const key = scopedKey(ACCENT_MUTED_KEY, serverId);
+    if (mutedFor) storage?.setItem(key, mutedFor);
+    else storage?.removeItem(key);
   } catch {}
 }
 
@@ -88,8 +113,6 @@ export function themeAccent(t: PluginThemeDef | null): { bg: string; hover: stri
 export function selectedAccent(t: PluginThemeDef | null, muted: boolean, builtin: string): string {
   return themeAccent(t) && !muted ? "theme" : builtin;
 }
-
-export const ACCENT_MUTED_KEY = "vicuna-plugin-accent-muted";
 
 /** Settings → Plugins: Install works as soon as a source is typed; only an
  *  install/upgrade/uninstall in flight blocks it (loading the list does not). */

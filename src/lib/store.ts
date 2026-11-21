@@ -1049,20 +1049,26 @@ async function writeSqlitePrefs(p: Prefs): Promise<void> {
   await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pref_session_filter', $1)", [p.sessionFilter ?? "all"]);
 }
 
-/** Prefs that name places on the backend machine: on a remote server they
- *  are kept per server so a server path never becomes the local default. */
+/** Prefs that belong to one host: on a remote server they are kept per
+ *  server so a server's workspace, sidebar scope, theme or accent never
+ *  overwrites This computer (or another server). */
 interface ServerScopedPrefs {
   defaultWorkspace: string;
   sessionFilter: string;
+  theme?: "light" | "dark";
+  accent?: string;
 }
 
 function readServerPrefs(id: string): ServerScopedPrefs {
   try {
     const p = JSON.parse(localStorage.getItem(serverKey(LS_PREFS, id)) ?? "{}");
-    return {
+    const out: ServerScopedPrefs = {
       defaultWorkspace: typeof p.defaultWorkspace === "string" ? p.defaultWorkspace : "",
       sessionFilter: typeof p.sessionFilter === "string" ? p.sessionFilter : DEFAULT_PREFS.sessionFilter
     };
+    if (p.theme === "light" || p.theme === "dark") out.theme = p.theme;
+    if (typeof p.accent === "string" && p.accent.length > 0) out.accent = p.accent;
+    return out;
   } catch {
     return { defaultWorkspace: "", sessionFilter: DEFAULT_PREFS.sessionFilter };
   }
@@ -1070,7 +1076,15 @@ function readServerPrefs(id: string): ServerScopedPrefs {
 
 function withServerPrefs(p: Prefs): Prefs {
   const id = activeServerId();
-  return id ? { ...p, ...readServerPrefs(id) } : p;
+  if (!id) return p;
+  const sp = readServerPrefs(id);
+  return {
+    ...p,
+    defaultWorkspace: sp.defaultWorkspace,
+    sessionFilter: sp.sessionFilter,
+    ...(sp.theme ? { theme: sp.theme } : {}),
+    ...(sp.accent ? { accent: sp.accent } : {})
+  };
 }
 
 /** Synchronous startup read (before initApp): local prefs with the active
@@ -1095,12 +1109,15 @@ export function savePrefs(p: Prefs): void {
   const server = activeServerId();
   if (server) {
     try {
-      localStorage.setItem(serverKey(LS_PREFS, server), JSON.stringify({ defaultWorkspace: p.defaultWorkspace, sessionFilter: p.sessionFilter }));
+      localStorage.setItem(
+        serverKey(LS_PREFS, server),
+        JSON.stringify({ defaultWorkspace: p.defaultWorkspace, sessionFilter: p.sessionFilter, theme: p.theme, accent: p.accent })
+      );
     } catch {
       /* ignore */
     }
     const local = readLocalPrefs();
-    p = { ...p, defaultWorkspace: local.defaultWorkspace, sessionFilter: local.sessionFilter };
+    p = { ...p, defaultWorkspace: local.defaultWorkspace, sessionFilter: local.sessionFilter, theme: local.theme, accent: local.accent };
   }
   try {
     localStorage.setItem(LS_PREFS, JSON.stringify(p));
