@@ -1340,6 +1340,7 @@
   async function quitVicuna(force = false) {
     if (!force && scheduled.length > 0) {
       settingsOpen = false;
+      pluginsOpen = false;
       quitPromptOpen = true;
       return;
     }
@@ -2139,7 +2140,8 @@
   let gotoError = $state<string | null>(null);
   let gotoSel = $state(0);
   let settingsOpen = $state(false);
-  let settingsTab = $state<"general" | "models" | "openrouter" | "plugins">("general");
+  let settingsTab = $state<"general" | "models" | "openrouter">("general");
+  let pluginsOpen = $state(false);
   const CLI_INSTALL_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh";
   let cliCopied = $state(false);
   async function copyCliInstall() {
@@ -2930,12 +2932,18 @@
   }
 
   async function openSettings() {
+    pluginsOpen = false;
     settingsTab = "general";
     settingsOpen = true;
     void refreshCliStatus();
     void refreshBuildInfo();
     void refreshWorkEngine();
     void refreshBrowserEngine();
+  }
+
+  function openPlugins() {
+    settingsOpen = false;
+    pluginsOpen = true;
   }
 
   /** Browser engine row (Settings → Browser engine): which `lb` runs and
@@ -3276,7 +3284,7 @@
     green: { label: "Green", light: { bg: "#16a34a", hover: "#15803d", fg: "#ffffff" }, dark: { bg: "#22c55e", hover: "#16a34a", fg: "#111111" } }
   };
 
-  // plugin themes (Settings → Plugins): the active one is cached whole in
+  // plugin themes (Plugins modal): the active one is cached whole in
   // localStorage per host (src/lib/pluginTheme.ts) and overrides the built-in palette.
   let plugins = $state<InstalledPlugin[]>([]);
   let pluginTheme = $state<ActivePluginTheme | null>(typeof window !== "undefined" ? readActiveTheme(localStorage, activeServerId()) : null);
@@ -4637,13 +4645,14 @@
   });
 
   $effect(() => {
-    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !lightboxSrc && !pendingSaveConfirm) return;
+    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !pluginsOpen && !lightboxSrc && !pendingSaveConfirm) return;
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         pendingDeleteId = null;
         pendingMsgDelete = null;
         closeGoto();
         settingsOpen = false;
+        pluginsOpen = false;
         closeLightbox();
         pendingSaveConfirm = false;
       }
@@ -4658,7 +4667,7 @@
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (gotoOpen || settingsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
+      if (gotoOpen || settingsOpen || pluginsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
       e.preventDefault();
       composerEl?.focus();
     };
@@ -4685,7 +4694,7 @@
   $effect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
-        if (settingsOpen || pendingDeleteId || pendingMsgDelete != null || pendingSaveConfirm || lightboxSrc || modelOpen) return;
+        if (settingsOpen || pluginsOpen || pendingDeleteId || pendingMsgDelete != null || pendingSaveConfirm || lightboxSrc || modelOpen) return;
         e.preventDefault();
         openGoto();
       }
@@ -9053,7 +9062,7 @@
         e.preventDefault();
         return;
       }
-      if (settingsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
+      if (settingsOpen || pluginsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
       if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
@@ -9775,6 +9784,10 @@
             </button>
           </div>
         {/if}
+        <button class="goto" data-testid="plugins-btn" aria-label="Plugins" title="Plugins" onclick={openPlugins}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
+          <span>Plugins</span>
+        </button>
         <button class="goto" data-testid="settings-btn" aria-label="Settings" title="Settings" onclick={openSettings}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
           <span>Settings</span>
@@ -9915,9 +9928,14 @@
         <button class="icon-btn" data-testid="sidebar-toggle" aria-label="Open sidebar" title="Toggle sidebar ({isMac ? '⌘B' : 'Ctrl+B'})" onclick={() => setSidebar(true)}>
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
         </button>
-        <button class="icon-btn" data-testid="settings-btn-collapsed" aria-label="Open settings" title="Settings" onclick={openSettings}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
-        </button>
+        <div class="collapsed-rail-foot">
+          <button class="icon-btn" data-testid="plugins-btn-collapsed" aria-label="Open plugins" title="Plugins" onclick={openPlugins}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
+          </button>
+          <button class="icon-btn" data-testid="settings-btn-collapsed" aria-label="Open settings" title="Settings" onclick={openSettings}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="M12 21a8.985 8.985 0 0 1-1.755-.173 1 1 0 0 1-.791-.813l-.273-1.606a6.933 6.933 0 0 1-1.32-.762l-1.527.566a1 1 0 0 1-1.1-.278 8.977 8.977 0 0 1-1.756-3.041 1 1 0 0 1 .31-1.092l1.254-1.04a6.979 6.979 0 0 1 0-1.524L3.787 10.2a1 1 0 0 1-.31-1.092 8.977 8.977 0 0 1 1.756-3.042 1 1 0 0 1 1.1-.278l1.527.566a6.933 6.933 0 0 1 1.32-.762l.274-1.606a1 1 0 0 1 .791-.813 8.957 8.957 0 0 1 3.51 0 1 1 0 0 1 .791.813l.273 1.606a6.933 6.933 0 0 1 1.32.762l1.527-.566a1 1 0 0 1 1.1.278 8.977 8.977 0 0 1 1.756 3.041 1 1 0 0 1-.31 1.092l-1.254 1.04a6.979 6.979 0 0 1 0 1.524l1.254 1.04a1 1 0 0 1 .31 1.092 8.977 8.977 0 0 1-1.756 3.041 1 1 0 0 1-1.1.278l-1.527-.566a6.933 6.933 0 0 1-1.32.762l-.273 1.606a1 1 0 0 1-.791.813A8.985 8.985 0 0 1 12 21zm-.7-2.035a6.913 6.913 0 0 0 1.393 0l.247-1.451a1 1 0 0 1 .664-.779 4.974 4.974 0 0 0 1.696-.975 1 1 0 0 1 1.008-.186l1.381.512a7.012 7.012 0 0 0 .7-1.206l-1.133-.939a1 1 0 0 1-.343-.964 5.018 5.018 0 0 0 0-1.953 1 1 0 0 1 .343-.964l1.124-.94a7.012 7.012 0 0 0-.7-1.206l-1.38.512a1 1 0 0 1-1-.186 4.974 4.974 0 0 0-1.688-.976 1 1 0 0 1-.664-.779l-.248-1.45a6.913 6.913 0 0 0-1.393 0l-.25 1.45a1 1 0 0 1-.664.779A4.974 4.974 0 0 0 8.7 8.24a1 1 0 0 1-1 .186l-1.385-.512a7.012 7.012 0 0 0-.7 1.206l1.133.939a1 1 0 0 1 .343.964 5.018 5.018 0 0 0 0 1.953 1 1 0 0 1-.343.964l-1.128.94a7.012 7.012 0 0 0 .7 1.206l1.38-.512a1 1 0 0 1 1 .186 4.974 4.974 0 0 0 1.688.976 1 1 0 0 1 .664.779zm.7-3.725a3.24 3.24 0 0 1 0-6.48 3.24 3.24 0 0 1 0 6.48zm0-4.48A1.24 1.24 0 1 0 13.24 12 1.244 1.244 0 0 0 12 10.76z"/></svg>
+          </button>
+        </div>
       </div>
     {/if}
 
@@ -12057,11 +12075,8 @@
       <button class="seg-btn {settingsTab === 'general' ? 'sel' : ''}" data-testid="settings-tab-general" role="tab" onclick={() => (settingsTab = "general")}>General</button>
       <button class="seg-btn {settingsTab === 'models' ? 'sel' : ''}" data-testid="settings-tab-ollama" role="tab" onclick={openModelsTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg></span>Ollama</button>
       <button class="seg-btn {settingsTab === 'openrouter' ? 'sel' : ''}" data-testid="settings-tab-openrouter" role="tab" onclick={openOpenRouterTab}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg></span>OpenRouter</button>
-      <button class="seg-btn {settingsTab === 'plugins' ? 'sel' : ''}" data-testid="settings-tab-plugins" role="tab" onclick={() => (settingsTab = "plugins")}><span class="tab-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg></span>Plugins</button>
     </div>
-    {#if settingsTab === "plugins"}
-      <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onHarnessesChanged={() => void refreshWorkEngine()} onUseTheme={usePluginTheme} onOpenPanel={(k) => { settingsOpen = false; openSidePanel(k); }} />
-    {:else if settingsTab === "general"}
+    {#if settingsTab === "general"}
     <div class="setting-row">
       <span class="setting-label">Theme</span>
       <div class="seg">
@@ -12567,6 +12582,26 @@
     {/if}
   </div>
 {/if}
+{#if pluginsOpen}
+  <button
+    class="confirm-backdrop"
+    data-testid="plugins-backdrop"
+    aria-label="Close plugins"
+    onclick={() => (pluginsOpen = false)}
+    tabindex="-1"
+  ></button>
+  <div
+    class="confirm-card settings-card"
+    data-testid="plugins-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Plugins"
+  >
+    <button class="modal-x" data-testid="close-plugins-btn" aria-label="Close plugins" onclick={() => (pluginsOpen = false)}>×</button>
+    <p class="confirm-text">Plugins</p>
+    <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onHarnessesChanged={() => void refreshWorkEngine()} onUseTheme={usePluginTheme} onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }} />
+  </div>
+{/if}
 {/if}
 
 {#if codeEditorPath && CodeEditorComp}
@@ -12801,6 +12836,7 @@
   .queue-hint { font-size: 11.5px; color: var(--faint); }
   .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
+  .collapsed-rail-foot { display: flex; flex-direction: column; gap: 4px; }
   .collapsed-rail .icon-btn { width: 100%; padding: 4px 0; border-radius: 8px; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
   .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
@@ -13415,7 +13451,7 @@
     .empty-title { font-size: 20px; margin-bottom: 20px; }
     .model-pill { max-width: 150px; }
     .model-drop { width: 330px; max-width: calc(100vw - 48px); }
-  .collapsed-rail [data-testid='settings-btn-collapsed'] { display: none; }
+  .collapsed-rail-foot { display: none; }
     .work-banner { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
     .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
