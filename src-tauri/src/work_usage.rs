@@ -14,6 +14,7 @@
 //! - OpenCode / `pi` / `fx`: no subscription quota; the popup shows no tab for them
 //!   and the command returns an informational note if asked anyway.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -1320,6 +1321,307 @@ pub async fn work_usage(engine: Option<String>) -> Result<WorkUsageReport, Strin
     fetch_usage_logic(engine).await
 }
 
+// ---------- vicuna-mcp `usage_status`: plain text for agents ----------
+//
+// The agent-facing view of the same report the Usage popup draws. It runs
+// entirely in the backend (no window), so a lead on `vicuna serve` can read
+// quota before starting an expensive worker, and explain a harness failure
+// ("Claude is at its limit until 18:00"). Reports are cached briefly because
+// each read launches a CLI (and, for Claude/agy, a PTY).
+
+/// Harnesses whose subscription usage can be read (the Usage view's tabs).
+pub const QUOTA_ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::Agy];
+
+/// How long a fetched report is reused by `usage_status`.
+const STATUS_TTL: Duration = Duration::from_secs(60);
+
+static STATUS_CACHE: std::sync::Mutex<Vec<(String, Instant, WorkUsageReport)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn status_cache_get(engine: Engine) -> Option<WorkUsageReport> {
+    let now = Instant::now();
+    let mut cache = STATUS_CACHE.lock().ok()?;
+    cache.retain(|(_, at, _)| now.duration_since(*at) < STATUS_TTL);
+    cache.iter().find(|(id, _, _)| id == engine.id()).map(|(_, _, r)| r.clone())
+}
+
+fn status_cache_put(engine: Engine, report: &WorkUsageReport) {
+    let Ok(mut cache) = STATUS_CACHE.lock() else { return };
+    cache.retain(|(id, _, _)| id != engine.id());
+    cache.push((engine.id().to_string(), Instant::now(), report.clone()));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageVerdict {
+    Ok,
+    Low,
+    Exhausted,
+    Unknown,
+}
+
+impl UsageVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageVerdict::Ok => "ok",
+            UsageVerdict::Low => "low",
+            UsageVerdict::Exhausted => "exhausted",
+            UsageVerdict::Unknown => "unknown",
+        }
+    }
+}
+
+/// Remaining share (0..=100) for one meter, whichever direction it reports.
+pub fn meter_remaining(meter: &UsageMeter) -> f64 {
+    let pct = if meter.percent.is_finite() { meter.percent.clamp(0.0, 100.0) } else { 0.0 };
+    if meter.kind == "remaining" { pct } else { 100.0 - pct }
+}
+
+/// `ok` (≥20% left) / `low` (<20% left) / `exhausted` (none left), plus the
+/// tightest meter (its label and remaining %). No meters at all is `unknown`.
+pub fn usage_verdict(report: &WorkUsageReport) -> (UsageVerdict, Option<(String, f64)>) {
+    let multi = report.groups.iter().filter(|g| !g.meters.is_empty()).count() > 1;
+    let mut tightest: Option<(String, f64)> = None;
+    for group in &report.groups {
+        for meter in &group.meters {
+            let label = if multi && !group.title.is_empty() {
+                format!("{} · {}", group.title, meter.label)
+            } else {
+                meter.label.clone()
+            };
+            let remaining = meter_remaining(meter);
+            if tightest.as_ref().map(|(_, r)| remaining < *r).unwrap_or(true) {
+                tightest = Some((label, remaining));
+            }
+        }
+    }
+    let Some(t) = tightest else {
+        return (UsageVerdict::Unknown, None);
+    };
+    let verdict = if t.1 <= 0.0 {
+        UsageVerdict::Exhausted
+    } else if t.1 < 20.0 {
+        UsageVerdict::Low
+    } else {
+        UsageVerdict::Ok
+    };
+    (verdict, Some(t))
+}
+
+fn fmt_pct(v: f64) -> String {
+    let v = if v.is_finite() { v.clamp(0.0, 100.0) } else { 0.0 };
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// `Resets in 3h 18m` / `Refreshes in 145h 21m` -> minutes from now.
+fn relative_reset_minutes(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let t = t
+        .strip_prefix("Resets in ")
+        .or_else(|| t.strip_prefix("Refreshes in "))
+        .or_else(|| t.strip_prefix("resets in "))
+        .or_else(|| t.strip_prefix("refreshes in "))
+        .or_else(|| t.strip_prefix("in "))?;
+    let mut total = 0i64;
+    let mut any = false;
+    for part in t.split_whitespace() {
+        let split = part.find(|c: char| !c.is_ascii_digit()).unwrap_or(part.len());
+        let (num, unit) = part.split_at(split);
+        let n: i64 = num.parse().ok()?;
+        total += match unit {
+            "d" => n * 1_440,
+            "h" => n * 60,
+            "m" => n,
+            _ => return None,
+        };
+        any = true;
+    }
+    any.then_some(total)
+}
+
+/// `2026-11-23 21:00` at the given local offset (civil-from-days, no tz crate).
+pub fn format_local_time(epoch_secs: i64, offset_min: i64) -> String {
+    let secs = epoch_secs + offset_min * 60;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", tod / 3_600, (tod % 3_600) / 60)
+}
+
+/// One harness's reset text in local terms: relative CLI text (`Resets in
+/// 3h 18m`) becomes an absolute local time when the offset is known; text that
+/// already names a clock time and zone is passed through untouched.
+fn reset_text(text: &str, now_epoch: i64, local_offset_min: Option<i64>) -> String {
+    if let (Some(offset), Some(mins)) = (local_offset_min, relative_reset_minutes(text)) {
+        return format!("resets {} local", format_local_time(now_epoch + mins * 60, offset));
+    }
+    // the CLI already names a clock time (and zone): keep it, lowercased so it
+    // reads after the `·` separator ("resets 9:40pm (America/Toronto)")
+    let t = text.trim();
+    let mut chars = t.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_lowercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// Plain-text `usage_status` result: one block per harness with each meter,
+/// its reset time and a one-line verdict (`ok` / `low` / `exhausted` /
+/// `unknown`). `now_epoch` + `local_offset_min` are parameters so the text is
+/// deterministic in tests; `None` keeps relative reset text as the CLI wrote it.
+pub fn format_usage_status(
+    reports: &[WorkUsageReport],
+    now_epoch: i64,
+    local_offset_min: Option<i64>,
+) -> String {
+    if reports.is_empty() {
+        return "No usage to report.".to_string();
+    }
+    let mut blocks: Vec<String> = Vec::new();
+    for report in reports {
+        let mut head = format!("{} ({})", report.engine_label, report.engine);
+        if let Some(plan) = &report.plan {
+            head.push_str(&format!(" · plan {plan}"));
+        }
+        // Never the account: agents must not see emails/identifiers.
+        let (verdict, tightest) = usage_verdict(report);
+        let verdict_line = match (&verdict, &tightest) {
+            (UsageVerdict::Unknown, _) => {
+                let reason = report
+                    .error
+                    .as_deref()
+                    .or(report.note.as_deref())
+                    .unwrap_or("no usage data was reported (the CLI's /usage view could not be read)");
+                format!("verdict: unknown — {reason}")
+            }
+            (_, Some((label, left))) => format!(
+                "verdict: {} — {}% left on \"{}\"",
+                verdict.as_str(),
+                fmt_pct(*left),
+                label
+            ),
+            _ => format!("verdict: {}", verdict.as_str()),
+        };
+        let mut lines = vec![head, format!("  {verdict_line}")];
+        let multi = report.groups.iter().filter(|g| !g.meters.is_empty()).count() > 1;
+        for group in &report.groups {
+            for meter in &group.meters {
+                let used = 100.0 - meter_remaining(meter);
+                let label = if multi && !group.title.is_empty() {
+                    format!("{} · {}", group.title, meter.label)
+                } else {
+                    meter.label.clone()
+                };
+                let mut line = format!(
+                    "  - {label}: {}% used · {}% left",
+                    fmt_pct(used),
+                    fmt_pct(meter_remaining(meter))
+                );
+                if let Some(reset) = &meter.reset_text {
+                    line.push_str(&format!(" · {}", reset_text(reset, now_epoch, local_offset_min)));
+                }
+                lines.push(line);
+            }
+        }
+        if !report.stats.is_empty() {
+            let stats: Vec<String> = report.stats.iter().map(|s| format!("{} {}", s.label, s.value)).collect();
+            lines.push(format!("  stats: {}", stats.join(" · ")));
+        }
+        if report.groups.iter().all(|g| g.meters.is_empty()) {
+            if let Some(raw) = report.raw.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                let raw: String = raw.lines().take(6).collect::<Vec<_>>().join(" / ");
+                let clipped: String = raw.chars().take(400).collect();
+                let ellipsis = if raw.chars().count() > 400 { "…" } else { "" };
+                lines.push(format!("  raw: {clipped}{ellipsis}"));
+            }
+        }
+        blocks.push(lines.join("\n"));
+    }
+    if blocks.len() > 1 {
+        let mut best: Option<(&str, f64)> = None;
+        for report in reports {
+            if let (_, Some((_, left))) = usage_verdict(report) {
+                if best.map(|(_, b)| left > b).unwrap_or(true) {
+                    best = Some((report.engine.as_str(), left));
+                }
+            }
+        }
+        if let Some((engine, left)) = best {
+            blocks.push(format!(
+                "Most headroom: {engine} ({}% left). Pick a harness with headroom for expensive work; a `low`/`exhausted` harness will fail its next call.",
+                fmt_pct(left)
+            ));
+        }
+    }
+    blocks.join("\n\n")
+}
+
+/// Read usage for one harness (or every installed quota harness) as plain
+/// text for the agent. Results are cached for `STATUS_TTL`; concurrent
+/// harnesses are fetched in parallel (each is a CLI launch).
+pub async fn usage_status_text(harness: Option<&str>, local_offset_min: Option<i64>) -> Result<String, String> {
+    let explicit = match harness.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => Some(
+            Engine::parse(h)
+                .ok_or_else(|| format!("unknown harness `{h}` (use claude, codex, agy, opencode, pi or fx)"))?,
+        ),
+        None => None,
+    };
+    let targets: Vec<Engine> = match explicit {
+        Some(engine) => vec![engine],
+        None => QUOTA_ENGINES.iter().copied().filter(|e| e.is_present()).collect(),
+    };
+    if targets.is_empty() {
+        let installed: Vec<&str> = Engine::ALL.iter().filter(|e| e.is_present()).map(|e| e.id()).collect();
+        return Ok(if installed.is_empty() {
+            "No Work harness is installed on this server, so there is no usage to report.".to_string()
+        } else {
+            format!(
+                "No quota-reporting harness is installed ({} is installed, but does not report subscription usage).",
+                installed.join(", ")
+            )
+        });
+    }
+    let mut got: HashMap<String, WorkUsageReport> = HashMap::new();
+    let mut pending = Vec::new();
+    for engine in targets.iter().copied() {
+        match status_cache_get(engine) {
+            Some(report) => {
+                got.insert(engine.id().to_string(), report);
+            }
+            None => pending.push(async move {
+                let report = match fetch_usage_logic(Some(engine.id().to_string())).await {
+                    Ok(report) => report,
+                    Err(error) => {
+                        let mut report = WorkUsageReport::base(engine);
+                        report.error = Some(error);
+                        report
+                    }
+                };
+                (engine, report)
+            }),
+        }
+    }
+    for (engine, report) in futures_util::future::join_all(pending).await {
+        status_cache_put(engine, &report);
+        got.insert(engine.id().to_string(), report);
+    }
+    let reports: Vec<WorkUsageReport> = targets.iter().filter_map(|e| got.remove(e.id())).collect();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(format_usage_status(&reports, now, local_offset_min))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1532,6 +1834,146 @@ Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-26T16:11:35Z\n";
         assert_eq!(r.groups[0].meters[0].percent, 5.0);
         assert_eq!(r.stats[0].value, "$188.55");
         assert_eq!(r.stats[1].value, "1 available");
+    }
+
+    fn meter(label: &str, percent: f64, kind: &str, reset: Option<&str>) -> UsageMeter {
+        UsageMeter {
+            label: label.to_string(),
+            percent,
+            kind: kind.to_string(),
+            value_text: format!("{percent}% {kind}"),
+            reset_text: reset.map(str::to_string),
+        }
+    }
+
+    fn report(engine: Engine, groups: Vec<UsageGroup>) -> WorkUsageReport {
+        let mut r = WorkUsageReport::base(engine);
+        r.groups = groups;
+        r
+    }
+
+    /// Verdicts come from the tightest meter's remaining share: 20% is the
+    /// `low` line, 0% is `exhausted`, and a report with no meters is `unknown`
+    /// (that is what a signed-out or unreadable harness looks like).
+    #[test]
+    fn usage_verdicts_follow_remaining_share() {
+        let ok = report(Engine::Claude, vec![UsageGroup { title: String::new(), subtitle: None, meters: vec![meter("Current session", 5.0, "used", None)] }]);
+        assert_eq!(usage_verdict(&ok), (UsageVerdict::Ok, Some(("Current session".to_string(), 95.0))));
+
+        let low = report(Engine::Claude, vec![UsageGroup { title: String::new(), subtitle: None, meters: vec![meter("Current session", 85.0, "used", None)] }]);
+        assert_eq!(usage_verdict(&low).0, UsageVerdict::Low);
+        assert_eq!(usage_verdict(&low).1.unwrap().1, 15.0);
+
+        let exhausted = report(Engine::Codex, vec![UsageGroup { title: "Rate Limits".into(), subtitle: None, meters: vec![meter("Weekly Limit", 100.0, "used", None)] }]);
+        assert_eq!(usage_verdict(&exhausted).0, UsageVerdict::Exhausted);
+
+        // agy reports "remaining": 19.9% left is already low
+        let remaining = report(Engine::Agy, vec![UsageGroup { title: "GEMINI MODELS".into(), subtitle: None, meters: vec![meter("Weekly Limit Remaining", 19.9, "remaining", None)] }]);
+        assert_eq!(usage_verdict(&remaining), (UsageVerdict::Low, Some(("Weekly Limit Remaining".to_string(), 19.9))));
+
+        let mut missing = WorkUsageReport::base(Engine::Claude);
+        missing.error = Some("Claude Code CLI not found".to_string());
+        assert_eq!(usage_verdict(&missing), (UsageVerdict::Unknown, None));
+    }
+
+    /// Multi-group reports prefix the group (agy has per-model quotas) and the
+    /// tightest meter wins across groups.
+    #[test]
+    fn multi_group_labels_and_tightest_meter() {
+        let r = report(
+            Engine::Agy,
+            vec![
+                UsageGroup { title: "GEMINI MODELS".into(), subtitle: None, meters: vec![meter("Weekly Limit Remaining", 86.63, "remaining", None)] },
+                UsageGroup { title: "CLAUDE AND GPT MODELS".into(), subtitle: None, meters: vec![meter("Weekly Limit Remaining", 2.5, "remaining", None)] },
+            ],
+        );
+        let (verdict, tightest) = usage_verdict(&r);
+        assert_eq!(verdict, UsageVerdict::Low);
+        assert_eq!(tightest.unwrap().0, "CLAUDE AND GPT MODELS · Weekly Limit Remaining");
+    }
+
+    #[test]
+    fn relative_resets_become_local_times() {
+        assert_eq!(relative_reset_minutes("Resets in 3h 18m"), Some(198));
+        assert_eq!(relative_reset_minutes("Refreshes in 145h 21m"), Some(8_721));
+        assert_eq!(relative_reset_minutes("Resets 9:40pm (America/Toronto)"), None);
+        assert_eq!(relative_reset_minutes("Quota available"), None);
+        // 2026-11-26 13:33 UTC = 08:33 at UTC-5
+        assert_eq!(format_local_time(1_795_700_000, -300), "2026-11-26 08:33");
+        assert_eq!(format_local_time(1_795_700_000, 0), "2026-11-26 13:33");
+    }
+
+    /// The agent-facing text: header, verdict line, one line per meter with
+    /// used/left, reset in local time, stats, and a cross-harness headroom
+    /// summary. `now`/offset are parameters so this is deterministic.
+    #[test]
+    fn formats_usage_status_text() {
+        let mut claude = report(
+            Engine::Claude,
+            vec![UsageGroup {
+                title: String::new(),
+                subtitle: None,
+                meters: vec![
+                    meter("Current session", 85.0, "used", Some("Resets 9:40pm (America/Toronto)")),
+                    meter("Current week (all models)", 12.0, "used", Some("Resets in 2d 3h")),
+                ],
+            }],
+        );
+        claude.plan = Some("Claude Pro".into());
+        claude.account = Some("user@example.com".into());
+
+        let mut codex = report(
+            Engine::Codex,
+            vec![UsageGroup {
+                title: "Rate Limits".into(),
+                subtitle: None,
+                meters: vec![meter("Weekly Limit", 26.0, "used", Some("Resets in 3h 18m"))],
+            }],
+        );
+        codex.plan = Some("ChatGPT Plus".into());
+        codex.stats = vec![UsageStat { label: "Credits Balance".into(), value: "$188.55".into() }];
+
+        let text = format_usage_status(&[claude, codex], 1_795_700_000, Some(-300));
+        let expected = "\
+Claude Code (claude) · plan Claude Pro
+  verdict: low — 15% left on \"Current session\"
+  - Current session: 85% used · 15% left · resets 9:40pm (America/Toronto)
+  - Current week (all models): 12% used · 88% left · resets 2026-11-28 11:33 local
+
+Codex (codex) · plan ChatGPT Plus
+  verdict: ok — 74% left on \"Weekly Limit\"
+  - Weekly Limit: 26% used · 74% left · resets 2026-11-26 11:51 local
+  stats: Credits Balance $188.55
+
+Most headroom: codex (74% left). Pick a harness with headroom for expensive work; a `low`/`exhausted` harness will fail its next call.";
+        assert_eq!(text, expected);
+        assert!(!text.contains('@') && !text.contains("user@example.com"), "{text}");
+    }
+
+    #[test]
+    fn unknown_reports_carry_the_reason() {
+        let mut missing = WorkUsageReport::base(Engine::Claude);
+        missing.error = Some("Claude Code CLI not found, install it: https://claude.com/setup".into());
+        let text = format_usage_status(&[missing], 0, None);
+        assert!(text.contains("verdict: unknown — Claude Code CLI not found"), "{text}");
+
+        let mut opencode = WorkUsageReport::base(Engine::Opencode);
+        opencode.note = Some("OpenCode does not report subscription quota or usage.".into());
+        let text = format_usage_status(&[opencode], 0, None);
+        assert!(text.contains("verdict: unknown — OpenCode does not report"), "{text}");
+    }
+
+    /// A cached report is reused inside the TTL and replaced by a newer fetch.
+    #[test]
+    fn usage_cache_reuses_reports_briefly() {
+        let mut r = WorkUsageReport::base(Engine::Claude);
+        r.plan = Some("Cached".into());
+        status_cache_put(Engine::Claude, &r);
+        assert_eq!(status_cache_get(Engine::Claude).and_then(|r| r.plan), Some("Cached".to_string()));
+        let mut newer = WorkUsageReport::base(Engine::Claude);
+        newer.plan = Some("Fresh".into());
+        status_cache_put(Engine::Claude, &newer);
+        assert_eq!(status_cache_get(Engine::Claude).and_then(|r| r.plan), Some("Fresh".to_string()));
     }
 
 }

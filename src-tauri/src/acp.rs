@@ -1439,6 +1439,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Run commands with your own shell tool. For dev servers, watchers and other long-running jobs, use its background mode where it has one (or start them in the background from the shell), keep working on what does not depend on them, and check their output when you need it.\n\
 - To add, edit, list, enable, disable, or remove custom MCP servers in Vicuna (e.g. when the user gives an MCP URL endpoint), use the `manage_mcp` tool on vicuna-mcp (the fixed `vicuna-mcp` server itself cannot be modified or disabled). When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
 - To check back later (a slow deploy or CI run, a follow-up the user asks for at a certain time), call `schedule_wakeup` on vicuna-mcp with a `message` for yourself and `in_minutes` or a local `at` time, then end your turn: Vicuna sends that message into this session at the time.\n\
+- Before starting an expensive worker session (or when a harness call fails with a quota/limit error), call `usage_status` on vicuna-mcp to see each harness's remaining quota and reset time, and pick one that has quota left.\n\
 {session_info}\n{goal}",
         goal = goal
             .filter(|g| !g.trim().is_empty())
