@@ -623,13 +623,183 @@ pub fn storage(cmd: &str, id: &str, key: Option<&str>, value: Option<&Value>) ->
     }
 }
 
-/// Server API actions: `plugin_list | plugin_install {source} |
+// ---------------------------------------------------------------------------
+// Explore: the official plugin index (github.com/anslwy/vicuna-plugins).
+// Fetched by the server (so remote/headless windows work), cached for a few
+// minutes, and treated as untrusted: entries that break any rule are
+// dropped, never repaired.
+
+/// The official index. `VICUNA_PLUGINS_INDEX_URL` overrides it (tests).
+pub const INDEX_URL: &str = "https://raw.githubusercontent.com/anslwy/vicuna-plugins/main/index.json";
+const INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_INDEX: usize = 512 * 1024;
+const MAX_INDEX_ENTRIES: usize = 500;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub source: String,
+    pub kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
+    pub tags: Vec<String>,
+    #[serde(rename = "minVicuna", skip_serializing_if = "Option::is_none")]
+    pub min_vicuna: Option<String>,
+}
+
+/// Images may only come from GitHub over https (no other hosts, no
+/// credentials/ports, no quotes or whitespace that could break out of an
+/// attribute).
+pub fn valid_image_url(u: &str) -> bool {
+    if u.len() > 512 || u.bytes().any(|b| b <= b' ' || b"\"'<>\\`".contains(&b) || b >= 0x7f) {
+        return false;
+    }
+    ["https://raw.githubusercontent.com/", "https://github.com/"].iter().any(|p| u.strip_prefix(p).is_some_and(|r| !r.is_empty() && !r.starts_with('/')))
+}
+
+/// Plain one-line text: trimmed, 1..=max chars, no control characters.
+fn clean_text(v: &Value, max: usize) -> Option<String> {
+    let s = v.as_str()?.trim();
+    (!s.is_empty() && s.chars().count() <= max && !s.chars().any(|c| c.is_control() && c != '\n')).then(|| s.to_string())
+}
+
+fn valid_semver(s: &str) -> bool {
+    let p: Vec<&str> = s.split('.').collect();
+    p.len() == 3 && p.iter().all(|x| !x.is_empty() && x.len() <= 6 && x.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// One index entry, or why it was rejected.
+fn parse_entry(v: &Value) -> Result<CatalogEntry, String> {
+    let id = v["id"].as_str().filter(|s| valid_id(s)).ok_or("invalid id")?.to_string();
+    let name = clean_text(&v["name"], 60).ok_or("invalid name")?;
+    let description = clean_text(&v["description"], 300).ok_or("invalid description")?;
+    let author = clean_text(&v["author"], 60).ok_or("invalid author")?;
+    let source = v["source"].as_str().ok_or("missing source")?;
+    // only owner/repo: the index can't point installs at arbitrary URLs
+    let Ok(Source::Repo { owner, repo }) = parse_source(source) else { return Err("source must be owner/repo".into()) };
+    if source.contains("://") || source.starts_with("github.com") {
+        return Err("source must be owner/repo".into());
+    }
+    let mut kinds: Vec<String> = Vec::new();
+    for k in v["kinds"].as_array().ok_or("missing kinds")? {
+        let k = k.as_str().filter(|k| *k == "theme" || *k == "panel").ok_or("unknown kind")?;
+        if !kinds.iter().any(|x| x == k) {
+            kinds.push(k.to_string());
+        }
+    }
+    if kinds.is_empty() {
+        return Err("no kinds".into());
+    }
+    let img = |k: &str| -> Result<Option<String>, String> {
+        match &v[k] {
+            Value::Null => Ok(None),
+            Value::String(s) if valid_image_url(s) => Ok(Some(s.clone())),
+            _ => Err(format!("{k} must be an https GitHub URL")),
+        }
+    };
+    let (icon, screenshot) = (img("icon")?, img("screenshot")?);
+    let tags = match &v["tags"] {
+        Value::Null => vec![],
+        Value::Array(a) if a.len() <= 8 => a.iter().map(|t| clean_text(t, 24).filter(|t| !t.contains('\n'))).collect::<Option<Vec<_>>>().ok_or("invalid tag")?,
+        _ => return Err("invalid tags".into()),
+    };
+    let min_vicuna = match &v["minVicuna"] {
+        Value::Null => None,
+        Value::String(s) if valid_semver(s) => Some(s.clone()),
+        _ => return Err("invalid minVicuna".into()),
+    };
+    if name.contains('\n') || author.contains('\n') {
+        return Err("name/author must be one line".into());
+    }
+    Ok(CatalogEntry { id, name, description, author, source: format!("{owner}/{repo}"), kinds, icon, screenshot, tags, min_vicuna })
+}
+
+/// Parse a whole index: `{"version": 1, "plugins": [...]}`. Bad entries
+/// (and duplicate ids after the first) are skipped and counted.
+pub fn parse_index(bytes: &[u8]) -> Result<(Vec<CatalogEntry>, usize), String> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("invalid plugin index: {e}"))?;
+    if v["version"].as_u64() != Some(1) {
+        return Err("unsupported plugin index version".into());
+    }
+    let list = v["plugins"].as_array().ok_or("invalid plugin index: no plugins list")?;
+    let (mut out, mut skipped) = (Vec::<CatalogEntry>::new(), 0usize);
+    for e in list.iter().take(MAX_INDEX_ENTRIES) {
+        match parse_entry(e) {
+            Ok(c) if !out.iter().any(|o| o.id == c.id) => out.push(c),
+            _ => skipped += 1,
+        }
+    }
+    skipped += list.len().saturating_sub(MAX_INDEX_ENTRIES);
+    Ok((out, skipped))
+}
+
+fn semver_lt(a: &str, b: &str) -> bool {
+    let p = |s: &str| s.split('.').map(|x| x.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    p(a) < p(b)
+}
+
+/// Same repo, whatever spelling the install used (`owner/repo`, URL, `.git`).
+fn same_source(a: &str, b: &str) -> bool {
+    match (parse_source(a), parse_source(b)) {
+        (Ok(Source::Repo { owner: o1, repo: r1 }), Ok(Source::Repo { owner: o2, repo: r2 })) => o1.eq_ignore_ascii_case(&o2) && r1.eq_ignore_ascii_case(&r2),
+        _ => false,
+    }
+}
+
+type IndexCache = Option<(std::time::Instant, String, Vec<CatalogEntry>, usize)>;
+fn index_cache() -> &'static std::sync::Mutex<IndexCache> {
+    static C: std::sync::OnceLock<std::sync::Mutex<IndexCache>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// `plugin_catalog {refresh?}`: the index entries, each with its install
+/// state (`installed` = version or null, `conflict` = same id installed from
+/// another source) and whether this Vicuna is new enough.
+pub async fn catalog(refresh: bool) -> Result<Value, String> {
+    let url = std::env::var("VICUNA_PLUGINS_INDEX_URL").unwrap_or_else(|_| INDEX_URL.into());
+    let cached = {
+        let g = index_cache().lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().filter(|(t, u, ..)| !refresh && *u == url && t.elapsed() < INDEX_TTL).map(|(t, _, e, s)| (*t, e.clone(), *s))
+    };
+    let (fetched_at, entries, skipped) = match cached {
+        Some(c) => c,
+        None => {
+            let bytes = get_capped(&client()?, &url, "application/json", None, MAX_INDEX).await?.ok_or_else(|| format!("{url}: not found"))?;
+            let (e, s) = parse_index(&bytes)?;
+            let now = std::time::Instant::now();
+            *index_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some((now, url.clone(), e.clone(), s));
+            (now, e, s)
+        }
+    };
+    let this = env!("CARGO_PKG_VERSION");
+    let rows: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let inst = read_installed(&e.id);
+            let mut v = serde_json::to_value(e).unwrap();
+            v["installed"] = json!(inst.as_ref().map(|(m, _)| m.version.clone()));
+            v["conflict"] = json!(inst.as_ref().is_some_and(|(_, i)| !same_source(&i.source, &e.source)));
+            v["compatible"] = json!(e.min_vicuna.as_deref().is_none_or(|m| !semver_lt(this, m)));
+            v
+        })
+        .collect();
+    let age = fetched_at.elapsed().as_secs();
+    Ok(json!({ "url": url, "plugins": rows, "skipped": skipped, "ageSecs": age, "vicunaVersion": this }))
+}
+
+/// Server API actions: `plugin_catalog {refresh?} | plugin_list | plugin_install {source} |
 /// plugin_upgrade {id} | plugin_uninstall {id} | plugin_storage_get|keys|
 /// set|remove {id, key?, value?}`.
 pub async fn action(cmd: &str, args: &Value) -> Result<Value, String> {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string).ok_or(format!("missing {k}"));
     match cmd {
         "plugin_list" => Ok(list()),
+        "plugin_catalog" => catalog(args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false)).await,
         "plugin_install" => install(&s("source")?).await,
         "plugin_upgrade" => upgrade(&s("id")?).await,
         "plugin_uninstall" => uninstall(&s("id")?),
@@ -716,6 +886,60 @@ mod tests {
         assert_eq!(m.files(), vec!["notes.html".to_string(), "notes.svg".to_string()]);
     }
 
+    fn idx_entry() -> Value {
+        json!({"id":"lagoon","name":"Lagoon","description":"Teal themes.","author":"anslwy","source":"anslwy/vicuna-theme-lagoon",
+            "kinds":["theme"],"icon":"https://raw.githubusercontent.com/anslwy/vicuna-plugins/main/icons/lagoon.svg",
+            "screenshot":"https://github.com/anslwy/vicuna-plugins/raw/main/s.jpg","tags":["dark"],"minVicuna":"0.0.45"})
+    }
+
+    #[test]
+    fn index_entries_are_validated_not_repaired() {
+        let ok = parse_entry(&idx_entry()).unwrap();
+        assert_eq!((ok.source.as_str(), ok.kinds.clone(), ok.min_vicuna.as_deref()), ("anslwy/vicuna-theme-lagoon", vec!["theme".to_string()], Some("0.0.45")));
+        let bad = |k: &str, v: Value| {
+            let mut e = idx_entry();
+            e[k] = v;
+            parse_entry(&e).is_err()
+        };
+        for (k, v) in [
+            ("id", json!("Bad Id")), ("id", json!("../x")), ("name", json!("")), ("name", json!("x".repeat(61))),
+            ("name", json!("a\nb")), ("description", json!("x".repeat(301))), ("description", json!("a\u{7}b")), ("author", Value::Null),
+            ("source", json!("https://evil.example/p.json")), ("source", json!("https://github.com/a/b")), ("source", json!("a/b/c")),
+            ("kinds", json!([])), ("kinds", json!(["theme", "script"])), ("kinds", json!("theme")),
+            ("icon", json!("http://raw.githubusercontent.com/a/b.svg")), ("icon", json!("https://evil.example/i.svg")),
+            ("icon", json!("https://raw.githubusercontent.com.evil.example/i.svg")), ("icon", json!("javascript:alert(1)")),
+            ("screenshot", json!("https://github.com/a/b\" onerror=\"x")), ("screenshot", json!("https://github.com//evil.example/x")),
+            ("icon", json!("data:image/svg+xml,<svg/>")), ("tags", json!(["x".repeat(25)])), ("tags", json!((0..9).map(|i| i.to_string()).collect::<Vec<_>>())),
+            ("minVicuna", json!("1.0")), ("minVicuna", json!(">=1.0.0")),
+        ] {
+            assert!(bad(k, v.clone()), "{k} = {v}");
+        }
+        // optional fields may be absent; duplicate kinds collapse
+        let mut e = idx_entry();
+        for k in ["icon", "screenshot", "tags", "minVicuna"] {
+            e.as_object_mut().unwrap().remove(k);
+        }
+        e["kinds"] = json!(["panel", "panel", "theme"]);
+        let c = parse_entry(&e).unwrap();
+        assert_eq!((c.icon, c.tags.len(), c.kinds), (None, 0, vec!["panel".to_string(), "theme".to_string()]));
+    }
+
+    #[test]
+    fn index_skips_bad_and_duplicate_entries() {
+        let mut bad = idx_entry();
+        bad["icon"] = json!("https://evil.example/x.svg");
+        let mut other = idx_entry();
+        other["id"] = json!("other");
+        let body = json!({"version": 1, "plugins": [idx_entry(), bad, idx_entry(), other, 42]}).to_string();
+        let (list, skipped) = parse_index(body.as_bytes()).unwrap();
+        assert_eq!((list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), skipped), (vec!["lagoon", "other"], 3));
+        assert!(parse_index(br#"{"version": 2, "plugins": []}"#).is_err());
+        assert!(parse_index(br#"{"version": 1}"#).is_err());
+        assert!(parse_index(b"<html>").is_err());
+        assert!(same_source("https://github.com/Me/Repo.git", "me/repo") && !same_source("me/repo", "me/other"));
+        assert!(semver_lt("0.0.9", "0.0.45") && !semver_lt("0.1.0", "0.0.45"));
+    }
+
     #[test]
     fn panel_csp_locks_the_document_down() {
         for d in ["sandbox allow-scripts;", "default-src 'none'", "connect-src 'none'", "form-action 'none'", "frame-src 'none'", "base-uri 'none'"] {
@@ -751,6 +975,9 @@ mod tests {
                     ("200 OK", format!("<p>notes {v}</p>"))
                 } else if req.starts_with("GET /repos/me/nord/contents/notes.svg") {
                     ("200 OK", "<svg/>".to_string())
+                } else if req.starts_with("GET /index.json") {
+                    let e = |id: &str, src: &str| json!({"id": id, "name": id, "description": "d", "author": "me", "source": src, "kinds": ["panel"], "minVicuna": "999.0.0"});
+                    ("200 OK", json!({"version": 1, "plugins": [e("nord", "me/nord"), e("clash", "someone/clash"), {"id": "BAD"}]}).to_string())
                 } else if req.starts_with("GET /repos/me/huge/contents/vicuna-plugin.json") {
                     let mut m = serde_json::to_value(manifest()).unwrap();
                     m["id"] = json!("huge");
@@ -770,10 +997,27 @@ mod tests {
             std::env::set_var("VICUNA_PLUGINS_DIR", &dir);
             std::env::set_var("VICUNA_PLUGINS_GITHUB_API", format!("http://127.0.0.1:{port}"));
             std::env::set_var("GH_TOKEN", "test");
+            std::env::set_var("VICUNA_PLUGINS_INDEX_URL", format!("http://127.0.0.1:{port}/index.json"));
         }
+
+        // catalog: install state, bad entries skipped, minVicuna gate
+        let c = action("plugin_catalog", &json!({})).await.unwrap();
+        assert_eq!((c["skipped"].clone(), c["plugins"].as_array().unwrap().len()), (json!(1), 2));
+        assert_eq!((c["plugins"][0]["installed"].clone(), c["plugins"][0]["compatible"].clone()), (Value::Null, json!(false)));
+        // a hand-made install of id "clash" from elsewhere shows as a conflict
+        std::fs::create_dir_all(dir.join("clash")).unwrap();
+        let mut cm = manifest();
+        cm.id = "clash".into();
+        std::fs::write(dir.join("clash").join(MANIFEST), serde_json::to_vec(&cm).unwrap()).unwrap();
+        std::fs::write(dir.join("clash").join("install.json"), json!({"source": "evil/clash", "installedAt": 0}).to_string()).unwrap();
 
         let e = action("plugin_install", &json!({"source": "me/nord"})).await.unwrap();
         assert_eq!(e["version"], "1.0.0");
+        // cached index, fresh install state
+        let c = action("plugin_catalog", &json!({})).await.unwrap();
+        assert_eq!((c["plugins"][0]["installed"].clone(), c["plugins"][0]["conflict"].clone()), (json!("1.0.0"), json!(false)));
+        assert_eq!(c["plugins"][1]["conflict"], json!(true));
+        std::fs::remove_dir_all(dir.join("clash")).unwrap();
         assert_eq!(list().as_array().unwrap().len(), 1);
         // panel files are served only under the capability, only listed files
         let base = e["panelBase"].as_str().unwrap().to_string();
