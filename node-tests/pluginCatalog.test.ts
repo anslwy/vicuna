@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cardAction, filterCatalog, safeImageUrl, type CatalogEntry } from "../src/lib/pluginCatalog.ts";
+import { cardAction, filterCatalog, githubRepoUrl, safeImageUrl, type CatalogEntry } from "../src/lib/pluginCatalog.ts";
 
 const entry = (over: Partial<CatalogEntry> = {}): CatalogEntry => ({
   id: "lagoon", name: "Lagoon Themes", description: "Deep teal dark theme.", author: "anslwy", source: "anslwy/vicuna-theme-lagoon",
@@ -30,4 +30,46 @@ test("card action", () => {
   assert.equal(cardAction(entry({ installed: "1.0.0" })), "upgrade");
   assert.equal(cardAction(entry({ installed: "1.0.0", conflict: true })), "conflict");
   assert.equal(cardAction(entry({ compatible: false })), "incompatible");
+});
+
+test("githubRepoUrl resolves GitHub sources and ignores local/non-GitHub sources", () => {
+  const expected = "https://github.com/anslwy/vicuna-theme-lagoon";
+  for (const src of [
+    "anslwy/vicuna-theme-lagoon",
+    "  anslwy/vicuna-theme-lagoon/  ",
+    "anslwy/vicuna-theme-lagoon.git",
+    "github.com/anslwy/vicuna-theme-lagoon",
+    "https://github.com/anslwy/vicuna-theme-lagoon",
+    "https://github.com/anslwy/vicuna-theme-lagoon/",
+    "https://github.com/anslwy/vicuna-theme-lagoon.git",
+    "http://github.com/anslwy/vicuna-theme-lagoon",
+    "HTTPS://GITHUB.COM/anslwy/vicuna-theme-lagoon.GIT",
+  ]) {
+    assert.equal(githubRepoUrl(src), expected, src);
+  }
+  assert.equal(githubRepoUrl("my_org/my.plugin-1"), "https://github.com/my_org/my.plugin-1");
+  for (const nonGh of [
+    "",
+    "   ",
+    null,
+    undefined,
+    42,
+    "/home/user/my-plugin",
+    "./my-plugin",
+    "../my-plugin",
+    "file:///home/user/my-plugin",
+    "C:\\plugins\\my-plugin",
+    "C:/plugins/my-plugin",
+    "https://example.com/vicuna-plugin.json",
+    "https://github.com/anslwy/vicuna-theme-lagoon/releases/download/v1.0.0/vicuna-plugin.json",
+    "https://gitlab.com/anslwy/vicuna-theme-lagoon",
+    "anslwy/vicuna/extra",
+    "only-one-segment",
+    "../evil",
+    "owner/..",
+    "owner/repo with space",
+    "owner/repo?q=1",
+  ]) {
+    assert.equal(githubRepoUrl(nonGh), null, String(nonGh));
+  }
 });

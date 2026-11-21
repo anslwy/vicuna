@@ -6,7 +6,7 @@
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
   import { commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
-  import { cardAction, filterCatalog, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
+  import { cardAction, filterCatalog, githubRepoUrl, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
   let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged }: {
     onHarnessesChanged?: () => void;
@@ -219,6 +219,7 @@
           {@const shot = safeImageUrl(e.screenshot)}
           {@const icon = safeImageUrl(e.icon)}
           {@const inst = installedById.get(e.id)}
+          {@const repoUrl = githubRepoUrl(e.source)}
           <div class="pl-card" data-testid="plugin-card-{e.id}">
             {#if shot}<img class="pl-shot" src={shot} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
             <div class="pl-card-body">
@@ -244,7 +245,16 @@
               <div class="pl-tags">
                 {#each e.kinds as k (k)}<span class="pl-kind">{KIND_LABEL[k] ?? k}</span>{/each}
                 {#each e.tags as t (t)}<span class="pl-tag">{t}</span>{/each}
-                <span class="pl-src" title={e.source}>{e.source}</span>
+                <span class="pl-src" title={e.source}>
+                  {#if repoUrl}
+                    <a class="pl-src-link" href={repoUrl} target="_blank" rel="noopener noreferrer" title="Open {e.source} on GitHub" data-testid="plugin-card-repo-{e.id}">
+                      <svg class="pl-gh" width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+                      <span class="pl-src-text">{e.source}</span>
+                    </a>
+                  {:else}
+                    {e.source}
+                  {/if}
+                </span>
               </div>
               {#if inst && act === "upgrade"}
                 <div class="pl-themes">
@@ -280,6 +290,7 @@
     <div class="pl-muted" data-testid="plugins-empty">{listing ? "Loading…" : "No plugins installed."}</div>
   {:else}
     {#each plugins as p (p.id)}
+      {@const repoUrl = githubRepoUrl(p.source)}
       <div class="pl-item" data-testid="plugin-row-{p.id}">
         <div class="pl-item-top">
           <span class="pl-name">{p.name}</span>
@@ -289,7 +300,16 @@
           <button class="pl-btn {confirmRemove === p.id ? 'danger' : ''}" data-testid="plugin-uninstall-{p.id}" disabled={!!busy} onclick={() => uninstall(p)} onblur={() => { if (confirmRemove === p.id) confirmRemove = null; }}>{busy === `uninstall:${p.id}` ? "Removing…" : confirmRemove === p.id ? "Confirm?" : "Uninstall"}</button>
         </div>
         {#if p.description}<div class="pl-muted">{p.description}</div>{/if}
-        <div class="pl-src" title={p.source}>{p.source}</div>
+        <div class="pl-src" title={p.source}>
+          {#if repoUrl}
+            <a class="pl-src-link" href={repoUrl} target="_blank" rel="noopener noreferrer" title="Open {p.source} on GitHub" data-testid="plugin-repo-{p.id}">
+              <svg class="pl-gh" width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+              <span class="pl-src-text">{p.source}</span>
+            </a>
+          {:else}
+            {p.source}
+          {/if}
+        </div>
         <div class="pl-themes">
           {#if p.bridge}
             <span class="pl-theme" data-testid="plugin-bridge-{p.id}">Bridge · {p.bridge.name || p.name} (right-click a Work session to configure)</span>
@@ -377,6 +397,11 @@
   .pl-ver { color: var(--muted); font-size: 12px; }
   .pl-spacer { flex: 1; }
   .pl-src { color: var(--muted-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-src-link { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; min-width: 0; color: inherit; text-decoration: none; vertical-align: middle; }
+  .pl-src-link:hover { color: var(--text); }
+  .pl-src-link:hover .pl-src-text { text-decoration: underline; }
+  .pl-src-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .pl-gh { flex: none; opacity: 0.85; }
   .pl-themes { display: flex; flex-wrap: wrap; gap: 6px; }
   .pl-theme { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border-2); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 10px; font: inherit; font-size: 12.5px; cursor: pointer; }
   .pl-theme:hover { background: var(--hover); }
@@ -399,7 +424,7 @@
   .pl-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
   .pl-kind { font-size: 11px; font-weight: 600; color: var(--accent-fg); background: var(--accent); border-radius: 6px; padding: 1px 7px; }
   .pl-tag { font-size: 11px; color: var(--muted); background: var(--hover); border-radius: 6px; padding: 1px 7px; }
-  .pl-tags .pl-src { flex: 1; min-width: 0; text-align: right; }
+  .pl-tags .pl-src { flex: 1; min-width: 0; display: flex; justify-content: flex-end; }
   .pl-foot a { color: var(--accent); }
   .pl-harness { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; border: 1px dashed var(--border-2); border-radius: 10px; padding: 6px 10px; }
   .pl-cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--hover); border-radius: 6px; padding: 2px 6px; word-break: break-all; }
