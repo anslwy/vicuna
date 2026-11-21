@@ -177,6 +177,9 @@ pub struct EngineSummary {
     pub installed: bool,
     pub version: Option<String>,
     pub missing: Option<String>,
+    /// The Usage view has a tab for it (quota harness or plugin usage map).
+    #[serde(default)]
+    pub usage: bool,
 }
 
 pub fn not_installed_info() -> WorkEngineInfo {

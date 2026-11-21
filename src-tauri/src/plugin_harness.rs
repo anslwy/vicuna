@@ -74,6 +74,135 @@ pub struct Harness {
     pub install_hint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_url: Option<String>,
+    /// Optional subscription-usage command + a declarative map of its JSON
+    /// output (see `UsageSpec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageSpec>,
+}
+
+/// `usage`: a command printing JSON (same rules as `acp`: bare program on
+/// PATH, args list, no shell) and a map from JSON pointers (RFC 6901, e.g.
+/// `/allowance/weekly/usedPercent`) to the Usage view's fields. No plugin
+/// code runs: Vicuna reads the output itself (JSON only, capped at
+/// `USAGE_MAX_BYTES` / `USAGE_TIMEOUT_SECS`).
+///
+/// ```json
+/// "usage": {
+///   "command": "muse", "args": ["usage", "--json"],
+///   "map": {
+///     "plan": "/allowance/tier",
+///     "note": "/hint",
+///     "meters": [
+///       { "label": "Weekly", "usedPercent": "/allowance/weekly/usedPercent", "resetsAt": "/allowance/weekly/resetsAtMs" },
+///       { "each": "/limits", "labelPath": "/name", "used": "/used", "limit": "/max", "resetsAt": "/resetsAt" }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Per meter: `label` (fixed text) or `labelPath`; one of `usedPercent`,
+/// `remainingPercent` or `used` + `limit`; optional `resetsAt` (ISO 8601 or
+/// epoch seconds/milliseconds) and `group`. With `each`, the meter repeats
+/// for every element of that array and its other paths are relative to the
+/// element. A meter whose value is missing is skipped; no meters at all
+/// reports usage as unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageSpec {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub map: UsageMap,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageMap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub meters: Vec<UsageMeterSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMeterSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub each: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+pub const USAGE_MAX_BYTES: usize = 256 * 1024;
+pub const USAGE_TIMEOUT_SECS: u64 = 15;
+const MAX_METERS: usize = 16;
+
+impl UsageSpec {
+    pub fn launch(&self) -> AcpLaunch {
+        AcpLaunch { command: self.command.clone(), args: self.args.clone() }
+    }
+}
+
+fn valid_pointer(p: &str) -> bool {
+    (p.is_empty() || p.starts_with('/')) && p.len() <= 200 && !p.chars().any(char::is_control)
+}
+
+fn valid_text(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && t.chars().count() <= 40 && !t.chars().any(char::is_control)
+}
+
+fn validate_usage(u: &UsageSpec) -> Result<(), String> {
+    valid_command(&u.command).map_err(|e| format!("usage: {e}"))?;
+    if u.args.len() > MAX_ARGS {
+        return Err(format!("usage: at most {MAX_ARGS} arguments"));
+    }
+    for a in &u.args {
+        valid_arg(a).map_err(|e| format!("usage: {e}"))?;
+    }
+    let m = &u.map;
+    for p in [&m.plan, &m.note].into_iter().flatten() {
+        if !valid_pointer(p) {
+            return Err(format!("usage: {p:?} is not a JSON pointer (\"/a/b\")"));
+        }
+    }
+    if m.meters.is_empty() || m.meters.len() > MAX_METERS {
+        return Err(format!("usage: map.meters needs 1-{MAX_METERS} entries"));
+    }
+    for (i, x) in m.meters.iter().enumerate() {
+        let paths = [&x.each, &x.label_path, &x.used_percent, &x.remaining_percent, &x.used, &x.limit, &x.resets_at];
+        if let Some(bad) = paths.into_iter().flatten().find(|p| !valid_pointer(p)) {
+            return Err(format!("usage: meter {i}: {bad:?} is not a JSON pointer (\"/a/b\")"));
+        }
+        for t in [&x.label, &x.group].into_iter().flatten() {
+            if !valid_text(t) {
+                return Err(format!("usage: meter {i}: labels must be 1-40 characters"));
+            }
+        }
+        if x.label.is_none() && x.label_path.is_none() {
+            return Err(format!("usage: meter {i} needs a label or labelPath"));
+        }
+        let ways = x.used_percent.is_some() as u8 + x.remaining_percent.is_some() as u8 + (x.used.is_some() || x.limit.is_some()) as u8;
+        if ways != 1 || x.used.is_some() != x.limit.is_some() {
+            return Err(format!("usage: meter {i} needs exactly one of usedPercent, remainingPercent or used + limit"));
+        }
+    }
+    Ok(())
 }
 
 fn valid_id(s: &str) -> bool {
@@ -143,6 +272,9 @@ pub fn validate(list: &[Harness]) -> Result<(), String> {
                 return Err(format!("harness {}: installUrl must be an https URL", h.id));
             }
         }
+        if let Some(u) = &h.usage {
+            validate_usage(u).map_err(|e| format!("harness {}: {e}", h.id))?;
+        }
     }
     Ok(())
 }
@@ -156,6 +288,9 @@ pub struct Grant {
     pub command: String,
     pub args: Vec<String>,
     pub granted_at: i64,
+    /// The usage command approved with it (None = the harness had none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AcpLaunch>,
 }
 
 pub type Consent = BTreeMap<String, Grant>;
@@ -169,7 +304,21 @@ fn write_consent(plugin_dir: &Path, c: &Consent) -> Result<(), String> {
 }
 
 pub fn consented(consent: &Consent, h: &Harness) -> bool {
-    consent.get(&h.id).is_some_and(|g| g.command == h.acp.command && g.args == h.acp.args)
+    consent.get(&h.id).is_some_and(|g| {
+        g.command == h.acp.command && g.args == h.acp.args && g.usage == h.usage.as_ref().map(UsageSpec::launch)
+    })
+}
+
+fn launch_of(v: Option<&Value>) -> Option<AcpLaunch> {
+    let v = v.filter(|v| !v.is_null())?;
+    Some(AcpLaunch {
+        command: v.get("command").and_then(Value::as_str).unwrap_or_default().to_string(),
+        args: v
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    })
 }
 
 /// Harnesses (of the current manifest) that need the user's approval.
@@ -191,10 +340,11 @@ pub fn grant(plugin_dir: &Path, list: &[Harness], approved: &[Value], now: i64) 
             .and_then(Value::as_array)
             .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        if cmd != h.acp.command || args != h.acp.args {
+        let usage = launch_of(a.get("usage"));
+        if cmd != h.acp.command || args != h.acp.args || usage != h.usage.as_ref().map(UsageSpec::launch) {
             return Err(format!("harness {hid}: the command changed since it was shown; review it again"));
         }
-        consent.insert(hid.to_string(), Grant { command: cmd.to_string(), args, granted_at: now });
+        consent.insert(hid.to_string(), Grant { command: cmd.to_string(), args, granted_at: now, usage });
     }
     write_consent(plugin_dir, &consent)?;
     Ok(consent)
@@ -220,6 +370,7 @@ pub fn describe(h: &Harness, consent: &Consent, plugin_id: &str) -> Value {
         "installHint": h.install_hint, "installUrl": h.install_url,
         "enabled": consented(consent, h),
         "installed": find_command(&h.acp.command).is_some(),
+        "usage": h.usage.as_ref().map(|u| json!({"command": u.command, "args": u.args})),
     })
 }
 
@@ -344,6 +495,67 @@ pub fn launch(key: &str, workspace: &str) -> Result<(PathBuf, tokio::process::Co
     Ok((bin, cmd))
 }
 
+// ---------- usage command ----------
+
+/// Whether this harness reports usage (it has a usage map and is enabled).
+pub fn reports_usage(key: &str) -> bool {
+    lookup(key).is_some_and(|r| r.enabled && r.harness.usage.is_some())
+}
+
+/// Run the consented usage command and return (map, parsed JSON output).
+/// Refuses unless the user approved exactly this usage command.
+pub fn run_usage(key: &str) -> Result<(UsageMap, Value), String> {
+    let r = lookup(key).ok_or("this plugin harness is no longer installed")?;
+    let u = r.harness.usage.clone().ok_or_else(|| format!("{} does not report usage.", r.harness.label))?;
+    if !r.enabled {
+        return Err(format!(
+            "\"{}\" is not enabled: approve its commands in Settings → Plugins before Vicuna reads its usage.",
+            r.harness.label
+        ));
+    }
+    let bin = find_command(&u.command).ok_or_else(|| format!("the usage command `{}` was not found on PATH", u.command))?;
+    let out = run_capped(&bin, &u.args, USAGE_MAX_BYTES, std::time::Duration::from_secs(USAGE_TIMEOUT_SECS))?;
+    let v: Value = serde_json::from_slice(&out).map_err(|_| format!("`{}` did not print JSON", u.command))?;
+    Ok((u.map, v))
+}
+
+/// Spawn `bin args` (no shell, cwd = home), read at most `max` bytes of
+/// stdout and kill it after `timeout`.
+pub fn run_capped(bin: &Path, args: &[String], max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
+        cmd.env("PATH", p);
+    }
+    if let Some(h) = crate::opencode::home_dir() {
+        cmd.current_dir(h);
+    }
+    cmd.env("NO_COLOR", "1");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", bin.display()))?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let r = (&mut stdout).take(max as u64 + 1).read_to_end(&mut buf);
+        let _ = tx.send(r.map(|_| buf));
+    });
+    let got = rx.recv_timeout(timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+    match got {
+        Ok(Ok(buf)) if buf.len() > max => Err(format!("usage output is larger than {} KB", max / 1024)),
+        Ok(Ok(buf)) => Ok(buf),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("the usage command took longer than {}s", timeout.as_secs())),
+    }
+}
+
 // ---------- saved model per harness ----------
 
 fn models_path() -> Option<PathBuf> {
@@ -430,6 +642,7 @@ mod tests {
             models: vec![],
             install_hint: String::new(),
             install_url: None,
+            usage: None,
         }
     }
 
@@ -502,5 +715,74 @@ mod tests {
         revoke(&dir, Some("demo")).unwrap();
         assert!(!consented(&read_consent(&dir), &v1[0]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn usage_spec(cmd: &str, args: &[&str]) -> UsageSpec {
+        serde_json::from_value(json!({
+            "command": cmd, "args": args,
+            "map": {"meters": [{"label": "Weekly", "usedPercent": "/w/used"}]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn usage_command_and_map_are_validated() {
+        let mut x = h("muse", &["acp"]);
+        x.usage = Some(usage_spec("muse", &["usage", "--json"]));
+        assert!(validate(&[x.clone()]).is_ok());
+        for (cmd, args) in [("/bin/muse", vec!["usage"]), ("muse", vec!["usage;rm"]), ("muse", vec!["$(id)"]), ("../muse", vec![])] {
+            x.usage = Some(usage_spec(cmd, &args));
+            assert!(validate(&[x.clone()]).is_err(), "{cmd} {args:?}");
+        }
+        let bad_maps = [
+            json!({"meters": []}),
+            json!({"meters": [{"label": "W", "usedPercent": "w/used"}]}),
+            json!({"meters": [{"usedPercent": "/a"}]}),
+            json!({"meters": [{"label": "W"}]}),
+            json!({"meters": [{"label": "W", "usedPercent": "/a", "remainingPercent": "/b"}]}),
+            json!({"meters": [{"label": "W", "used": "/a"}]}),
+            json!({"plan": "plan", "meters": [{"label": "W", "usedPercent": "/a"}]}),
+        ];
+        for m in bad_maps {
+            x.usage = Some(serde_json::from_value(json!({"command": "muse", "args": ["usage"], "map": m.clone()})).unwrap());
+            assert!(validate(&[x.clone()]).is_err(), "{m}");
+        }
+    }
+
+    #[test]
+    fn usage_command_is_part_of_consent() {
+        let dir = std::env::temp_dir().join(format!("vicuna-uconsent-{}-{}", std::process::id(), crate::plugins::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut x = h("muse", &["acp"]);
+        x.usage = Some(usage_spec("muse", &["usage", "--json"]));
+        let list = vec![x.clone()];
+        // approving only the acp command (dialog without the usage line) is refused
+        assert!(grant(&dir, &list, &[json!({"id":"demo","command":"muse","args":["acp"]})], 1).is_err());
+        assert!(grant(&dir, &list, &[json!({"id":"demo","command":"muse","args":["acp"],"usage":{"command":"muse","args":["usage"]}})], 1).is_err());
+        grant(&dir, &list, &[json!({"id":"demo","command":"muse","args":["acp"],"usage":{"command":"muse","args":["usage","--json"]}})], 1).unwrap();
+        assert!(consented(&read_consent(&dir), &x));
+        // a changed usage command needs fresh consent
+        let mut y = x.clone();
+        y.usage = Some(usage_spec("muse", &["usage", "--all"]));
+        assert!(!consented(&read_consent(&dir), &y));
+        // an upgrade adding usage to a harness approved without it, too
+        let mut z = x.clone();
+        z.usage = None;
+        assert!(!consented(&read_consent(&dir), &z));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_capped_enforces_size_and_time() {
+        let sh = std::path::Path::new("/bin/sh");
+        if !sh.exists() {
+            return;
+        }
+        let a = |s: &str| vec!["-c".to_string(), s.to_string()];
+        assert_eq!(run_capped(sh, &a("printf '{\"a\":1}'"), 1024, std::time::Duration::from_secs(5)).unwrap(), br#"{"a":1}"#);
+        assert!(run_capped(sh, &a("head -c 5000 /dev/zero"), 1024, std::time::Duration::from_secs(5)).unwrap_err().contains("larger"));
+        let t = std::time::Instant::now();
+        assert!(run_capped(sh, &a("sleep 30"), 1024, std::time::Duration::from_millis(300)).unwrap_err().contains("longer"));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 }

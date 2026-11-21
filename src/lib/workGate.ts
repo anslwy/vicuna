@@ -9,6 +9,8 @@ export interface EngineSummary {
   installed: boolean;
   version: string | null;
   missing: string | null;
+  /** The Usage view has a tab for it (quota harness or plugin usage map). */
+  usage?: boolean;
 }
 
 /** Work engine detection (re-run on every call: Refresh, window focus): the
@@ -117,11 +119,11 @@ export const USAGE_ENGINES = ["claude", "codex", "agy"] as const;
 /** Installed quota harnesses for the usage popup tabs, plus the tab to open on:
  *  the active engine when it has a quota, else the first installed one
  *  (null when none is installed). */
-export function usageTabs<T extends { id: string; installed: boolean }>(
+export function usageTabs<T extends { id: string; installed: boolean; usage?: boolean }>(
   engines: T[],
   active: string,
 ): { tabs: T[]; initial: string | null } {
-  const tabs = engines.filter((e) => e.installed && (USAGE_ENGINES as readonly string[]).includes(e.id));
+  const tabs = engines.filter((e) => e.installed && (e.usage || (USAGE_ENGINES as readonly string[]).includes(e.id)));
   const initial = tabs.some((e) => e.id === active) ? active : (tabs[0]?.id ?? null);
   return { tabs, initial };
 }

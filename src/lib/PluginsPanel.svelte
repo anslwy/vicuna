@@ -301,6 +301,7 @@
             <div class="pl-harness" data-testid="plugin-harness-{p.id}-{h.id}">
               <span class="pl-name">{h.label}</span>
               <code class="pl-cmd" title="The command this harness runs">{commandLine(h)}</code>
+              {#if h.usage}<code class="pl-cmd" title="The command that reads its usage">{commandLine(h.usage)}</code>{/if}
               {#if h.enabled}<span class="pl-badge ok">Enabled</span>{:else}<span class="pl-badge">Disabled</span>{/if}
               {#if !h.installed}<span class="pl-badge" title={h.installHint ?? ""}>`{h.command}` not found</span>{/if}
               <span class="pl-spacer"></span>
@@ -335,10 +336,14 @@
       <div class="pl-consent-h">
         <div class="pl-name">{h.label}</div>
         <code class="pl-cmd big" data-testid="harness-consent-command-{h.id}">{commandLine(h)}</code>
+        {#if h.usage}
+          <div class="pl-muted">and, to read its subscription usage for the Usage view:</div>
+          <code class="pl-cmd big" data-testid="harness-consent-usage-{h.id}">{commandLine(h.usage)}</code>
+        {/if}
         <div class="pl-muted">{h.installed ? `Found \`${h.command}\` on this server's PATH.` : `\`${h.command}\` is not installed on this server yet. ${h.installHint ?? ""}`}</div>
       </div>
     {/each}
-    <p class="pl-warn">The agent works in the session's workspace folder with the same powers as the built-in harnesses: it can read and change files and run commands as you. The program comes from your own install, not from the plugin. Only allow plugins you trust. If an upgrade changes this command, Vicuna asks again.</p>
+    <p class="pl-warn">The agent works in the session's workspace folder with the same powers as the built-in harnesses: it can read and change files and run commands as you. The program comes from your own install, not from the plugin. Only allow plugins you trust. If an upgrade changes these commands, Vicuna asks again.</p>
     <div class="pl-row pl-consent-actions">
       <button class="pl-btn" data-testid="harness-consent-decline" onclick={declineConsent}>Not now</button>
       <button class="pl-btn primary" data-testid="harness-consent-accept" disabled={consentBusy} onclick={acceptConsent}>{consentBusy ? "Enabling…" : "Allow and enable"}</button>
