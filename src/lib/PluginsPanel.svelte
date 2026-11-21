@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Settings → Plugins: install from a GitHub repo (or manifest URL),
+  // Plugins modal: install from a GitHub repo (or manifest URL),
   // upgrade, uninstall. All work happens on the server (plugin_* actions),
   // so a remote server window manages that server's plugins.
   import { onMount } from "svelte";
@@ -29,7 +29,7 @@
   let consent = $state<{ plugin: InstalledPlugin; harnesses: PluginHarness[] } | null>(null);
   let consentBusy = $state(false);
 
-  /** Move the dialog to <body>: the Settings card is transformed, which
+  /** Move the dialog to <body>: the Plugins modal card is transformed, which
    *  would trap position:fixed inside it (and clip the dialog). */
   function portal(node: HTMLElement) {
     document.body.appendChild(node);
