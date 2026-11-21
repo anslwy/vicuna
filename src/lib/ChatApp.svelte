@@ -8206,7 +8206,7 @@
     save();
   }
 
-  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; retried?: boolean; attach?: { turnId: string; channel: string; startedMs?: number; snapshot?: { messages: any[]; index: number; pendingHead: { name: string; args: Record<string, any> } | null; pendingAsk: WorkAgentEvent | null } } } = {}) {
+  async function runWorkTurn(chat: Chat, index: number, workspace: string, seedContext: ChatMsg[] = [], opts: { freshSession?: boolean; retried?: boolean; attach?: { turnId: string; channel: string; startedMs?: number; snapshot?: { messages: any[]; index: number; pendingHead: { name: string; args: Record<string, any> } | null; pendingAsk: WorkAgentEvent | null; pendingAskRecords?: string[] } } } = {}) {
     // reply label: the opencode model this turn runs on (refined by the
     // backend's "model" event), never the Chat-mode model
     // a session pinned to its own harness (lead-created workers) runs on it;
@@ -8251,6 +8251,9 @@
     // in-flight tool head (for say/ask/done display) + the ask answer the
     // frontend itself sent (the record mirrors it once the result lands)
     let pendingHead: { name: string; args: Record<string, any> } | null = null;
+    // ask-log records answered while a tool-result <details> card is still open
+    // (the ask_user tool call itself): flushed right after </details> on toolend
+    let pendingAskRecords: string[] = [];
     let askOutcome: "answer" | "dismiss" | null = null;
     let askText = "";
     // token batching: same ~120ms behavior the old loop had — every state
@@ -8596,7 +8599,8 @@
           } else {
             if (t?.messages[curIndex]) {
               const m = t.messages[curIndex];
-              t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) };
+              const askTail = pendingAskRecords.length ? pendingAskRecords.splice(0).join("") : "";
+              t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) + askTail };
               chats = [...chats];
             }
           }
@@ -8693,16 +8697,22 @@
                 askOutcome = outcome;
                 askText = answer;
                 // vicuna-mcp questions: record the Q/A in the transcript here
-                // (permission asks get the backend's Approved/Denied note)
+                // (permission asks get the backend's Approved/Denied note). When
+                // a tool-result <details> card is open (the ask_user call
+                // itself), defer the record until toolend closes </details>,
+                // otherwise it lands inside the collapsed card and disappears.
                 const t = live();
                 if (isAgentQuestion(ev.ask_id) && t?.messages[curIndex]) {
-                  const m = t.messages[curIndex];
-                  t.messages[curIndex] = {
-                    ...m,
-                    content: m.content + formatAskRecord(ev.question, display ?? answer, outcome === "dismiss")
-                  };
-                  chats = [...chats];
-                  saveSoon();
+                  const rec = formatAskRecord(ev.question, display ?? answer, outcome === "dismiss");
+                  const inCard = !!pendingHead && pendingHead.name !== "ask" && pendingHead.name !== "say";
+                  if (inCard) {
+                    pendingAskRecords.push(rec);
+                  } else {
+                    const m = t.messages[curIndex];
+                    t.messages[curIndex] = { ...m, content: m.content + rec };
+                    chats = [...chats];
+                    saveSoon();
+                  }
                 }
                 // a server recording the turn writes the same record
                 replyToTurn(ev.ask_id, answer, isAgentQuestion(ev.ask_id) ? { display: display ?? answer, dismissed: outcome === "dismiss" } : undefined, ev.question);
@@ -8735,6 +8745,7 @@
       if (snap) {
         curIndex = snap.index;
         pendingHead = snap.pendingHead;
+        pendingAskRecords = [...(snap.pendingAskRecords ?? [])];
       }
       replyRoute.bind(opts.attach.turnId);
       attachWorkAgentTurn(opts.attach.channel, (ev) => handleEvent(ev));
