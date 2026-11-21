@@ -19,6 +19,8 @@ export type InstalledPlugin = {
   /** Work harnesses (plugin_harness.rs), with consent state. */
   harnesses?: import("./pluginHarness").PluginHarness[];
   pendingConsent?: import("./pluginHarness").PluginHarness[];
+  /** Messaging bridge (plugins.rs `BridgeSpec`). */
+  bridge?: import("./bridgePlugin").PluginBridgeDef | null;
 };
 /** What we cache: the theme plus its plugin-qualified key. */
 export type ActivePluginTheme = PluginThemeDef & { key: string; pluginName: string };
