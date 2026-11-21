@@ -893,8 +893,9 @@ async fn reply_or_edit(token: &str, chat: i64, msg: Option<i64>, (text, kb): (St
 /// (harness, model) a session runs with: its own pick, else the server's.
 fn lead_engine_model(chat: &Value) -> (String, String) {
     let x = turns::parse_extra(chat);
-    let engine = crate::work_engine::effective_engine(x.engine.as_deref());
-    let model = if x.engine.is_some() { x.work_model.clone() } else { engine.saved_model() };
+    let Ok((engine, model)) = crate::work_engine::session_engine(x.engine.as_deref(), x.work_model.as_deref()) else {
+        return (format!("{} (not installed)", x.engine.unwrap_or_default()), "default".into());
+    };
     (engine.id().to_string(), model.filter(|m| !m.is_empty()).unwrap_or_else(|| "default".into()))
 }
 

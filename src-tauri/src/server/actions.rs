@@ -231,6 +231,15 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                     }
                 }
             }
+            // the session's own harness + model (what its next turn runs on)
+            if let Some(eng) = args.get("engine").and_then(Value::as_str).map(str::trim).filter(|e| !e.is_empty()) {
+                let e = crate::work_engine::Engine::parse(eng).ok_or_else(|| format!("unknown harness {eng}"))?;
+                extra["engine"] = json!(e.id());
+                extra["workModel"] = match args.get("workModel").and_then(Value::as_str).filter(|m| !m.is_empty()) {
+                    Some(m) => json!(m),
+                    None => Value::Null,
+                };
+            }
             if let Some(workspace) = args.get("workspace") {
                 idle(st, &id)?;
                 if chat["mode"] != "work" {
@@ -402,5 +411,22 @@ mod tests {
         assert!(dispatch(&st, "session_update", &json!({"id": "a", "title": "   ", "role": "lead"})).await.is_err());
         let b2 = load(&st, "b").await.unwrap();
         assert_eq!(extra_of(&b2)["role"], "lead");
+    }
+
+    #[tokio::test]
+    async fn session_update_sets_the_sessions_own_harness() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        crate::server_store::init_schema(&db).await.unwrap();
+        let st = Arc::new(BridgeState { db: Some(db), ..Default::default() });
+        dispatch(&st, "session_create", &json!({"id": "a", "title": "A", "mode": "work"})).await.unwrap();
+        dispatch(&st, "session_create", &json!({"id": "b", "title": "B", "mode": "work"})).await.unwrap();
+        let a = dispatch(&st, "session_update", &json!({"id": "a", "engine": "claude", "workModel": "opus"})).await.unwrap();
+        assert_eq!(extra_of(&a)["engine"], "claude");
+        assert_eq!(extra_of(&a)["workModel"], "opus");
+        let a = dispatch(&st, "session_update", &json!({"id": "a", "engine": "agy", "workModel": null})).await.unwrap();
+        assert_eq!(extra_of(&a)["engine"], "agy");
+        assert!(extra_of(&a)["workModel"].is_null());
+        assert!(extra_of(&load(&st, "b").await.unwrap()).get("engine").is_none(), "other session untouched");
+        assert!(dispatch(&st, "session_update", &json!({"id": "a", "engine": "nope"})).await.is_err());
     }
 }

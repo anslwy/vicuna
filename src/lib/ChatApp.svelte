@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from "svelte";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, setServerOllama, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { shouldWarnOllamaUnavailable } from "$lib/ollamaWarning";
@@ -47,6 +47,7 @@
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName } from "$lib/pluginHarness";
+  import { sessionPick, missingHarnessReason, handoffAt, labelHarness } from "$lib/sessionEngine";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -2196,10 +2197,13 @@
   /** Engine picker (composer model menu + Settings): lists every harness,
    *  disabling ones that are not installed. */
   async function pickWorkEngine(id: string) {
-    if (workEngineInfo && engineId(workEngineInfo) === id) return;
+    if (workEngineInfo && engineId(workEngineInfo) === id && !sessionEngineMissing) return;
     try {
       const prev = workEngineInfo ? engineId(workEngineInfo) : null;
       applyWorkEngine(await selectWorkEngine(id), prev);
+      sessionEngineMissing = null;
+      // the picker changes THIS session's harness (what its next turn runs on)
+      void pinActivePick();
       if (modelOpen) void refreshOpencodeModels();
     } catch (e: any) {
       error = typeof e === "string" ? e : (e?.message ?? String(e));
@@ -2213,6 +2217,49 @@
       error = typeof e === "string" ? e : (e?.message ?? String(e));
     }
   }
+  /** the open session stored a harness that can't be selected (uninstalled
+   *  plugin): Send is blocked until the user picks another one */
+  let sessionEngineMissing = $state<string | null>(null);
+  /** Write the picker's current harness + model into the open Work session
+   *  (server-side `chats.extra`), so the header, picker, footer and the
+   *  session's next turn all agree. */
+  async function pinActivePick() {
+    const c = activeChat;
+    if (!c || composerMode !== "work" || !workEngineInfo) return;
+    const engine = engineId(workEngineInfo);
+    const model = workModel;
+    if (c.engine === engine && (c.workModel ?? null) === model) return;
+    c.engine = engine;
+    c.workModel = model;
+    if (serverPersist && c.messages.length > 0) await serverAction("session_update", { id: c.id, engine, workModel: model });
+    else save();
+  }
+  /** Show the open session's own harness + model in the header and picker:
+   *  a session that stored one runs on it, so the view follows it. */
+  let syncSeq = 0;
+  $effect(() => {
+    const c = activeChat;
+    const info = workEngineInfo;
+    if (!c || !info || composerMode !== "work") return;
+    const pick = sessionPick(c, { engine: engineId(info), model: untrack(() => workModel) });
+    if (!pick.own) { sessionEngineMissing = null; return; }
+    if (pick.engine !== engineId(info)) {
+      const seq = ++syncSeq;
+      const prev = engineId(info);
+      void untrack(() => selectWorkEngine(pick.engine)).then((next) => {
+        if (seq !== syncSeq) return;
+        sessionEngineMissing = null;
+        applyWorkEngine(next, prev);
+        workModel = pick.model;
+        ocModels = null;
+      }).catch(() => {
+        if (seq === syncSeq) sessionEngineMissing = pick.engine;
+      });
+      return;
+    }
+    sessionEngineMissing = null;
+    if (untrack(() => workModel) !== pick.model) workModel = pick.model;
+  });
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
   /** Short engine name for "<name> default" ("muse" for plugin:muse-acp/muse). */
   const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : engineId(workEngineInfo));
@@ -2222,7 +2269,9 @@
   const usageHoverEngine = $derived(usageTabs(workEngines, engineId(workEngineInfo)).initial);
   /** Send gate: no engine → Work send disabled with the install hint. */
   const workGate = $derived(
-    workEngineChecked && workEngineInfo === null
+    sessionEngineMissing
+      ? { blocked: true, reason: missingHarnessReason(sessionEngineMissing) }
+      : workEngineChecked && workEngineInfo === null
       ? { blocked: true, reason: "Could not check for the Work engine (backend unavailable)." }
       : workSendGate(workEngineInfo)
   );
@@ -2241,7 +2290,9 @@
       const list = await listWorkModels(eng);
       if (engineId(workEngineInfo) !== eng) return; // switched engine mid-fetch
       ocModels = list;
-      workModel = list.current;
+      // a session with its own pick keeps it; the list's current is the global one
+      const own = activeChat?.engine ? activeChat : null;
+      workModel = own ? (own.workModel ?? null) : list.current;
     } catch (e: any) {
       ocModelsError = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
@@ -2252,6 +2303,7 @@
     workModel = id;
     modelOpen = false;
     error = null;
+    void pinActivePick();
     await warnIfOllamaUnavailable(id?.startsWith("ollama/") ?? false);
     try {
       await setWorkModel(engineId(workEngineInfo), id);
@@ -8091,6 +8143,12 @@
     const own = chats.find((x) => x.id === chat.id) ?? chat;
     const turnEngine = own.engine || engineId(workEngineInfo);
     const turnPick: string | null = own.engine ? (own.workModel ?? null) : workModel;
+    // first turn of a session without its own harness: pin the last-used pick
+    // so the session never silently changes agent later
+    if (!own.engine) {
+      own.engine = turnEngine;
+      own.workModel = turnPick;
+    }
     let turnModel = workReplyModel(null, turnPick, turnEngine);
     {
       const c0 = chats.find((x) => x.id === chat.id);
@@ -10001,7 +10059,13 @@
             <!-- work turns keep thinking collapsed between rounds, so the label
                  stays shimmering for the whole turn, not just the first stream -->
             {@const thinkingLive = (activeStreaming || activeWorkRunning) && isLast && !continuing && (thinkingActive || isWorkMsg)}
+            {@const handoff = isWorkMsg ? handoffAt(activeChat.messages, i) : null}
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
+              {#if handoff}
+                <div class="compact-div handoff-div" data-testid="handoff-divider">
+                  <Tooltip text="The new harness starts its own session: it gets Vicuna's transcript of this conversation, not the previous harness's own context."><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff <span class="engine-chip">{@render engineIcon(labelHarness(handoff.from) ?? "")}</span> {handoff.from} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.to) ?? "")}</span> {handoff.to}</span></Tooltip>
+                </div>
+              {/if}
               {#if m.summary}
                 <div class="compact-div" data-testid="compact-divider">
                   <Tooltip text="Messages above this line are no longer in context — the model only sees the summary below."><span>Session compacted</span></Tooltip>
@@ -13124,6 +13188,7 @@
   .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
+  .handoff-inner { display: inline-flex; align-items: center; gap: 6px; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }

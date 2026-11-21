@@ -293,7 +293,7 @@ pub async fn work_agent_start(
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
 ) -> Result<String, String> {
-    let engine = crate::work_engine::effective_engine(engine.as_deref());
+    let engine = crate::work_engine::requested_engine(engine.as_deref())?;
     if !engine.is_present() {
         return Err(engine.missing_message());
     }

@@ -301,7 +301,7 @@ async fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing channel marker onEvent".to_string())?
                 .to_string();
-            let engine = crate::work_engine::effective_engine(arg_opt_str(args, "engine").as_deref());
+            let engine = crate::work_engine::requested_engine(arg_opt_str(args, "engine").as_deref())?;
             if !engine.is_present() {
                 return Err(engine.missing_message());
             }
