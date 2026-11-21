@@ -48,8 +48,10 @@ pub const MANAGE_SESSIONS_TOOL: &str = "manage_sessions";
 pub const MANAGE_SCHEDULE_TOOL: &str = "manage_schedule";
 pub const OVERVIEW_TOOL: &str = "session_overview";
 pub const SEARCH_TOOL: &str = "search_sessions";
+/// Read each Work harness's remaining subscription quota (read-only, cached).
+pub const USAGE_TOOL: &str = "usage_status";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 10;
+pub const TOOL_COUNT: usize = 11;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -62,6 +64,7 @@ pub const CLAUDE_MANAGE_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_sessio
 pub const CLAUDE_MANAGE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__manage_schedule";
 pub const CLAUDE_OVERVIEW_TOOL_ID: &str = "mcp__vicuna-mcp__session_overview";
 pub const CLAUDE_SEARCH_TOOL_ID: &str = "mcp__vicuna-mcp__search_sessions";
+pub const CLAUDE_USAGE_TOOL_ID: &str = "mcp__vicuna-mcp__usage_status";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -96,7 +99,10 @@ custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedu
 message in this session later (check back on slow work, follow up at a time the user names); `manage_schedule` lists, reschedules or cancels scheduled items \
 (your own session's; the lead can manage every session's). In the user's lead session, \
 `manage_sessions` creates, messages, stops and removes worker sessions (each on its own harness/model); a worker's reply \
-reaches the lead as a message when its turn ends.";
+reaches the lead as a message when its turn ends. `usage_status` reads each installed harness's remaining subscription \
+quota and reset time (cached ~60 s). Check it before starting an expensive worker session so you pick a harness with \
+headroom, and after a harness call fails with a limit/usage error so you can explain it (e.g. \"Claude is at its limit \
+until 18:00\") or switch harnesses.";
 
 #[cfg(feature = "desktop")]
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
@@ -660,6 +666,20 @@ fn search_schema() -> Value {
     })
 }
 
+fn usage_schema() -> Value {
+    json!({
+        "name": USAGE_TOOL,
+        "title": "Harness usage and quota",
+        "description": "Read the subscription usage/quota of each installed Work harness (Claude Code, Codex, Antigravity) — the same numbers Vicuna's Usage view shows — with no app window needed. Per harness: plan/account, every meter with used/left %, its reset time in local time, and a verdict: `ok` (≥20% left), `low` (<20% left), `exhausted` (none left) or `unknown` with the reason (not installed, not signed in, or the CLI printed nothing). Pass `harness` for one engine. Results are cached ~60 s. Use it before starting an expensive worker session (pick a harness with headroom) and when a harness call fails with a limit/usage error, so you can explain it or switch harnesses. OpenCode, pi and fx do not report subscription quota.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "harness": { "type": "string", "enum": ["claude", "codex", "agy", "opencode", "pi", "fx"], "description": "Only this harness (default: every installed quota harness)." }
+            }
+        }
+    })
+}
+
 fn manage_mcp_schema() -> Value {
     json!({
         "name": MANAGE_MCP_TOOL,
@@ -1182,6 +1202,33 @@ async fn search_sessions(args: &Value) -> Value {
     }
 }
 
+/// The local zone's offset from UTC in minutes, via sqlite (no tz crate):
+/// `strftime('%s')` of a localtime string read as UTC is exactly the offset.
+/// `None` (no database) leaves relative reset text as the CLI wrote it.
+async fn local_offset_minutes() -> Option<i64> {
+    let pool = db_pool().await.ok()?;
+    let secs: Option<i64> = sqlx::query_scalar(
+        "SELECT CAST(strftime('%s','now','localtime') AS INTEGER) - CAST(strftime('%s','now') AS INTEGER)",
+    )
+    .fetch_one(&pool)
+    .await
+    .ok();
+    secs.map(|s| s / 60)
+}
+
+/// `usage_status`: the Usage view's report as plain text. Runs here (the
+/// backend) rather than through the window, so a headless `vicuna serve` and
+/// a lead session can read quota with no GUI open. `caller_session_id` is
+/// accepted for consistency but not needed (the read is not turn-scoped).
+async fn usage_status(args: &Value) -> Value {
+    let harness = args.get("harness").and_then(Value::as_str);
+    let offset = local_offset_minutes().await;
+    match crate::work_usage::usage_status_text(harness, offset).await {
+        Ok(text) => text_result(&text, false),
+        Err(e) => text_result(&e, true),
+    }
+}
+
 fn is_fixed_vicuna_mcp(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case(SERVER_NAME)
 }
@@ -1693,6 +1740,7 @@ async fn handle_rpc(
             with_caller_arg(list_sessions_schema()),
             with_caller_arg(overview_schema()),
             with_caller_arg(search_schema()),
+            with_caller_arg(usage_schema()),
             manage_mcp_schema(),
             with_caller_arg(schedule_schema()),
             with_caller_arg(manage_sessions_schema()),
@@ -1711,6 +1759,7 @@ async fn handle_rpc(
                 (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
                 (_, OVERVIEW_TOOL) => session_overview(&args).await,
                 (_, SEARCH_TOOL) => search_sessions(&args).await,
+                (_, USAGE_TOOL) => usage_status(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
@@ -2363,7 +2412,7 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
         assert!(!names.contains(&"run"), "the run tool was removed");
         // a stale client calling it gets a protocol error, not a crash
         let (_, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run", "arguments": { "command": "true" } } })).await;
