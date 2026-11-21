@@ -118,6 +118,69 @@ export function workReplyModel(
  *  only have local stats (or nothing), so they get no tab. */
 export const USAGE_ENGINES = ["claude", "codex", "agy"] as const;
 
+/** Background polling interval & staleness window for usage reports (5 min). */
+export const USAGE_POLL_INTERVAL_MS = 5 * 60_000;
+
+/** Discard persisted usage snapshots older than 24 hours on startup. */
+export const USAGE_CACHE_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/** Human-readable relative age for the usage badge & modal ("just now", "3m ago", "2h ago", "1d ago"). */
+export function formatUsageAge(atMs: number, nowMs: number = Date.now()): string {
+  const diff = Math.max(0, nowMs - atMs);
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+/** Whether a cached usage timestamp is missing or older than `maxAgeMs`. */
+export function isUsageStale(
+  atMs: number | null | undefined,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = USAGE_POLL_INTERVAL_MS,
+): boolean {
+  return typeof atMs !== "number" || !Number.isFinite(atMs) || nowMs - atMs >= maxAgeMs;
+}
+
+/** Order in which background polling refreshes installed quota harnesses:
+ *  the active engine first (so the header badge updates fastest), then the rest. */
+export function usagePollOrder<T extends { id: string; installed: boolean; usage?: boolean }>(
+  engines: T[],
+  active: string,
+): string[] {
+  const { tabs, initial } = usageTabs(engines, active);
+  if (!initial) return [];
+  return [initial, ...tabs.map((t) => t.id).filter((id) => id !== initial)];
+}
+
+/** Hydrate persisted per-engine usage snapshots from localStorage JSON,
+ *  dropping malformed entries, errors, and snapshots older than `maxAgeMs`. */
+export function parseUsageCache<T>(
+  raw: string | null,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = USAGE_CACHE_MAX_AGE_MS,
+): Record<string, { report: T | null; error: string | null; at: number }> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, { report: T | null; error: string | null; at: number }> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!v || typeof v !== "object") continue;
+      const rec = v as { report?: unknown; at?: unknown };
+      if (!rec.report || typeof rec.report !== "object") continue;
+      if (typeof rec.at !== "number" || !Number.isFinite(rec.at)) continue;
+      if (nowMs - rec.at > maxAgeMs || rec.at > nowMs + 60_000) continue;
+      out[k] = { report: rec.report as T, error: null, at: rec.at };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 /** Installed quota harnesses for the usage popup tabs, plus the tab to open on:
  *  the active engine when it has a quota, else the first installed one
  *  (null when none is installed). */
