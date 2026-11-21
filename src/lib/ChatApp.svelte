@@ -2248,6 +2248,8 @@
       const prev = engineId(info);
       void untrack(() => selectWorkEngine(pick.engine)).then((next) => {
         if (seq !== syncSeq) return;
+        // the backend fell back to another harness: this session's is gone
+        if (engineId(next) !== pick.engine) { sessionEngineMissing = pick.engine; return; }
         sessionEngineMissing = null;
         applyWorkEngine(next, prev);
         workModel = pick.model;
@@ -9867,7 +9869,7 @@
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
           <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
+          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? engineId(workEngineInfo) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           <span class="hdr-meters">
           {#if usageHoverEngine}
             {@const hov = usageHoverCache[usageHoverEngine]}
@@ -10526,7 +10528,7 @@
           <div class="model-pill-wrap">
             <button class="model-pill" data-testid="model-selector" data-engine={engineId(workEngineInfo)} title={workModel ? `${workEngineLabel}: ${workModel}` : `${workEngineLabel} default model`} disabled={!workEngineInfo?.installed && workEngines.length === 0} onclick={toggleModel}>
               {#if workEngineList.length > 1}<span class="engine-chip" data-testid="work-engine-chip" title={workEngineLabel}>{@render engineIcon(engineId(workEngineInfo))}</span>{/if}
-              <span class="model-name" data-testid="work-model-name">{workModel ?? `${workEngineShort} default`}</span>
+              <span class="model-name" data-testid="work-model-name">{sessionEngineMissing ? "Pick a harness" : (workModel ?? `${workEngineShort} default`)}</span>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4"/></svg>
             </button>
             {#if modelOpen}
