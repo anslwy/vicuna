@@ -670,7 +670,7 @@ fn usage_schema() -> Value {
     json!({
         "name": USAGE_TOOL,
         "title": "Harness usage and quota",
-        "description": "Read the subscription usage/quota of each installed Work harness (Claude Code, Codex, Antigravity) — the same numbers Vicuna's Usage view shows — with no app window needed. Per harness: plan/account, every meter with used/left %, its reset time in local time, and a verdict: `ok` (≥20% left), `low` (<20% left), `exhausted` (none left) or `unknown` with the reason (not installed, not signed in, or the CLI printed nothing). Pass `harness` for one engine. Results are cached ~60 s. Use it before starting an expensive worker session (pick a harness with headroom) and when a harness call fails with a limit/usage error, so you can explain it or switch harnesses. OpenCode, pi and fx do not report subscription quota.",
+        "description": "Read the subscription usage/quota of each installed Work harness (Claude Code, Codex, Antigravity) — the same numbers Vicuna's Usage view shows — with no app window needed. Per harness: plan name, every meter with used/left %, its reset time in local time, and a verdict: `ok` (≥20% left), `low` (<20% left), `exhausted` (none left) or `unknown` with the reason (not installed, not signed in, or the CLI printed nothing). Pass `harness` for one engine. Results are cached ~60 s. Use it before starting an expensive worker session (pick a harness with headroom) and when a harness call fails with a limit/usage error, so you can explain it or switch harnesses. OpenCode, pi and fx do not report subscription quota.",
         "inputSchema": {
             "type": "object",
             "properties": {

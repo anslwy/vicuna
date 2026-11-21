@@ -1491,9 +1491,7 @@ pub fn format_usage_status(
         if let Some(plan) = &report.plan {
             head.push_str(&format!(" · plan {plan}"));
         }
-        if let Some(account) = &report.account {
-            head.push_str(&format!(" · {account}"));
-        }
+        // Never the account: agents must not see emails/identifiers.
         let (verdict, tightest) = usage_verdict(report);
         let verdict_line = match (&verdict, &tightest) {
             (UsageVerdict::Unknown, _) => {
@@ -1937,7 +1935,7 @@ Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-26T16:11:35Z\n";
 
         let text = format_usage_status(&[claude, codex], 1_795_700_000, Some(-300));
         let expected = "\
-Claude Code (claude) · plan Claude Pro · user@example.com
+Claude Code (claude) · plan Claude Pro
   verdict: low — 15% left on \"Current session\"
   - Current session: 85% used · 15% left · resets 9:40pm (America/Toronto)
   - Current week (all models): 12% used · 88% left · resets 2026-11-28 11:33 local
@@ -1949,6 +1947,7 @@ Codex (codex) · plan ChatGPT Plus
 
 Most headroom: codex (74% left). Pick a harness with headroom for expensive work; a `low`/`exhausted` harness will fail its next call.";
         assert_eq!(text, expected);
+        assert!(!text.contains('@') && !text.contains("user@example.com"), "{text}");
     }
 
     #[test]
