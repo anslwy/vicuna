@@ -10129,7 +10129,7 @@
                     {@const wsIsNone = isNoWorkspacePath(c.workspace)}
                     {@const wsBase = wsIsNone ? "" : workspaceBase(c.workspace ?? "")}
                     {#if wsIsNone}
-                      <span class="work-badge ws-badge" data-testid="ws-badge" title="No workspace">
+                      <span class="work-badge ws-badge" data-testid="ws-badge" title="No workspace — uses a temporary empty scratch folder if needed">
                         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
                         <span>No workspace</span>
                       </span>
@@ -11074,8 +11074,9 @@
               <button
                 class="model-pill ws-pill {wsIsNone ? 'ws-pill-none' : ''}"
                 data-testid="workspace-pill"
-                title={wsIsNone ? "No workspace — click to pick a folder" : (wsPath.trim() ? `Workspace: ${wsPath.trim()} — click to change` : "Pick a workspace folder")}
+                title={wsIsNone ? undefined : (wsPath.trim() ? `Workspace: ${wsPath.trim()} — click to change` : "Pick a workspace folder")}
                 aria-label="Pick workspace folder"
+                aria-describedby={wsIsNone && !wsMenuOpen ? "workspace-pill-tip" : undefined}
                 onclick={() => { wsMenuOpen = false; void pickWorkspace(); }}
               >
                 {#if wsIsNone}
@@ -11086,6 +11087,12 @@
                   <span class="model-name">{wsName || "Workspace"}</span>
                 {/if}
               </button>
+              {#if wsIsNone && !wsMenuOpen}
+                <span class="ws-tooltip" id="workspace-pill-tip" role="tooltip">
+                  Ready to chat without a project folder. Vicuna uses a temporary empty scratch folder if needed.
+                  <span class="ws-tooltip-hint">Click to pick a folder.</span>
+                </span>
+              {/if}
               <button
                 class="model-pill ws-caret"
                 data-testid="workspace-menu-btn"
@@ -11113,6 +11120,7 @@
                     class="ctx-item ws-menu-opt {wsIsNone ? 'sel' : ''}"
                     role="menuitemcheckbox"
                     aria-checked={wsIsNone}
+                    aria-describedby="workspace-menu-none-tip"
                     data-testid="workspace-menu-none"
                     onclick={() => void selectNoWorkspace()}
                   >
@@ -11122,6 +11130,9 @@
                       <svg class="ws-menu-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>
                     {/if}
                   </button>
+                  <span class="ws-tooltip" id="workspace-menu-none-tip" role="tooltip">
+                    Chat without a project folder. Vicuna uses a temporary empty scratch folder if needed.
+                  </span>
                 </div>
               {/if}
             </div>
@@ -13814,6 +13825,38 @@
   .ws-menu-opt { display: flex; align-items: center; gap: 8px; }
   .ws-menu-opt.sel { background: var(--hover-3); }
   .ws-menu-check { margin-left: auto; color: var(--accent); }
+  .ws-tooltip {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    z-index: 41;
+    box-sizing: border-box;
+    width: min(240px, 50cqw);
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--card);
+    box-shadow: 0 4px 16px rgba(0,0,0,.14);
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.5;
+    text-align: left;
+    pointer-events: none;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 100ms ease-out;
+  }
+  .ws-tooltip-hint { display: block; margin-top: 4px; color: var(--muted); }
+  .ws-pill:is(:hover, :focus-visible) + .ws-tooltip,
+  .ws-menu-opt:is(:hover, :focus-visible) + .ws-tooltip { visibility: visible; opacity: 1; }
+  @container (max-width: 500px) {
+    .composer-bar:has(.ws-split) { position: relative; flex-wrap: wrap; }
+    .ws-split { position: static; }
+    .ws-menu, .ws-tooltip { left: 0; right: auto; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ws-tooltip { transition: none; }
+  }
   .prov-ico { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted-2); }
   .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
   .model-pill-wrap { position: relative; }
