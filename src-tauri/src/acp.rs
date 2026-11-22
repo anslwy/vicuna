@@ -110,6 +110,20 @@ impl AcpState {
         }
     }
 
+    /// Invalidate only the failed mapping: another turn may have replaced it.
+    fn forget_poisoned_session(&self, key: &str, failed_session: &str, error: &str) -> bool {
+        let _ = self.load();
+        let Ok(mut sessions) = self.sessions.lock() else { return false };
+        if !remove_poisoned_session(&mut sessions, key, failed_session, error) {
+            return false;
+        }
+        if let Ok(path) = sessions_path() {
+            let doc = serde_json::to_string_pretty(&*sessions).unwrap_or_default();
+            let _ = std::fs::write(path, doc);
+        }
+        true
+    }
+
     /// The warm, initialized ACP client for `engine`; (re)spawned when there
     /// is none, it died, or detection now resolves a different binary.
     async fn client(&self, engine: Engine, workspace: &str) -> Result<Arc<AcpClient>, String> {
@@ -252,6 +266,33 @@ fn home_dir() -> Result<PathBuf, String> {
     #[cfg(not(windows))]
     let home = std::env::var("HOME").map_err(|_| "cannot locate home folder".to_string())?;
     Ok(PathBuf::from(home))
+}
+
+/// Permanent media/history errors survive retries because the native session
+/// replays the same invalid tool output. Do not discard context for generic
+/// 400s, quota, auth, network, or model configuration failures.
+fn is_poisoned_history_error(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("unable to process input: the file or media data is empty, corrupted, or malformed")
+        || ((e.contains("invalid_argument") || e.contains("400") || e.contains("invalid_request_error"))
+            && ((e.contains("image") || e.contains("media") || e.contains("history"))
+                && ["corrupted", "malformed", "invalid image data", "invalid base64", "invalid conversation history"]
+                    .iter().any(|needle| e.contains(needle))))
+}
+
+fn remove_poisoned_session(
+    sessions: &mut HashMap<String, String>,
+    key: &str,
+    failed_session: &str,
+    error: &str,
+) -> bool {
+    if !is_poisoned_history_error(error)
+        || sessions.get(key).map(String::as_str) != Some(failed_session)
+    {
+        return false;
+    }
+    sessions.remove(key);
+    true
 }
 
 fn sessions_path() -> Result<PathBuf, String> {
@@ -1783,8 +1824,8 @@ async fn run_turn_inner(
     };
     let (client, (acp_session, resumed, mut used_model)) =
         open_session_retrying(engine, state, client, saved, workspace, &mcp, on_event, stop).await?;
-    if let Some(k) = key {
-        state.set(k, acp_session.clone());
+    if let Some(k) = &key {
+        state.set(k.clone(), acp_session.clone());
     }
     let (mut updates, _route) = client.route(&acp_session);
 
@@ -1959,9 +2000,16 @@ async fn run_turn_inner(
                 }
             }
             Err(e) => {
+                // Also clear sessions poisoned by a tool in their first turn,
+                // even if Stop raced with the error. The next send rebuilds
+                // text context from Vicuna without replaying native tool media.
+                let reset = key.as_deref().is_some_and(|k| state.forget_poisoned_session(k, &acp_session, &e));
                 if cancelled || stop.load(Ordering::Relaxed) {
                     stop.store(true, Ordering::Relaxed);
                     break;
+                }
+                if reset {
+                    return Err(format!("{}\n\nThe native session contained invalid media/history and was reset. Send another message to continue in a fresh session with the visible conversation.", friendly_prompt_error(engine, e)));
                 }
                 return Err(friendly_prompt_error(engine, e));
             }
@@ -2190,6 +2238,29 @@ mod tests {
         drop(old_guard);
         forward(&routes, &json!({ "sessionId": "a" }), json!(7));
         assert_eq!(new_rx.try_recv().unwrap(), json!(7));
+    }
+
+    #[test]
+    fn poisoned_media_invalidates_only_the_failed_native_session() {
+        let exact = "INVALID_ARGUMENT (code 400): Unable to process input: the file or media data is empty, corrupted, or malformed";
+        for error in [exact, "400 invalid image data", "invalid_request_error: invalid base64 image", "400: invalid conversation history"] {
+            let mut sessions = HashMap::from([
+                ("agy|chat1|/w".to_string(), "poisoned".to_string()),
+                ("agy|chat2|/w".to_string(), "healthy".to_string()),
+            ]);
+            assert!(remove_poisoned_session(&mut sessions, "agy|chat1|/w", "poisoned", error));
+            assert!(!sessions.contains_key("agy|chat1|/w"));
+            assert_eq!(sessions["agy|chat2|/w"], "healthy");
+            // Persisting this map must not restore the poisoned mapping.
+            let restored: HashMap<String, String> = serde_json::from_str(&serde_json::to_string(&sessions).unwrap()).unwrap();
+            assert!(!restored.contains_key("agy|chat1|/w"));
+        }
+        let mut sessions = HashMap::from([("chat".to_string(), "replacement".to_string())]);
+        assert!(!remove_poisoned_session(&mut sessions, "chat", "old", exact));
+        for error in ["400 model not found", "INVALID_ARGUMENT: image model not supported", "429 quota exceeded", "401 Unauthorized", "connection reset", "400 invalid tools schema", "image generation failed"] {
+            assert!(!remove_poisoned_session(&mut sessions, "chat", "replacement", error), "{error}");
+            assert_eq!(sessions["chat"], "replacement");
+        }
     }
 
     #[test]
