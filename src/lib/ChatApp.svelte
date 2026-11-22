@@ -48,7 +48,7 @@
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
-  import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels } from "$lib/sessionEngine";
+  import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex } from "$lib/sessionEngine";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -1142,6 +1142,7 @@
   }
 
   const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
+  const activeSummaryIndex = $derived(latestSummaryIndex(activeChat?.messages ?? []));
   // composer reflects the starter toggle while starting (home or empty draft);
   // a thread with messages keeps its own mode
   const composerMode = $derived(
@@ -5893,12 +5894,7 @@
       flashNotice("Session changed during compaction — try again.");
       return;
     }
-    // visible divider + summary for the user; the flag is what trims the
-    // model's context (compactedHistory drops everything up to it). Any
-    // older summary loses its flag so only the latest boundary counts.
-    for (const m of c.messages) {
-      if (m.summary) m.summary = undefined;
-    }
+    // Keep older summaries marked so handoff detection can skip them.
     c.messages = [
       ...c.messages,
       { role: "assistant", content: summary.trim(), model: selectedModel, summary: true }
@@ -8147,10 +8143,7 @@
    *  summary carries their context instead. No-op for threads never
    *  compacted, so every history-building site uses this. */
   function compactedHistory(messages: ChatMsg[]): ChatMsg[] {
-    let from = 0;
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].summary) from = i;
-    }
+    const from = Math.max(0, latestSummaryIndex(messages));
     return messages.slice(from).map(toHistory);
   }
 
@@ -10650,7 +10643,7 @@
                   <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {handoff.engine.from} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {handoff.engine.to}{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} → <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}{/if}</span></Tooltip>
                 </div>
               {/if}
-              {#if m.summary}
+              {#if i === activeSummaryIndex}
                 <div class="compact-div" data-testid="compact-divider">
                   <Tooltip text="Messages above this line are no longer in context — the model only sees the summary below."><span>Session compacted</span></Tooltip>
                 </div>

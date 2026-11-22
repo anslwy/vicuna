@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sessionPick, missingHarnessReason } from "../src/lib/sessionEngine.ts";
+import { sessionPick, missingHarnessReason, handoffAt, workspaceHandoffLabels, latestSummaryIndex } from "../src/lib/sessionEngine.ts";
 
 const global = { engine: "agy", model: "gemini-4-neon-medium" };
 
@@ -19,7 +19,6 @@ test("missing harness reason names it", () => {
   assert.match(missingHarnessReason("plugin:muse"), /plugin:muse.*not installed/);
 });
 
-import { handoffAt, workspaceHandoffLabels } from "../src/lib/sessionEngine.ts";
 test("handoff divider only where the harness changes", () => {
   const ms = [
     { role: "user" }, { role: "assistant", model: "claude/opus" },
@@ -32,6 +31,59 @@ test("handoff divider only where the harness changes", () => {
   assert.deepEqual(handoffAt(ms, 5), { engine: { from: "claude/haiku", to: "agy/gemini-4-neon-medium" } });
   assert.equal(handoffAt(ms, 7), null);
   assert.equal(handoffAt(ms, 4), null);
+});
+
+test("compaction does not create a handoff within the same harness", () => {
+  const messages = [
+    { role: "assistant", model: "agy/gemini-4-neon-medium" },
+    { role: "assistant", model: "gemma4:31b-cloud", summary: true },
+    { role: "user" },
+    { role: "assistant", model: "agy/gemini-4-neon-medium" }
+  ];
+  assert.equal(handoffAt(messages, 1), null);
+  assert.equal(handoffAt(messages, 3), null);
+});
+
+test("a harness handoff after compaction starts from the previous Work reply", () => {
+  const messages = [
+    { role: "assistant", model: "agy/gemini-4-neon-medium" },
+    { role: "assistant", model: "gemma4:31b-cloud", summary: true },
+    { role: "user" },
+    { role: "assistant", model: "claude/opus" }
+  ];
+  assert.deepEqual(handoffAt(messages, 3), {
+    engine: { from: "agy/gemini-4-neon-medium", to: "claude/opus" }
+  });
+});
+
+test("workspace handoffs skip compaction summaries even when they record a workspace", () => {
+  const messages = [
+    { role: "assistant", model: "claude/opus", workspace: "/repo/alpha" },
+    { role: "assistant", model: "gemma4:31b-cloud", workspace: "/repo/summary", summary: true },
+    { role: "user" },
+    { role: "assistant", model: "claude/opus", workspace: "/repo/alpha" },
+    { role: "assistant", model: "gemma4:31b-cloud", workspace: "/repo/summary", summary: true },
+    { role: "user" },
+    { role: "assistant", model: "claude/opus", workspace: "/repo/beta" }
+  ];
+  assert.equal(handoffAt(messages, 1), null);
+  assert.equal(handoffAt(messages, 3), null);
+  assert.deepEqual(handoffAt(messages, 6), { workspace: { from: "/repo/alpha", to: "/repo/beta" } });
+});
+
+test("a second compaction keeps the first summary identifiable and moves the boundary", () => {
+  const reply = { role: "assistant", model: "agy/gemini-4-neon-medium" };
+  const messages = [
+    reply,
+    { role: "assistant", model: "gemma4:31b-cloud", summary: true },
+    reply,
+    { role: "assistant", model: "qwen3:0.6b", summary: true },
+    reply
+  ];
+  assert.equal(latestSummaryIndex(messages), 3);
+  for (let i = 1; i < messages.length; i++) {
+    assert.equal(handoffAt(messages, i), null);
+  }
 });
 
 test("handoff divider where the workspace changes", () => {

@@ -363,9 +363,8 @@ export interface ChatMsg {
   tool_calls?: OllamaToolCall[];
   /** tool result target (Ollama `tool` role uses `tool_name`) */
   tool_name?: string;
-  /** compaction summary (work mode): the divider in the UI renders above
-   *  this message, and the model only ever sees this message + newer ones —
-   *  older transcript stays on screen for the user but leaves the context. */
+  /** Work compaction summary. The latest summary marks the UI divider and
+   *  the start of model-visible history. */
   summary?: boolean;
 }
 
