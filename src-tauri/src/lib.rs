@@ -52,6 +52,7 @@ pub mod whisper;
 pub mod plugins;
 pub mod plugin_harness;
 pub mod plugin_icon;
+pub mod skills;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 
@@ -1640,8 +1641,12 @@ pub async fn work_read_file_logic(
     offset: Option<u64>,
     limit: Option<u64>,
 ) -> Result<WorkFileContent, String> {
-    let canon = work_canonical_root(root.trim())?;
-    let full = work_join_allow_temp(&canon, &path)?;
+    let full = if let Some(skill_path) = skills::resolve_skills_absolute(std::path::Path::new(path.trim())) {
+        skill_path
+    } else {
+        let canon = work_canonical_root(root.trim())?;
+        work_join_allow_temp(&canon, &path)?
+    };
     let meta = std::fs::metadata(&full).map_err(|_| "file not found".to_string())?;
     if !meta.is_file() {
         return Err("not a file".to_string());
@@ -1859,13 +1864,19 @@ pub async fn work_write_file_logic(root: String, path: String, content: String) 
     if content.len() > 524288 {
         return Err("content too large (max ~512KB per write)".to_string());
     }
-    let canon = work_canonical_root(root.trim())?;
-    let full = work_join_allow_temp(&canon, &path)?;
+    let (canon, full) = if let Some(skill_path) = skills::resolve_skills_absolute(std::path::Path::new(path.trim())) {
+        (None, skill_path)
+    } else {
+        let canon = work_canonical_root(root.trim())?;
+        let full = work_join_allow_temp(&canon, &path)?;
+        (Some(canon), full)
+    };
     if full.is_dir() {
         return Err("cannot overwrite a folder".to_string());
     }
     if let Some(parent) = full.parent() {
-        if !parent.starts_with(&canon) && !path_is_under_temp(parent) {
+        let in_workspace = canon.as_ref().is_some_and(|c| parent.starts_with(c));
+        if !in_workspace && !path_is_under_temp(parent) && !skills::path_is_under_skills(parent) {
             return Err("path escapes the workspace".to_string());
         }
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folders: {e}"))?;
@@ -5548,6 +5559,37 @@ async fn mcp_delete_server(app: AppHandle, id: String) -> Result<Vec<mcp::McpSer
     mcp_list_servers(app).await
 }
 
+// ---------- Skills (~/vicuna/skills/<slug>/SKILL.md) ----------
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn skills_list() -> Result<Vec<skills::SkillSummary>, String> {
+    skills::list_skills()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn skills_read(slug: String) -> Result<skills::SkillDetail, String> {
+    skills::read_skill(&slug)
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn skills_save(
+    slug: String,
+    content: String,
+    enabled: Option<bool>,
+) -> Result<skills::SkillSummary, String> {
+    skills::save_skill(&slug, &content, enabled)
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn skills_toggle(slug: String, enabled: bool) -> Result<skills::SkillSummary, String> {
+    skills::toggle_skill(&slug, enabled)
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn skills_remove(slug: String) -> Result<(), String> {
+    skills::remove_skill(&slug)
+}
+
 #[cfg(feature = "desktop")]
 #[tauri::command]
 async fn mcp_connect(
@@ -5846,6 +5888,11 @@ pub fn run() {
             mcp_signin,
             mcp_signout,
             mcp_login_present,
+            skills_list,
+            skills_read,
+            skills_save,
+            skills_toggle,
+            skills_remove,
             browser_status,
             browser_start,
             browser_stop,

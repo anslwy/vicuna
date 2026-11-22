@@ -61,6 +61,8 @@
   import TelegramModal from "$lib/TelegramModal.svelte";
   import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
+  import SkillsModal from "$lib/SkillsModal.svelte";
+  import { listSkills, enabledSkillCount, type SkillSummary } from "$lib/skills";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, browserThemeParams, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, resolveTerminalColors, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
@@ -6783,6 +6785,32 @@
     codeEditorPath = null;
   }
 
+  let skillsOpen = $state(false);
+  let skillsList = $state<SkillSummary[]>([]);
+  const skillsEnabledCount = $derived(enabledSkillCount(skillsList));
+
+  async function refreshSkills() {
+    try {
+      skillsList = await listSkills();
+    } catch {
+      /* ignore when backend unavailable */
+    }
+  }
+
+  onMount(() => {
+    void refreshSkills();
+  });
+
+  function openSkillsModal() {
+    skillsOpen = true;
+    void refreshSkills();
+  }
+
+  async function openSkillInEditor(skill: SkillSummary) {
+    skillsOpen = false;
+    await openInEditor(skill.path);
+  }
+
   async function expOpenFile() {
     const p = expCtx;
     closeExpCtx();
@@ -9316,7 +9344,7 @@
         e.preventDefault();
         return;
       }
-      if (settingsOpen || pluginsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
+      if (settingsOpen || pluginsOpen || skillsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
       if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
@@ -10957,6 +10985,19 @@
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
               {#if mcpEnabledCount}
                 <span class="mcp-dot" data-testid="mcp-dot">{mcpEnabledCount}</span>
+              {/if}
+            </button>
+            <button
+              class="icon-btn mcp-btn"
+              data-testid="skills-btn"
+              aria-label="Skills"
+              title={skillsEnabledCount ? `Skills (${skillsEnabledCount} enabled)` : "Skills"}
+              aria-pressed={skillsOpen}
+              onclick={openSkillsModal}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 19l1 2.5L8.5 22 6 23l-1 1-1-1-2.5-1L4 21.5 5 19z"/></svg>
+              {#if skillsEnabledCount}
+                <span class="mcp-dot" data-testid="skills-dot">{skillsEnabledCount}</span>
               {/if}
             </button>
             {@const rawWsPath = activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace}
@@ -13208,13 +13249,22 @@
 {/if}
 {/if}
 
+{#if skillsOpen}
+  <SkillsModal
+    skills={skillsList}
+    onChanged={(next) => (skillsList = next)}
+    onEdit={(skill) => void openSkillInEditor(skill)}
+    onClose={() => (skillsOpen = false)}
+  />
+{/if}
+
 {#if codeEditorPath && CodeEditorComp}
   {#key codeEditorPath}
     <CodeEditorComp
       root={codeEditorRoot}
       path={codeEditorPath}
       onclose={closeCodeEditor}
-      onsaved={() => { gitRefreshTick++; if (explorerOpen && !explorerLoading) void loadExplorer(); }}
+      onsaved={() => { gitRefreshTick++; if (explorerOpen && !explorerLoading) void loadExplorer(); void refreshSkills(); }}
       onopenexternal={isTauriRuntime() ? (p: string) => void openPathExternal(p) : undefined}
     />
   {/key}
