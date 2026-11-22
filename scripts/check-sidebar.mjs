@@ -2,9 +2,13 @@
 import {
   ALL_FILTER,
   CHAT_FILTER,
+  NO_WORKSPACE_FILTER,
+  NO_WORKSPACE_SENTINEL,
   WORKSPACE_PREFIX,
+  isNoWorkspacePath,
   folderOf,
   folderOptionKey,
+  workspaceFilterKey,
   workspaceOfFolderKey,
   folderOptions,
   matchesFilter,
@@ -77,6 +81,9 @@ eq(workspaceOfFolderKey("/p/beta"), "/p/beta", "legacy raw root still decodes");
 // a workspace literally named "all" or "chat" is not the channel
 eq(workspaceOfFolderKey("W:/p/all"), "/p/all", "folder named all is not the All channel");
 eq(workspaceOfFolderKey("W:/p/chat"), "/p/chat", "folder named chat is not the Chat channel");
+eq(workspaceFilterKey("/p/beta/"), "W:/p/beta", "workspaceFilterKey normalizes trailing slash");
+eq(workspaceFilterKey("C:\\p\\beta\\"), "W:/p/beta".replace("/p", "C:/p"), "workspaceFilterKey normalizes windows path");
+eq(workspaceFilterKey("   "), null, "blank workspace has no filter key");
 
 // ---- folderOptions: derived from sessions, never from prefs ----
 const now = new Date(2024, 4, 15, 12, 0, 0).getTime();
@@ -118,6 +125,21 @@ const twins = folderOptions([
   chat("t2", { now, age: HOUR, mode: "work", workspace: "/Users/me/side/api" })
 ]);
 eq(twins.map((o) => o.label), ["All", "Chat", "work › api", "side › api"], "duplicate bases are parent-qualified");
+
+// extraWorkspace includes a 0-session workspace (e.g. synced from composer) without duplicating existing ones
+const withExtra = folderOptions(
+  [chat("b", { now, mode: "work", workspace: "/p/beta" })],
+  "/p/fresh/"
+);
+eq(withExtra.map((o) => o.label), ["All", "Chat", "fresh", "beta"], "extraWorkspace appears with 0 count");
+eq(withExtra[2], { key: "W:/p/fresh", label: "fresh", title: "/p/fresh", count: 0 }, "extraWorkspace entry shape");
+eq(resolveSessionFilter("W:/p/fresh", withExtra), "W:/p/fresh", "extraWorkspace resolves instead of falling back to All");
+const dupExtra = folderOptions(
+  [chat("b", { now, mode: "work", workspace: "/p/beta" })],
+  "/p/beta/"
+);
+eq(dupExtra.map((o) => o.label), ["All", "Chat", "beta"], "extraWorkspace matching existing folder is not duplicated");
+eq(dupExtra[2].count, 1, "existing folder keeps its count");
 
 // ---- normalize / resolve: a stale filter cannot blank the sidebar ----
 eq(normalizeSessionFilter(undefined), ALL_FILTER, "undefined -> all");
@@ -209,6 +231,33 @@ eq(showWorkspaceBadge(wsBetaSlash, "W:/p/beta"), false, "trailing slash still ma
 eq(showWorkspaceBadge(wsBeta, "/p/beta"), false, "legacy raw root filter still hides pill");
 eq(showWorkspaceBadge(wsAlpha, "W:/p/beta"), true, "different workspace (e.g. Pinned) keeps its pill");
 eq(showWorkspaceBadge(wsLoose, "W:/p/beta"), true, "workspace-less work session keeps Work badge");
+
+// ---- No workspace mode (scratch per-session folder) ----
+eq(isNoWorkspacePath(NO_WORKSPACE_SENTINEL), true, "sentinel is no-workspace");
+eq(isNoWorkspacePath("/home/me/vicuna/scratch/fe0e2692-f7d3"), true, "posix scratch folder is no-workspace");
+eq(isNoWorkspacePath("C:\\Users\\me\\vicuna\\scratch\\abc_123\\"), true, "windows scratch folder is no-workspace");
+eq(isNoWorkspacePath("/home/me/repos/vicuna"), false, "normal repo is not no-workspace");
+eq(folderOf(chat("nw", { mode: "work", workspace: "/home/me/vicuna/scratch/sess-1" })), NO_WORKSPACE_FILTER, "scratch session lives in No workspace channel");
+eq(workspaceFilterKey(NO_WORKSPACE_SENTINEL), NO_WORKSPACE_FILTER, "sentinel maps to No workspace filter");
+eq(workspaceOfFolderKey(NO_WORKSPACE_FILTER), null, "No workspace filter has no single repo root");
+const withNoWs = folderOptions([
+  chat("nw1", { now, age: 1 * MIN, mode: "work", workspace: "/home/me/vicuna/scratch/sess-1" }),
+  chat("nw2", { now, age: 2 * MIN, mode: "work", workspace: "/home/me/vicuna/scratch/sess-2" }),
+  chat("w1", { now, age: 3 * MIN, mode: "work", workspace: "/p/beta" })
+]);
+eq(withNoWs.map((o) => o.label), ["All", "Chat", "No workspace", "beta"], "No workspace groups all scratch sessions into one option");
+eq(withNoWs.find((o) => o.key === NO_WORKSPACE_FILTER)?.count, 2, "No workspace counts all scratch sessions");
+const pendingNoWs = folderOptions([chat("w1", { now, mode: "work", workspace: "/p/beta" })], NO_WORKSPACE_SENTINEL);
+eq(pendingNoWs.map((o) => o.label), ["All", "Chat", "No workspace", "beta"], "extraWorkspace sentinel offers No workspace with 0 count");
+eq(pendingNoWs.find((o) => o.key === NO_WORKSPACE_FILTER)?.count, 0, "pending No workspace counts zero");
+eq(resolveSessionFilter(NO_WORKSPACE_FILTER, pendingNoWs), NO_WORKSPACE_FILTER, "No workspace resolves");
+eq(filterChats([
+  chat("nw1", { now, mode: "work", workspace: "/home/me/vicuna/scratch/sess-1" }),
+  chat("c1", { now }),
+  chat("w1", { now, mode: "work", workspace: "/p/beta" })
+], NO_WORKSPACE_FILTER).map((c) => c.id), ["nw1"], "No workspace filter matches only scratch sessions");
+eq(showWorkspaceBadge(chat("nw1", { mode: "work", workspace: "/home/me/vicuna/scratch/sess-1" }), NO_WORKSPACE_FILTER), false, "No workspace scope hides redundant badge");
+eq(showWorkspaceBadge(chat("nw1", { mode: "work", workspace: "/home/me/vicuna/scratch/sess-1" }), ALL_FILTER), true, "All scope shows No workspace badge");
 
 if (failures > 0) {
   console.error(`\n${failures} sidebar check(s) failed`);

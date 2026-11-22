@@ -1379,6 +1379,48 @@ pub async fn work_validate_root_logic(path: String) -> Result<String, String> {
     Ok(work_display_string(&work_canonical_root(path.trim())?))
 }
 
+/// True when `path` points to a Vicuna per-session scratch workspace
+/// (`~/vicuna/scratch/<session-id>`), used by "No workspace" mode.
+pub fn is_scratch_workspace(path: &str) -> bool {
+    let norm = path.trim().replace('\\', "/");
+    let norm = norm.trim_end_matches('/');
+    if let Some((_, tail)) = norm.rsplit_once("/vicuna/scratch/") {
+        return !tail.is_empty()
+            && !tail.contains('/')
+            && tail.len() <= 64
+            && tail
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    }
+    false
+}
+
+fn scratch_workspace_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
+    let id = session_id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid session".to_string());
+    }
+    Ok(uploads_home_dir()?
+        .join("vicuna")
+        .join("scratch")
+        .join(id))
+}
+
+pub async fn work_ensure_scratch_workspace_logic(session_id: String) -> Result<String, String> {
+    let dir = scratch_workspace_dir(&session_id)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create scratch workspace: {e}"))?;
+    let canon = work_canonical_root(
+        dir.to_str()
+            .ok_or_else(|| "invalid scratch workspace path".to_string())?,
+    )?;
+    Ok(work_display_string(&canon))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkDirEntry {
     pub name: String,
@@ -2299,6 +2341,11 @@ async fn github_download_asset(url: String, file_name: String) -> Result<String,
 #[cfg_attr(feature = "desktop", tauri::command)]
 async fn work_validate_root(path: String) -> Result<String, String> {
     work_validate_root_logic(path).await
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+async fn work_ensure_scratch_workspace(session_id: String) -> Result<String, String> {
+    work_ensure_scratch_workspace_logic(session_id).await
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -5712,6 +5759,7 @@ pub fn run() {
             ollama_start_server,
             ollama_stop_server,
             work_validate_root,
+            work_ensure_scratch_workspace,
             work_list_dir,
             work_tree,
             work_import_file,

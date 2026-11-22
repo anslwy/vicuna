@@ -82,7 +82,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
+  import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
     captureViewAnchor,
     followAfterScroll,
@@ -1473,7 +1473,9 @@
     }
     let ws: string;
     try {
-      ws = await canonicalWorkspace(rawWs);
+      ws = isNoWorkspacePath(rawWs)
+        ? await ensureScratchWorkspace(thread ? thread.id : crypto.randomUUID())
+        : await canonicalWorkspace(rawWs);
     } catch (e: any) {
       const msg = typeof e === "string" ? e : (e?.message ?? String(e));
       workspaceError = msg;
@@ -2079,6 +2081,12 @@
       save();
     }
     activeId = null;
+    if (sessionFilter === NO_WORKSPACE_FILTER) {
+      pendingWorkspace = NO_WORKSPACE_SENTINEL;
+    } else {
+      const scopeWs = workspaceOfFolderKey(sessionFilter);
+      if (scopeWs !== null) pendingWorkspace = scopeWs;
+    }
     isPinned = true;
     editingIndex = null;
     editDraft = "";
@@ -4149,6 +4157,7 @@
     defaultWorkspace = canon;
     pendingWorkspace = canon;
     pendingMode = "work";
+    syncScopeToWorkspace(canon);
     persistPrefs();
     const existing = chats.find(
       (c) => (c.mode ?? "chat") === "work" && c.workspace === canon && c.messages.length === 0
@@ -4488,7 +4497,21 @@
   // themselves. Order by last user-message time, not creation: a reply to an
   // old session brings it back to the top (and into Today).
   const orderedChats = $derived([...chats].sort((a, b) => chatActivity(b) - chatActivity(a)));
-  const folderRows = $derived(folderOptions(orderedChats));
+  // When the user explicitly switches workspace (or enables No workspace) while
+  // scoped (not "all"), keep that entry visible in Scope even with 0 sessions.
+  const activeScopeWorkspace = $derived.by(() => {
+    if (sessionFilterRaw === ALL_FILTER) return null;
+    const composerWs = (activeChat && activeChat.messages.length > 0 && activeChat.mode === "work"
+      ? (activeChat.workspace ?? pendingWorkspace)
+      : pendingWorkspace).trim();
+    if (sessionFilterRaw === NO_WORKSPACE_FILTER) {
+      return isNoWorkspacePath(composerWs) ? NO_WORKSPACE_SENTINEL : null;
+    }
+    const filterWs = workspaceOfFolderKey(sessionFilterRaw);
+    if (!filterWs) return null;
+    return workspaceFilterKey(composerWs) === folderOptionKey(filterWs) ? filterWs : null;
+  });
+  const folderRows = $derived(folderOptions(orderedChats, activeScopeWorkspace));
   const sessionFilter = $derived(resolveSessionFilter(sessionFilterRaw, folderRows));
   // full path of the chosen scope: a native <select> can only tooltip the
   // control, not each option, so the closed state carries the path instead
@@ -4664,12 +4687,32 @@
     flashNotice(c.role === "lead" ? `"${c.title}" is now the lead: from its next turn it can create, message, stop and remove sessions.` : `"${c.title}" is no longer the lead.`);
   }
 
+  /** Keep the sidebar scope synced with an explicit workspace change,
+   *  unless the user has chosen "All". */
+  function syncScopeToWorkspace(workspace: string) {
+    if (sessionFilter === ALL_FILTER) return;
+    const key = workspaceFilterKey(workspace);
+    if (key) sessionFilterRaw = key;
+  }
+
   /** Choose the sidebar scope. Picking a workspace also makes it where New
    *  starts: the last-used work folder and the composer's pending workspace
    *  both follow the dropdown, so a new session lands in the scope you are
    *  looking at instead of whichever folder was used last. */
   function setSessionFilter(key: string) {
     sessionFilterRaw = key;
+    if (key === NO_WORKSPACE_FILTER) {
+      pendingWorkspace = NO_WORKSPACE_SENTINEL;
+      pendingMode = "work";
+      workspaceError = null;
+      const c = activeChat;
+      if (c && c.messages.length === 0) {
+        c.mode = "work";
+        c.workspace = NO_WORKSPACE_SENTINEL;
+      }
+      persistPrefs();
+      return;
+    }
     const ws = workspaceOfFolderKey(key);
     if (ws !== null) {
       defaultWorkspace = ws;
@@ -5995,7 +6038,9 @@
         // desktop canonicalizes (must exist); plain browsers validate through
         // the bridge (same check, server-side). Without either backend the
         // call below throws and the turn never starts.
-        workRoot = await canonicalWorkspace(rawWs);
+        workRoot = isNoWorkspacePath(rawWs)
+          ? await ensureScratchWorkspace(stagedId)
+          : await canonicalWorkspace(rawWs);
       } catch (e: any) {
         const msg = typeof e === "string" ? e : (e?.message ?? String(e));
         workspaceError = msg;
@@ -6003,8 +6048,12 @@
         return;
       }
       workspaceError = null;
-      defaultWorkspace = workRoot;
-      pendingWorkspace = workRoot;
+      if (isNoWorkspacePath(rawWs)) {
+        pendingWorkspace = NO_WORKSPACE_SENTINEL;
+      } else {
+        defaultWorkspace = workRoot;
+        pendingWorkspace = workRoot;
+      }
       persistPrefs();
     }
     if (!chat) {
@@ -8101,13 +8150,48 @@
     return await invokeOrBridge<string>("work_validate_root", { path: path.trim() });
   }
 
+  async function ensureScratchWorkspace(sessionId: string): Promise<string> {
+    return await invokeOrBridge<string>("work_ensure_scratch_workspace", { sessionId });
+  }
+
+  let wsMenuOpen = $state(false);
+
+  /** Switch to No Workspace mode: uses an empty per-session scratch folder
+   *  under ~/vicuna/scratch/<session-id> so Work engines run without touching
+   *  any existing repository. */
+  async function selectNoWorkspace() {
+    wsMenuOpen = false;
+    workspaceError = null;
+    const workspaceChat = activeChat;
+    if (composerMode === "work" && workspaceChat && workspaceChat.messages.length > 0) {
+      try {
+        const scratch = await ensureScratchWorkspace(workspaceChat.id);
+        workspaceChat.workspace = scratch;
+        await persistSessionWorkspace(workspaceChat, scratch);
+      } catch (e: any) {
+        workspaceError = typeof e === "string" ? e : (e?.message ?? String(e));
+        error = workspaceError;
+        return;
+      }
+    } else if (workspaceChat && workspaceChat.messages.length === 0) {
+      workspaceChat.mode = "work";
+      workspaceChat.workspace = NO_WORKSPACE_SENTINEL;
+    }
+    pendingMode = "work";
+    pendingWorkspace = NO_WORKSPACE_SENTINEL;
+    syncScopeToWorkspace(NO_WORKSPACE_SENTINEL);
+    persistPrefs();
+  }
+
   /** Workspace pill (composer bar, work contexts): native folder picker on
    *  desktop; inline popup form in plain browsers (no FS access for a
    *  dialog, and no window.prompt — it auto-dismisses headlessly). */
   async function pickWorkspace() {
+    const rawHint = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
+    const pickerHint = isNoWorkspacePath(rawHint) ? (isNoWorkspacePath(defaultWorkspace) ? "" : defaultWorkspace.trim()) : rawHint;
     if (!isTauriRuntime() || onServer) {
       if (await canBrowseFolders()) {
-        openFolderPicker((composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim(), "composer");
+        openFolderPicker(pickerHint, "composer");
         return;
       }
       const el = document.querySelector<HTMLInputElement>("[data-testid=workspace-input-active]");
@@ -8116,7 +8200,7 @@
         el.scrollIntoView({ block: "nearest" });
         return;
       }
-      workspaceDraft = (composerMode === "work" ? (activeChat?.workspace ?? pendingWorkspace) : pendingWorkspace).trim();
+      workspaceDraft = pickerHint;
       workspaceError = null;
       workspacePickerOpen = true;
       return;
@@ -8125,7 +8209,7 @@
       const { open } = await import("@tauri-apps/plugin-dialog");
       // "/" is the Unix fresh-install default, not a valid Windows path —
       // never hand it to the native dialog as a default folder.
-      const hint = pendingWorkspace.trim() || defaultWorkspace.trim();
+      const hint = pickerHint || (isNoWorkspacePath(defaultWorkspace) ? "" : defaultWorkspace.trim());
       const picked = await open({
         directory: true,
         multiple: false,
@@ -8139,6 +8223,7 @@
       if (!workspaceError) {
         await persistSessionWorkspace(workspaceChat, picked);
         defaultWorkspace = picked;
+        syncScopeToWorkspace(picked);
         persistPrefs();
       }
     } catch (e: any) {
@@ -8219,6 +8304,7 @@
     if (!workspaceError) {
       await persistSessionWorkspace(workspaceChat, picked);
       defaultWorkspace = picked;
+      syncScopeToWorkspace(picked);
       persistPrefs();
       workspacePickerOpen = false;
     }
@@ -9524,6 +9610,18 @@
         setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
+      // Keep the composer workspace synced with a non-"all" workspace scope on
+      // startup (even if server work_default_workspace or prefs drifted).
+      const resolvedStartupScope = resolveSessionFilter(sessionFilterRaw, folderOptions(chats));
+      if (resolvedStartupScope === NO_WORKSPACE_FILTER) {
+        pendingWorkspace = NO_WORKSPACE_SENTINEL;
+      } else {
+        const startupScopeWs = workspaceOfFolderKey(resolvedStartupScope);
+        if (startupScopeWs !== null) {
+          pendingWorkspace = startupScopeWs;
+          defaultWorkspace = startupScopeWs;
+        }
+      }
       // reopen where the user left off (saved on every navigation); the
       // draft below then restores their unsent text into the composer
       const savedActive = await loadActiveChat();
@@ -9995,8 +10093,14 @@
                     {/if}
                   {/each}
                   {#if showWorkspaceBadge(c, sessionFilter)}
-                    {@const wsBase = workspaceBase(c.workspace ?? "")}
-                    {#if wsBase}
+                    {@const wsIsNone = isNoWorkspacePath(c.workspace)}
+                    {@const wsBase = wsIsNone ? "" : workspaceBase(c.workspace ?? "")}
+                    {#if wsIsNone}
+                      <span class="work-badge ws-badge" data-testid="ws-badge" title="No workspace">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
+                        <span>No workspace</span>
+                      </span>
+                    {:else if wsBase}
                       <span class="work-badge ws-badge" data-testid="ws-badge" title={displayWorkspace(c.workspace ?? "")}>
                         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                         <span>{wsBase}</span>
@@ -10910,18 +11014,65 @@
                 <span class="mcp-dot" data-testid="mcp-dot">{mcpConnectedCount}</span>
               {/if}
             </button>
-            {@const wsPath = displayWorkspace(activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace)}
+            {@const rawWsPath = activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace}
+            {@const wsIsNone = isNoWorkspacePath(rawWsPath)}
+            {@const wsPath = wsIsNone ? "" : displayWorkspace(rawWsPath)}
             {@const wsName = wsPath.trim() ? (workspaceBase(wsPath) || wsPath.trim()) : ""}
-            <button
-              class="model-pill ws-pill"
-              data-testid="workspace-pill"
-              title={wsPath.trim() ? `Workspace: ${wsPath.trim()} — click to change` : "Pick a workspace folder"}
-              aria-label="Pick workspace folder"
-              onclick={() => void pickWorkspace()}
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              <span class="model-name">{wsName || "Workspace"}</span>
-            </button>
+            <div class="ws-split">
+              <button
+                class="model-pill ws-pill {wsIsNone ? 'ws-pill-none' : ''}"
+                data-testid="workspace-pill"
+                title={wsIsNone ? "No workspace — click to pick a folder" : (wsPath.trim() ? `Workspace: ${wsPath.trim()} — click to change` : "Pick a workspace folder")}
+                aria-label="Pick workspace folder"
+                onclick={() => { wsMenuOpen = false; void pickWorkspace(); }}
+              >
+                {#if wsIsNone}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
+                  <span class="model-name">No workspace</span>
+                {:else}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                  <span class="model-name">{wsName || "Workspace"}</span>
+                {/if}
+              </button>
+              <button
+                class="model-pill ws-caret"
+                data-testid="workspace-menu-btn"
+                aria-label="Workspace options"
+                aria-haspopup="menu"
+                aria-expanded={wsMenuOpen}
+                title="Workspace options"
+                onclick={() => (wsMenuOpen = !wsMenuOpen)}
+              >
+                <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 4 4 4-4"/></svg>
+              </button>
+              {#if wsMenuOpen}
+                <button class="sched-backdrop" data-testid="workspace-menu-backdrop" aria-label="Close workspace menu" onclick={() => (wsMenuOpen = false)} tabindex="-1"></button>
+                <div class="ws-menu" data-testid="workspace-menu" role="menu" aria-label="Workspace options">
+                  <button
+                    class="ctx-item ws-menu-opt"
+                    role="menuitem"
+                    data-testid="workspace-menu-pick"
+                    onclick={() => { wsMenuOpen = false; void pickWorkspace(); }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    <span>Pick folder…</span>
+                  </button>
+                  <button
+                    class="ctx-item ws-menu-opt {wsIsNone ? 'sel' : ''}"
+                    role="menuitemcheckbox"
+                    aria-checked={wsIsNone}
+                    data-testid="workspace-menu-none"
+                    onclick={() => void selectNoWorkspace()}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
+                    <span>No workspace</span>
+                    {#if wsIsNone}
+                      <svg class="ws-menu-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>
+                    {/if}
+                  </button>
+                </div>
+              {/if}
+            </div>
             {#if workspacePickerOpen && (!isTauriRuntime() || onServer) && !ctxMenu}
               <span class="model-pill-wrap">
                 <button class="model-backdrop" data-testid="workspace-picker-backdrop" aria-label="Close workspace picker" onclick={dismissWorkspacePicker} tabindex="-1"></button>
@@ -13572,6 +13723,16 @@
   .slash-desc { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: var(--muted); text-align: right; }
   .spacer { flex: 1; }
   .model-pill { display: flex; align-items: center; gap: 6px; background: var(--card); color: var(--text); border: none; border-radius: 16px; padding: 7px 12px; font-size: 13.5px; cursor: pointer; max-width: 260px; }
+  /* Work mode: workspace picker + dropdown caret joined into one split pill */
+  .ws-split { position: relative; display: inline-flex; align-items: stretch; }
+  .ws-split > .ws-pill { border-radius: 16px 0 0 16px; padding-right: 9px; }
+  .ws-split > .ws-pill.ws-pill-none { color: var(--muted); }
+  .ws-split > .ws-caret { border-radius: 0 16px 16px 0; padding: 7px 8px 7px 6px; border-left: 1px solid var(--border); color: var(--muted); }
+  .ws-split > .ws-pill:hover, .ws-split > .ws-caret:hover { background: var(--hover-3); color: var(--text); }
+  .ws-menu { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 41; min-width: 185px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 5px; display: flex; flex-direction: column; text-align: left; }
+  .ws-menu-opt { display: flex; align-items: center; gap: 8px; }
+  .ws-menu-opt.sel { background: var(--hover-3); }
+  .ws-menu-check { margin-left: auto; color: var(--accent); }
   .prov-ico { display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted-2); }
   .model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: inherit; }
   .model-pill-wrap { position: relative; }

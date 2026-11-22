@@ -22,10 +22,24 @@ import type { Chat } from "./store";
 
 /** Chat = the workspace-less channel; any other value is a workspace root. */
 export const CHAT_FILTER = "chat";
+/** No workspace = Work sessions using an empty per-session scratch folder. */
+export const NO_WORKSPACE_FILTER = "none";
+/** Sentinel value held in pendingWorkspace before a No Workspace session gets its scratch dir. */
+export const NO_WORKSPACE_SENTINEL = "__vicuna_no_workspace__";
 /** All = no scoping at all (the default). */
 export const ALL_FILTER = "all";
 /** Prefix that marks an option key as a workspace root. */
 export const WORKSPACE_PREFIX = "W:";
+
+/** True when a workspace string represents No Workspace mode (either the
+ *  unsent sentinel or a materialized `~/vicuna/scratch/<session-id>` folder). */
+export function isNoWorkspacePath(p: string | null | undefined): boolean {
+  const s = (p ?? "").trim();
+  if (!s) return false;
+  if (s === NO_WORKSPACE_SENTINEL || s === NO_WORKSPACE_FILTER) return true;
+  const norm = s.replace(/\\/g, "/").replace(/\/+$/, "");
+  return /\/vicuna\/scratch\/[A-Za-z0-9_-]{1,64}$/.test(norm);
+}
 
 /** Final path segment on any platform, with Rust's Windows verbatim prefix
  *  stripped. Mirrors displayWorkspace/workspaceBase in ChatApp.svelte, which
@@ -37,11 +51,12 @@ export function workspaceBase(p: string): string {
   return out.trim().split(/[/\\]/).filter(Boolean).pop() ?? "";
 }
 
-/** The folder a session lives in: its workspace root, or CHAT_FILTER when it
- *  has none (plain chats and workspace-less work sessions). */
+/** The folder a session lives in: its workspace root, NO_WORKSPACE_FILTER for
+ *  scratch sessions, or CHAT_FILTER when it has none. */
 export function folderOf(c: Chat): string {
   const ws = (c.workspace ?? "").trim();
   if (!ws) return CHAT_FILTER;
+  if (isNoWorkspacePath(ws)) return NO_WORKSPACE_FILTER;
   return displayRoot(ws);
 }
 
@@ -54,20 +69,30 @@ function displayRoot(p: string): string {
   return out.replace(/\\/g, "/").replace(/\/+$/, "") || CHAT_FILTER;
 }
 
-/** Encode a folder (a root or CHAT_FILTER) as a dropdown option key. */
+/** Encode a folder (a root or reserved channel) as a dropdown option key. */
 export function folderOptionKey(folder: string): string {
-  if (folder === ALL_FILTER || folder === CHAT_FILTER) return folder;
+  if (folder === ALL_FILTER || folder === CHAT_FILTER || folder === NO_WORKSPACE_FILTER) return folder;
   return WORKSPACE_PREFIX + folder;
 }
 
+/** Normalize a raw workspace path into its sidebar scope option key, or null
+ *  when empty. */
+export function workspaceFilterKey(workspace: string): string | null {
+  const ws = workspace.trim();
+  if (!ws) return null;
+  if (isNoWorkspacePath(ws)) return NO_WORKSPACE_FILTER;
+  const root = displayRoot(ws);
+  return root === CHAT_FILTER ? null : folderOptionKey(root);
+}
+
 /**
- * The workspace root an option key points at, or null for All/Chat.
+ * The workspace root an option key points at, or null for All/Chat/No workspace.
  *
  * Accepts a raw root too, so a filter stored by an older build (which kept
  * the bare root in prefs) keeps working instead of silently falling back.
  */
 export function workspaceOfFolderKey(key: string): string | null {
-  if (key === ALL_FILTER || key === CHAT_FILTER) return null;
+  if (key === ALL_FILTER || key === CHAT_FILTER || key === NO_WORKSPACE_FILTER) return null;
   if (key.startsWith(WORKSPACE_PREFIX)) {
     const root = key.slice(WORKSPACE_PREFIX.length);
     return root ? root : null;
@@ -98,7 +123,7 @@ export interface FolderOption {
  * `chats` is expected in display order (most recent first); the order is
  * preserved when deriving each workspace's recency.
  */
-export function folderOptions(chats: Chat[]): FolderOption[] {
+export function folderOptions(chats: Chat[], extraWorkspace?: string | null): FolderOption[] {
   const byKey = new Map<string, FolderOption & { recency: number }>();
   byKey.set(ALL_FILTER, { key: ALL_FILTER, label: "All", title: "", count: 0, recency: -1 });
   byKey.set(CHAT_FILTER, { key: CHAT_FILTER, label: "Chat", title: "", count: 0, recency: -1 });
@@ -112,12 +137,29 @@ export function folderOptions(chats: Chat[]): FolderOption[] {
     const key = folderOptionKey(folder);
     let opt = byKey.get(key);
     if (!opt) {
-      opt = { key, label: workspaceBase(folder), title: folder, count: 0, recency: i };
+      opt = key === NO_WORKSPACE_FILTER
+        ? { key, label: "No workspace", title: "", count: 0, recency: -0.75 }
+        : { key, label: workspaceBase(folder), title: folder, count: 0, recency: i };
       byKey.set(key, opt);
     }
     opt.count++;
     // first sighting in display order = this folder's newest session
-    if (opt.recency > i) opt.recency = i;
+    if (key !== NO_WORKSPACE_FILTER && opt.recency > i) opt.recency = i;
+  }
+  if (extraWorkspace) {
+    if (isNoWorkspacePath(extraWorkspace)) {
+      if (!byKey.has(NO_WORKSPACE_FILTER)) {
+        byKey.set(NO_WORKSPACE_FILTER, { key: NO_WORKSPACE_FILTER, label: "No workspace", title: "", count: 0, recency: -0.75 });
+      }
+    } else {
+      const folder = displayRoot(extraWorkspace);
+      if (folder !== CHAT_FILTER) {
+        const key = folderOptionKey(folder);
+        if (!byKey.has(key)) {
+          byKey.set(key, { key, label: workspaceBase(folder), title: folder, count: 0, recency: -0.5 });
+        }
+      }
+    }
   }
   byKey.get(ALL_FILTER)!.count = total;
   const order = [...byKey.values()].sort((a, b) => {
@@ -125,6 +167,8 @@ export function folderOptions(chats: Chat[]): FolderOption[] {
     if (b.key === ALL_FILTER) return 1;
     if (a.key === CHAT_FILTER) return -1;
     if (b.key === CHAT_FILTER) return 1;
+    if (a.key === NO_WORKSPACE_FILTER) return -1;
+    if (b.key === NO_WORKSPACE_FILTER) return 1;
     return a.recency - b.recency;
   });
   return disambiguate(order.map(({ recency: _recency, ...rest }) => rest));
@@ -175,6 +219,7 @@ export function resolveSessionFilter(filter: unknown, options: FolderOption[]): 
 export function matchesFilter(c: Chat, filter: string): boolean {
   const f = normalizeSessionFilter(filter);
   if (f === ALL_FILTER) return true;
+  if (f === NO_WORKSPACE_FILTER) return folderOf(c) === NO_WORKSPACE_FILTER;
   const ws = workspaceOfFolderKey(f);
   if (ws === null) return folderOf(c) === CHAT_FILTER;
   return folderOf(c) === ws;
@@ -188,12 +233,12 @@ export function filterChats(chats: Chat[], filter: string): Chat[] {
 }
 
 /** Whether a sidebar row should render its workspace pill. When the sidebar is
- *  already scoped to the session's own workspace, repeating that folder name
- *  on every row is redundant and steals width from the title. Under All, Chat,
- *  or a different workspace (e.g. a Pinned session from another folder), keep
- *  the pill so the row's workspace remains clear. */
+ *  already scoped to the session's own workspace (or No workspace), repeating
+ *  that label on every row is redundant and steals width from the title. */
 export function showWorkspaceBadge(c: Chat, filter: string): boolean {
-  const ws = workspaceOfFolderKey(normalizeSessionFilter(filter));
+  const f = normalizeSessionFilter(filter);
+  if (f === NO_WORKSPACE_FILTER) return folderOf(c) !== NO_WORKSPACE_FILTER;
+  const ws = workspaceOfFolderKey(f);
   if (ws === null) return true;
   return folderOf(c) !== ws;
 }

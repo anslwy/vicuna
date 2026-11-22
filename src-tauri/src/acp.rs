@@ -1477,10 +1477,21 @@ Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read 
         .unwrap_or_else(|| {
             "- Session context: call `get_session_id` on vicuna-mcp to check the current Vicuna session ID, `read_session` (paginated) to read session history if the workspace/harness changed or earlier context was omitted, and `list_sessions` to browse other sessions.".to_string()
         });
-    format!(
-        "You are Vicuna Work mode, operating inside this workspace: {workspace}\n\
+    let intro = if crate::is_scratch_workspace(workspace) {
+        format!(
+            "You are Vicuna Work mode in No Workspace mode (no project repository is attached). An empty scratch folder ({workspace}) is available if you need to create temporary files, but the user may simply be having a general conversation — do not scan or assume a codebase exists.\n\
 \n\
-Use your own built-in tools to inspect and change files and run commands. The workspace is your boundary:\n\
+If you use your built-in tools, stay inside the scratch folder unless the user explicitly asks:"
+        )
+    } else {
+        format!(
+            "You are Vicuna Work mode, operating inside this workspace: {workspace}\n\
+\n\
+Use your own built-in tools to inspect and change files and run commands. The workspace is your boundary:"
+        )
+    };
+    format!(
+        "{intro}\n\
 - Do not read, list, search, write, or delete outside it unless the user explicitly asks; ask first with a clear reason. Scratch files belong in the system temp dir, never in the repo.\n\
 - Never crawl from / or the home folder (`find /`, `find ~`, `grep -r /`): on macOS that triggers a consent dialog for every protected folder. Use targeted paths.\n\
 - Keep the user oriented: write one short line before a batch of tool calls saying what you are doing and why, then after the work summarize what changed with paths and commands that matter.\n\

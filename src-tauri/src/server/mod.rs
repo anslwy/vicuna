@@ -464,6 +464,11 @@ async fn dispatch(
         "work_validate_root" => {
             Ok(serde_json::json!(crate::work_validate_root_logic(s("path")?).await?))
         }
+        "work_ensure_scratch_workspace" => {
+            Ok(serde_json::json!(
+                crate::work_ensure_scratch_workspace_logic(s("sessionId")?).await?
+            ))
+        }
         "work_list_dir" => {
             let path = arg_opt_str(args, "path");
             Ok(serde_json::json!(crate::work_list_dir_logic(s("root")?, path).await?))
@@ -1459,6 +1464,7 @@ pub const API_ACTIONS: &[&str] = &[
     "work_undo",
     "work_usage",
     "work_validate_root",
+    "work_ensure_scratch_workspace",
     "work_write_file",
     "api_actions",
     "whisper_install",
