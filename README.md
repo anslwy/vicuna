@@ -6,9 +6,9 @@ Drive Claude Code, Codex, Antigravity, OpenCode, `fx`, `pi`, and ACP plugin harn
 
 | ![Work mode with Fork-style Git diff](docs/assets/work-git-diff.jpg) | ![Built-in code editor with Vim mode](docs/assets/code-editor.jpg) |
 |:---:|:---:|
-| Work mode + Fork-style Git diff *(Dark)* | Built-in code editor with Vim mode *(Light)* |
+| Work mode + Fork-style Git diff | Built-in code editor with Vim mode |
 | ![Plugins Explore marketplace](docs/assets/plugins-explore.jpg) | ![Settings and custom themes](docs/assets/settings-themes.jpg) |
-| Plugins Explore marketplace *(Lagoon Night)* | Settings & custom themes *(Lagoon Dune)* |
+| Plugins Explore marketplace | Settings & custom themes |
 
 ## Highlights
 
