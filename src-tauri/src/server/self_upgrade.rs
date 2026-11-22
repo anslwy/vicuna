@@ -19,13 +19,30 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     matches!((parse_version(latest), parse_version(current)), (Some(l), Some(c)) if l > c)
 }
 
+/// Strip Linux's ` (deleted)` suffix from `/proc/self/exe` when the binary on
+/// disk was atomically replaced while this server process is still running
+/// (e.g. after `vicuna upgrade --no-restart`, `install-cli.sh`, or a failed
+/// restart), so retrying an in-app upgrade execs the replacement binary
+/// instead of failing with ENOENT.
+pub fn strip_deleted_suffix(exe: &std::path::Path) -> std::path::PathBuf {
+    if let Some(s) = exe.to_str() {
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    exe.to_path_buf()
+}
+
 /// True when this process may replace its own binary from the UI.
 pub fn can_upgrade() -> bool {
     if cfg!(feature = "desktop") || cfg!(windows) {
         return false;
     }
     match std::env::current_exe() {
-        Ok(exe) => !exe.components().any(|c| c.as_os_str() == "target"),
+        Ok(exe) => {
+            let exe = strip_deleted_suffix(&exe);
+            !exe.components().any(|c| c.as_os_str() == "target")
+        }
         Err(_) => false,
     }
 }
@@ -66,7 +83,7 @@ pub fn start() -> Result<serde_json::Value, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = strip_deleted_suffix(&std::env::current_exe().map_err(|e| e.to_string())?);
         let dir = super::server_dir();
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let log_path = dir.join("upgrade.log");
@@ -184,5 +201,12 @@ mod tests {
         assert!(is_newer("v0.0.10", "0.0.9"));
         assert!(!is_newer("v0.0.33", "0.0.33"));
         assert!(!is_newer("garbage", "0.0.1"));
+    }
+    #[test]
+    fn strip_deleted_suffix_handles_linux_unlinked_exe() {
+        let p = std::path::Path::new("/home/ubuntu/.local/bin/vicuna (deleted)");
+        assert_eq!(strip_deleted_suffix(p), std::path::PathBuf::from("/home/ubuntu/.local/bin/vicuna"));
+        let normal = std::path::Path::new("/home/ubuntu/.local/bin/vicuna");
+        assert_eq!(strip_deleted_suffix(normal), normal);
     }
 }
