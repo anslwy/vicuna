@@ -14,7 +14,8 @@ import {
   groupByDate,
   workspaceBase,
   visibleChats,
-  isPinnedRow
+  isPinnedRow,
+  showWorkspaceBadge
 } from "../src/lib/sidebar.ts";
 
 let failures = 0;
@@ -195,6 +196,19 @@ eq(visibleChats(arch, false, "c").map((c) => c.id), ["b", "c"], "the open sessio
 eq(isPinnedRow({ pinned: true, messages: [1] }), true, "pinned row");
 eq(isPinnedRow({ pinned: true, archived: true, messages: [1] }), false, "archived leaves Pinned");
 eq(isPinnedRow({ pinned: true, messages: [] }), false, "empty never pinned");
+
+// ---- showWorkspaceBadge: hide redundant pill when already in that workspace scope ----
+const wsBeta = chat("wb", { now, mode: "work", workspace: "/p/beta" });
+const wsBetaSlash = chat("wbs", { now, mode: "work", workspace: "/p/beta/" });
+const wsAlpha = chat("wa", { now, mode: "work", workspace: "/p/alpha" });
+const wsLoose = chat("wl", { now, mode: "work", workspace: null });
+eq(showWorkspaceBadge(wsBeta, ALL_FILTER), true, "All scope shows workspace pill");
+eq(showWorkspaceBadge(wsBeta, CHAT_FILTER), true, "Chat scope keeps workspace pill (e.g. Pinned work session)");
+eq(showWorkspaceBadge(wsBeta, "W:/p/beta"), false, "matching workspace scope hides redundant pill");
+eq(showWorkspaceBadge(wsBetaSlash, "W:/p/beta"), false, "trailing slash still matches scope and hides pill");
+eq(showWorkspaceBadge(wsBeta, "/p/beta"), false, "legacy raw root filter still hides pill");
+eq(showWorkspaceBadge(wsAlpha, "W:/p/beta"), true, "different workspace (e.g. Pinned) keeps its pill");
+eq(showWorkspaceBadge(wsLoose, "W:/p/beta"), true, "workspace-less work session keeps Work badge");
 
 if (failures > 0) {
   console.error(`\n${failures} sidebar check(s) failed`);
