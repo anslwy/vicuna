@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/anslwy/vicuna/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/anslwy/vicuna?include_prereleases&style=flat-square"></a>
-  <a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/github/license/anslwy/vicuna?style=flat-square"></a>
+  <a href="https://www.apache.org/licenses/LICENSE-2.0"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/anslwy/vicuna?style=flat-square"></a>
 </p>
 
 <p align="center"><a href="#install"><b>Install</b></a> · <a href="#highlights">Highlights</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
@@ -123,4 +123,4 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 ## License
 
-MIT
+Apache-2.0
