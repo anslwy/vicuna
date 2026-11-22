@@ -87,11 +87,14 @@
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
   import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, resolveDraftWorkspace, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
+    captureOpenToolDetails,
     captureViewAnchor,
     followAfterScroll,
+    restoreOpenToolDetails,
     restoreViewAnchor,
     scrollKeyDirection,
     upwardScrollInput,
+    type OpenDetailsSnapshot,
     type ViewAnchor
   } from "$lib/scrollFollow";
   import { fetchOpenRouterModels, testOpenRouterKey, readOpenRouterCache, writeOpenRouterCache, filterOpenRouterModels, formatContextLength, formatModelPricing, formatCacheAge, formatUsd, isFreeModel, supportsVision, supportsTools, maskKey, setOpenRouterApiKey, isOpenRouterSelection, openRouterModelId, openRouterSelection, displayOpenRouterId, findOpenRouterModel, OPENROUTER_FILTERS, type OpenRouterFilter, type OpenRouterKeyInfo, type OpenRouterModel } from "$lib/openrouter";
@@ -992,8 +995,26 @@
   let scrollFrame = 0;
   /** viewport anchor held across a streamed DOM write while the reader is paused */
   let viewAnchor: ViewAnchor | null = null;
+  /** open <details class="tool-result"> cards held across a DOM write */
+  let openDetailsSnapshot: OpenDetailsSnapshot = [];
+  /** incremented to invalidate any in-flight releaseReaderPlace() on user scroll input */
+  let scrollRestoreGen = 0;
+  /** true while a paused-reader restore is in flight so momentary collapse cannot flip isPinned */
+  let scrollRestoring = false;
+  let scrollRestoreRaf = 0;
   let draggingScrollbar = false;
   let touchScrollY: number | null = null;
+
+  function cancelScrollRestore() {
+    scrollRestoreGen++;
+    viewAnchor = null;
+    openDetailsSnapshot = [];
+    if (scrollRestoreRaf) {
+      cancelAnimationFrame(scrollRestoreRaf);
+      scrollRestoreRaf = 0;
+    }
+    scrollRestoring = false;
+  }
 
   function hasMessageSelection() {
     const sel = window.getSelection();
@@ -1014,7 +1035,9 @@
   }
 
   function pauseForScrollInput(deltaY: number, target: EventTarget | null) {
-    if (messagesEl && upwardScrollInput(deltaY, messagesEl.scrollTop) && !nestedScrollerConsumes(target, deltaY)) {
+    if (!messagesEl || nestedScrollerConsumes(target, deltaY)) return;
+    if (deltaY !== 0) cancelScrollRestore();
+    if (upwardScrollInput(deltaY, messagesEl.scrollTop)) {
       isPinned = false;
     }
   }
@@ -1039,6 +1062,7 @@
     // Overlay scrollbars have no layout width. Reserve their edge too.
     const gutter = Math.max(12, messagesEl.offsetWidth - messagesEl.clientWidth);
     if (e.clientX < rect.right - gutter) return;
+    cancelScrollRestore();
     draggingScrollbar = true;
     isPinned = false;
   }
@@ -1062,6 +1086,11 @@
 
   function onMessagesScroll() {
     if (!messagesEl) return;
+    // Ignore scroll events fired by a momentary DOM collapse or our own
+    // anchor restore while releaseReaderPlace() is in flight — otherwise a
+    // collapsed answer can make scrollHeight - clientHeight - scrollTop <= 2
+    // and falsely flip isPinned back to true.
+    if (scrollRestoring) return;
     // WebKit may reset scrollTop during a streamed {@html} replacement,
     // focus loss, or layout correction. A scroll event alone is NOT proof
     // the reader scrolled up. Only the input handlers above may unpin.
@@ -1070,42 +1099,83 @@
   }
 
   function jumpToBottom() {
+    cancelScrollRestore();
     isPinned = true;
-    viewAnchor = null;
     scrollBottom();
   }
 
   // A paused reader must not be moved by the stream. Auto-follow is not the
   // only thing that moves the viewport: when the answer above grows, Chromium
   // still anchors an overflowing scroller (despite `overflow-anchor: none`) and
-  // pushes the text down; when `scrollHeight` collapses — the thinking block is
-  // destroyed as soon as the answer starts — scrollTop is clamped and the view
-  // jumps toward the top. Neither produces a scroll event the app could tell
-  // apart from a real gesture, so record what is on screen around the write and
-  // put it back. Same reasoning as this file's note on input-only unpinning.
+  // pushes the text down; when `scrollHeight` collapses — an `{@html}`
+  // replacement tears down the last message's `.answer` or the thinking block
+  // collapses — scrollTop is clamped and the view jumps back up toward the top
+  // of the last message. Neither produces a scroll event the app could tell
+  // apart from a real gesture, so record open tool cards + what is on screen
+  // around the write and put them back.
   function holdReaderPlace() {
     if (!messagesEl) return false;
+    openDetailsSnapshot = captureOpenToolDetails(messagesEl);
     // a pinned view is owned by scrollBottom(); a gesture or a selection during
     // the stream clears the anchor so the reader is never fought
     if (isPinned || draggingScrollbar || hasMessageSelection()) {
       viewAnchor = null;
-      return false;
+      return openDetailsSnapshot.length > 0;
     }
     viewAnchor = captureViewAnchor(messagesEl, messagesEl);
-    return viewAnchor != null;
+    return viewAnchor != null || openDetailsSnapshot.length > 0;
   }
 
-  /** Re-apply the anchor recorded by holdReaderPlace, once per flush. */
+  /** Re-apply open tool cards and the anchor recorded by holdReaderPlace. */
   async function releaseReaderPlace() {
     const anchor = viewAnchor;
+    const details = openDetailsSnapshot;
     viewAnchor = null;
-    if (!anchor || !messagesEl) return;
-    // the {tick()} await lets Svelte commit the new markdown; a single frame
-    // after that is where Chromium's own anchoring adjustment has landed
+    openDetailsSnapshot = [];
+    if ((!anchor && details.length === 0) || !messagesEl) return;
+    const gen = ++scrollRestoreGen;
+    if (scrollRestoreRaf) {
+      cancelAnimationFrame(scrollRestoreRaf);
+      scrollRestoreRaf = 0;
+    }
+    if (anchor) scrollRestoring = true;
+    // Let Svelte commit the new {@html} markdown before restoring open cards
+    // and the paused viewport position.
     await tick();
-    if (!messagesEl || isPinned || hasMessageSelection()) return;
-    if (!anchor.el.isConnected) return;
+    if (gen !== scrollRestoreGen || !messagesEl) {
+      if (gen === scrollRestoreGen) scrollRestoring = false;
+      return;
+    }
+    if (details.length > 0) restoreOpenToolDetails(messagesEl, details);
+    if (!anchor || isPinned || draggingScrollbar || hasMessageSelection()) {
+      scrollRestoring = false;
+      return;
+    }
     restoreViewAnchor(messagesEl, anchor);
+    // One animation frame later, WebKit/Chromium post-layout clamping or
+    // scroll-anchoring adjustments have landed; re-apply once if needed.
+    scrollRestoreRaf = requestAnimationFrame(() => {
+      scrollRestoreRaf = 0;
+      if (gen !== scrollRestoreGen || !messagesEl) {
+        if (gen === scrollRestoreGen) scrollRestoring = false;
+        return;
+      }
+      if (!isPinned && !draggingScrollbar && !hasMessageSelection()) {
+        restoreViewAnchor(messagesEl, anchor);
+      }
+      scrollRestoring = false;
+    });
+  }
+
+  /** Run a message-list state mutation while preserving a paused reader's
+   *  scroll position and any open tool-result <details> cards when `chatId`
+   *  is the currently open session. */
+  function withPreservedScroll(chatId: string, mutate: () => void) {
+    const isOpen = chatId === activeId;
+    const held = isOpen && holdReaderPlace();
+    mutate();
+    if (isOpen) scrollBottom();
+    if (held) void releaseReaderPlace();
   }
 
   // The send/stop/queue buttons are an {#if} swap: starting or stopping a
@@ -5434,18 +5504,17 @@
       if (!c || !msg) return;
       const isOpen = activeId === id;
       const keep = isOpen ? captureStreamSel(index) : null;
-      const held = isOpen && holdReaderPlace();
-      c.messages[index] = {
-        ...msg,
-        content: (replacement ?? msg.content) + pendingText,
-        thinking: (msg.thinking ?? "") + pendingThinking
-      };
+      withPreservedScroll(id, () => {
+        c.messages[index] = {
+          ...msg,
+          content: (replacement ?? msg.content) + pendingText,
+          thinking: (msg.thinking ?? "") + pendingThinking
+        };
+      });
       pendingText = "";
       pendingThinking = "";
       replacement = undefined;
       if (keep) void tick().then(() => restoreStreamSel(index, keep));
-      if (isOpen) scrollBottom();
-      if (held) void releaseReaderPlace();
     }
     function receive(event: ChatTurnEvent) {
       if (event.type === "done" || event.type === "error") {
@@ -5589,16 +5658,15 @@
       // tokens update state but never touch them
       const isOpen = chat.id === activeId;
       const keep = isOpen ? captureStreamSel(index) : null;
-      const held = isOpen && holdReaderPlace();
-      const c = chats.find((x) => x.id === chat.id);
-      if (c && c.messages[index]) {
-        const m = c.messages[index];
-        c.messages[index] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
-        chats = [...chats];
-      }
+      withPreservedScroll(chat.id, () => {
+        const c = chats.find((x) => x.id === chat.id);
+        if (c && c.messages[index]) {
+          const m = c.messages[index];
+          c.messages[index] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: m.model ?? selectedModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
+          chats = [...chats];
+        }
+      });
       if (keep) void tick().then(() => restoreStreamSel(index, keep));
-      if (isOpen) scrollBottom();
-      if (held) void releaseReaderPlace();
       saveSoon();
     }
     function scheduleFlush() {
@@ -8406,10 +8474,18 @@
             const full = await invokeOrBridge<any>("chats_get", { id: raw.id }).catch(() => null);
             if (!full || workRunningIds.includes(raw.id) || serverChatFeeds.has(raw.id)) continue;
             const fresh = adoptServerChat(full);
-            chats = chats.map((c) => c.id === fresh.id ? fresh : c);
+            withPreservedScroll(fresh.id, () => {
+              chats = chats.map((c) => c.id === fresh.id ? fresh : c);
+            });
           } else {
             const fresh = adoptServerChat(raw);
-            chats = local ? chats.map((c) => c.id === fresh.id ? fresh : c) : [fresh, ...chats];
+            if (local) {
+              withPreservedScroll(fresh.id, () => {
+                chats = chats.map((c) => c.id === fresh.id ? fresh : c);
+              });
+            } else {
+              chats = [fresh, ...chats];
+            }
           }
         }
       }
@@ -8529,12 +8605,14 @@
     const local = chats.find((x) => x.id === id);
     const fresh = adoptServerChat(raw);
     if (!local) return;
-    if (serverSessionTools) Object.assign(local, fresh);
-    else {
-      local.messages = fresh.messages;
-      if ((fresh.updatedAt ?? 0) > (local.updatedAt ?? 0)) local.updatedAt = fresh.updatedAt;
-    }
-    chats = [...chats];
+    withPreservedScroll(id, () => {
+      if (serverSessionTools) Object.assign(local, fresh);
+      else {
+        local.messages = fresh.messages;
+        if ((fresh.updatedAt ?? 0) > (local.updatedAt ?? 0)) local.updatedAt = fresh.updatedAt;
+      }
+      chats = [...chats];
+    });
     save();
   }
 
@@ -8603,16 +8681,15 @@
       pendingTh = "";
       const isOpen = chat.id === activeId;
       const keep = isOpen ? captureStreamSel(curIndex) : null;
-      const held = isOpen && holdReaderPlace();
-      const c = chats.find((x) => x.id === chat.id);
-      if (c && c.messages[curIndex]) {
-        const m = c.messages[curIndex];
-        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: turnModel, ...(m.workspace || turnWorkspace ? { workspace: m.workspace ?? turnWorkspace } : {}), genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
-        chats = [...chats];
-      }
+      withPreservedScroll(chat.id, () => {
+        const c = chats.find((x) => x.id === chat.id);
+        if (c && c.messages[curIndex]) {
+          const m = c.messages[curIndex];
+          c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: turnModel, ...(m.workspace || turnWorkspace ? { workspace: m.workspace ?? turnWorkspace } : {}), genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
+          chats = [...chats];
+        }
+      });
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
-      if (isOpen) scrollBottom();
-      if (held) void releaseReaderPlace();
       saveSoon();
     }
     function scheduleFlush() {
@@ -8653,11 +8730,13 @@
     }
     function appendContent(s: string) {
       flushNow();
-      const c = live();
-      if (!c?.messages[curIndex]) return;
-      const m = c.messages[curIndex];
-      c.messages[curIndex] = { ...m, content: m.content + s };
-      chats = [...chats];
+      withPreservedScroll(chat.id, () => {
+        const c = live();
+        if (!c?.messages[curIndex]) return;
+        const m = c.messages[curIndex];
+        c.messages[curIndex] = { ...m, content: m.content + s };
+        chats = [...chats];
+      });
     }
     // native history: proper tool roles for the model; the display message
     // holds narration + markdown results for persistence. seedContext carries
@@ -8920,57 +8999,59 @@
           flushNow();
           const head = pendingHead;
           pendingHead = null;
-          const t = live();
-          if (ev.name === "say") {
-            // display channel for models that emit tool calls only: the text
-            // becomes normal assistant prose, not a collapsed tool block
-            const text = String(head?.args.text ?? "").trim();
-            if (text && !ev.output.startsWith("Error:") && t?.messages[curIndex]) {
-              const m = t.messages[curIndex];
-              const sep = m.content.trim() ? "\n\n" : "";
-              t.messages[curIndex] = { ...m, content: `${m.content}${sep}${text}\n\n` };
-              chats = [...chats];
-            } else if (t?.messages[curIndex]) {
-              const m = t.messages[curIndex];
-              t.messages[curIndex] = { ...m, content: m.content + formatToolCallHead(ev.name, head?.args ?? {}) + formatToolCallTail(ev.output) };
-              chats = [...chats];
+          withPreservedScroll(chat.id, () => {
+            const t = live();
+            if (ev.name === "say") {
+              // display channel for models that emit tool calls only: the text
+              // becomes normal assistant prose, not a collapsed tool block
+              const text = String(head?.args.text ?? "").trim();
+              if (text && !ev.output.startsWith("Error:") && t?.messages[curIndex]) {
+                const m = t.messages[curIndex];
+                const sep = m.content.trim() ? "\n\n" : "";
+                t.messages[curIndex] = { ...m, content: `${m.content}${sep}${text}\n\n` };
+                chats = [...chats];
+              } else if (t?.messages[curIndex]) {
+                const m = t.messages[curIndex];
+                t.messages[curIndex] = { ...m, content: m.content + formatToolCallHead(ev.name, head?.args ?? {}) + formatToolCallTail(ev.output) };
+                chats = [...chats];
+              }
+            } else if (ev.name === "ask") {
+              // visible harness record of the Q/A (or dismissal); a cancelled
+              // ask (Stop / chat deleted) emits no ToolEnd, so nothing lands
+              if ((askOutcome === "answer" || askOutcome === "dismiss") && t?.messages[curIndex]) {
+                const m = t.messages[curIndex];
+                t.messages[curIndex] = {
+                  ...m,
+                  content: m.content + formatAskRecord(String(head?.args.question ?? ""), askText, askOutcome === "dismiss")
+                };
+                chats = [...chats];
+              }
+              askOutcome = null;
+              askText = "";
+            } else {
+              if (t?.messages[curIndex]) {
+                const m = t.messages[curIndex];
+                const askTail = pendingAskRecords.length ? pendingAskRecords.splice(0).join("") : "";
+                t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) + askTail };
+                chats = [...chats];
+              }
             }
-          } else if (ev.name === "ask") {
-            // visible harness record of the Q/A (or dismissal); a cancelled
-            // ask (Stop / chat deleted) emits no ToolEnd, so nothing lands
-            if ((askOutcome === "answer" || askOutcome === "dismiss") && t?.messages[curIndex]) {
-              const m = t.messages[curIndex];
-              t.messages[curIndex] = {
-                ...m,
-                content: m.content + formatAskRecord(String(head?.args.question ?? ""), askText, askOutcome === "dismiss")
-              };
-              chats = [...chats];
-            }
-            askOutcome = null;
-            askText = "";
-          } else {
-            if (t?.messages[curIndex]) {
-              const m = t.messages[curIndex];
-              const askTail = pendingAskRecords.length ? pendingAskRecords.splice(0).join("") : "";
-              t.messages[curIndex] = { ...m, content: m.content + formatToolCallTail(ev.output) + askTail };
-              chats = [...chats];
-            }
-          }
-          scrollIfOpen();
+          });
           saveSoon();
           break;
         }
         case "bgcompleted": {
-          const t = live();
-          if (t?.messages[curIndex]) {
-            const m = t.messages[curIndex];
-            t.messages[curIndex] = {
-              ...m,
-              content: m.content + formatToolResult("exec", { command: `${ev.command} (${ev.job_id})` }, ev.output)
-            };
-            chats = [...chats];
-          }
-          scrollIfOpen();
+          withPreservedScroll(chat.id, () => {
+            const t = live();
+            if (t?.messages[curIndex]) {
+              const m = t.messages[curIndex];
+              t.messages[curIndex] = {
+                ...m,
+                content: m.content + formatToolResult("exec", { command: `${ev.command} (${ev.job_id})` }, ev.output)
+              };
+              chats = [...chats];
+            }
+          });
           saveSoon();
           break;
         }
@@ -9060,9 +9141,11 @@
                   if (inCard) {
                     pendingAskRecords.push(rec);
                   } else {
-                    const m = t.messages[curIndex];
-                    t.messages[curIndex] = { ...m, content: m.content + rec };
-                    chats = [...chats];
+                    withPreservedScroll(chat.id, () => {
+                      const m = t.messages[curIndex];
+                      t.messages[curIndex] = { ...m, content: m.content + rec };
+                      chats = [...chats];
+                    });
                     saveSoon();
                   }
                 }

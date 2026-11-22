@@ -61,8 +61,8 @@ export type ViewAnchor = {
   el: HTMLElement;
   /** viewport top of `el`, relative to the scroller's box */
   top: number;
-  /** how far `el` sat from the bottom of the content, for a reader at the end */
-  fromBottom: number;
+  /** scroller.scrollTop at capture time (fallback when `el` is detached) */
+  scrollTop: number;
 };
 
 type ScrollerLike = {
@@ -102,26 +102,62 @@ export function captureViewAnchor(scroller: ScrollerLike, scrollerEl: Element): 
     best = first;
     bestTop = first.getBoundingClientRect().top - box.top;
   }
-  return { el: best, top: bestTop, fromBottom: scroller.scrollHeight - scroller.scrollTop };
+  return { el: best, top: bestTop, scrollTop: scroller.scrollTop };
 }
 
 /**
  * Put the anchored element back where the reader saw it. Content that grew
  * above the viewport shifts `top` by exactly the amount the reader must be
- * compensated for, so the new scrollTop is `scrollTop + delta`. Returns
- * whether a correction was needed (the caller can skip a redundant write).
- *
- * A reader who was already at the end keeps their place at the end instead,
- * so a taller answer reveals more text rather than scrolling past it.
+ * compensated for, so the new scrollTop is `scrollTop + delta`. If the
+ * browser clamped `scrollTop` during a momentary `{@html}` teardown of the
+ * mutating last message, `delta` equals the exact clamped distance and puts
+ * `scrollTop` right back where the reader was. Falls back to `anchor.scrollTop`
+ * if `anchor.el` was detached or yields a non-finite rect.
  */
 export function restoreViewAnchor(scroller: ScrollerLike, anchor: ViewAnchor): boolean {
-  const atEnd = anchor.fromBottom >= scroller.scrollHeight - 4;
-  const target = atEnd
-    ? scroller.scrollHeight - scroller.clientHeight
-    : scroller.scrollTop + (anchor.el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - anchor.top);
+  let target = anchor.scrollTop;
+  if (anchor.el.isConnected !== false) {
+    const elTop = anchor.el.getBoundingClientRect().top;
+    const boxTop = scroller.getBoundingClientRect().top;
+    const computed = scroller.scrollTop + (elTop - boxTop - anchor.top);
+    if (Number.isFinite(computed)) target = computed;
+  }
   const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
   const next = Math.min(max, Math.max(0, target));
   if (Math.abs(next - scroller.scrollTop) < 1) return false;
   scroller.scrollTop = next;
   return true;
+}
+
+/** Snapshot of open `<details class="tool-result">` elements per message row. */
+export type OpenDetailsSnapshot = Array<{ msgIndex: number; openIndices: number[] }>;
+
+export function captureOpenToolDetails(scrollerEl: Pick<Element, "querySelectorAll">): OpenDetailsSnapshot {
+  const out: OpenDetailsSnapshot = [];
+  for (const row of Array.from(scrollerEl.querySelectorAll("[data-msg-index]"))) {
+    const rawIdx = row.getAttribute("data-msg-index");
+    const msgIndex = rawIdx != null ? Number(rawIdx) : NaN;
+    if (!Number.isFinite(msgIndex)) continue;
+    const details = Array.from(row.querySelectorAll<HTMLDetailsElement>("details.tool-result"));
+    const openIndices: number[] = [];
+    for (let i = 0; i < details.length; i++) {
+      if (details[i].open) openIndices.push(i);
+    }
+    if (openIndices.length > 0) out.push({ msgIndex, openIndices });
+  }
+  return out;
+}
+
+export function restoreOpenToolDetails(
+  scrollerEl: Pick<Element, "querySelector">,
+  snapshot: OpenDetailsSnapshot
+): void {
+  for (const { msgIndex, openIndices } of snapshot) {
+    const row = scrollerEl.querySelector(`[data-msg-index="${msgIndex}"]`);
+    if (!row) continue;
+    const details = Array.from(row.querySelectorAll<HTMLDetailsElement>("details.tool-result"));
+    for (const idx of openIndices) {
+      if (idx >= 0 && idx < details.length) details[idx].open = true;
+    }
+  }
 }
