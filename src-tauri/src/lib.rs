@@ -3983,13 +3983,36 @@ fn cli_path_dirs() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Pick the user's Unix shell: `$SHELL` if set and present on disk, otherwise
+/// the first available shell on the platform (macOS prefers zsh; Linux and
+/// containers often have bash or only sh).
+#[cfg(not(windows))]
+fn default_unix_shell() -> String {
+    if let Ok(s) = std::env::var("SHELL") {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+            return trimmed.to_string();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let candidates = ["/bin/zsh", "/bin/bash", "/bin/sh"];
+    #[cfg(not(target_os = "macos"))]
+    let candidates = ["/bin/bash", "/usr/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/bin/sh"];
+    for c in candidates {
+        if std::path::Path::new(c).is_file() {
+            return c.to_string();
+        }
+    }
+    "/bin/sh".to_string()
+}
+
 /// PATH as the user's terminal sees it: probe `$SHELL -l` (profiles
 /// sourced). Best-effort with a short timeout — a slow/broken profile must
 /// never hang Settings. Windows doesn't need this (the registry check in
 /// `cli_on_path_in` covers it).
 #[cfg(not(windows))]
 async fn cli_shell_path_dirs() -> Vec<std::path::PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = default_unix_shell();
     let out = tokio::time::timeout(
         Duration::from_secs(3),
         tokio::process::Command::new(&shell)
@@ -4517,7 +4540,7 @@ where
         }
         #[cfg(not(windows))]
         {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let shell = default_unix_shell();
             let mut c = portable_pty::CommandBuilder::new(shell);
             c.args(["-l"]);
             c
