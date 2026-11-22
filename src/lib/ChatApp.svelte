@@ -13856,6 +13856,9 @@
   .ws-tooltip-hint { display: block; margin-top: 4px; color: var(--muted); }
   .ws-pill:is(:hover, :focus-visible) + .ws-tooltip,
   .ws-menu-opt:is(:hover, :focus-visible) + .ws-tooltip { visibility: visible; opacity: 1; }
+  @container (max-width: 500px) {
+    .ws-menu, .ws-tooltip { left: 0; right: auto; }
+  }
   @media (prefers-reduced-motion: reduce) {
     .ws-tooltip { transition: none; }
   }
