@@ -360,10 +360,11 @@ export async function listServers(): Promise<ServerInfo[]> {
   return (await invoke<ServerInfo[]>("server_list")) ?? [];
 }
 
-/** Verify + save (`url` may carry `#token`). */
-export async function connectServer(url: string, token: string): Promise<ServerInfo> {
+/** Verify + save (`url` may carry `#token`; `name` sets a custom display name,
+ *  `""` resets to host:port, `null`/`undefined` keeps existing or defaults). */
+export async function connectServer(url: string, token: string, name?: string | null): Promise<ServerInfo> {
   const { invoke } = await import("@tauri-apps/api/core");
-  return await invoke<ServerInfo>("server_connect", { url, token: token || null });
+  return await invoke<ServerInfo>("server_connect", { url, token: token || null, name: name ?? null });
 }
 
 export async function touchServer(id: string): Promise<void> {

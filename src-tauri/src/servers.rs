@@ -112,9 +112,31 @@ pub fn parse_server_url(input: &str) -> Result<(String, Option<String>), String>
     Ok((url, token))
 }
 
-/// Display name: host[:port] (what the picker shows).
+/// Display name: host[:port] (what the picker shows by default).
 fn short_name(url: &str) -> String {
     url.split("://").nth(1).unwrap_or(url).to_string()
+}
+
+/// Resolve the saved display name for a server:
+/// - `Some(non_empty)` sets a custom display name (trimmed).
+/// - `Some("")` explicitly clears a custom name back to `host[:port]`.
+/// - `None` preserves an existing name on update, or falls back to `host[:port]`.
+fn resolve_name(url: &str, name: Option<&str>, existing: Option<&str>) -> String {
+    match name {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                short_name(url)
+            } else {
+                trimmed.to_string()
+            }
+        }
+        None => existing
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| short_name(url)),
+    }
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
@@ -159,7 +181,7 @@ pub fn list() -> Vec<ServerInfo> {
 
 /// Verify (`server_info` through the authed invoke route), then save/update
 /// by URL and mark it most recent.
-pub async fn connect(url_input: &str, token: Option<String>) -> Result<ServerInfo, String> {
+pub async fn connect(url_input: &str, token: Option<String>, name: Option<String>) -> Result<ServerInfo, String> {
     let (url, frag) = parse_server_url(url_input)?;
     let existing = load().into_iter().find(|s| s.url == url);
     let token = token
@@ -182,11 +204,17 @@ pub async fn connect(url_input: &str, token: Option<String>) -> Result<ServerInf
         Some(s) => {
             s.token = token;
             s.last_used = now_ms();
-            s.name = short_name(&url);
+            s.name = resolve_name(&url, name.as_deref(), Some(&s.name));
             s.clone()
         }
         None => {
-            let s = ServerEntry { id: random_id(), name: short_name(&url), url, token, last_used: now_ms() };
+            let s = ServerEntry {
+                id: random_id(),
+                name: resolve_name(&url, name.as_deref(), None),
+                url,
+                token,
+                last_used: now_ms(),
+            };
             l.push(s.clone());
             s
         }
@@ -658,6 +686,17 @@ mod tests {
         assert_eq!(short_name("https://vps.tail1.ts.net:8443"), "vps.tail1.ts.net:8443");
     }
 
+    #[test]
+    fn custom_display_names_resolve() {
+        let url = "https://steamdeck.tail6986be.ts.net:8446";
+        assert_eq!(resolve_name(url, None, None), "steamdeck.tail6986be.ts.net:8446");
+        assert_eq!(resolve_name(url, Some("   "), None), "steamdeck.tail6986be.ts.net:8446");
+        assert_eq!(resolve_name(url, Some("  Deck 8446  "), None), "Deck 8446");
+        assert_eq!(resolve_name(url, None, Some("Deck 8446")), "Deck 8446");
+        assert_eq!(resolve_name(url, Some("Deck Dev"), Some("Deck 8446")), "Deck Dev");
+        assert_eq!(resolve_name(url, Some(""), Some("Deck 8446")), "steamdeck.tail6986be.ts.net:8446");
+    }
+
     /// Live round trip against a running `vicuna serve` (opt-in):
     ///   HOME=$(mktemp -d) VICUNA_TEST_SERVER_URL=http://127.0.0.1:7421 \
     ///   VICUNA_TEST_SERVER_TOKEN=... cargo test --lib live_server -- --ignored
@@ -666,12 +705,12 @@ mod tests {
     async fn live_server_connect_call_poll() {
         let url = std::env::var("VICUNA_TEST_SERVER_URL").expect("VICUNA_TEST_SERVER_URL");
         let token = std::env::var("VICUNA_TEST_SERVER_TOKEN").expect("VICUNA_TEST_SERVER_TOKEN");
-        let bad = connect(&url, Some("wrong".into())).await.unwrap_err();
+        let bad = connect(&url, Some("wrong".into()), None).await.unwrap_err();
         assert!(bad.contains("rejected"), "{bad}");
-        let sv = connect(&format!("{url}/"), Some(token.clone())).await.unwrap();
+        let sv = connect(&format!("{url}/"), Some(token.clone()), None).await.unwrap();
         assert_eq!(list().len(), 1);
         // reconnect without a token reuses the saved one
-        let again = connect(&url, None).await.unwrap();
+        let again = connect(&url, None, None).await.unwrap();
         assert_eq!(again.id, sv.id);
         let r = call(&sv.id, "/invoke", Some(json!({ "cmd": "chats_load", "args": {} })), None).await.unwrap();
         assert_eq!(r["ok"], true, "{r}");

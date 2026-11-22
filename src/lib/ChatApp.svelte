@@ -2808,6 +2808,8 @@
   let srvDialogOpen = $state(false);
   let srvUrlDraft = $state("");
   let srvTokenDraft = $state("");
+  let srvNameDraft = $state("");
+  let srvNameTouched = $state(false);
   let srvBusy = $state(false);
   let srvErr = $state<string | null>(null);
   /** chats could not be loaded from the active server */
@@ -2921,9 +2923,22 @@
     srvErr = null;
     srvUrlDraft = "";
     srvTokenDraft = "";
+    srvNameDraft = "";
+    srvNameTouched = false;
     srvDialogOpen = true;
     void refreshServers();
     requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-url-input]")?.focus());
+  }
+
+  function defaultServerName(url: string): string {
+    return url.split("://")[1] ?? url;
+  }
+
+  function fillRecentServer(sv: ServerInfo) {
+    srvUrlDraft = sv.url;
+    srvTokenDraft = "";
+    srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
+    srvNameTouched = true;
   }
 
   /** Open the server's own window (or focus it), or focus the main window
@@ -2944,7 +2959,11 @@
     srvBusy = true;
     srvErr = null;
     try {
-      const sv = await connectServer(srvUrlDraft.trim(), srvTokenDraft.trim());
+      const sv = await connectServer(
+        srvUrlDraft.trim(),
+        srvTokenDraft.trim(),
+        srvNameTouched ? srvNameDraft.trim() : null
+      );
       srvDialogOpen = false;
       await refreshServers();
       await switchServer(sv.id, sv.name);
@@ -11905,13 +11924,18 @@
     <input id="srv-token" class="srv-input" data-testid="server-token-input" type="password" placeholder="printed by vicuna serve (kept for saved servers)" autocomplete="off"
       bind:value={srvTokenDraft} disabled={srvBusy}
       onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
+    <label class="srv-field-label" for="srv-name">Display name <span class="srv-optional">(optional)</span></label>
+    <input id="srv-name" class="srv-input" data-testid="server-name-input" placeholder="defaults to host:port" autocomplete="off" spellcheck="false"
+      bind:value={srvNameDraft} disabled={srvBusy}
+      oninput={() => (srvNameTouched = true)}
+      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
     {#if srvErr}<p class="goto-error" data-testid="server-error">{srvErr}</p>{/if}
     <button class="srv-connect-btn" data-testid="server-connect-btn" disabled={srvBusy || srvUrlDraft.trim() === ""} onclick={() => void submitServer()}>{srvBusy ? "Connecting…" : "Connect"}</button>
     {#if srvList.length}
       <div class="srv-recent-label">Recent servers</div>
       {#each srvList as sv (sv.id)}
         <div class="srv-recent-row" data-testid="server-recent">
-          <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => { srvUrlDraft = sv.url; srvTokenDraft = ""; }}>{sv.name}</button>
+          <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => fillRecentServer(sv)}>{sv.name}</button>
           <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
             {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
           </button>
@@ -13106,6 +13130,7 @@
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .confirm-card.srv-card { width: min(460px, calc(100vw - 48px)); display: flex; flex-direction: column; gap: 6px; }
   .srv-field-label { font-size: 13.5px; font-weight: 600; color: var(--text); margin-top: 4px; }
+  .srv-optional { font-weight: 400; color: var(--muted); }
   .srv-input { border: 1px solid var(--border-2); border-radius: 12px; padding: 10px 12px; font: inherit; font-size: 14.5px; background: transparent; color: var(--text); }
   .srv-input:focus { outline: none; border-color: var(--accent); }
   .srv-connect-btn { margin-top: 8px; border: 1px solid var(--border-2); border-radius: 12px; padding: 10px; font: inherit; font-size: 15px; font-weight: 600; background: transparent; color: var(--text); cursor: pointer; }
