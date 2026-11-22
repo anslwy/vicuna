@@ -13,7 +13,7 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -714,25 +714,318 @@ pub fn parse_browsers_download_output(out: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Live CloakBrowser download progress exposed on `BrowserStatus.download`
+/// while `lb browsers download` is running in the background.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineDownloadProgress {
+    /// "downloading" | "extracting" | "ready" | "error"
+    pub phase: String,
+    pub downloaded_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// CloakBrowser engine status: binary path + whether this call fetched it.
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineInfo {
     pub path: String,
     pub downloaded: bool,
+    /// True when the caller passed `background: true` and a download is
+    /// running in the background (poll `browser_status().download` for
+    /// progress and completion without hitting remote HTTP timeouts).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub downloading: bool,
+}
+
+struct DownloadJob {
+    progress: Mutex<EngineDownloadProgress>,
+    done: tokio::sync::watch::Receiver<Option<Result<EngineInfo, String>>>,
+}
+
+static ENGINE_DOWNLOAD: OnceLock<Mutex<Option<Arc<DownloadJob>>>> = OnceLock::new();
+
+fn engine_download_slot() -> &'static Mutex<Option<Arc<DownloadJob>>> {
+    ENGINE_DOWNLOAD.get_or_init(|| Mutex::new(None))
+}
+
+/// Scan `cache` for `lb browsers download`'s in-flight temp archive
+/// (`.lb-download-<ver>-<pid>.tar.gz` or `.zip`) and return its current size.
+pub fn scan_download_temp_bytes(cache: &Path, pid: Option<u32>) -> Option<u64> {
+    let entries = std::fs::read_dir(cache).ok()?;
+    let pid_tag = pid.map(|p| format!("-{p}."));
+    let pid_end = pid.map(|p| format!("-{p}"));
+    let mut best_any: Option<(std::time::SystemTime, u64)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if !s.starts_with(".lb-download-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if let (Some(tag), Some(end)) = (pid_tag.as_deref(), pid_end.as_deref()) {
+            if s.contains(tag) || s.ends_with(end) {
+                return Some(meta.len());
+            }
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best_any.map(|(t, _)| mtime >= t).unwrap_or(true) {
+            best_any = Some((mtime, meta.len()));
+        }
+    }
+    best_any.map(|(_, len)| len)
+}
+
+/// Parse one stderr line/chunk from `lb browsers download` for phase or `%`.
+pub fn parse_download_stderr_line(line: &str, prog: &mut EngineDownloadProgress) {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("extract") || lower.contains("unpack") || lower.contains("decompress") {
+        prog.phase = "extracting".to_string();
+    }
+    // Look for a percentage token like "42%" or "42.5%"
+    for tok in line.split_whitespace() {
+        let trimmed = tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '%');
+        if let Some(num) = trimmed.strip_suffix('%') {
+            if let Ok(v) = num.parse::<f64>() {
+                if (0.0..=100.0).contains(&v) {
+                    prog.percent = Some(v.round() as u8);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot of any in-flight (or recently failed) CloakBrowser download.
+pub fn current_engine_download() -> Option<EngineDownloadProgress> {
+    let job = engine_download_slot().lock().ok()?.clone()?;
+    let done = job.done.borrow().clone();
+    match done {
+        None => job.progress.lock().ok().map(|p| p.clone()),
+        Some(Ok(_)) => None,
+        Some(Err(_)) => {
+            if find_cloak_browser().is_some() {
+                None
+            } else {
+                job.progress.lock().ok().map(|p| p.clone())
+            }
+        }
+    }
+}
+
+fn start_or_attach_download(bin: PathBuf) -> Arc<DownloadJob> {
+    let mut slot = engine_download_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = slot.as_ref() {
+        if existing.done.borrow().is_none() {
+            return Arc::clone(existing);
+        }
+    }
+    let (done_tx, done_rx) = tokio::sync::watch::channel(None);
+    let job = Arc::new(DownloadJob {
+        progress: Mutex::new(EngineDownloadProgress {
+            phase: "downloading".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            percent: None,
+            message: None,
+        }),
+        done: done_rx,
+    });
+    *slot = Some(Arc::clone(&job));
+    drop(slot);
+
+    let job_task = Arc::clone(&job);
+    tokio::spawn(async move {
+        let res = run_cloak_download(&bin, &job_task).await;
+        if let Ok(mut p) = job_task.progress.lock() {
+            match &res {
+                Ok(_) => {
+                    p.phase = "ready".to_string();
+                    p.percent = Some(100);
+                    p.message = None;
+                }
+                Err(e) => {
+                    p.phase = "error".to_string();
+                    p.message = Some(e.clone());
+                }
+            }
+        }
+        let _ = done_tx.send(Some(res));
+    });
+    job
+}
+
+async fn run_cloak_download(bin: &Path, job: &Arc<DownloadJob>) -> Result<EngineInfo, String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["browsers", "download"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run engine download: {e}"))?;
+    let pid = child.id();
+
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let mut stderr_pipe = child.stderr.take();
+    let job_err = Arc::clone(job);
+    let stderr_task = tokio::spawn(async move {
+        let mut all = String::new();
+        let Some(ref mut r) = stderr_pipe else {
+            return all;
+        };
+        let mut chunk = [0u8; 2048];
+        let mut pending = String::new();
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&chunk[..n]);
+                    all.push_str(&s);
+                    pending.push_str(&s);
+                    while let Some(idx) = pending.find(['\n', '\r']) {
+                        let line = pending[..idx].to_string();
+                        pending.drain(..=idx);
+                        if !line.trim().is_empty() {
+                            if let Ok(mut p) = job_err.progress.lock() {
+                                parse_download_stderr_line(&line, &mut p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !pending.trim().is_empty() {
+            if let Ok(mut p) = job_err.progress.lock() {
+                parse_download_stderr_line(&pending, &mut p);
+            }
+        }
+        all
+    });
+
+    let cache_dir = cloak_cache_dir();
+    let job_poll = Arc::clone(job);
+    let wait_fut = async {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        let mut saw_bytes = false;
+        loop {
+            tokio::select! {
+                status = child.wait() => return status,
+                _ = tick.tick() => {
+                    if let Some(ref dir) = cache_dir {
+                        match scan_download_temp_bytes(dir, pid) {
+                            Some(bytes) => {
+                                if bytes > 0 {
+                                    saw_bytes = true;
+                                }
+                                if let Ok(mut p) = job_poll.progress.lock() {
+                                    p.downloaded_bytes = bytes;
+                                }
+                            }
+                            None if saw_bytes => {
+                                if let Ok(mut p) = job_poll.progress.lock() {
+                                    if p.phase == "downloading" {
+                                        p.phase = "extracting".to_string();
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // ~150MB+ plus extract; generous ceiling for slow links
+    let status = tokio::time::timeout(Duration::from_secs(15 * 60), wait_fut)
+        .await
+        .map_err(|_| {
+            "CloakBrowser download timed out after 15 minutes — check your connection and retry"
+                .to_string()
+        })
+        .and_then(|r| r.map_err(|e| format!("could not run engine download: {e}")))?;
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
+        // filled concurrently (second instance raced us)? take the win
+        if let Some(hit) = find_cloak_browser() {
+            return Ok(EngineInfo {
+                path: hit.display().to_string(),
+                downloaded: false,
+                downloading: false,
+            });
+        }
+        if stderr.contains("unrecognized subcommand") {
+            return Err(
+                "this `lb` is too old to fetch engines (need ≥0.4.18) — upgrade live-browser or reinstall Vicuna"
+                    .to_string(),
+            );
+        }
+        let tail = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("");
+        return Err(format!(
+            "could not download the CloakBrowser engine{} — check your connection and retry",
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({tail})")
+            }
+        ));
+    }
+    if let Some(path) = parse_browsers_download_output(&stdout) {
+        return Ok(EngineInfo { path, downloaded: true, downloading: false });
+    }
+    find_cloak_browser()
+        .map(|hit| EngineInfo {
+            path: hit.display().to_string(),
+            downloaded: true,
+            downloading: false,
+        })
+        .ok_or_else(|| "engine download reported success but no binary appeared — retry".to_string())
 }
 
 /// Ensure the CloakBrowser engine exists, downloading it (one-time) when
-/// the cache is empty. CloakBrowser is the preferred engine; when it cannot
-/// be fetched or launched, `browser_start_logic` falls back to an installed
-/// system Chromium with an explicit `--chrome` + private `--profile` (so the
-/// original real-profile / running-instance-join trouble can't return).
-/// `VICUNA_BROWSER_CHROME` short-circuits this entirely. Idempotent — a
-/// warm cache returns instantly.
+/// the cache is empty. Concurrent callers share one in-flight download
+/// instead of spawning duplicate `lb browsers download` processes. When
+/// `background` is true, returns immediately with `downloading: true` so
+/// remote clients can poll `browser_status().download` for progress without
+/// hitting HTTP request timeouts.
 pub async fn browser_ensure_engine_logic(
     resource_dir: Option<PathBuf>,
+    background: bool,
 ) -> Result<EngineInfo, String> {
     if let Some(hit) = user_chrome_override() {
-        return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+        return Ok(EngineInfo {
+            path: hit.display().to_string(),
+            downloaded: false,
+            downloading: false,
+        });
     }
     let (bin, _) = resource_dir
         .as_deref()
@@ -740,47 +1033,29 @@ pub async fn browser_ensure_engine_logic(
         .or_else(|| resolve_lb_bin(None))
         .ok_or_else(|| "no `lb` browser engine found".to_string())?;
     if let Some(hit) = find_cloak_browser() {
-        return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+        return Ok(EngineInfo {
+            path: hit.display().to_string(),
+            downloaded: false,
+            downloading: false,
+        });
     }
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(["browsers", "download"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
-    // ~150MB+ plus extract; generous ceiling for slow links
-    let out = tokio::time::timeout(Duration::from_secs(15 * 60), cmd.output())
-        .await
-        .map_err(|_| {
-            "CloakBrowser download timed out after 15 minutes — check your connection and retry"
-                .to_string()
-        })
-        .and_then(|r| r.map_err(|e| format!("could not run engine download: {e}")))?;
-    if !out.status.success() {
-        // filled concurrently (second instance raced us)? take the win
-        if let Some(hit) = find_cloak_browser() {
-            return Ok(EngineInfo { path: hit.display().to_string(), downloaded: false });
+    let job = start_or_attach_download(bin);
+    if background {
+        return Ok(EngineInfo {
+            path: String::new(),
+            downloaded: false,
+            downloading: true,
+        });
+    }
+    let mut rx = job.done.clone();
+    loop {
+        if let Some(res) = rx.borrow().clone() {
+            return res;
         }
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("unrecognized subcommand") {
-            return Err(
-                "this `lb` is too old to fetch engines (need ≥0.4.18) — upgrade live-browser or reinstall Vicuna"
-                    .to_string(),
-            );
+        if rx.changed().await.is_err() {
+            return Err("engine download task ended unexpectedly — retry".to_string());
         }
-        let tail = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
-        return Err(format!(
-            "could not download the CloakBrowser engine{} — check your connection and retry",
-            if tail.is_empty() { String::new() } else { format!(" ({tail})") }
-        ));
     }
-    if let Some(path) = parse_browsers_download_output(&String::from_utf8_lossy(&out.stdout)) {
-        return Ok(EngineInfo { path, downloaded: true });
-    }
-    find_cloak_browser()
-        .map(|hit| EngineInfo { path: hit.display().to_string(), downloaded: true })
-        .ok_or_else(|| "engine download reported success but no binary appeared — retry".to_string())
 }
 
 /// `bin --version`, best-effort (failures mean "unknown", never fatal).
@@ -850,6 +1125,10 @@ pub struct BrowserStatus {
     pub health: Option<LbHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Live CloakBrowser download progress while a background engine fetch is
+    /// running (or its error before the next retry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download: Option<EngineDownloadProgress>,
 }
 
 /// Daemon status for the Browser tab + MCP seeding. `resource_dir` is
@@ -902,6 +1181,7 @@ pub async fn browser_status_logic(
         lb_version: resolved.as_ref().and_then(|(p, _)| cached_lb_version(p)),
         health: None,
         warning: stale_warning.or(fallback_warning),
+        download: current_engine_download(),
     };
     match probe_daemon(&client).await {
         Probe::Free => Ok(base),
@@ -914,7 +1194,7 @@ pub async fn browser_status_logic(
             )),
             ..base
         }),
-        Probe::Lb(h) => Ok(BrowserStatus { running: true, health: Some(h), ..base }),
+        Probe::Lb(h) => Ok(BrowserStatus { running: true, health: Some(h), download: None, ..base }),
         Probe::Foreign(e) => Ok(BrowserStatus {
             warning: Some(format!("port {} is busy ({e})", lb_port())),
             ..base
@@ -987,7 +1267,7 @@ pub async fn browser_start_logic(
     } else if prefer_system {
         find_cloak_browser()
     } else {
-        match browser_ensure_engine_logic(resource_dir.clone()).await {
+        match browser_ensure_engine_logic(resource_dir.clone(), false).await {
             Ok(info) => Some(PathBuf::from(info.path)),
             Err(e) => {
                 engine_error = Some(e);
@@ -1361,7 +1641,7 @@ pub async fn browser_takeover_logic(
     // replacement can start (a failed download must not cost their tabs).
     // Best-effort: a failed CloakBrowser download now falls back to a system
     // Chromium in `browser_start_logic`, so it must not block the takeover.
-    if let Err(e) = browser_ensure_engine_logic(resource_dir.clone()).await {
+    if let Err(e) = browser_ensure_engine_logic(resource_dir.clone(), false).await {
         let _ = e;
     }
     let client = probe_client();
@@ -1967,5 +2247,35 @@ mod tests {
         assert!(!pid_alive(pid), "tracked child should be killed and reaped");
         assert!(state.spawned_version.lock().unwrap().is_none());
         assert!(state.fallback.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn scan_download_temp_bytes_prefers_matching_pid() {
+        let dir = std::env::temp_dir().join("vicuna-lb-dlbytes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdirs");
+        assert_eq!(scan_download_temp_bytes(&dir, Some(79)), None);
+        std::fs::write(dir.join(".lb-download-146.0-99.tar.gz"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join(".lb-download-146.0-79.tar.gz"), vec![0u8; 4096]).unwrap();
+        assert_eq!(scan_download_temp_bytes(&dir, Some(79)), Some(4096));
+        assert_eq!(scan_download_temp_bytes(&dir, Some(99)), Some(100));
+        assert!(scan_download_temp_bytes(&dir, None).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_download_stderr_line_detects_percent_and_extracting() {
+        let mut p = EngineDownloadProgress {
+            phase: "downloading".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            percent: None,
+            message: None,
+        };
+        parse_download_stderr_line("Downloading... 42.6%", &mut p);
+        assert_eq!(p.phase, "downloading");
+        assert_eq!(p.percent, Some(43));
+        parse_download_stderr_line("Extracting archive...", &mut p);
+        assert_eq!(p.phase, "extracting");
     }
 }

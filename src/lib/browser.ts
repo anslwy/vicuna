@@ -24,6 +24,14 @@ export interface LbHealth {
   ui_ok?: boolean;
 }
 
+export interface EngineDownloadProgress {
+  phase: "downloading" | "extracting" | "ready" | "error" | string;
+  downloaded_bytes: number;
+  total_bytes?: number | null;
+  percent?: number | null;
+  message?: string | null;
+}
+
 export interface BrowserStatus {
   running: boolean;
   owned: boolean;
@@ -34,6 +42,7 @@ export interface BrowserStatus {
   lb_version?: string | null;
   health?: LbHealth | null;
   warning?: string | null;
+  download?: EngineDownloadProgress | null;
 }
 
 export async function browserStatus(): Promise<BrowserStatus> {
@@ -55,10 +64,30 @@ export async function browserRestart(): Promise<BrowserStatus> {
 export interface EngineInfo {
   path: string;
   downloaded: boolean;
+  downloading?: boolean;
 }
 
-export async function browserEnsureEngine(): Promise<EngineInfo> {
-  return await invokeOrBridge<EngineInfo>("browser_ensure_engine", {});
+export async function browserEnsureEngine(background = false): Promise<EngineInfo> {
+  return await invokeOrBridge<EngineInfo>(
+    "browser_ensure_engine",
+    background ? { background: true } : {}
+  );
+}
+
+/** Human-readable label for an in-flight CloakBrowser download. */
+export function formatDownloadProgress(p: EngineDownloadProgress): string {
+  if (p.phase === "extracting") return "Extracting browser engine…";
+  const mb = (bytes: number) => `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`;
+  if (p.percent != null && p.downloaded_bytes > 0 && p.total_bytes && p.total_bytes > 0) {
+    return `Downloading browser engine… ${p.percent}% (${mb(p.downloaded_bytes)} / ${mb(p.total_bytes)})`;
+  }
+  if (p.percent != null) {
+    return `Downloading browser engine… ${p.percent}%`;
+  }
+  if (p.downloaded_bytes > 0) {
+    return `Downloading browser engine… ${mb(p.downloaded_bytes)}`;
+  }
+  return "Downloading browser engine (one-time setup)…";
 }
 
 export async function browserTakeover(): Promise<BrowserStatus> {

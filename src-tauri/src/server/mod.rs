@@ -853,8 +853,12 @@ async fn dispatch(
             ))
         }
         "browser_ensure_engine" => {
+            let background = args
+                .get("background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             Ok(serde_json::json!(
-                crate::browser::browser_ensure_engine_logic(test_resource_dir()).await?
+                crate::browser::browser_ensure_engine_logic(test_resource_dir(), background).await?
             ))
         }
         "browser_takeover" => {
