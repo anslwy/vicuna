@@ -87,6 +87,7 @@ struct MsgSaveRow {
     content: String,
     thinking: String,
     model: Option<String>,
+    workspace: Option<String>,
     images: Option<Vec<String>>,
     gen_ms: Option<f64>,
     gen_tps: Option<f64>,
@@ -175,7 +176,7 @@ async fn chats_save(
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
             sqlx::query(
-                "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(chat.id.clone())
             .bind(m.role.clone())
@@ -188,6 +189,7 @@ async fn chats_save(
             .bind(m.gen_tps)
             .bind(m.summary.map(|b| if b { 1 } else { 0 }))
             .bind(m.gen_cost)
+            .bind(m.workspace.clone())
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("chats_save: {e}"))?;

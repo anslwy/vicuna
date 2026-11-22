@@ -347,6 +347,8 @@ export interface ChatMsg {
   thinkingOpen?: boolean;
   /** model that generated this message (assistant only) */
   model?: string;
+  /** workspace folder this reply ran in (Work mode assistant only) */
+  workspace?: string;
   /** attached images as data URLs (user only). Stripped to raw base64 at
    *  the transport layer — Ollama's `images[]` takes base64, not data URLs. */
   images?: string[];
