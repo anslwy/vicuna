@@ -3,6 +3,7 @@ name = "vicuna-bridge"
 version = "0.0.59"
 description = "vicuna — the Vicuna CLI: `vicuna serve` (headless server for the desktop app), `vicuna open`, and the dev bridge"
 authors = ["you"]
+license = "Apache-2.0"
 edition = "2024"
 
 [dependencies]

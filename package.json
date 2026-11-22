@@ -15,7 +15,7 @@
     "catalog:refresh": "python3 scripts/refresh-catalog.py",
     "test": "node --test node-tests/*.test.ts"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "@codemirror/commands": "^6.11.1",
     "@codemirror/language": "^6.13.1",
