@@ -1,17 +1,26 @@
 # Vicuna
 
-<img width="1189" height="785" alt="image" src="https://github.com/user-attachments/assets/9aad0db5-8163-4362-9875-11677bf317b1" />
+**Local-first desktop app and headless server for the coding agent CLIs you already use.**
 
-> Cross Platform ChatGPT-style Client built for [Ollama](https://ollama.com). Your private assistant with chat and work mode.
+Drive Claude Code, Codex, Antigravity, OpenCode, `fx`, `pi`, and ACP plugin harnesses from one native cross-platform interface — with built-in Git diff, code editor, terminal, live browser, MCP hub, and mobile bridges. Optional **Chat mode** supports local [Ollama](https://ollama.com) and OpenRouter models.
 
-Features:
+![Vicuna demo showing Work mode with Fork-style Git diff, built-in code editor with Vim mode, Plugins Explore marketplace, and Settings](docs/assets/vicuna-hero.gif)
 
-- Offline-first: Chat / work with your assistant without an internet connection. All sessions are also stored in your device offline.
-- Remote Ollama Host: Dynamically change the Ollama host to your own GPU server for a more powerful model.
-- Chat Mode: Suitable for general query with features like forking sessions, continuing from mid-sentence, editing user / assistant responses with/without triggering regeneration and more.
-- Work Mode: Designed to work autonomously to finish a task with features like built-in sidebar file explorer & terminal, MCP servers management and more.
+## Highlights
+
+- **One client for your coding CLIs** — run Claude Code, Codex, Antigravity, OpenCode, `fx`, `pi`, and ACP plugin harnesses side by side with per-session harness/model selection and a unified subscription usage meter.
+- **Unified MCP hub** — configure stdio and remote HTTP MCP servers once (including OAuth) and Vicuna auto-injects them into every Work harness.
+- **Headless server & remote work** — run `vicuna serve --tailscale` as a systemd or launchd service so agents keep working with your laptop closed; switch across multiple servers from the sidebar and schedule wake-ups.
+- **Built-in IDE side panels & Live Browser** — syntax-highlighted file editor (CodeMirror, Vim mode, Markdown preview), Fork-style Git staging and hunk diffs, integrated PTY terminal, and a collaborative live browser with desktop/mobile viewport presets, all synced to your active theme.
+- **Per-session Telegram & Discord bridges** — message any Work session from your phone without a VPN, answer permission/question cards with interactive buttons, and send voice memos transcribed locally via Whisper.
+- **Lead / Worker multi-agent orchestration** — promote a session to Lead to delegate subtasks to worker sessions across harnesses, with quota-aware harness selection and automatic completion reporting.
+- **Consent-first plugin system** — browse the built-in Explore marketplace for themes, sandboxed side panels, messaging bridges, and third-party ACP harnesses gated behind exact-command approval.
 
 ## Install
+
+### Desktop app
+
+macOS builds (`.dmg` and CLI) are Apple Developer ID signed and notarized.
 
 **macOS / Linux:**
 
@@ -25,127 +34,78 @@ curl -fsSL https://raw.githubusercontent.com/anslwy/vicuna/main/install.sh | sh
 irm https://raw.githubusercontent.com/anslwy/vicuna/main/install.ps1 | iex
 ```
 
-## Headless server (`vicuna` CLI)
+### Headless server (`vicuna` CLI)
 
-The `vicuna` binary is Vicuna's headless server + CLI (one-line install, no
-sudo; Linux and macOS):
+Run Vicuna on a workstation, home server, or VPS and connect from the desktop app (Linux and macOS, no `sudo` required):
 
 ```sh
 curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh
 vicuna serve --tailscale
 ```
 
-Then paste the printed URL + token into the app: sidebar server menu →
-Connect to new server…
+Paste the printed URL and token into the desktop app via **Sidebar server menu → Connect to new server…**.
 
 ```sh
 vicuna serve [--port N] [--bind ADDR] [--db PATH] [--tailscale [--https-port N]]
-                                        run a server in the foreground
-vicuna install-service [serve options]  keep it running on login/boot
+                                        # run the server in the foreground
+vicuna install-service [serve options]  # keep it running on login/boot (systemd / launchd)
 vicuna uninstall-service
-vicuna start [serve options]            start it in the background
-vicuna stop                             stop it
-vicuna restart [serve options]          restart it (detached)
-vicuna status                           running / how it runs / pid / version / log
-vicuna token                            print the server token
+vicuna start [serve options]            # start in the background
+vicuna stop                             # stop the running service or process
+vicuna restart [serve options]          # detached restart (safe from inside a hosted session)
+vicuna status                           # running state, pid, version, and log path
+vicuna token                            # print the server auth token
 vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
-                                        install the newest release
-vicuna open [path] / vicuna [path]      open a folder in the desktop app
+                                        # checksum-verified atomic upgrade + live DB backup
+vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 ```
 
-`start`, `stop`, `restart` and `status` share one detection layer: the
-systemd user unit or launchd agent installed by `install-service` when there
-is one, otherwise a bare `vicuna serve` process. Inside a distrobox/toolbox
-container a unit on the host's user manager is reached through
-`distrobox-host-exec`. `start` no-ops when a server is already running (and
-`stop` when none is), logs to `~/vicuna/server/serve.log` and writes
-`~/vicuna/server/vicuna.pid`. `restart` runs detached, so it also completes
-when the shell you ran it from is hosted by that very server.
+The CLI also drives any running server directly (`vicuna session`, `vicuna schedule`, `vicuna engines`, `vicuna models`, `vicuna mcp`, `vicuna server`, `vicuna api`).
 
-`upgrade` downloads the latest release with the installer's checksum +
-atomic replace (a running binary keeps its old inode, so no
-"text file busy"), snapshots the live server database to
-`~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db` (a `VACUUM INTO`
-copy, safe on an open WAL database), and restarts a running server once the
-new binary is in place. With no server running it installs and stops there.
-`--check` only reports, `--dry-run` prints every step without touching
-anything, `--no-restart` leaves the running server on the old binary.
+`upgrade` downloads the latest release with checksum verification and atomic binary replacement, snapshots the open WAL database via `VACUUM INTO` to `~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db`, and restarts a running server automatically. Inside a distrobox/toolbox container, service commands reach the host user manager via `distrobox-host-exec`.
 
 ## Prerequisites
 
-- [Ollama](https://ollama.com) installed and serving: `ollama serve`
-- At least one model pulled, e.g. `ollama pull gemma3:4b`
-- Node 18+ and npm (for development)
-- Rust toolchain (for development)
+- **Work mode:** at least one supported coding agent CLI installed and signed in on your machine or server — [Claude Code](https://docs.claude.com/en/docs/claude-code/setup), [Codex CLI](https://developers.openai.com/codex/cli), [Antigravity](https://antigravity.google), [OpenCode](https://opencode.ai/docs/#install), `fx`, `pi`, or an ACP harness plugin. Nothing is bundled or proxied through a third-party cloud; Vicuna drives the CLIs with your own credentials.
+- **Chat mode (optional):** [Ollama](https://ollama.com) (`ollama serve` + any pulled model, e.g. `ollama pull qwen3:8b`) for local models, and/or an OpenRouter API key. Ollama is **not** required if you only use Work mode.
+- **Development:** Node 18+, npm, and a Rust toolchain.
+
+## Architecture
+
+- **Unified Rust backend (`src-tauri/src/server/`):** `vicuna serve`, the dev bridge, and the desktop app's embedded server all run the same HTTP/SSE backend backed by SQLite (`vicuna.db`). Sessions, turns, schedules, and tool transcripts are persisted server-side so closing the window or laptop never interrupts an active run.
+- **Multi-harness drivers (`src-tauri/src/`):** native adapters for `claude` (`claude -p` stream-json), `codex` (`codex app-server` JSON-RPC), `opencode` / `agy` (ACP), `fx`, `pi` (`pi --mode rpc` + bridge extension), and third-party ACP plugin harnesses (`plugin_harness.rs`), plus unified subscription quota polling (`work_usage.rs`) and `vicuna-mcp` (`vicuna_mcp.rs`) for cross-session tools.
+- **Desktop shell & frontend (`src-tauri/src/lib.rs`, `src/`):** Tauri 2 shell + SvelteKit / Svelte 5 UI with CodeMirror 6 (Vim mode + Markdown preview), Fork-style Git panel (`git_panel.rs`), xterm.js PTY terminal, and runtime-synced built-in/plugin themes.
+- **Live Browser sidecar (`src-tauri/src/browser.rs`):** bundled `live-browser` (`lb`) sidecar shared between the agent (over MCP) and the user inside the side panel, supporting direct handover, viewport presets, and theme sync.
+- **Plugins & messaging bridges (`plugins.rs`, `server/telegram.rs`, `server/bridge_plugins.rs`, `whisper.rs`):** local-first plugin loader (themes, sandboxed panels, ACP harnesses with exact-command consent, and external messaging bridges such as Discord) alongside the built-in Telegram bridge and local Whisper transcription.
 
 ## Development
 
 ```sh
 npm install
-sh scripts/fetch-lb-sidecar.sh   # Browser tab's lb sidecar
+sh scripts/fetch-lb-sidecar.sh   # fetch the Browser tab's live-browser sidecar
 ```
 
-Web-only dev (fastest, uses the same UI against local Ollama):
+Run the web UI against a local dev server:
 
 ```sh
-npm run dev
-# open http://127.0.0.1:1420
+npm run dev                      # http://127.0.0.1:1420
 ```
 
-Desktop app dev:
+Run the full Tauri desktop app:
 
 ```sh
-npm run tauri dev
+npm run desktop:dev
 ```
 
-Other useful commands:
+Verification:
 
 ```sh
-npm run check   # svelte-check (must be 0 errors)
-npm run build   # static build to ./build
+npm test                         # node-tests suite
+npm run check                    # svelte-check (0 errors)
+npm run build                    # static frontend build
+cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-`cargo check` / `cargo build` also pass for the Tauri shell in `src-tauri/`.
+## License
 
-## Architecture
-
-- `src-tauri/src/lib.rs` owns all Ollama traffic: `ollama_list_models`,
-  `ollama_list_running`, `ollama_warm_model`, `ollama_chat_stream`,
-  `ollama_generate_stream` (reqwest → `http://localhost:11434`).
-- `src/lib/ollama.ts` is display-only: in the Tauri webview it invokes those
-  commands and renders streamed `Channel` events (`token` / `think` / `done`);
-  in a plain browser (`npm run dev`) it falls back to direct `fetch` so
-  web-only dev works without the shell.
-- Work mode runs on the user's installed [opencode](https://opencode.ai) CLI
-  over ACP: `src-tauri/src/acp.rs` keeps one warm `opencode acp` process,
-  opens a session per chat (workspace cwd + the MCP dialog's enabled servers and the built-in browser, kept under the 128-tool limit), applies
-  the model picked in Vicuna (listed from `opencode models`) and streams ACP
-  updates into the same UI event channel. Nothing is bundled and there is no
-  fallback: without opencode, Work mode shows an install link and Send is
-  disabled. Install: https://opencode.ai/docs/#install
-- Claude Code is the second Work engine: Vicuna drives your installed
-  `claude` CLI headless (`claude -p` with stream-json input/output, your own
-  login; no SDK or adapter, nothing else to install,
-  https://docs.claude.com/en/docs/claude-code/setup). When both engines are
-  installed, the Work model menu and Settings → Work engine let you switch;
-  models come from the engine itself, and replies are labelled
-  `claude/<model>` or opencode's `provider/model`.
-- Codex is the third Work engine: Vicuna drives your installed `codex` CLI
-  through `codex app-server` (its official JSON-RPC over stdio) with your own
-  login and `~/.codex/config.toml` (https://developers.openai.com/codex/cli).
-  Models come from `model/list`; with no pick in Vicuna your config's model
-  runs. Replies are labelled `codex/<model>`. Test without Codex quota:
-  `VICUNA_CODEX_FAKE=1 scripts/work-acceptance.sh present fake-codex codex`
-  (the real app-server against a scripted Responses API).
-- Chat streaming returns the full text; `done_reason: "load"` retries up to
-  3x after a 2s wait (model was reloading). Stop-button abort raises
-  `AbortError` on the frontend; the backend request runs detached (no cancel
-  propagation yet).
-- Refreshing mid-stream resumes automatically: a pending-stream marker
-  survives page unload and `initApp` picks the turn back up (live-verified).
-
-## Notes
-
-- The app expects Ollama at `http://localhost:11434` (`OLLAMA_BASE` in `src/lib/ollama.ts`, `src-tauri/src/lib.rs`).
-- Continue uses `/api/chat`, not `/api/generate`: the raw generate path was tested and emits harmony channel tokens, ignores stops, and roleplays new turns on gpt-oss-style models. Keep it that way.
-- Web dev server and the Tauri webview share the same frontend; storage backend is chosen at runtime (`__TAURI_INTERNALS__` / `__TAURI__` present = sqlite).
+MIT
