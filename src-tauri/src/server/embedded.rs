@@ -142,10 +142,7 @@ async fn start_inner(resource_dir: Option<PathBuf>) -> Result<LocalBackend, Stri
 /// running — it is not ours.
 pub fn shutdown() {
     let Some(st) = embedded_state() else { return };
-    crate::browser::kill_owned(&st.browser);
-    crate::term_kill_all(&st.terms);
-    crate::bg_kill_running(&st.bg);
-    crate::kill_agent_shells(&st.shell);
+    super::shutdown_state(&st);
 }
 
 // ---------- one-time import of the desktop's own chats ----------

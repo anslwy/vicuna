@@ -1541,27 +1541,62 @@ fn spawn_term_reaper(st: Arc<BridgeState>) {
     });
 }
 
+/// End everything this server started (browser daemon, terminals, background
+/// jobs, agent shells). Sync version for the desktop app's Quit hook.
+pub fn shutdown_state(st: &BridgeState) {
+    crate::browser::kill_owned(&st.browser);
+    crate::term_kill_all(&st.terms);
+    crate::bg_kill_running(&st.bg);
+    crate::kill_agent_shells(&st.shell);
+}
+
+/// Async graceful shutdown for `vicuna serve` / `vicuna bridge`: stops the
+/// owned browser daemon gracefully (waiting for `lb web --port P stop` so its
+/// Chromium is reaped and the port is released before exit), then tears down
+/// terminals, background jobs, and agent shells.
+pub async fn shutdown_state_async(st: &BridgeState) {
+    crate::browser::stop_owned(&st.browser).await;
+    crate::term_kill_all(&st.terms);
+    crate::bg_kill_running(&st.bg);
+    crate::kill_agent_shells(&st.shell);
+}
+
 impl Bound {
     /// Accept connections forever.
     pub async fn serve(self) {
+        self.serve_until(std::future::pending()).await;
+    }
+
+    /// Accept connections until `shutdown` resolves, then tear down owned
+    /// child processes (browser daemon, terminals, background jobs, agent
+    /// shells) before returning.
+    pub async fn serve_until<F: std::future::Future<Output = ()>>(self, shutdown: F) {
         let Bound { state, listener, .. } = self;
+        tokio::pin!(shutdown);
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let st = state.clone();
-            tokio::spawn(async move {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = hyper::service::service_fn(move |req| {
-                    let st = st.clone();
-                    async move { Ok::<_, std::convert::Infallible>(handle(st, req).await) }
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, svc)
-                    .with_upgrades()
-                    .await;
-            });
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        continue;
+                    };
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let svc = hyper::service::service_fn(move |req| {
+                            let st = st.clone();
+                            async move { Ok::<_, std::convert::Infallible>(handle(st, req).await) }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .with_upgrades()
+                            .await;
+                    });
+                }
+            }
         }
+        drop(listener);
+        shutdown_state_async(&state).await;
     }
 }
 
@@ -1680,5 +1715,45 @@ mod gzip_tests {
             .body(full_body("x".repeat(5000)))
             .unwrap();
         assert!(maybe_gzip(html).await.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serve_until_exits_and_stops_accepting_on_shutdown() {
+        let bound = bind(&Config {
+            bind: "127.0.0.1".into(),
+            port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("bind ephemeral port");
+        let addr = bound.addr;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(bound.serve_until(async move {
+            let _ = rx.await;
+        }));
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .expect("health before shutdown");
+        assert!(resp.status().is_success());
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("serve_until should return promptly")
+            .expect("serve_until task join");
+
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "listener should be closed after shutdown"
+        );
     }
 }
