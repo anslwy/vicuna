@@ -1460,6 +1460,40 @@ pub fn browser_mcp_command(resource_dir: Option<&Path>) -> Result<Vec<String>, S
     Ok(vec![bin.display().to_string(), "mcp".to_string()])
 }
 
+/// Gracefully stop the owned daemon during server shutdown, waiting for it
+/// to exit and release its port (and for `lb stop` to reap its Chromium).
+/// No-op when Vicuna never started a daemon (foreign/adopted daemons are
+/// never touched).
+pub async fn stop_owned(state: &BrowserState) {
+    let mut child = match state.child.lock() {
+        Ok(mut g) => match g.take() {
+            Some(c) => c,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if let Ok(mut g) = state.spawned_version.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.spawned_id.lock() {
+        g.take();
+    }
+    if let Ok(mut g) = state.fallback.lock() {
+        g.take();
+    }
+    let bin = owned_bin(state);
+    if let Some(bin) = bin.as_deref() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), graceful_stop(bin)).await;
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(bin) = bin.as_deref() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), graceful_stop(bin)).await;
+        }
+    }
+}
+
 /// Kill the owned daemon at Quit (never an adopted one — it isn't
 /// tracked). Fire-and-forget `lb web --port P stop` first so the daemon's
 /// Chromium is reaped even though the app exits without waiting for it.
@@ -1479,6 +1513,7 @@ pub fn kill_owned(state: &BrowserState) {
     if let Ok(mut g) = state.child.lock() {
         if let Some(mut child) = g.take() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -1901,5 +1936,36 @@ mod tests {
         assert!(!tail.contains("line 16"), "{tail}");
         assert!(log_tail(&dir.join("missing.log"), 3).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stop_owned_is_noop_without_child() {
+        let state = BrowserState::default();
+        stop_owned(&state).await;
+        assert!(!owned_child_alive(&state));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_owned_kills_and_reaps_tracked_child() {
+        let state = BrowserState::default();
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        state.child.lock().unwrap().replace(child);
+        *state.spawned_version.lock().unwrap() = Some("0.4.20".into());
+        *state.fallback.lock().unwrap() = Some("warn".into());
+
+        assert!(pid_alive(pid));
+        stop_owned(&state).await;
+        assert!(!owned_child_alive(&state));
+        assert!(!pid_alive(pid), "tracked child should be killed and reaped");
+        assert!(state.spawned_version.lock().unwrap().is_none());
+        assert!(state.fallback.lock().unwrap().is_none());
     }
 }

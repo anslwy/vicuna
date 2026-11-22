@@ -58,7 +58,28 @@ fn run(cfg: Config) {
         }
         _ => println!("vicuna bridge on http://{addr}"),
     }
-    rt.block_on(bound.serve());
+    rt.block_on(bound.serve_until(shutdown_signal()));
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 const USAGE: &str = "vicuna — Vicuna's command line
