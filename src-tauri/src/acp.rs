@@ -1547,9 +1547,11 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 - Run commands with your own shell tool. For dev servers, watchers and other long-running jobs, use its background mode where it has one (or start them in the background from the shell), keep working on what does not depend on them, and check their output when you need it.\n\
 - Use `manage_mcp` on vicuna-mcp to list or switch MCP servers for this session or manage shared custom server definitions (e.g. when the user gives an MCP URL endpoint). The fixed `vicuna-mcp` server is always available. When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
+- To list, read, add, edit, enable, disable, or remove Vicuna skills (stored in `~/vicuna/skills/<slug>/SKILL.md`), use the `manage_skills` tool on vicuna-mcp.\n\
 - To check back later (a slow deploy or CI run, a follow-up the user asks for at a certain time), call `schedule_wakeup` on vicuna-mcp with a `message` for yourself and `in_minutes` or a local `at` time, then end your turn: Vicuna sends that message into this session at the time.\n\
 - Before starting an expensive worker session (or when a harness call fails with a quota/limit error), call `usage_status` on vicuna-mcp to see each harness's remaining quota and reset time, and pick one that has quota left.\n\
-{session_info}\n{goal}",
+{session_info}\n{skills}{goal}",
+        skills = crate::skills::format_skills_prompt(),
         goal = goal
             .filter(|g| !g.trim().is_empty())
             .map(|g| format!(

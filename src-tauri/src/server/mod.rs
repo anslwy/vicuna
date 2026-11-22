@@ -794,6 +794,28 @@ async fn dispatch(
             crate::mcp::delete_file_server(&s("id")?)?;
             Ok(serde_json::json!(crate::mcp::session_servers(test_resource_dir().as_deref())?))
         }
+        // ----- Skills -----
+        "skills_list" => Ok(serde_json::json!(crate::skills::list_skills()?)),
+        "skills_read" => Ok(serde_json::json!(crate::skills::read_skill(&s("slug")?)?)),
+        "skills_save" => {
+            let enabled = args.get("enabled").and_then(|v| v.as_bool());
+            Ok(serde_json::json!(crate::skills::save_skill(
+                &s("slug")?,
+                &s("content")?,
+                enabled
+            )?))
+        }
+        "skills_toggle" => {
+            let enabled = args
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| "missing `enabled`".to_string())?;
+            Ok(serde_json::json!(crate::skills::toggle_skill(&s("slug")?, enabled)?))
+        }
+        "skills_remove" => {
+            crate::skills::remove_skill(&s("slug")?)?;
+            Ok(serde_json::Value::Null)
+        }
         "mcp_connect" => {
             let cfg: crate::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
@@ -1434,6 +1456,11 @@ pub const API_ACTIONS: &[&str] = &[
     "server_upgrade",
     "server_upgrade_check",
     "server_upgrade_status",
+    "skills_list",
+    "skills_read",
+    "skills_remove",
+    "skills_save",
+    "skills_toggle",
     "telegram_list",
     "telegram_remove",
     "telegram_save",

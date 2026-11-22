@@ -244,6 +244,7 @@ pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
         args.push(crate::vicuna_mcp::CLAUDE_SEARCH_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_USAGE_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_MANAGE_MCP_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_MANAGE_SKILLS_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_SCHEDULE_TOOL_ID.to_string());
         // refused outside lead sessions by vicuna-mcp itself
         args.push(crate::vicuna_mcp::CLAUDE_MANAGE_SESSIONS_TOOL_ID.to_string());
@@ -796,6 +797,7 @@ mod tests {
                 "mcp__vicuna-mcp__search_sessions",
                 "mcp__vicuna-mcp__usage_status",
                 "mcp__vicuna-mcp__manage_mcp",
+                "mcp__vicuna-mcp__manage_skills",
                 "mcp__vicuna-mcp__schedule_wakeup",
                 "mcp__vicuna-mcp__manage_sessions",
                 "mcp__vicuna-mcp__manage_schedule",

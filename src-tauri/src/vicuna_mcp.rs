@@ -40,6 +40,8 @@ pub const GET_SESSION_TOOL: &str = "get_session_id";
 pub const READ_SESSION_TOOL: &str = "read_session";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
+/// List/read/add/edit/enable/disable/remove Vicuna skills (~/vicuna/skills/<slug>/SKILL.md).
+pub const MANAGE_SKILLS_TOOL: &str = "manage_skills";
 /// The agent schedules a message to itself (a wake-up) in its own session.
 pub const SCHEDULE_TOOL: &str = "schedule_wakeup";
 /// Lead sessions create/start/stop/remove other sessions (refused elsewhere).
@@ -51,7 +53,7 @@ pub const SEARCH_TOOL: &str = "search_sessions";
 /// Read each Work harness's remaining subscription quota (read-only, cached).
 pub const USAGE_TOOL: &str = "usage_status";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 11;
+pub const TOOL_COUNT: usize = 12;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -59,6 +61,7 @@ pub const CLAUDE_GET_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__get_session_id";
 pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
 pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
+pub const CLAUDE_MANAGE_SKILLS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_skills";
 pub const CLAUDE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__schedule_wakeup";
 pub const CLAUDE_MANAGE_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_sessions";
 pub const CLAUDE_MANAGE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__manage_schedule";
@@ -95,7 +98,8 @@ using a built-in question tool; it waits for the answer and returns it. Run comm
 (use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
-custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `schedule_wakeup` to have Vicuna send you a \
+custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `manage_skills` to list, read, add, edit, \
+enable, disable, or remove Vicuna skills (`~/vicuna/skills/<slug>/SKILL.md`). Use `schedule_wakeup` to have Vicuna send you a \
 message in this session later (check back on slow work, follow up at a time the user names); `manage_schedule` lists, reschedules or cancels scheduled items \
 (your own session's; the lead can manage every session's). In the user's lead session, \
 `manage_sessions` creates, messages, stops and removes worker sessions (each on its own harness/model); a worker's reply \
@@ -732,6 +736,37 @@ fn manage_mcp_schema() -> Value {
                 "wake": {
                     "type": "boolean",
                     "description": "When true (default for 'add' and 'enable' once the server connects), Vicuna automatically starts a follow-up turn after this turn finishes so you can immediately call the newly active MCP server without waiting for the user. Set false if no follow-up turn is needed."
+                }
+            },
+            "required": ["action"]
+        }
+    })
+}
+
+fn manage_skills_schema() -> Value {
+    json!({
+        "name": MANAGE_SKILLS_TOOL,
+        "title": "Manage Vicuna skills",
+        "description": "List, read, add, edit, enable, disable, or remove Vicuna-managed skills stored in ~/vicuna/skills/<slug>/SKILL.md (YAML frontmatter `name:` and `description:` followed by Markdown instructions). Enabled skills are automatically injected into every Work harness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "read", "add", "edit", "enable", "disable", "remove"],
+                    "description": "Operation to perform."
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Skill slug: lowercase [a-z0-9][a-z0-9_-]{0,63} (required for read, add, edit, enable, disable, remove)."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full SKILL.md Markdown content with YAML frontmatter `name:` and `description:` (required for 'add'; optional for 'edit')."
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether the skill is enabled (defaults to true on 'add'; preserves existing value on 'edit' if omitted)."
                 }
             },
             "required": ["action"]
@@ -1748,6 +1783,107 @@ async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
     }
 }
 
+fn manage_skills_in(
+    skills_root: Option<&std::path::Path>,
+    config_path: Option<&std::path::Path>,
+    args: &Value,
+) -> Result<Value, String> {
+    let root = match skills_root {
+        Some(p) => p.to_path_buf(),
+        None => crate::skills::skills_dir()?,
+    };
+    let cfg = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => crate::skills::skills_config_path()?,
+    };
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "manage_skills requires `action`".to_string())?;
+    let need_slug = || -> Result<String, String> {
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("manage_skills action '{action}' requires `slug`"))?;
+        crate::skills::validate_slug(slug)?;
+        Ok(slug.to_string())
+    };
+    match action {
+        "list" => {
+            let skills = crate::skills::list_skills_in(&root, &cfg)?;
+            Ok(json!({
+                "skills": skills,
+                "skills_dir": root.to_string_lossy()
+            }))
+        }
+        "read" => {
+            let slug = need_slug()?;
+            let detail = crate::skills::read_skill_in(&root, &cfg, &slug)?;
+            Ok(serde_json::to_value(detail).map_err(|e| e.to_string())?)
+        }
+        "add" => {
+            let slug = need_slug()?;
+            if crate::skills::read_skill_in(&root, &cfg, &slug).is_ok() {
+                return Err(format!("skill '{slug}' already exists; use action='edit' to update it"));
+            }
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "manage_skills action 'add' requires `content`".to_string())?;
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let saved = crate::skills::save_skill_in(&root, &cfg, &slug, content, Some(enabled))?;
+            Ok(json!({ "ok": true, "action": "add", "skill": saved }))
+        }
+        "edit" => {
+            let slug = need_slug()?;
+            let _existing = crate::skills::read_skill_in(&root, &cfg, &slug)?;
+            let content = args.get("content").and_then(|v| v.as_str());
+            let enabled = args.get("enabled").and_then(|v| v.as_bool());
+            if content.is_none() && enabled.is_none() {
+                return Err("manage_skills action 'edit' requires `content` and/or `enabled`".to_string());
+            }
+            let updated = if let Some(c) = content {
+                crate::skills::save_skill_in(&root, &cfg, &slug, c, enabled)?
+            } else {
+                crate::skills::toggle_skill_in(&root, &cfg, &slug, enabled.unwrap())?
+            };
+            Ok(json!({ "ok": true, "action": "edit", "skill": updated }))
+        }
+        "enable" => {
+            let slug = need_slug()?;
+            let updated = crate::skills::toggle_skill_in(&root, &cfg, &slug, true)?;
+            Ok(json!({ "ok": true, "action": "enable", "skill": updated }))
+        }
+        "disable" => {
+            let slug = need_slug()?;
+            let updated = crate::skills::toggle_skill_in(&root, &cfg, &slug, false)?;
+            Ok(json!({ "ok": true, "action": "disable", "skill": updated }))
+        }
+        "remove" => {
+            let slug = need_slug()?;
+            crate::skills::remove_skill_in(&root, &cfg, &slug)?;
+            Ok(json!({ "ok": true, "action": "remove", "slug": slug }))
+        }
+        other => Err(format!(
+            "unknown action '{other}'; expected one of: list, read, add, edit, enable, disable, remove"
+        )),
+    }
+}
+
+fn manage_skills(args: &Value) -> Value {
+    match manage_skills_in(None, None, args) {
+        Ok(val) => {
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            text_result(&text, false)
+        }
+        Err(e) => text_result(&e, true),
+    }
+}
+
 /// One JSON-RPC message -> its response (None for notifications/responses).
 async fn handle_rpc(
     msg: &Value,
@@ -1778,6 +1914,7 @@ async fn handle_rpc(
             with_caller_arg(search_schema()),
             with_caller_arg(usage_schema()),
             manage_mcp_schema(),
+            manage_skills_schema(),
             with_caller_arg(schedule_schema()),
             with_caller_arg(manage_sessions_schema()),
             with_caller_arg(manage_schedule_schema()),
@@ -1797,6 +1934,7 @@ async fn handle_rpc(
                 (_, SEARCH_TOOL) => search_sessions(&args).await,
                 (_, USAGE_TOOL) => usage_status(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
+                (_, MANAGE_SKILLS_TOOL) => manage_skills(&args),
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
@@ -2776,6 +2914,99 @@ mod tests {
         assert_eq!(rem["name"], "kurisu-prod");
         let listed3 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), &context, "test").await.unwrap().value;
         assert_eq!(listed3["servers"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manage_skills_crud() {
+        let dir = std::env::temp_dir().join(format!(
+            "vicuna-mcp-skills-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("skills");
+        let cfg = dir.join("config").join("skills.json");
+
+        // 1. list empty
+        let l0 = manage_skills_in(Some(&root), Some(&cfg), &json!({ "action": "list" })).unwrap();
+        assert_eq!(l0["skills"].as_array().unwrap().len(), 0);
+
+        // 2. add
+        let md = "---\nname: Deploy\ndescription: Ship safely\n---\n\n# Steps\n";
+        let added = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "add", "slug": "deploy", "content": md }),
+        )
+        .unwrap();
+        assert_eq!(added["skill"]["slug"], "deploy");
+        assert_eq!(added["skill"]["enabled"], true);
+
+        // duplicate add rejected
+        assert!(manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "add", "slug": "deploy", "content": md }),
+        )
+        .is_err());
+
+        // invalid slug rejected
+        assert!(manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "add", "slug": "../bad", "content": md }),
+        )
+        .is_err());
+
+        // 3. read
+        let rd = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "read", "slug": "deploy" }),
+        )
+        .unwrap();
+        assert_eq!(rd["content"], md);
+
+        // 4. disable / enable
+        let dis = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "disable", "slug": "deploy" }),
+        )
+        .unwrap();
+        assert_eq!(dis["skill"]["enabled"], false);
+        let en = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "enable", "slug": "deploy" }),
+        )
+        .unwrap();
+        assert_eq!(en["skill"]["enabled"], true);
+
+        // 5. edit content
+        let md2 = "---\nname: Deploy v2\ndescription: Updated\n---\n\n# New\n";
+        let ed = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "edit", "slug": "deploy", "content": md2 }),
+        )
+        .unwrap();
+        assert_eq!(ed["skill"]["name"], "Deploy v2");
+
+        // 6. remove
+        let rem = manage_skills_in(
+            Some(&root),
+            Some(&cfg),
+            &json!({ "action": "remove", "slug": "deploy" }),
+        )
+        .unwrap();
+        assert_eq!(rem["slug"], "deploy");
+        let l1 = manage_skills_in(Some(&root), Some(&cfg), &json!({ "action": "list" })).unwrap();
+        assert_eq!(l1["skills"].as_array().unwrap().len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
