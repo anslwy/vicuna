@@ -2208,8 +2208,8 @@ fn server_list() -> Vec<servers::ServerInfo> {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-async fn server_connect(url: String, token: Option<String>) -> Result<servers::ServerInfo, String> {
-    servers::connect(&url, token).await
+async fn server_connect(url: String, token: Option<String>, name: Option<String>) -> Result<servers::ServerInfo, String> {
+    servers::connect(&url, token, name).await
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -4346,14 +4346,23 @@ fn open_server_window_impl(app: &AppHandle, id: &str, title: Option<&str>, chat:
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("bad server id".into());
     }
+    let resolved_name = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| servers::load().into_iter().find(|s| s.id == id).map(|s| s.name))
+        .filter(|n| !n.trim().is_empty());
     let label = format!("server-{id}");
     if let Some(w) = app.get_webview_window(&label) {
+        if let Some(name) = resolved_name.as_deref() {
+            let _ = w.set_title(&format!("{} — {name}", app_title()));
+        }
         let _ = w.unminimize();
         w.show().map_err(|e| format!("cannot show window: {e}"))?;
         w.set_focus().map_err(|e| format!("cannot focus window: {e}"))?;
         return Ok(());
     }
-    let name = title.filter(|t| !t.trim().is_empty()).unwrap_or(id);
+    let name = resolved_name.as_deref().unwrap_or(id);
     let mut url = format!("index.html?server={id}");
     if let Some(c) = chat.filter(|c| !c.is_empty()) {
         url.push_str(&format!("&chat={c}"));
