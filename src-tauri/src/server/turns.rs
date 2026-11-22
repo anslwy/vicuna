@@ -450,7 +450,11 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
     }
     let mut messages: Vec<Value> = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     messages.extend(user_msgs);
-    messages.push(persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id())));
+    let mut ph = persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id()));
+    if !workspace.is_empty() {
+        ph["workspace"] = json!(&workspace);
+    }
+    messages.push(ph);
     crate::server_store::write_messages(db, chat_id, &messages, Some(now_ms())).await?;
     let native: Vec<ChatMessage> =
         persist::compacted_history(&messages[..messages.len() - 1]).iter().filter_map(chat_message).collect();

@@ -334,9 +334,14 @@ async fn dispatch(
                 if !out.conflicts.is_empty() {
                     return Err(format!("{SESSION_CHANGED}: this session changed on the server since this window loaded it. Vicuna reloaded it; send again."));
                 }
-                let msgs: Vec<serde_json::Value> = row.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+                let mut msgs: Vec<serde_json::Value> = row.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
                 let idx = args.get("persistIndex").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(msgs.len().saturating_sub(1));
                 if idx < msgs.len() {
+                    if msgs[idx].get("workspace").and_then(|v| v.as_str()).map(str::trim).unwrap_or("").is_empty() {
+                        if let Some(ws) = args.get("workspace").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                            msgs[idx]["workspace"] = serde_json::json!(ws);
+                        }
+                    }
                     rec = Some(persist::Recorder::new(sid, msgs, idx, model.clone().filter(|m| !m.is_empty()), engine.id()));
                 }
             }

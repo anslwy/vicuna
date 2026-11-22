@@ -27,7 +27,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ];
 const CHAT_MIGRATIONS: &[&str] = &["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER", "extra TEXT", "rev INTEGER", "server_recorded INTEGER"];
-const MSG_MIGRATIONS: &[&str] = &["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL"];
+const MSG_MIGRATIONS: &[&str] = &["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL", "workspace TEXT"];
 
 /// Open (creating if needed) a server database at `path`.
 pub async fn open(path: &Path) -> Result<SqlitePool, String> {
@@ -117,6 +117,9 @@ fn message_json(m: &sqlx::sqlite::SqliteRow) -> Value {
     if let Some(t) = s("model") {
         o["model"] = json!(t);
     }
+    if let Some(t) = s("workspace") {
+        o["workspace"] = json!(t);
+    }
     if let Some(imgs) = s("images").and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_array) {
         o["images"] = imgs;
     }
@@ -137,7 +140,7 @@ pub async fn load_chats(pool: &SqlitePool) -> Result<Value, String> {
     load_chats_with_queries(
         pool,
         &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
-        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost FROM messages ORDER BY chat_id, idx",
+        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages ORDER BY chat_id, idx",
     )
     .await
 }
@@ -156,7 +159,7 @@ pub async fn load_chat_list(pool: &SqlitePool) -> Result<Value, String> {
         pool,
         &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
         &format!(
-            "SELECT chat_id, role, substr(content, 1, {LIST_PREVIEW_CHARS}) AS content, model, gen_ms, gen_tps, summary, gen_cost FROM messages ORDER BY chat_id, idx"
+            "SELECT chat_id, role, substr(content, 1, {LIST_PREVIEW_CHARS}) AS content, model, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages ORDER BY chat_id, idx"
         ),
     )
     .await?;
@@ -235,7 +238,7 @@ async fn insert_messages<'c>(
     for (i, m) in messages.iter().enumerate() {
         let images = m.images.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
         sqlx::query(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(chat_id)
         .bind(&m.role)
@@ -248,6 +251,7 @@ async fn insert_messages<'c>(
         .bind(m.gen_tps)
         .bind(m.summary.map(|b| if b { 1 } else { 0 }))
         .bind(m.gen_cost)
+        .bind(&m.workspace)
         .execute(&mut **tx)
         .await?;
     }
@@ -343,7 +347,7 @@ pub async fn load_chat(pool: &SqlitePool, id: &str) -> Result<Option<Value>, Str
         return Ok(None);
     };
     let msgs = sqlx::query(
-        "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost FROM messages WHERE chat_id = $1 ORDER BY idx",
+        "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages WHERE chat_id = $1 ORDER BY idx",
     )
     .bind(id)
     .fetch_all(&mut *tx)

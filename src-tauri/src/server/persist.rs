@@ -143,6 +143,7 @@ pub struct Recorder {
     /// index of the live assistant bubble (moves when queued prompts drain)
     pub cur: usize,
     pub turn_model: String,
+    workspace: Option<String>,
     pick: Option<String>,
     engine: String,
     /// in-flight tool call: (name, args, raw args JSON)
@@ -166,11 +167,19 @@ impl Recorder {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| work_reply_model(None, pick.as_deref(), engine));
+        let workspace = messages
+            .get(cur)
+            .and_then(|m| m.get("workspace"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Self {
             chat_id: chat_id.to_string(),
             messages,
             cur,
             turn_model,
+            workspace,
             pick,
             engine: engine.to_string(),
             pending_head: None,
@@ -267,7 +276,11 @@ impl Recorder {
                         u["images"] = imgs.clone();
                     }
                     self.messages.push(u);
-                    self.messages.push(assistant_placeholder(&self.turn_model));
+                    let mut ph = assistant_placeholder(&self.turn_model);
+                    if let Some(ws) = &self.workspace {
+                        ph["workspace"] = json!(ws);
+                    }
+                    self.messages.push(ph);
                 }
                 self.cur = self.messages.len().saturating_sub(1);
                 self.dirty = true;

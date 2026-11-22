@@ -47,7 +47,7 @@
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
-  import { sessionPick, missingHarnessReason, handoffAt, labelHarness } from "$lib/sessionEngine";
+  import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels } from "$lib/sessionEngine";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -8523,12 +8523,13 @@
       own.workModel = turnPick;
     }
     let turnModel = workReplyModel(null, turnPick, turnEngine);
+    const turnWorkspace = workspace.trim() || undefined;
     {
       const c0 = chats.find((x) => x.id === chat.id);
       const m0 = c0?.messages[index];
       // a server snapshot already carries the label the server recorded
       if (c0 && m0 && m0.role === "assistant" && !opts.attach?.snapshot) {
-        c0.messages[index] = { ...m0, model: turnModel };
+        c0.messages[index] = { ...m0, model: turnModel, ...(turnWorkspace ? { workspace: turnWorkspace } : {}) };
         chats = [...chats];
       }
     }
@@ -8576,7 +8577,7 @@
       const c = chats.find((x) => x.id === chat.id);
       if (c && c.messages[curIndex]) {
         const m = c.messages[curIndex];
-        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: turnModel, genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
+        c.messages[curIndex] = { role: "assistant", content: m.content + tok, thinking: (m.thinking ?? "") + th, thinkingOpen: m.thinkingOpen, model: turnModel, ...(m.workspace || turnWorkspace ? { workspace: m.workspace ?? turnWorkspace } : {}), genMs: m.genMs, genTps: m.genTps, genCost: m.genCost };
         chats = [...chats];
       }
       if (keep) void tick().then(() => restoreStreamSel(curIndex, keep));
@@ -8841,7 +8842,7 @@
               t.messages = [
                 ...t.messages,
                 { role: "user", content: q.content, ...(q.images ? { images: q.images } : {}) },
-                { role: "assistant", content: "", thinking: "", model: turnModel }
+                { role: "assistant", content: "", thinking: "", model: turnModel, ...(turnWorkspace ? { workspace: turnWorkspace } : {}) }
               ];
             }
             chats = [t, ...chats.filter((x) => x.id !== t.id)];
@@ -10600,8 +10601,14 @@
             {@const handoff = isWorkMsg ? handoffAt(activeChat.messages, i) : null}
             <div class="row asst-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if handoff}
+                {@const wsLabels = handoff.workspace ? workspaceHandoffLabels(handoff.workspace.from, handoff.workspace.to) : null}
+                {@const handoffTip = handoff.engine && handoff.workspace
+                  ? `The new harness and workspace (${handoff.workspace.from} → ${handoff.workspace.to}) start a fresh session: it gets Vicuna's transcript of this conversation, not the previous session's own context.`
+                  : handoff.workspace
+                    ? `The new workspace (${handoff.workspace.from} → ${handoff.workspace.to}) starts its own session: it gets Vicuna's transcript of this conversation, not the previous workspace's own context.`
+                    : "The new harness starts its own session: it gets Vicuna's transcript of this conversation, not the previous harness's own context."}
                 <div class="compact-div handoff-div" data-testid="handoff-divider">
-                  <Tooltip text="The new harness starts its own session: it gets Vicuna's transcript of this conversation, not the previous harness's own context."><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff <span class="engine-chip">{@render engineIcon(labelHarness(handoff.from) ?? "")}</span> {handoff.from} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.to) ?? "")}</span> {handoff.to}</span></Tooltip>
+                  <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {handoff.engine.from} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {handoff.engine.to}{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} → <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}{/if}</span></Tooltip>
                 </div>
               {/if}
               {#if m.summary}
@@ -14038,6 +14045,8 @@
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
   .handoff-inner { display: inline-flex; align-items: center; gap: 6px; }
+  .ws-handoff-chip { display: inline-flex; align-items: center; opacity: 0.85; }
+  .handoff-sep { opacity: 0.5; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }

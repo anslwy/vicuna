@@ -34,23 +34,76 @@ export function labelHarness(label: string | null | undefined): string | null {
   return i > 0 ? l.slice(0, i) : l;
 }
 
-/** A reply that runs on a different harness than the previous reply: the new
- *  harness starts its own engine session and only gets Vicuna's transcript,
- *  so the thread shows a "Context handoff" divider there. */
+/** Normalize a workspace path for handoff comparisons (strip Windows verbatim
+ *  prefix and trailing slashes). */
+function normWorkspace(p: string | null | undefined): string | null {
+  const s = (p ?? "").replace(/^\\\\\?\\/, "").trim();
+  if (!s) return null;
+  const trimmed = s.replace(/[/\\]+$/, "");
+  return trimmed || s;
+}
+
+/** Short display labels for a workspace handoff: folder basenames when they
+ *  differ, or the shortest differing trailing path segments when two paths
+ *  share the same folder name. */
+export function workspaceHandoffLabels(from: string, to: string): { from: string; to: string } {
+  const a = (normWorkspace(from) ?? from).split(/[/\\]/).filter(Boolean);
+  const b = (normWorkspace(to) ?? to).split(/[/\\]/).filter(Boolean);
+  if (!a.length || !b.length) return { from, to };
+  const max = Math.max(a.length, b.length);
+  for (let n = 1; n <= max; n++) {
+    const la = a.slice(-n).join("/");
+    const lb = b.slice(-n).join("/");
+    if (la !== lb) return { from: la, to: lb };
+  }
+  return { from: normWorkspace(from) ?? from, to: normWorkspace(to) ?? to };
+}
+
+export interface HandoffInfo {
+  engine?: { from: string; to: string };
+  workspace?: { from: string; to: string };
+}
+
+/** A reply that runs on a different harness or workspace than the previous
+ *  reply: the new harness or workspace starts its own engine session and only
+ *  gets Vicuna's transcript, so the thread shows a "Context handoff" divider. */
 export function handoffAt(
-  messages: readonly { role: string; model?: string | null }[],
+  messages: readonly { role: string; model?: string | null; workspace?: string | null }[],
   i: number
-): { from: string; to: string } | null {
+): HandoffInfo | null {
   const m = messages[i];
   if (!m || m.role !== "assistant") return null;
-  const to = labelHarness(m.model);
-  if (!to) return null;
-  for (let k = i - 1; k >= 0; k--) {
-    const p = messages[k];
-    if (p.role !== "assistant") continue;
-    const from = labelHarness(p.model);
-    if (!from) continue;
-    return from === to ? null : { from: p.model as string, to: m.model as string };
+
+  let engine: { from: string; to: string } | undefined;
+  const toEngine = labelHarness(m.model);
+  if (toEngine) {
+    for (let k = i - 1; k >= 0; k--) {
+      const p = messages[k];
+      if (p.role !== "assistant") continue;
+      const fromEngine = labelHarness(p.model);
+      if (!fromEngine) continue;
+      if (fromEngine !== toEngine) {
+        engine = { from: p.model as string, to: m.model as string };
+      }
+      break;
+    }
   }
-  return null;
+
+  let workspace: { from: string; to: string } | undefined;
+  const toWs = normWorkspace(m.workspace);
+  if (toWs) {
+    for (let k = i - 1; k >= 0; k--) {
+      const p = messages[k];
+      if (p.role !== "assistant") continue;
+      const fromWs = normWorkspace(p.workspace);
+      if (!fromWs) continue;
+      if (fromWs !== toWs) {
+        workspace = { from: fromWs, to: toWs };
+      }
+      break;
+    }
+  }
+
+  if (!engine && !workspace) return null;
+  return { ...(engine ? { engine } : {}), ...(workspace ? { workspace } : {}) };
 }
