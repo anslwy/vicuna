@@ -62,3 +62,14 @@ test("workspaceHandoffLabels uses basenames and disambiguates collisions", () =>
   assert.deepEqual(workspaceHandoffLabels("/work/vicuna", "/tmp/vic-wt"), { from: "vicuna", to: "vic-wt" });
   assert.deepEqual(workspaceHandoffLabels("/work/a/vicuna", "/work/b/vicuna"), { from: "a/vicuna", to: "b/vicuna" });
 });
+
+test("No workspace mode: sentinel and its scratch folder are one value, labelled cleanly", () => {
+  const msgs = [
+    { role: "user" }, { role: "assistant", model: "claude/opus", workspace: "__vicuna_no_workspace__" },
+    { role: "user" }, { role: "assistant", model: "claude/opus", workspace: "/home/me/vicuna/scratch/abc-123" },
+    { role: "user" }, { role: "assistant", model: "claude/opus", workspace: "/repo/alpha" },
+  ];
+  assert.equal(handoffAt(msgs, 3), null);
+  assert.deepEqual(handoffAt(msgs, 5), { workspace: { from: "No workspace", to: "/repo/alpha" } });
+  assert.deepEqual(workspaceHandoffLabels("No workspace", "/repo/alpha"), { from: "No workspace", to: "alpha" });
+});

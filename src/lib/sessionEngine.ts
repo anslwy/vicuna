@@ -34,9 +34,22 @@ export function labelHarness(label: string | null | undefined): string | null {
   return i > 0 ? l.slice(0, i) : l;
 }
 
+export const NO_WORKSPACE_LABEL = "No workspace";
+
+/** Same rule as `isNoWorkspacePath` in sidebar.ts (kept local: node tests load
+ *  this file without a bundler, so extensionless sibling imports fail). */
+function isNoWorkspacePath(p: string | null | undefined): boolean {
+  const s = (p ?? "").trim();
+  if (!s) return false;
+  if (s === "__vicuna_no_workspace__" || s === "none") return true;
+  return /\/vicuna\/scratch\/[A-Za-z0-9_-]{1,64}$/.test(s.replace(/\\/g, "/").replace(/\/+$/, ""));
+}
+
 /** Normalize a workspace path for handoff comparisons (strip Windows verbatim
  *  prefix and trailing slashes). */
 function normWorkspace(p: string | null | undefined): string | null {
+  // No workspace mode (sentinel or its per-session scratch folder) is one value.
+  if (isNoWorkspacePath(p)) return NO_WORKSPACE_LABEL;
   const s = (p ?? "").replace(/^\\\\\?\\/, "").trim();
   if (!s) return null;
   const trimmed = s.replace(/[/\\]+$/, "");
