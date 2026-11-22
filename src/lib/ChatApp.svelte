@@ -82,7 +82,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, visibleChats, isPinnedRow } from "$lib/sidebar";
+  import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
     captureViewAnchor,
     followAfterScroll,
@@ -9729,7 +9729,7 @@
         <label class="scope-label" for="scope-select">Scope</label>
         <select
           id="scope-select"
-          class="scope-select"
+          class="scope-select {sessionFilter !== ALL_FILTER ? 'scoped' : ''}"
           data-testid="scope-select"
           aria-label="Scope sessions"
           title={scopeTitle || "Every session"}
@@ -9821,14 +9821,16 @@
                       </span>
                     {/if}
                   {/each}
-                  {@const wsBase = workspaceBase(c.workspace ?? "")}
-                  {#if wsBase}
-                    <span class="work-badge ws-badge" title={displayWorkspace(c.workspace ?? "")}>
-                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                      <span>{wsBase}</span>
-                    </span>
-                  {:else}
-                    <span class="work-badge" title="Work session">Work</span>
+                  {#if showWorkspaceBadge(c, sessionFilter)}
+                    {@const wsBase = workspaceBase(c.workspace ?? "")}
+                    {#if wsBase}
+                      <span class="work-badge ws-badge" data-testid="ws-badge" title={displayWorkspace(c.workspace ?? "")}>
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                        <span>{wsBase}</span>
+                      </span>
+                    {:else}
+                      <span class="work-badge" title="Work session">Work</span>
+                    {/if}
                   {/if}
                 {/if}
               {/if}
@@ -13054,6 +13056,8 @@
   .scope-label { font-size: 12px; color: var(--muted); flex: none; }
   .scope-select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 9px; font-size: 12px; font-family: inherit; line-height: 1.5; color: var(--text-dim); cursor: pointer; text-overflow: ellipsis; }
   .scope-select:hover { background: var(--hover-2); }
+  .scope-select.scoped { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border-2)); background: color-mix(in srgb, var(--accent) 6%, transparent); font-weight: 500; }
+  .scope-select.scoped:hover { background: color-mix(in srgb, var(--accent) 11%, transparent); }
   .scope-select:focus { outline: none; border-color: var(--accent); }
   .history { overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 2px; }
   .pinned-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -13650,7 +13654,7 @@
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; min-width: 0; }
-  .chat-item .work-badge.ws-badge { flex-shrink: 1; }
+  .chat-item .work-badge.ws-badge { flex-shrink: 1; font-weight: 500; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); padding: 1px 7px; }
   .ws-badge svg { flex-shrink: 0; }
   .ws-badge span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }

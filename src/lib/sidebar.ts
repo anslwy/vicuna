@@ -187,6 +187,17 @@ export function filterChats(chats: Chat[], filter: string): Chat[] {
   return chats.filter((c) => matchesFilter(c, f));
 }
 
+/** Whether a sidebar row should render its workspace pill. When the sidebar is
+ *  already scoped to the session's own workspace, repeating that folder name
+ *  on every row is redundant and steals width from the title. Under All, Chat,
+ *  or a different workspace (e.g. a Pinned session from another folder), keep
+ *  the pill so the row's workspace remains clear. */
+export function showWorkspaceBadge(c: Chat, filter: string): boolean {
+  const ws = workspaceOfFolderKey(normalizeSessionFilter(filter));
+  if (ws === null) return true;
+  return folderOf(c) !== ws;
+}
+
 /** Archive visibility: hidden archived sessions drop out of the list, except
  *  the one being viewed (`keepId`) so it doesn't vanish under the user. */
 export function visibleChats<T extends { id: string; archived?: boolean }>(chats: T[], showArchived: boolean, keepId: string | null = null): T[] {
