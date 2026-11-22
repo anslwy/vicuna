@@ -68,10 +68,11 @@ Message any Work session from your phone without a VPN using built-in Telegram o
 <tr>
 <td width="40%" valign="middle">
 <h3>Built-in code editor, terminal &amp; Live Browser</h3>
-Edit files in CodeMirror with Vim mode and Markdown preview, or open an integrated PTY terminal. Share live browser tabs with your agent and switch between desktop and mobile viewport presets.
+Edit files in CodeMirror with Vim mode and Markdown preview, or open an integrated PTY terminal. Share browser tabs with your agent and switch between desktop and mobile viewport presets. If a remote agent hits a sign-in prompt, take over the tab, enter your authenticator code, and click <b>Done</b> to hand it back.
 </td>
 <td width="60%">
-<img src="docs/assets/code-editor.jpg" alt="Built-in CodeMirror editor with Vim mode" width="100%" />
+<img src="docs/assets/code-editor.jpg" alt="Built-in CodeMirror editor with Vim mode" width="100%" /><br />
+<img src="docs/assets/live-browser.jpg" alt="Live Browser handoff while a Work agent waits for the user to sign in to a staging dashboard" width="100%" />
 </td>
 </tr>
 <tr>
