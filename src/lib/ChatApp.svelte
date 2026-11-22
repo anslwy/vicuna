@@ -62,7 +62,7 @@
   import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import SkillsModal from "$lib/SkillsModal.svelte";
-  import { listSkills, enabledSkillCount, type SkillSummary } from "$lib/skills";
+  import { enabledSkillCount, listSkills, newSkillSelection, removeSkill, resolveSkills, saveSkill, saveSkillDefaults, skillSwitches, type SkillsEnabledMap, type SkillSummary } from "$lib/skills";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, browserThemeParams, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, resolveTerminalColors, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
   import { telegramConnLabel, telegramConnState, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
@@ -1548,6 +1548,7 @@
           messages: [msg, reply],
           mode: "work",
           mcpEnabled: await newMcpEnabled(),
+          skillsEnabled: await newSessionSkills(),
           workspace: ws
         };
         chats = [chat, ...chats];
@@ -1687,6 +1688,7 @@
           messages: msgs,
           mode: "work",
           mcpEnabled: await newMcpEnabled(),
+          skillsEnabled: await newSessionSkills(),
           workspace: ws,
           engine: engine || engineId(workEngineInfo),
           workModel: str("model") || null,
@@ -2041,6 +2043,7 @@
 
   function newChat() {
     homeMcpEnabled = undefined;
+    homeSkillsEnabled = undefined;
     // navigating never touches live turns: other sessions keep streaming or
     // working in the background (sidebar shimmer shows them)
     // the composer box is global: New never touches the textbox.
@@ -4153,6 +4156,7 @@
       messages: [],
       mode: "work",
       mcpEnabled: serverSessionTools ? undefined : await newMcpEnabled(),
+      skillsEnabled: serverSessionTools ? undefined : await newSessionSkills(),
       workspace: canon
     };
     if (serverSessionTools) {
@@ -5297,6 +5301,7 @@
       forkFromIndex: i,
       mode: c.mode ?? "chat",
       mcpEnabled: c.mode === "work" ? await newMcpEnabled() : undefined,
+      skillsEnabled: c.mode === "work" ? await newSessionSkills() : undefined,
       workspace: c.workspace ?? null
     };
     if (!made) chats = [fork, ...chats];
@@ -6049,16 +6054,23 @@
         ],
         mode: effectiveMode,
         mcpEnabled: effectiveMode === "work" ? await newMcpEnabled(homeMcpEnabled) : undefined,
+        skillsEnabled: effectiveMode === "work" ? await newSessionSkills(homeSkillsEnabled) : undefined,
         workspace: effectiveMode === "work" ? workRoot : null
       };
       chats = [chat, ...chats];
-      if (effectiveMode === "work") homeMcpEnabled = undefined;
+      if (effectiveMode === "work") {
+        homeMcpEnabled = undefined;
+        homeSkillsEnabled = undefined;
+      }
       activeId = chat.id;
       isPinned = true;
       freshChat = true;
       save();
     } else {
       if (chat.messages.length === 0) {
+        if (chat.skillsEnabled === undefined && effectiveMode === "work") {
+          chat.skillsEnabled = await newSessionSkills();
+        }
         chat.mode = effectiveMode;
         if (effectiveMode === "work") chat.workspace = workRoot;
       }
@@ -6786,15 +6798,64 @@
   }
 
   let skillsOpen = $state(false);
-  let skillsList = $state<SkillSummary[]>([]);
+  let skillDefinitions = $state<SkillSummary[]>([]);
+  let skillsLoaded = $state(false);
+  let homeSkillsEnabled = $state<SkillsEnabledMap>();
+  const skillsList = $derived(activeChat
+    ? resolveSkills(skillDefinitions, activeChat.skillsEnabled)
+    : resolveSkills(skillDefinitions, newSkillSelection(skillDefinitions, homeSkillsEnabled)));
   const skillsEnabledCount = $derived(enabledSkillCount(skillsList));
 
   async function refreshSkills() {
     try {
-      skillsList = await listSkills();
+      skillDefinitions = await listSkills();
+      skillsLoaded = true;
     } catch {
-      /* ignore when backend unavailable */
+      // Keep the last catalog while the backend reconnects.
     }
+  }
+
+  async function newSessionSkills(draft?: SkillsEnabledMap) {
+    try {
+      return newSkillSelection(await listSkills(), draft);
+    } catch {
+      return skillsLoaded ? newSkillSelection(skillDefinitions, draft) : undefined;
+    }
+  }
+
+  async function setSkillForSession(sid: string | null, slug: string, enabled: boolean) {
+    if (sid === null) {
+      homeSkillsEnabled = { ...homeSkillsEnabled, [slug]: enabled };
+      return;
+    }
+    const updated = await serverAction("session_update", { id: sid, skillToggle: { slug, enabled } });
+    if (updated) return;
+    if (updated === null) throw new Error("Could not update the session's skill.");
+    const chat = chats.find((item) => item.id === sid);
+    if (!chat) throw new Error("Work session no longer exists.");
+    chat.skillsEnabled = { ...(chat.skillsEnabled ?? skillSwitches(skillDefinitions)), [slug]: enabled };
+    save();
+  }
+
+  async function setSkillsAsDefault() {
+    const defaults = skillSwitches(skillsList);
+    const previous = skillSwitches(skillDefinitions);
+    await saveSkillDefaults(defaults);
+    // Legacy sessions were using the old defaults. The server freezes these
+    // in its database, and the dev bridge keeps its copies in the window.
+    for (const chat of chats) {
+      if (chat.mode === "work" && chat.skillsEnabled === undefined) chat.skillsEnabled = previous;
+    }
+    if (!serverPersist) save();
+    await refreshSkills();
+  }
+
+  function forgetSkillSwitch(slug: string) {
+    if (homeSkillsEnabled) delete homeSkillsEnabled[slug];
+    for (const chat of chats) {
+      if (chat.skillsEnabled) delete chat.skillsEnabled[slug];
+    }
+    if (!serverPersist) save();
   }
 
   onMount(() => {
@@ -8828,6 +8889,16 @@
           }
           break;
         }
+        case "skillschanged": {
+          const target = chats.find((item) => item.id === ev.session_id);
+          if (target && ev.enabled) {
+            target.skillsEnabled = ev.enabled;
+            if (!serverPersist) save();
+          }
+          if (ev.removed) forgetSkillSwitch(ev.removed);
+          void refreshSkills();
+          break;
+        }
         case "mcpchanged": {
           const current = live();
           if (current && ev.enabled) {
@@ -9065,6 +9136,7 @@
         model: turnPick ?? "",
         lead: own.role === "lead",
         mcpEnabled: (live() ?? chat).mcpEnabled,
+        skillsEnabled: (live() ?? chat).skillsEnabled,
         mcpOnly: (live() ?? chat).mcpOnly,
         freshSession: opts.freshSession ?? false,
         workspace,
@@ -9138,6 +9210,7 @@
       ],
       mode: "work",
       mcpEnabled: await newMcpEnabled(),
+      skillsEnabled: await newSessionSkills(),
       workspace: ws || null,
       forkedFrom: { id: src.id, title: src.title },
       forkFromIndex: null
@@ -13252,7 +13325,19 @@
 {#if skillsOpen}
   <SkillsModal
     skills={skillsList}
-    onChanged={(next) => (skillsList = next)}
+    loaded={skillsLoaded}
+    onToggleSkill={(slug, enabled) => setSkillForSession(activeChat?.id ?? null, slug, enabled)}
+    onSetDefault={setSkillsAsDefault}
+    onCreate={async (slug, content) => {
+      const created = await saveSkill(slug, content);
+      await refreshSkills();
+      return created;
+    }}
+    onDeleteSkill={async (slug) => {
+      await removeSkill(slug);
+      forgetSkillSwitch(slug);
+      await refreshSkills();
+    }}
     onEdit={(skill) => void openSkillInEditor(skill)}
     onClose={() => (skillsOpen = false)}
   />

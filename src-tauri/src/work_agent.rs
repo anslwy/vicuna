@@ -58,6 +58,11 @@ pub enum WorkAgentEvent {
     ScheduleControl { req_id: String, action: String, args: serde_json::Value, lead: bool },
     #[serde(rename = "sessioncontrol")]
     SessionControl { req_id: String, action: String, args: serde_json::Value },
+    SkillsChanged {
+        session_id: String,
+        enabled: Option<crate::skills::EnabledMap>,
+        removed: Option<String>,
+    },
     McpChanged {
         enabled: Option<crate::mcp::EnabledMap>,
         wake: Option<(String, Option<usize>)>,
@@ -137,6 +142,8 @@ pub struct TurnState {
     /// result after this many seconds, for engines that time MCP calls out
     /// with no way to raise the limit (agy: 3 minutes)
     pub ask_poll_secs: AtomicU64,
+    pub(crate) skills_enabled: tokio::sync::Mutex<crate::skills::EnabledMap>,
+    skills_prompt: String,
     pub(crate) mcp: std::sync::OnceLock<crate::vicuna_mcp::TurnMcp>,
     pub(crate) mcp_wakes: Mutex<Vec<(String, Option<usize>)>>,
 }
@@ -175,6 +182,16 @@ pub fn turn_is_live(state: &WorkAgentState, turn_id: &str) -> bool {
 }
 
 impl TurnState {
+    pub(crate) fn with_skills(mut self, enabled: crate::skills::EnabledMap) -> Self {
+        self.skills_prompt = crate::skills::format_skills_prompt(&enabled);
+        *self.skills_enabled.get_mut() = enabled;
+        self
+    }
+
+    pub(crate) fn skills_prompt(&self) -> &str {
+        &self.skills_prompt
+    }
+
     pub fn new() -> Self {
         Self {
             stop: AtomicBool::new(false),
@@ -185,6 +202,8 @@ impl TurnState {
             done: AtomicBool::new(false),
             ask_parked: Mutex::new(Vec::new()),
             ask_poll_secs: AtomicU64::new(0),
+            skills_enabled: Default::default(),
+            skills_prompt: Default::default(),
             mcp: Default::default(),
             mcp_wakes: Mutex::new(Vec::new()),
         }
@@ -299,6 +318,7 @@ pub async fn work_agent_start(
     engine: Option<String>,
     lead: Option<bool>,
     mcp_enabled: Option<crate::mcp::EnabledMap>,
+    skills_enabled: Option<crate::skills::EnabledMap>,
     mcp_only: Option<Vec<String>>,
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
@@ -308,7 +328,7 @@ pub async fn work_agent_start(
         return Err(engine.missing_message());
     }
     crate::vicuna_mcp::set_app_handle(app.clone());
-    let turn = Arc::new(TurnState::new());
+    let turn = Arc::new(TurnState::new().with_skills(skills_enabled.unwrap_or_else(crate::skills::defaults)));
     turn.lead.store(lead.unwrap_or(false), Ordering::Relaxed);
     let turn_id = agent_state.next_turn(turn.clone());
     let mgr = app.state::<crate::mcp::McpManager>().inner().clone();

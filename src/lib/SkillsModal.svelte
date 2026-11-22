@@ -1,33 +1,38 @@
 <script lang="ts">
   // Vicuna Skills manager modal: list, toggle, create, edit (opens SKILL.md in
   // CodeMirror), and delete skills stored under ~/vicuna/skills/<slug>/SKILL.md.
-  import { onMount } from "svelte";
   import {
     buildSkillTemplate,
     enabledSkillCount,
-    listSkills,
-    removeSkill,
-    saveSkill,
     slugifySkillName,
-    toggleSkill,
     validateSkillSlug,
     type SkillSummary
   } from "$lib/skills";
 
   let {
     skills = [],
-    onChanged,
+    loaded,
+    onCreate,
+    onToggleSkill,
+    onDeleteSkill,
+    onSetDefault,
     onEdit,
     onClose
   }: {
     skills?: SkillSummary[];
-    onChanged?: (next: SkillSummary[]) => void;
+    loaded: boolean;
+    onCreate: (slug: string, content: string) => Promise<SkillSummary>;
+    onToggleSkill: (slug: string, enabled: boolean) => Promise<void>;
+    onDeleteSkill: (slug: string) => Promise<void>;
+    onSetDefault: () => Promise<void>;
     onEdit: (skill: SkillSummary) => void;
     onClose: () => void;
   } = $props();
 
-  let items = $state<SkillSummary[]>([]);
-  let loading = $state(false);
+  let savingDefaults = $state(false);
+  let defaultFeedback = $state("");
+  let defaultTimer: ReturnType<typeof setTimeout>;
+  $effect(() => () => clearTimeout(defaultTimer));
   let busySlug = $state<string | null>(null);
   let confirmDeleteSlug = $state<string | null>(null);
   let err = $state<string | null>(null);
@@ -40,30 +45,23 @@
   let newDesc = $state("");
   let creatingBusy = $state(false);
 
-  const enabledCount = $derived(enabledSkillCount(items));
+  const enabledCount = $derived(enabledSkillCount(skills));
 
-  function syncItems(next: SkillSummary[]) {
-    items = next;
-    onChanged?.(next);
-  }
-
-  async function refresh() {
-    loading = true;
+  async function setDefault() {
+    savingDefaults = true;
+    defaultFeedback = "";
     err = null;
+    clearTimeout(defaultTimer);
     try {
-      const fresh = await listSkills();
-      syncItems(fresh);
-    } catch (e: any) {
-      err = typeof e === "string" ? e : (e?.message ?? String(e));
+      await onSetDefault();
+      defaultFeedback = "Saved as default";
+      defaultTimer = setTimeout(() => { defaultFeedback = ""; }, 2500);
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      savingDefaults = false;
     }
   }
-
-  onMount(() => {
-    items = [...skills];
-    void refresh();
-  });
 
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
@@ -103,16 +101,14 @@
       err = slugErr;
       return;
     }
-    if (items.some((s) => s.slug === slug)) {
+    if (skills.some((s) => s.slug === slug)) {
       err = `A skill named "${slug}" already exists.`;
       return;
     }
     creatingBusy = true;
     try {
       const content = buildSkillTemplate(newName.trim() || slug, newDesc.trim());
-      const created = await saveSkill(slug, content, true);
-      const fresh = await listSkills();
-      syncItems(fresh.length ? fresh : [...items, created]);
+      const created = await onCreate(slug, content);
       creating = false;
       onEdit(created);
     } catch (e: any) {
@@ -122,13 +118,13 @@
     }
   }
 
-  async function onToggle(skill: SkillSummary) {
+  async function onToggle(skill: SkillSummary, input: HTMLInputElement) {
     busySlug = skill.slug;
     err = null;
     try {
-      const updated = await toggleSkill(skill.slug, !skill.enabled);
-      syncItems(items.map((s) => (s.slug === skill.slug ? updated : s)));
+      await onToggleSkill(skill.slug, !skill.enabled);
     } catch (e: any) {
+      input.checked = skill.enabled;
       err = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
       busySlug = null;
@@ -143,9 +139,8 @@
     busySlug = skill.slug;
     err = null;
     try {
-      await removeSkill(skill.slug);
+      await onDeleteSkill(skill.slug);
       confirmDeleteSlug = null;
-      syncItems(items.filter((s) => s.slug !== skill.slug));
     } catch (e: any) {
       err = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
@@ -177,8 +172,8 @@
         <path d="M5 19l1 2.5L8.5 22 6 23l-1 1-1-1-2.5-1L4 21.5 5 19z" opacity="0.7"/>
       </svg>
       <span>Skills</span>
-      {#if items.length > 0}
-        <span class="sk-count">{enabledCount} / {items.length} enabled</span>
+      {#if skills.length > 0}
+        <span class="sk-count">{enabledCount} / {skills.length} enabled</span>
       {/if}
     </div>
     <div class="sk-head-actions">
@@ -190,6 +185,15 @@
           onclick={startCreate}
         >
           + New skill
+        </button>
+        <button
+          type="button"
+          class="sk-btn small"
+          data-testid="set-default-skills-btn"
+          onclick={setDefault}
+          disabled={!loaded || savingDefaults || busySlug !== null}
+        >
+          {savingDefaults ? "Saving…" : "Set default"}
         </button>
       {/if}
       <button
@@ -203,6 +207,10 @@
       </button>
     </div>
   </div>
+
+  {#if defaultFeedback}
+    <div class="sk-muted" role="status">{defaultFeedback}</div>
+  {/if}
 
   {#if err}
     <div class="sk-err" role="alert">{err}</div>
@@ -272,9 +280,9 @@
   {/if}
 
   <div class="sk-list" data-testid="skills-list">
-    {#if loading && items.length === 0}
-      <div class="sk-empty">Loading skills…</div>
-    {:else if items.length === 0}
+    {#if !loaded}
+      <div class="sk-empty">Skills are unavailable until Vicuna connects.</div>
+    {:else if skills.length === 0}
       <div class="sk-empty">
         <p>No skills yet.</p>
         <p class="sk-muted">
@@ -282,14 +290,14 @@
         </p>
       </div>
     {:else}
-      {#each items as skill (skill.slug)}
+      {#each skills as skill (skill.slug)}
         <div class="sk-row" class:disabled={!skill.enabled} data-testid="skill-row-{skill.slug}">
           <label class="sk-toggle" title={skill.enabled ? "Disable skill" : "Enable skill"}>
             <input
               type="checkbox"
               checked={skill.enabled}
-              disabled={busySlug === skill.slug}
-              onchange={() => void onToggle(skill)}
+              disabled={busySlug !== null || savingDefaults || creatingBusy}
+              onchange={(e) => void onToggle(skill, e.currentTarget)}
               aria-label={`Toggle ${skill.name}`}
             />
             <span class="sk-switch"></span>
@@ -308,7 +316,7 @@
               type="button"
               class="sk-btn small"
               data-testid="edit-skill-{skill.slug}"
-              disabled={busySlug === skill.slug}
+              disabled={busySlug !== null || savingDefaults || creatingBusy}
               onclick={() => onEdit(skill)}
             >
               Edit
@@ -317,7 +325,7 @@
               type="button"
               class="sk-btn small danger"
               data-testid="delete-skill-{skill.slug}"
-              disabled={busySlug === skill.slug}
+              disabled={busySlug !== null || savingDefaults || creatingBusy}
               onclick={() => void onDelete(skill)}
             >
               {confirmDeleteSlug === skill.slug ? "Confirm?" : "Delete"}
@@ -330,7 +338,7 @@
 
   <div class="sk-foot">
     <span class="sk-hint">
-      Enabled skills load automatically in every Work harness. Agents can also manage skills via <code>manage_skills</code>.
+      Enabled skills load in this Work session. Set default saves these switches for new sessions. Agents can also manage skills via <code>manage_skills</code>.
     </span>
   </div>
 </div>

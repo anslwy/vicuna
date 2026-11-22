@@ -101,6 +101,7 @@ pub struct LaunchParams {
     pub rec: Option<Recorder>,
     pub report_to: Option<String>,
     pub(crate) mcp_selection: crate::mcp::SessionSelection,
+    pub(crate) skills_enabled: Option<crate::skills::EnabledMap>,
 }
 
 /// The live turn of a session, if one is still running.
@@ -122,7 +123,11 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
             ));
         }
     }
-    let turn = Arc::new(TurnState::new());
+    let skills_enabled = match (&st.db, &p.session_id) {
+        (Some(db), Some(id)) => crate::server_store::session_skills(db, id).await?,
+        _ => None,
+    }.or(p.skills_enabled).unwrap_or_else(crate::skills::defaults);
+    let turn = Arc::new(TurnState::new().with_skills(skills_enabled));
     turn.lead.store(p.lead, Ordering::Relaxed);
     let turn_id = st.agent.next_turn(turn.clone());
     let resources = st.resource_dir.clone().or_else(crate::server::test_resource_dir);
@@ -485,6 +490,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
             rec: Some(rec),
             report_to,
             mcp_selection: extra.mcp,
+            skills_enabled: None,
         },
     )
     .await

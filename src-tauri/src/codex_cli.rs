@@ -752,7 +752,13 @@ pub async fn run_turn_inner(
     let cli = crate::codex::find_codex().ok_or_else(|| Engine::Codex.missing_message())?;
     let last_user = acp::last_user_message(messages).ok_or_else(|| "Work mode: no user message to send".to_string())?;
     let key = acp::session_key(Engine::Codex, session_id, workspace);
-    let saved = if fresh_session { None } else { key.as_deref().and_then(|k| state.get(k)) };
+    let scope = acp::skills_scope(turn.skills_prompt());
+    let saved = if fresh_session {
+        None
+    } else {
+        key.as_deref().and_then(|k| state.get(k))
+            .and_then(|saved| saved.strip_prefix(&scope).map(str::to_owned))
+    };
 
     let (mcp, mcp_note) = acp::mcp_servers_for_turn(mcp_snapshot).await;
     if let Some(note) = mcp_note {
@@ -771,7 +777,7 @@ pub async fn run_turn_inner(
     let base_text = format!("{}{}", last_user.content, goal_note);
     let fresh_text = format!(
         "{}\n\n---\n{}{}",
-        acp::system_prompt(workspace, None, session_id).trim(),
+        acp::system_prompt(workspace, None, session_id, turn.skills_prompt()).trim(),
         acp::history_preamble(messages, last_user),
         base_text
     );
@@ -803,7 +809,7 @@ pub async fn run_turn_inner(
         }
     };
     if let Some(k) = &key {
-        state.set(k.clone(), thread.clone());
+        state.set(k.clone(), format!("{scope}{thread}"));
     }
     if picked.is_none() {
         // the user's config.toml default: label the reply with what runs
