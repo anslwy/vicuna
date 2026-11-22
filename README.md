@@ -4,7 +4,11 @@
 
 Drive Claude Code, Codex, Antigravity, OpenCode, `fx`, `pi`, and ACP plugin harnesses from one native cross-platform interface — with built-in Git diff, code editor, terminal, live browser, MCP hub, and mobile bridges. Optional **Chat mode** supports local [Ollama](https://ollama.com) and OpenRouter models.
 
-![Vicuna demo showing Work mode with Fork-style Git diff, built-in code editor with Vim mode, Plugins Explore marketplace, and Settings](docs/assets/vicuna-hero.gif)
+| ![Work mode with Fork-style Git diff](docs/assets/work-git-diff.jpg) | ![Built-in code editor with Vim mode](docs/assets/code-editor.jpg) |
+|:---:|:---:|
+| Work mode + Fork-style Git diff *(Dark)* | Built-in code editor with Vim mode *(Light)* |
+| ![Plugins Explore marketplace](docs/assets/plugins-explore.jpg) | ![Settings and custom themes](docs/assets/settings-themes.jpg) |
+| Plugins Explore marketplace *(Lagoon Night)* | Settings & custom themes *(Lagoon Dune)* |
 
 ## Highlights
 
