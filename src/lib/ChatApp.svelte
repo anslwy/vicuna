@@ -12057,9 +12057,6 @@
           </button>
         </span>
       </div>
-      {#if usageReport?.account}
-        <p class="usage-account" data-testid="usage-account">{usageReport.account}</p>
-      {/if}
       {#if installedEngines.length > 1}
         <div class="usage-tabs" role="tablist" aria-label="Work harnesses">
           {#each installedEngines as eng (eng.id)}
@@ -12076,6 +12073,9 @@
     </div>
     <div class="usage-body">
       {#if usageReport}
+        {#if usageReport.account}
+          <p class="usage-account" data-testid="usage-account">{usageReport.account}</p>
+        {/if}
         {#if usageError}
           <p class="sched-warn" data-testid="usage-error">{usageError}</p>
         {/if}
@@ -13463,22 +13463,22 @@
   .sched-top.confirm-backdrop { z-index: 52; }
   .sched-top.confirm-card { z-index: 53; }
   .confirm-card.sched-card { width: min(560px, calc(100vw - 48px)); max-height: 76vh; top: 50%; display: flex; flex-direction: column; }
-  .confirm-card.usage-card { width: min(600px, calc(100vw - 48px)); max-height: 80vh; }
-  .usage-head { display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+  .confirm-card.usage-card { width: min(600px, calc(100vw - 48px)); height: min(640px, 80vh); max-height: 80vh; }
+  .usage-head { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
   .usage-title-row { display: flex; align-items: center; gap: 8px; padding-right: 28px; }
   .usage-title-row .sched-title { margin-bottom: 0; }
-  .usage-plan { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--hover); color: var(--text-dim); }
+  .usage-plan { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--hover); color: var(--text-dim); white-space: nowrap; }
   .usage-title-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
   .usage-updated { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
   .usage-refresh { border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   .usage-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
   .usage-refresh:disabled { opacity: .55; cursor: default; }
-  .usage-account { font-size: 12.5px; color: var(--muted); margin: 0; }
+  .usage-account { font-size: 12.5px; color: var(--muted); margin: 0 0 -4px 0; }
   .usage-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
   .usage-tab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
   .usage-tab:hover { background: var(--hover); color: var(--text); }
   .usage-tab.sel { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  .usage-body { overflow-y: auto; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
+  .usage-body { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
   .usage-loading { font-size: 13.5px; color: var(--muted); margin: 8px 0; }
   .usage-groups { display: flex; flex-direction: column; gap: 16px; }
   .usage-group { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
