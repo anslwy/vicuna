@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 const root = new URL("..", import.meta.url).pathname;
 const chatApp = readFileSync(root + "src/lib/ChatApp.svelte", "utf8");
+const settingsModal = readFileSync(root + "src/lib/SettingsModal.svelte", "utf8");
 
 test("sidebar footer orders Server switcher, Plugins, then Settings", () => {
   const footerStart = chatApp.indexOf('<div class="side-footer">');
@@ -30,12 +31,12 @@ test("collapsed rail includes Server switcher, Plugins, then Settings", () => {
 });
 
 test("Settings modal no longer contains a Plugins tab", () => {
-  assert.equal(chatApp.includes('data-testid="settings-tab-plugins"'), false);
-  assert.equal(chatApp.includes('settingsTab === "plugins"'), false);
-  assert.equal(chatApp.includes("settingsTab === 'plugins'"), false);
-  assert.ok(chatApp.includes('data-testid="settings-tab-general"'));
-  assert.ok(chatApp.includes('data-testid="settings-tab-ollama"'));
-  assert.ok(chatApp.includes('data-testid="settings-tab-openrouter"'));
+  assert.equal(settingsModal.includes('data-testid="settings-tab-plugins"'), false);
+  assert.equal(settingsModal.includes('settingsTab === "plugins"'), false);
+  assert.equal(settingsModal.includes("settingsTab === 'plugins'"), false);
+  assert.ok(settingsModal.includes('data-testid="settings-tab-general"'));
+  assert.ok(settingsModal.includes('data-testid="settings-tab-ollama"'));
+  assert.ok(settingsModal.includes('data-testid="settings-tab-openrouter"'));
 });
 
 test("standalone Plugins modal hosts PluginsPanel with close controls", () => {
