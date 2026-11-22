@@ -6,7 +6,9 @@ use std::os::windows::process::CommandExt as _;
 use tauri::AppHandle;
 
 use crate::agent_shell::AGENT_NONINTERACTIVE_ENV;
-use crate::cli_launcher::{cli_path_dirs, cli_shell_path_dirs};
+use crate::cli_launcher::cli_path_dirs;
+#[cfg(not(windows))]
+use crate::cli_launcher::cli_shell_path_dirs;
 use crate::skills;
 use crate::updates_uploads::uploads_home_dir;
 #[cfg(windows)]

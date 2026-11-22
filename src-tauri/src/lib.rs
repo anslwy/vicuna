@@ -82,8 +82,10 @@ pub use work_fs::{
     WorkGrepHit, WorkImageContent, WorkTreeEntry,
 };
 pub(crate) use work_fs::{
-    full_disk_scan_error, refuse_full_disk_scan, trunc_out, work_display_string, work_exec_path,
+    full_disk_scan_error, refuse_full_disk_scan, trunc_out, work_display_string,
 };
+#[cfg(not(windows))]
+pub(crate) use work_fs::work_exec_path;
 pub use bg_exec::{
     bg_kill, bg_kill_running, bg_list, bg_snapshot, bg_start, BgExecState, BgJobStatus,
     BgJobSummary,

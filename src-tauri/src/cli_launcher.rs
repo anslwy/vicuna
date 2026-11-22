@@ -3,6 +3,8 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 #[cfg(windows)]
+use std::process::{Command, Stdio};
+#[cfg(windows)]
 use crate::CREATE_NO_WINDOW;
 
 /// ---------- Vicuna CLI launcher (Settings → General, desktop only) ----------

@@ -9,8 +9,10 @@ use tauri::State;
 
 use crate::{
     bg_exec::bg_now_secs, full_disk_scan_error, kill_pid, refuse_full_disk_scan, trunc_out,
-    work_canonical_root, work_display_string, work_exec_path,
+    work_canonical_root, work_display_string,
 };
+#[cfg(not(windows))]
+use crate::work_exec_path;
 
 /// ---------- Persistent interactive agent shell ----------
 ///

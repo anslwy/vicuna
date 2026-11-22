@@ -7,9 +7,11 @@ use tauri::State;
 use tokio::io::AsyncReadExt as _;
 
 use crate::{
-    full_disk_scan_error, kill_job, refuse_full_disk_scan, work_canonical_root, work_exec_path,
+    full_disk_scan_error, kill_job, refuse_full_disk_scan, work_canonical_root,
     AGENT_NONINTERACTIVE_ENV,
 };
+#[cfg(not(windows))]
+use crate::work_exec_path;
 #[cfg(windows)]
 use crate::CREATE_NO_WINDOW;
 

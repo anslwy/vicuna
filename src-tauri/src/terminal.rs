@@ -9,6 +9,7 @@ use std::os::windows::process::CommandExt as _;
 #[cfg(feature = "desktop")]
 use tauri::State;
 
+#[cfg(not(windows))]
 use crate::cli_launcher::default_unix_shell;
 use crate::ipc::Channel;
 use crate::work_fs::{work_canonical_root, work_display_string};
