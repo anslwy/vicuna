@@ -80,7 +80,7 @@
   import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
-  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, type BrowserStatus } from "$lib/browser";
+  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
   import { ALL_FILTER, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
@@ -6839,6 +6839,8 @@
   let browserError = $state<string | null>(null);
   /** starting-view label: plain starts vs button restarts/takeovers. */
   let browserStartLabel = $state("Starting browser…");
+  /** live CloakBrowser download progress while an engine fetch is in flight. */
+  let browserDownload = $state<EngineDownloadProgress | null>(null);
   /** wall-clock start of the in-flight start drive: the starting view shows
    *  elapsed seconds so a slow Windows first launch never reads as frozen. */
   let browserStartedAt = $state<number | null>(null);
@@ -6869,17 +6871,46 @@
     });
     return browserDrive;
   }
-  /** one-time CloakBrowser fetch with an honest label (backend start
-   *  ensures internally too — this pre-warm exists so a minutes-long first
-   *  download doesn't sit under "Starting browser…" looking stuck).
-   *  Best-effort: a failed/blocked download must not abort the start, since
-   *  the backend falls back to an installed system Chromium. */
-  async function prewarmBrowserEngine() {
-    browserStartLabel = "Downloading browser engine (one-time setup)…";
+  /** one-time CloakBrowser fetch with live progress polling (non-blocking on
+   *  new backends so remote servers never hit HTTP timeouts during a slow
+   *  ~200 MB download; falls back gracefully on older backends that ignore
+   *  `background: true`). Best-effort: a failed/blocked download must not
+   *  abort the start, since the backend falls back to a system Chromium. */
+  async function prewarmBrowserEngine(existing?: EngineDownloadProgress | null) {
+    const active = (d?: EngineDownloadProgress | null) =>
+      d != null && (d.phase === "downloading" || d.phase === "extracting");
+    browserDownload = active(existing) ? existing! : null;
+    browserStartLabel = browserDownload
+      ? formatDownloadProgress(browserDownload)
+      : "Downloading browser engine (one-time setup)…";
     try {
-      await browserEnsureEngine();
+      let poll = active(existing);
+      if (!poll) {
+        const info = await browserEnsureEngine(true);
+        poll = !!info.downloading;
+      }
+      if (poll) {
+        const deadline = Date.now() + 15 * 60 * 1000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const st = await browserStatus();
+          if (st.running) {
+            browserDownload = null;
+            return;
+          }
+          const d = st.download ?? null;
+          if (!active(d)) {
+            browserDownload = null;
+            return;
+          }
+          browserDownload = d;
+          browserStartLabel = formatDownloadProgress(d!);
+        }
+      }
     } catch {
       /* fall through: the start path falls back to a system Chromium */
+    } finally {
+      browserDownload = null;
     }
   }
 
@@ -6927,7 +6958,8 @@
     try {
       let st = await browserStatus();
       if (!st.running) {
-        await prewarmBrowserEngine();
+        await prewarmBrowserEngine(st.download);
+        browserStartedAt = Date.now();
         browserStartLabel = "Starting browser…";
         st = await withBrowserTimeout(
           browserStart(),
@@ -11773,7 +11805,14 @@
             {:else if browserStarting}
               <div class="exp-empty" data-testid="browser-starting">
                 <div>{browserStartDisplay}</div>
-                {#if browserStartSeconds >= 20}
+                {#if browserDownload}
+                  {#if browserDownload.percent != null}
+                    <progress class="browser-dl-bar" max="100" value={browserDownload.percent}></progress>
+                  {/if}
+                  <div class="browser-start-hint">
+                    One-time download for the built-in browser engine.
+                  </div>
+                {:else if browserStartSeconds >= 20}
                   <div class="browser-start-hint">
                     First launch can take a minute while antivirus scans the engine. If this never finishes, the start
                     path falls back to an installed Chrome/Edge automatically — retry from the restart button above.
@@ -13772,6 +13811,7 @@
   .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
   .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .browser-start-hint { margin-top: 8px; font-size: 12px; line-height: 1.45; color: var(--muted); opacity: 0.85; }
+  .browser-dl-bar { margin-top: 10px; width: min(240px, 70%); height: 6px; accent-color: var(--accent); }
   @keyframes browser-restart-spin { to { transform: rotate(360deg); } }
   .browser-restarting svg { animation: browser-restart-spin 1s linear infinite; }
   .browser-kill-armed { color: var(--danger); }

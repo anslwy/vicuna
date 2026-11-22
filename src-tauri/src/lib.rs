@@ -5601,8 +5601,12 @@ async fn browser_restart(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
-async fn browser_ensure_engine(app: AppHandle) -> Result<browser::EngineInfo, String> {
-    browser::browser_ensure_engine_logic(browser_resource_dir(&app)).await
+async fn browser_ensure_engine(
+    app: AppHandle,
+    background: Option<bool>,
+) -> Result<browser::EngineInfo, String> {
+    browser::browser_ensure_engine_logic(browser_resource_dir(&app), background.unwrap_or(false))
+        .await
 }
 
 #[cfg(feature = "desktop")]
