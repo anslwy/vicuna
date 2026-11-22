@@ -11,6 +11,7 @@
 // token, lastUsed.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -53,11 +54,30 @@ fn path() -> Option<PathBuf> {
     crate::opencode::home_dir().map(|h| h.join("vicuna").join("config").join("servers.json"))
 }
 
+fn cache() -> &'static Mutex<Option<(PathBuf, Vec<ServerEntry>)>> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, Vec<ServerEntry>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 pub fn load() -> Vec<ServerEntry> {
-    path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let Some(p) = path() else {
+        return Vec::new();
+    };
+    if let Ok(guard) = cache().lock() {
+        if let Some((cached_path, entries)) = guard.as_ref() {
+            if *cached_path == p {
+                return entries.clone();
+            }
+        }
+    }
+    let entries: Vec<ServerEntry> = std::fs::read_to_string(&p)
+        .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(mut guard) = cache().lock() {
+        *guard = Some((p, entries.clone()));
+    }
+    entries
 }
 
 fn save(list: &[ServerEntry]) -> Result<(), String> {
@@ -70,6 +90,9 @@ fn save(list: &[ServerEntry]) -> Result<(), String> {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Ok(mut guard) = cache().lock() {
+        *guard = Some((p, list.to_vec()));
     }
     Ok(())
 }
@@ -139,8 +162,15 @@ fn resolve_name(url: &str, name: Option<&str>, existing: Option<&str>) -> String
     }
 }
 
-fn client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder().timeout(timeout).build().map_err(|e| e.to_string())
+fn shared_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("reqwest client")
+    })
 }
 
 fn transport_error(url: &str, e: reqwest::Error) -> String {
@@ -155,13 +185,13 @@ fn transport_error(url: &str, e: reqwest::Error) -> String {
 
 /// One HTTP call to a server. `body` = POST json, else GET.
 pub async fn request(url: &str, token: &str, path: &str, body: Option<&Value>, timeout: Duration) -> Result<Value, String> {
-    let c = client(timeout)?;
+    let c = shared_client();
     let full = format!("{url}{path}");
     let rb = match body {
         Some(b) => c.post(&full).json(b),
         None => c.get(&full),
     };
-    let res = rb.bearer_auth(token).send().await.map_err(|e| transport_error(url, e))?;
+    let res = rb.timeout(timeout).bearer_auth(token).send().await.map_err(|e| transport_error(url, e))?;
     let status = res.status();
     let v: Value = res.json().await.unwrap_or(Value::Null);
     if status.as_u16() == 401 {

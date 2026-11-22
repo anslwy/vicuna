@@ -51,7 +51,27 @@ const EVENT_CAP: usize = 2000;
 const SESSION_CHANGED: &str = "SESSION_CHANGED";
 const BODY_CAP: u64 = 32 * 1024 * 1024;
 
-type EventQueues = Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>;
+#[derive(Clone, Default)]
+pub struct EventQueues {
+    map: Arc<Mutex<HashMap<String, VecDeque<serde_json::Value>>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl EventQueues {
+    pub fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<String, VecDeque<serde_json::Value>>>> {
+        self.map.lock()
+    }
+
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+}
 
 pub struct BridgeState {
     pub bg: Arc<BgExecState>,
@@ -120,7 +140,7 @@ impl Default for BridgeState {
             tz_offset_min: std::sync::atomic::AtomicI64::new(0),
             sched_lock: tokio::sync::Mutex::new(()),
             chat_lock: tokio::sync::Mutex::new(()),
-            events: Arc::new(Mutex::new(HashMap::new())),
+            events: EventQueues::default(),
             resource_dir: None,
         }
     }
@@ -141,6 +161,7 @@ pub(crate) fn push_event(queues: &EventQueues, id: &str, raw: &str) {
             }
         }
     }
+    queues.notify_waiters();
 }
 
 fn enqueue(q: &mut VecDeque<serde_json::Value>, v: serde_json::Value) {
@@ -1247,12 +1268,23 @@ async fn handle_inner(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Inc
             }
         };
         touch(&st);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-        let mut events = drain_events(&st.events, &id);
-        while events.is_empty() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-            events = drain_events(&st.events, &id);
-        }
+        let events = if wait_ms == 0 {
+            drain_events(&st.events, &id)
+        } else {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+            loop {
+                let notified = st.events.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let batch = drain_events(&st.events, &id);
+                if !batch.is_empty() {
+                    break batch;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break drain_events(&st.events, &id);
+                }
+            }
+        };
         touch(&st);
         let body = serde_json::json!({"events": events}).to_string();
         return json_resp(200, body);
@@ -1633,6 +1665,7 @@ impl Bound {
                     let Ok((stream, _)) = accepted else {
                         continue;
                     };
+                    let _ = stream.set_nodelay(true);
                     let st = state.clone();
                     tokio::spawn(async move {
                         let io = hyper_util::rt::TokioIo::new(stream);
@@ -1722,6 +1755,34 @@ mod event_queue_tests {
         assert_eq!(ev[1]["text"], "ab");
         assert_eq!(ev[2]["type"], "toolstart");
         assert_eq!(ev[3]["text"], "z");
+    }
+
+    #[tokio::test]
+    async fn push_event_wakes_waiter_immediately() {
+        let q: EventQueues = Default::default();
+        let q2 = q.clone();
+        let start = tokio::time::Instant::now();
+        let waiter = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let notified = q2.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let batch = drain_events(&q2, "term-1");
+                if !batch.is_empty() {
+                    return batch;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return drain_events(&q2, "term-1");
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        push_event(&q, "term-1", r#"{"type":"data","data":"a"}"#);
+        let ev = waiter.await.unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["data"], "a");
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
     }
 }
 

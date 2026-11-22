@@ -223,39 +223,37 @@ export async function bridgeAvailable(): Promise<boolean> {
   }
 }
 
-/** Remote polls long-poll: the server holds the request until events arrive
- *  (or REMOTE_WAIT_MS passes), so output shows up at once instead of on the
+/** Long-poll timeout: the server holds the request until events arrive
+ *  (or POLL_WAIT_MS passes), so output shows up at once instead of on the
  *  next tick — terminal echo needs this. */
-const REMOTE_WAIT_MS = 15000;
+const POLL_WAIT_MS = 15000;
 
-async function pollOnce(id: string): Promise<any> {
+async function pollOnce(id: string, signal?: AbortSignal): Promise<any> {
   if (viaServerCall()) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<any>("server_call", { id: TRANSPORT, path: `/poll/${id}?wait=${REMOTE_WAIT_MS}`, body: null, timeoutMs: REMOTE_WAIT_MS + 10000 });
+    return await invoke<any>("server_call", { id: TRANSPORT, path: `/poll/${id}?wait=${POLL_WAIT_MS}`, body: null, timeoutMs: POLL_WAIT_MS + 10000 });
   }
-  const wait = isServerBacked() ? `?wait=${REMOTE_WAIT_MS}` : "";
-  const res = await fetch(`${bridgeBase()}/poll/${id}${wait}`, { headers: bridgeHeaders(false) });
+  const res = await fetch(`${bridgeBase()}/poll/${id}?wait=${POLL_WAIT_MS}`, { headers: bridgeHeaders(false), signal });
   if (!res.ok) throw new Error(`poll ${res.status}`);
   return await res.json();
 }
 
 /** Poll-based stand-in for a Tauri Channel. The bridge queues events per
- *  channel id; this drains them into onmessage — every 200ms on loopback,
- *  back-to-back long-polls to a remote server. Polls never overlap. */
+ *  channel id; this drains them into onmessage via back-to-back long-polls.
+ *  Polls never overlap. */
 export class BridgeChannel {
   readonly id: string;
   onmessage: ((ev: any) => void) | null = null;
-  private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
   private failures = 0;
   private inFlight = false;
+  private abortCtrl: AbortController | null = null;
 
   /** `id` reattaches to an existing server-side channel (a Work turn that
    *  kept running while this window was closed); omitted = a new channel. */
   constructor(id?: string) {
     this.id = id ?? crypto.randomUUID();
-    if (isServerBacked()) void this.longPollLoop();
-    else this.timer = setInterval(() => void this.poll(), 200);
+    void this.longPollLoop();
   }
 
   private async longPollLoop(): Promise<void> {
@@ -273,17 +271,17 @@ export class BridgeChannel {
 
   stop(): void {
     this.stopped = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
+    this.abortCtrl?.abort();
+    this.abortCtrl = null;
   }
 
   private async poll(): Promise<boolean> {
     if (this.inFlight) return true;
     this.inFlight = true;
+    const ctrl = new AbortController();
+    this.abortCtrl = ctrl;
     try {
-      const j = await pollOnce(this.id);
+      const j = await pollOnce(this.id, ctrl.signal);
       if (this.stopped) return true;
       this.failures = 0;
       for (const ev of j?.events ?? []) {
@@ -295,6 +293,7 @@ export class BridgeChannel {
       }
       return true;
     } catch {
+      if (this.stopped) return true;
       // repeated poll failures mean the bridge/server went away mid-turn —
       // surface it as an error event instead of hanging. A remote server
       // gets more slack (network blips), ~15s instead of ~2s.
@@ -312,6 +311,7 @@ export class BridgeChannel {
       }
       return false;
     } finally {
+      if (this.abortCtrl === ctrl) this.abortCtrl = null;
       this.inFlight = false;
     }
   }
