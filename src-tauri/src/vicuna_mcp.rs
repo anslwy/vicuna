@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use crate::ipc::Channel;
 #[cfg(feature = "desktop")]
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -683,8 +683,8 @@ fn usage_schema() -> Value {
 fn manage_mcp_schema() -> Value {
     json!({
         "name": MANAGE_MCP_TOOL,
-        "title": "Manage Vicuna custom MCP servers",
-        "description": "List, add, edit, enable, disable, or remove custom MCP servers configured in Vicuna (~/vicuna/config/vicuna.json). The fixed `vicuna-mcp` server cannot be modified, disabled, or removed.",
+        "title": "Manage Vicuna MCP servers",
+        "description": "List MCP servers for the calling session, switch servers on or off for this session, or add, edit, and remove shared custom server definitions. The fixed `vicuna-mcp` server is always available.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -727,7 +727,7 @@ fn manage_mcp_schema() -> Value {
                 },
                 "enabled": {
                     "type": "boolean",
-                    "description": "Whether the server is enabled (defaults to true on 'add'; preserves existing value on 'edit' if omitted)."
+                    "description": "Whether the server is enabled in this session (defaults to true on 'add'; preserves existing value on 'edit' if omitted)."
                 },
                 "wake": {
                     "type": "boolean",
@@ -1230,7 +1230,7 @@ async fn usage_status(args: &Value) -> Value {
 }
 
 fn is_fixed_vicuna_mcp(name: &str) -> bool {
-    name.trim().eq_ignore_ascii_case(SERVER_NAME)
+    crate::mcp::is_fixed(name)
 }
 
 fn parse_string_map_arg(v: Option<&Value>) -> Result<Option<HashMap<String, String>>, String> {
@@ -1330,10 +1330,7 @@ fn save_server_in(
     path: Option<&std::path::Path>,
     cfg: &crate::mcp::McpServerConfig,
 ) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
-    match path {
-        Some(p) => crate::mcp::save_file_server_in(p, cfg),
-        None => crate::mcp::save_file_server(cfg),
-    }
+    crate::mcp::rename_file_server(path, &cfg.id, cfg)
 }
 
 fn delete_server_in(
@@ -1346,10 +1343,62 @@ fn delete_server_in(
     }
 }
 
+/// The MCP management tool uses the same selection and backend as the calling turn.
+pub(crate) struct TurnMcp {
+    manager: Option<crate::mcp::McpManager>,
+    resources: Option<std::path::PathBuf>,
+    local: tokio::sync::Mutex<crate::mcp::SessionSelection>,
+    server: Option<std::sync::Weak<crate::server::BridgeState>>,
+}
+
+impl TurnMcp {
+    pub fn new(
+        manager: crate::mcp::McpManager,
+        resources: Option<std::path::PathBuf>,
+        selection: crate::mcp::SessionSelection,
+        server: Option<std::sync::Weak<crate::server::BridgeState>>,
+    ) -> Self {
+        Self { manager: Some(manager), resources, local: tokio::sync::Mutex::new(selection), server }
+    }
+
+    async fn start_browser(&self) {
+        if let Some(st) = self.server.as_ref().and_then(|st| st.upgrade()) {
+            let _ = crate::browser::browser_start_logic(self.resources.clone(), &st.browser).await;
+            return;
+        }
+        #[cfg(feature = "desktop")]
+        if let Some(browser) = APP_HANDLE.get().and_then(|app| app.try_state::<crate::browser::BrowserState>()) {
+            let _ = crate::browser::browser_start_logic(self.resources.clone(), &browser).await;
+        }
+    }
+
+    async fn selection(&self, sid: &str) -> Result<crate::mcp::SessionSelection, String> {
+        if let Some(st) = self.server.as_ref().and_then(|st| st.upgrade()) {
+            if let Some(db) = &st.db {
+                return crate::server_store::session_mcp(db, sid).await?
+                    .ok_or_else(|| "Work session no longer exists".into());
+            }
+        }
+        Ok(self.local.lock().await.clone())
+    }
+
+    async fn set_enabled(&self, sid: &str, path: Option<&std::path::Path>, id: &str, enabled: bool) -> Result<crate::mcp::EnabledMap, String> {
+        if let Some(st) = self.server.as_ref().and_then(|st| st.upgrade()) {
+            if let Some(db) = &st.db {
+                let _write = st.chat_lock.lock().await;
+                return Ok(crate::server_store::set_session_mcp(db, sid, id, enabled).await?.enabled.unwrap_or_default());
+            }
+        }
+        let defaults = if path.is_some() { crate::mcp::defaults_in(path) } else { crate::mcp::defaults() };
+        Ok(self.local.lock().await.set_enabled(&defaults, id, enabled).clone())
+    }
+}
+
 struct ManageMcpOutcome {
     value: Value,
     changed: bool,
     wake_server: Option<(String, Option<usize>)>,
+    enabled: Option<crate::mcp::EnabledMap>,
 }
 
 async fn connect_summary(
@@ -1371,7 +1420,8 @@ async fn connect_summary(
 async fn manage_mcp_in(
     path: Option<&std::path::Path>,
     args: &Value,
-    mgr: Option<&crate::mcp::McpManager>,
+    context: &TurnMcp,
+    sid: &str,
 ) -> Result<ManageMcpOutcome, String> {
     let action = args
         .get("action")
@@ -1380,9 +1430,16 @@ async fn manage_mcp_in(
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    let mgr = context.manager.as_ref();
+    let configured = || list_servers_in(path);
+    let available = || match path {
+        Some(_) => configured(),
+        None => crate::mcp::session_servers(context.resources.as_deref()),
+    };
     match action.as_str() {
         "list" => {
-            let servers = list_servers_in(path)?;
+            let servers = available()?;
+            let selection = context.selection(sid).await?;
             let (connected_ids, tool_counts) = match mgr {
                 Some(m) => (m.connected_ids().await, m.tool_counts().await),
                 None => (Vec::new(), HashMap::new()),
@@ -1390,7 +1447,8 @@ async fn manage_mcp_in(
             let items: Vec<Value> = servers
                 .iter()
                 .map(|s| {
-                    let is_conn = connected_ids.iter().any(|id| id == &s.id);
+                    let enabled = selection.is_enabled(&s.id, s.enabled);
+                    let is_conn = enabled && connected_ids.iter().any(|id| id == &s.id);
                     let mut header_keys: Vec<&String> = s.headers.as_ref().map(|h| h.keys().collect()).unwrap_or_default();
                     header_keys.sort();
                     let mut env_keys: Vec<&String> = s.env.as_ref().map(|e| e.keys().collect()).unwrap_or_default();
@@ -1402,7 +1460,7 @@ async fn manage_mcp_in(
                         "command": s.command,
                         "header_keys": header_keys,
                         "env_keys": env_keys,
-                        "enabled": s.enabled,
+                        "enabled": enabled,
                         "connected": is_conn,
                         "tools": tool_counts.get(&s.id).copied(),
                     })
@@ -1420,12 +1478,13 @@ async fn manage_mcp_in(
                 }),
                 changed: false,
                 wake_server: None,
+                enabled: None,
             })
         }
         "add" => {
             let raw_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let name = validate_server_name(raw_name)?;
-            let existing = list_servers_in(path)?;
+            let existing = available()?;
             if find_server(&existing, &name).is_some() {
                 return Err(format!("MCP server `{name}` already exists. Use action='edit' to update it."));
             }
@@ -1459,6 +1518,7 @@ async fn manage_mcp_in(
                 enabled,
             };
             save_server_in(path, &cfg)?;
+            let selection = context.set_enabled(sid, path, &cfg.id, enabled).await?;
             let (conn, connected_ok, tools_n) = if enabled {
                 connect_summary(mgr, &cfg).await
             } else {
@@ -1484,6 +1544,7 @@ async fn manage_mcp_in(
                 }),
                 changed: true,
                 wake_server: waking.then(|| (cfg.name.clone(), tools_n)),
+                enabled: Some(selection),
             })
         }
         "edit" => {
@@ -1526,7 +1587,10 @@ async fn manage_mcp_in(
                 Some(v) => parse_string_map_arg(Some(v))?,
                 None => prev.env.clone(),
             };
-            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(prev.enabled);
+            let enabled = match args.get("enabled").and_then(Value::as_bool) {
+                Some(on) => on,
+                None => context.selection(sid).await?.is_enabled(&prev.id, prev.enabled),
+            };
 
             let (final_url, final_headers, final_cmd, final_env) = if transport == "http" {
                 let u = validate_http_url(url.as_deref().unwrap_or(""))?;
@@ -1551,10 +1615,12 @@ async fn manage_mcp_in(
             if let Some(m) = mgr {
                 let _ = m.disconnect(&prev.id).await;
             }
-            save_server_in(path, &updated)?;
-            if target_name != prev.id {
-                delete_server_in(path, &prev.id)?;
-            }
+            crate::mcp::rename_file_server(path, &prev.id, &updated)?;
+            let selection = if target_name != prev.id || args.get("enabled").and_then(Value::as_bool).is_some() {
+                Some(context.set_enabled(sid, path, &updated.id, enabled).await?)
+            } else {
+                None
+            };
             let (conn, connected_ok, tools_n) = if updated.enabled {
                 connect_summary(mgr, &updated).await
             } else {
@@ -1580,6 +1646,7 @@ async fn manage_mcp_in(
                 }),
                 changed: true,
                 wake_server: waking.then(|| (updated.name.clone(), tools_n)),
+                enabled: selection,
             })
         }
         "enable" | "disable" => {
@@ -1587,29 +1654,31 @@ async fn manage_mcp_in(
             if is_fixed_vicuna_mcp(raw_name) {
                 return Err("`vicuna-mcp` is a fixed built-in server and cannot be enabled or disabled.".to_string());
             }
-            let existing_list = list_servers_in(path)?;
+            let existing_list = available()?;
             let mut cfg = find_server(&existing_list, raw_name)
                 .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
                 .clone();
             let enable = action == "enable";
             cfg.enabled = enable;
-            save_server_in(path, &cfg)?;
+            let selection = context.set_enabled(sid, path, &cfg.id, enable).await?;
+            if enable && cfg.id == crate::mcp::BROWSER_ID &&
+                !configured()?.iter().any(|s| s.id == cfg.id) {
+                context.start_browser().await;
+                if let Some(env) = cfg.env.as_mut() {
+                    env.insert("LB_SERVER".into(), crate::browser::lb_server_url());
+                }
+            }
             let (conn, connected_ok, tools_n) = if enable {
                 connect_summary(mgr, &cfg).await
             } else {
-                if let Some(m) = mgr {
-                    let _ = m.disconnect(&cfg.id).await;
-                    (json!({ "connected": false }), false, None)
-                } else {
-                    (Value::Null, false, None)
-                }
+                (Value::Null, false, None)
             };
             let wake_arg = args.get("wake").and_then(|v| v.as_bool());
             let waking = enable && connected_ok && wake_arg != Some(false);
             let note = if waking {
-                "Updated in vicuna.json and connected. Vicuna will automatically start a follow-up turn when this turn finishes so you can use this server right away."
+                "Enabled for this session and connected. Vicuna will start a follow-up turn when this turn finishes."
             } else {
-                "Updated in vicuna.json. Work engines pick up MCP config changes on the next turn."
+                "Updated for this session. The change applies on the next turn."
             };
             Ok(ManageMcpOutcome {
                 value: json!({
@@ -1623,6 +1692,7 @@ async fn manage_mcp_in(
                 }),
                 changed: true,
                 wake_server: waking.then(|| (cfg.name.clone(), tools_n)),
+                enabled: Some(selection),
             })
         }
         "remove" => {
@@ -1647,64 +1717,30 @@ async fn manage_mcp_in(
                 }),
                 changed: true,
                 wake_server: None,
+                enabled: None,
             })
         }
         _ => Err("`action` must be one of: list, add, edit, enable, disable, remove".to_string()),
     }
 }
 
-/// Headless server: called with (session id, server name, tool count) when
-/// `manage_mcp` adds/enables a server that should wake the session after the
-/// turn (the desktop emits `vicuna-mcp-wake` to its window instead). The
-/// bridge sets it so the follow-up turn runs with no window open.
-type McpWakeHook = Box<dyn Fn(&str, &str, Option<usize>) + Send + Sync>;
-static MCP_WAKE_HOOK: std::sync::OnceLock<McpWakeHook> = std::sync::OnceLock::new();
-
-pub fn set_mcp_wake_hook(f: impl Fn(&str, &str, Option<usize>) + Send + Sync + 'static) {
-    let _ = MCP_WAKE_HOOK.set(Box::new(f));
-}
-
-#[cfg(not(feature = "desktop"))]
 async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
-    // headless server: the config file is the source of truth; the desktop
-    // app reconciles its MCP list from it (no live manager / window events)
-    match manage_mcp_in(None, args, None).await {
+    let Some((target, context, sid)) = target.and_then(|t| {
+        Some((t, t.turn.mcp.get()?, t.session_id.as_deref()?))
+    }) else {
+        return text_result("manage_mcp needs a Work session", true);
+    };
+    match manage_mcp_in(None, args, context, sid).await {
         Ok(out) => {
-            if let (Some((name, tools)), Some(session_id), Some(hook)) =
-                (out.wake_server, target.and_then(|t| t.session_id.as_deref()), MCP_WAKE_HOOK.get())
-            {
-                hook(session_id, &name, tools);
+            if let Some(wake) = &out.wake_server {
+                if let Ok(mut wakes) = target.turn.mcp_wakes.lock() {
+                    if !wakes.iter().any(|(name, _)| name == &wake.0) {
+                        wakes.push(wake.clone());
+                    }
+                }
             }
-            text_result(&out.value.to_string(), false)
-        }
-        Err(e) => text_result(&e, true),
-    }
-}
-
-#[cfg(feature = "desktop")]
-async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
-    let app = APP_HANDLE.get();
-    let mgr_state = app.and_then(|a| a.try_state::<crate::mcp::McpManager>());
-    let mgr = mgr_state.as_deref();
-    match manage_mcp_in(None, args, mgr).await {
-        Ok(out) => {
-            if let Some(a) = app {
-                if out.changed {
-                    let _ = a.emit("vicuna-mcp-changed", ());
-                }
-                if let (Some((name, tools)), Some(session_id)) = (
-                    out.wake_server,
-                    target.and_then(|t| t.session_id.as_deref()),
-                ) {
-                    let _ = a.emit(
-                        "vicuna-mcp-wake",
-                        json!({
-                            "sessionId": session_id,
-                            "name": name,
-                            "tools": tools,
-                        }),
-                    );
-                }
+            if out.changed {
+                let _ = target.on_event.send(WorkAgentEvent::McpChanged { enabled: out.enabled, wake: out.wake_server });
             }
             text_result(&out.value.to_string(), false)
         }
@@ -2627,9 +2663,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join("vicuna.json");
+        let context = TurnMcp {
+            manager: None,
+            resources: None,
+            local: Default::default(),
+            server: None,
+        };
 
         // 1. list on empty config still shows fixed vicuna-mcp
-        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap();
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), &context, "test").await.unwrap();
         let (listed, changed) = (out.value, out.changed);
         assert!(!changed);
         assert!(out.wake_server.is_none());
@@ -2641,7 +2683,8 @@ mod tests {
             let err = manage_mcp_in(
                 Some(&cfg_path),
                 &json!({ "action": act, "name": "vicuna-mcp", "url": "http://127.0.0.1:9999/mcp" }),
-                None,
+                &context,
+            "test",
             )
             .await
             .err()
@@ -2658,7 +2701,8 @@ mod tests {
                 "url": "http://100.118.224.35:8793/mcp/5471aba1",
                 "headers": { "Authorization": "Bearer secret" }
             }),
-            None,
+            &context,
+            "test",
         )
         .await
         .unwrap();
@@ -2672,7 +2716,8 @@ mod tests {
         let dup_err = manage_mcp_in(
             Some(&cfg_path),
             &json!({ "action": "add", "name": "Kurisu", "url": "http://127.0.0.1:1/mcp" }),
-            None,
+            &context,
+            "test",
         )
         .await
         .err()
@@ -2680,19 +2725,21 @@ mod tests {
         assert!(dup_err.contains("already exists"));
 
         // 4. disable / enable (case-insensitive)
-        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "disable", "name": "KURISU" }), None)
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "disable", "name": "KURISU" }), &context, "test")
             .await
             .unwrap();
         let (dis, changed) = (out.value, out.changed);
         assert!(changed);
         assert_eq!(dis["enabled"], false);
 
-        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "enable", "name": "kurisu" }), None)
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "enable", "name": "kurisu" }), &context, "test")
             .await
             .unwrap();
         let (en, changed) = (out.value, out.changed);
         assert!(changed);
         assert_eq!(en["enabled"], true);
+        assert!(!crate::mcp::list_file_servers_in(&cfg_path).unwrap()[0].enabled);
+        assert!(!crate::mcp::SessionSelection::default().is_enabled("kurisu", false));
 
         // 5. edit url + rename
         let out = manage_mcp_in(
@@ -2703,7 +2750,8 @@ mod tests {
                 "new_name": "kurisu-prod",
                 "url": "https://example.com/mcp"
             }),
-            None,
+            &context,
+            "test",
         )
         .await
         .unwrap();
@@ -2712,7 +2760,7 @@ mod tests {
         assert_eq!(ed["name"], "kurisu-prod");
 
         // list shows renamed server with header_keys (not raw secret)
-        let listed2 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap().value;
+        let listed2 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), &context, "test").await.unwrap().value;
         let servers = listed2["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["name"], "kurisu-prod");
@@ -2720,13 +2768,13 @@ mod tests {
         assert_eq!(servers[0]["header_keys"], json!(["Authorization"]));
 
         // 6. remove
-        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "remove", "name": "kurisu-prod" }), None)
+        let out = manage_mcp_in(Some(&cfg_path), &json!({ "action": "remove", "name": "kurisu-prod" }), &context, "test")
             .await
             .unwrap();
         let (rem, changed) = (out.value, out.changed);
         assert!(changed);
         assert_eq!(rem["name"], "kurisu-prod");
-        let listed3 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), None).await.unwrap().value;
+        let listed3 = manage_mcp_in(Some(&cfg_path), &json!({ "action": "list" }), &context, "test").await.unwrap().value;
         assert_eq!(listed3["servers"].as_array().unwrap().len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);

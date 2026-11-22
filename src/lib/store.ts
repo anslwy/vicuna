@@ -10,7 +10,7 @@ import {
   writeCachedChat
 } from "./chatCache";
 
-export interface Chat {
+export interface Chat extends ChatExtra {
   id: string;
   title: string;
   createdAt: number;
@@ -51,7 +51,7 @@ export interface Chat {
 }
 
 export { chatExtraJson, parseChatExtra } from "./leadSessions";
-import { chatExtraJson, parseChatExtra } from "./leadSessions";
+import { chatExtraJson, parseChatExtra, type ChatExtra } from "./leadSessions";
 
 /** effective sidebar time: last user message, falling back to creation
  *  for sessions that predate updatedAt. */

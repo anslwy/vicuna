@@ -28,7 +28,7 @@ function frontendCommands(): Map<string, string> {
   ];
   for (const f of files) {
     const src = read(f);
-    for (const m of src.matchAll(/\b(?:invokeOrBridge|invokeCmd|bridgeInvoke|serverInvoke|invoke)(?:<[^>()]*>)?\(\s*"([a-z_]+)"/g)) {
+    for (const m of src.matchAll(/\b(?:invokeOrBridge|invokeMcp|invokeCmd|bridgeInvoke|serverInvoke|invoke)(?:<[^>()]*>)?\(\s*"([a-z_]+)"/g)) {
       if (!out.has(m[1])) out.set(m[1], f);
     }
   }

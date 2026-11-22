@@ -85,8 +85,6 @@ pub struct BridgeState {
     pub recorders: turns::Recorders,
     chat_turns: chat::ChatTurns,
     redo_history: session_tools::RedoHistory,
-    /// session -> MCP servers added mid-turn that wake it when the turn ends
-    pub mcp_wakes: Arc<Mutex<HashMap<String, Vec<(String, Option<usize>)>>>>,
     /// the user's UTC offset (minutes), as last reported by a window; the
     /// server resolves `schedule_wakeup` local times with it
     pub tz_offset_min: std::sync::atomic::AtomicI64,
@@ -119,7 +117,6 @@ impl Default for BridgeState {
             recorders: Arc::new(Mutex::new(HashMap::new())),
             chat_turns: Mutex::new(HashMap::new()),
             redo_history: Default::default(),
-            mcp_wakes: Arc::new(Mutex::new(HashMap::new())),
             tz_offset_min: std::sync::atomic::AtomicI64::new(0),
             sched_lock: tokio::sync::Mutex::new(()),
             chat_lock: tokio::sync::Mutex::new(()),
@@ -345,6 +342,15 @@ async fn dispatch(
                     rec = Some(persist::Recorder::new(sid, msgs, idx, model.clone().filter(|m| !m.is_empty()), engine.id()));
                 }
             }
+            let selection = match (&st.db, &session_id) {
+                (Some(db), Some(id)) => crate::server_store::session_mcp(db, id).await?,
+                _ => None,
+            }.unwrap_or_else(|| {
+                crate::mcp::SessionSelection::from_extra(&serde_json::json!({
+                    "mcpEnabled": args.get("mcpEnabled"),
+                    "mcp": args.get("mcpOnly"),
+                }))
+            });
             let turn_id = turns::launch(
                 st,
                 turns::LaunchParams {
@@ -357,7 +363,7 @@ async fn dispatch(
                     fresh_session: args.get("freshSession").and_then(|v| v.as_bool()).unwrap_or(false),
                     lead: args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false),
                     report_to: rec.as_ref().and(arg_opt_str(args, "reportTo")),
-                    mcp_only: args.get("persistChat").map(|c| turns::parse_extra(c).mcp).unwrap_or(None),
+                    mcp_selection: selection,
                     rec,
                 },
             )
@@ -771,15 +777,22 @@ async fn dispatch(
             ))
         }
         // ----- MCP -----
-        "mcp_list_servers" => Ok(serde_json::json!(crate::mcp::list_file_servers()?)),
+        "mcp_list_servers" => Ok(serde_json::json!(crate::mcp::session_servers(test_resource_dir().as_deref())?)),
+        "mcp_set_defaults" => {
+            let enabled = serde_json::from_value(args["enabled"].clone()).map_err(|e| format!("bad MCP defaults: {e}"))?;
+            crate::mcp::set_defaults(&enabled)?;
+            Ok(serde_json::json!(crate::mcp::session_servers(test_resource_dir().as_deref())?))
+        }
         "mcp_save_server" => {
             let cfg: crate::mcp::McpServerConfig =
                 serde_json::from_value(args.get("config").cloned().unwrap_or_default())
                     .map_err(|e| format!("bad config: {e}"))?;
-            Ok(serde_json::json!(crate::mcp::save_file_server(&cfg)?))
+            crate::mcp::save_file_server(&cfg, args["previousId"].as_str())?;
+            Ok(serde_json::json!(crate::mcp::session_servers(test_resource_dir().as_deref())?))
         }
         "mcp_delete_server" => {
-            Ok(serde_json::json!(crate::mcp::delete_file_server(&s("id")?)?))
+            crate::mcp::delete_file_server(&s("id")?)?;
+            Ok(serde_json::json!(crate::mcp::session_servers(test_resource_dir().as_deref())?))
         }
         "mcp_connect" => {
             let cfg: crate::mcp::McpServerConfig =
@@ -1380,6 +1393,7 @@ pub const API_ACTIONS: &[&str] = &[
     "mcp_delete_server",
     "mcp_disconnect",
     "mcp_list_servers",
+    "mcp_set_defaults",
     "mcp_list_tools",
     "mcp_login_present",
     "mcp_save_server",
@@ -1507,15 +1521,7 @@ pub async fn bind(cfg: &Config) -> Result<Bound, String> {
         turns::spawn_scheduler(state.clone());
         telegram::spawn(state.clone());
         bridge_plugins::spawn(state.clone());
-        let wakes = state.mcp_wakes.clone();
-        crate::vicuna_mcp::set_mcp_wake_hook(move |sid, name, tools| {
-            if let Ok(mut m) = wakes.lock() {
-                let list = m.entry(sid.to_string()).or_default();
-                if !list.iter().any(|(n, _)| n == name) {
-                    list.push((name.to_string(), tools));
-                }
-            }
-        });
+
     }
     spawn_term_reaper(state.clone());
     Ok(Bound { state, listener, addr })

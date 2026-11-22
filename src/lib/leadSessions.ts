@@ -1,3 +1,5 @@
+import type { McpSelection } from "./mcp";
+
 // Lead session (vicuna-mcp `manage_sessions`): pure text helpers. The lead
 // creates/messages/stops/removes worker sessions; the window performs the
 // action (ChatApp `leadControl`) and these build what the lead model reads.
@@ -59,7 +61,7 @@ export function sessionListText(rows: SessionRow[], engines: string[], defaultEn
   return lines.join("\n");
 }
 
-export interface ChatExtra {
+export interface ChatExtra extends McpSelection {
   engine?: string | null;
   workModel?: string | null;
   role?: "lead" | null;
@@ -77,6 +79,8 @@ export function chatExtraJson(c: ChatExtra): string | null {
   if (c.leadId) o.leadId = c.leadId;
   if (c.pinned) o.pinned = true;
   if (c.archived) o.archived = true;
+  if (c.mcpEnabled) o.mcpEnabled = c.mcpEnabled;
+  if (c.mcpOnly) o.mcp = c.mcpOnly;
   return Object.keys(o).length ? JSON.stringify(o) : null;
 }
 
@@ -97,6 +101,12 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (typeof o.leadId === "string" && o.leadId) out.leadId = o.leadId;
   if (o.pinned === true) out.pinned = true;
   if (o.archived === true) out.archived = true;
+  if (o.mcpEnabled && typeof o.mcpEnabled === "object" && !Array.isArray(o.mcpEnabled)) {
+    out.mcpEnabled = Object.fromEntries(Object.entries(o.mcpEnabled).filter(
+      (entry): entry is [string, boolean] => typeof entry[1] === "boolean"
+    ));
+  }
+  if (Array.isArray(o.mcp)) out.mcpOnly = o.mcp.filter((value: unknown) => typeof value === "string");
   return out;
 }
 

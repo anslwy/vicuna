@@ -5517,19 +5517,35 @@ async fn tray_set_status(
 /// shape) — the file is the source of truth, the UI edits it. Connections
 /// are runtime-only in the McpManager (stdio children die on disconnect).
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-async fn mcp_list_servers() -> Result<Vec<mcp::McpServerConfig>, String> {
-    mcp::list_file_servers()
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn mcp_list_servers(app: AppHandle) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::session_servers(app.path().resource_dir().ok().as_deref())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-async fn mcp_save_server(config: mcp::McpServerConfig) -> Result<Vec<mcp::McpServerConfig>, String> {
-    mcp::save_file_server(&config)
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn mcp_set_defaults(app: AppHandle, enabled: mcp::EnabledMap) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::set_defaults(&enabled)?;
+    mcp_list_servers(app).await
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-async fn mcp_delete_server(id: String) -> Result<Vec<mcp::McpServerConfig>, String> {
-    mcp::delete_file_server(&id)
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn mcp_save_server(
+    app: AppHandle,
+    config: mcp::McpServerConfig,
+    previous_id: Option<String>,
+) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::save_file_server(&config, previous_id.as_deref())?;
+    mcp_list_servers(app).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn mcp_delete_server(app: AppHandle, id: String) -> Result<Vec<mcp::McpServerConfig>, String> {
+    mcp::delete_file_server(&id)?;
+    mcp_list_servers(app).await
 }
 
 #[cfg(feature = "desktop")]
@@ -5820,6 +5836,7 @@ pub fn run() {
             quit_app,
             tray_set_status,
             mcp_list_servers,
+            mcp_set_defaults,
             mcp_save_server,
             mcp_delete_server,
             mcp_connect,

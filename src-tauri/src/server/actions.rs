@@ -139,6 +139,8 @@ pub(super) fn fork_row(src: &Value, id: &str, at: usize, fork_id: &str, msgs: Ve
     // the harness/model/MCP pick carries over
     let mut extra = extra_of(src);
     if let Some(o) = extra.as_object_mut() {
+        o.remove("mcpEnabled");
+        o.remove("mcp");
         for k in ["role", "pinned", "archived", "leadId"] {
             o.remove(k);
         }
@@ -202,6 +204,16 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
         "session_update" => {
             let id = arg_str(args, "id")?;
             let _w = st.chat_lock.lock().await;
+            if let Some(toggle) = args.get("mcpToggle") {
+                let server_id = arg_str(toggle, "id")?;
+                let enabled = toggle["enabled"].as_bool().ok_or("Missing MCP enabled state")?;
+                if crate::mcp::is_fixed(&server_id) {
+                    return Err("vicuna-mcp is always enabled".into());
+                }
+                let db = st.db.as_ref().ok_or("this bridge stores no sessions")?;
+                crate::server_store::set_session_mcp(db, &id, &server_id, enabled).await?;
+                return load(st, &id).await;
+            }
             let mut chat = load(st, &id).await?;
             let mut extra = extra_of(&chat);
             if let Some(t) = args.get("title").and_then(Value::as_str) {

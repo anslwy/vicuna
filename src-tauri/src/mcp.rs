@@ -1473,6 +1473,137 @@ fn config_to_entry(c: &McpServerConfig) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+pub type EnabledMap = HashMap<String, bool>;
+
+pub const BROWSER_ID: &str = "browser";
+
+pub(crate) fn extra_object(raw: Option<&str>) -> serde_json::Value {
+    raw.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SessionSelection {
+    pub enabled: Option<EnabledMap>,
+    // Existing CLI session allowlist. Explicit switches take precedence.
+    pub only: Option<Vec<String>>,
+}
+
+impl SessionSelection {
+    pub fn from_extra(extra: &serde_json::Value) -> Self {
+        Self {
+            enabled: extra.get("mcpEnabled").and_then(serde_json::Value::as_object).map(|o| {
+                o.iter().filter_map(|(id, value)| value.as_bool().map(|on| (id.clone(), on))).collect()
+            }),
+            only: extra.get("mcp").and_then(serde_json::Value::as_array).map(|a| {
+                a.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect()
+            }),
+        }
+    }
+
+    pub fn is_enabled(&self, id: &str, default: bool) -> bool {
+        if is_fixed(id) {
+            return true;
+        }
+        self.enabled.as_ref().and_then(|map| map.get(id)).copied()
+            .or_else(|| self.only.as_ref().map(|names| names.iter().any(|name| name == id)))
+            .unwrap_or(default)
+    }
+
+    pub fn set_enabled(&mut self, defaults: &EnabledMap, id: &str, enabled: bool) -> &EnabledMap {
+        let mut map = self.enabled.take().unwrap_or_else(|| self.resolve(defaults));
+        map.insert(id.to_owned(), enabled);
+        self.enabled.insert(map)
+    }
+
+    pub fn resolve(&self, defaults: &EnabledMap) -> EnabledMap {
+        defaults.iter().map(|(id, on)| (id.clone(), self.is_enabled(id, *on))).collect()
+    }
+}
+
+pub(crate) fn is_fixed(id: &str) -> bool {
+    id.trim().eq_ignore_ascii_case(crate::vicuna_mcp::SERVER_NAME)
+}
+
+fn browser_default(doc: &serde_json::Value) -> bool {
+    doc.get("browserMcpEnabled").and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+pub(crate) fn defaults() -> EnabledMap {
+    defaults_in(vicuna_config_path().ok().as_deref())
+}
+
+pub(crate) fn defaults_in(path: Option<&std::path::Path>) -> EnabledMap {
+    let doc = path.map(read_doc_in).unwrap_or_default();
+    let mut map: EnabledMap = servers_in_doc(&doc).into_iter().map(|s| (s.id, s.enabled)).collect();
+    if !map.keys().any(|id| id.eq_ignore_ascii_case(BROWSER_ID)) {
+        map.insert(BROWSER_ID.into(), browser_default(&doc));
+    }
+    map
+}
+
+pub(crate) fn session_servers(resource_dir: Option<&std::path::Path>) -> Result<Vec<McpServerConfig>, String> {
+    Ok(session_catalog(resource_dir)?.0)
+}
+
+pub(crate) fn session_catalog(resource_dir: Option<&std::path::Path>) -> Result<(Vec<McpServerConfig>, bool), String> {
+    Ok(session_catalog_in(&vicuna_config_path()?, resource_dir))
+}
+
+fn session_catalog_in(path: &std::path::Path, resource_dir: Option<&std::path::Path>) -> (Vec<McpServerConfig>, bool) {
+    let doc = read_doc_in(path);
+    let mut servers = servers_in_doc(&doc);
+    if !servers.iter().any(|s| s.id.eq_ignore_ascii_case(BROWSER_ID)) {
+        if let Ok(command) = crate::browser::browser_mcp_command(resource_dir) {
+            servers.insert(0, McpServerConfig {
+                id: BROWSER_ID.into(),
+                name: BROWSER_ID.into(),
+                transport: "stdio".into(),
+                command: Some(command),
+                env: Some(HashMap::from([("LB_SERVER".into(), crate::browser::lb_server_url())])),
+                url: None,
+                headers: None,
+                oauth: None,
+                enabled: browser_default(&doc),
+            });
+            return (servers, true);
+        }
+    }
+    (servers, false)
+}
+
+static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn set_defaults(enabled: &EnabledMap) -> Result<(), String> {
+    set_defaults_in(&vicuna_config_path()?, enabled)
+}
+
+fn set_defaults_in(path: &std::path::Path, enabled: &EnabledMap) -> Result<(), String> {
+    let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
+    let mut doc = read_doc_in(path);
+    if !doc.is_object() {
+        doc = serde_json::json!({});
+    }
+    let has_browser = doc.get("mcp").and_then(serde_json::Value::as_object)
+        .is_some_and(|map| map.keys().any(|id| id.eq_ignore_ascii_case(BROWSER_ID)));
+    if !has_browser {
+        if let Some(on) = enabled.get(BROWSER_ID) {
+            doc["browserMcpEnabled"] = serde_json::json!(on);
+        }
+    }
+    if let Some(map) = doc.get_mut("mcp").and_then(serde_json::Value::as_object_mut) {
+        for (id, entry) in map {
+            if !is_fixed(id) && entry_to_config(id, entry).is_some() {
+                if let Some(on) = enabled.get(id) {
+                    entry["enabled"] = serde_json::json!(on);
+                }
+            }
+        }
+    }
+    write_doc_in(path, &doc)
+}
+
 /// All MCP servers in vicuna.json (empty when the file is missing).
 pub fn list_file_servers() -> Result<Vec<McpServerConfig>, String> {
     let path = vicuna_config_path()?;
@@ -1480,9 +1611,9 @@ pub fn list_file_servers() -> Result<Vec<McpServerConfig>, String> {
 }
 
 /// Insert/replace one server entry, preserving every other key in the file.
-pub fn save_file_server(cfg: &McpServerConfig) -> Result<Vec<McpServerConfig>, String> {
+pub fn save_file_server(cfg: &McpServerConfig, previous_id: Option<&str>) -> Result<Vec<McpServerConfig>, String> {
     let path = vicuna_config_path()?;
-    save_file_server_in(&path, cfg)
+    write_file_server(&path, cfg, true, previous_id)
 }
 
 /// Remove one server entry (no-op when absent).
@@ -1504,28 +1635,79 @@ fn write_doc_in(path: &std::path::Path, doc: &serde_json::Value) -> Result<(), S
         std::fs::create_dir_all(parent).map_err(|e| format!("mcp: cannot create config dir: {e}"))?;
     }
     let text = serde_json::to_string_pretty(doc).map_err(|e| format!("mcp: cannot encode config: {e}"))?;
-    std::fs::write(path, text + "\n").map_err(|e| format!("mcp: cannot write config: {e}"))?;
-    Ok(())
+    let temp = path.with_extension(format!("{}.tmp", random_b64url(12)?));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        writeln!(file, "{text}")?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|e| format!("mcp: cannot write config: {e}"))
 }
 
 pub(crate) fn list_file_servers_in(path: &std::path::Path) -> Result<Vec<McpServerConfig>, String> {
     let doc = read_doc_in(path);
+    Ok(servers_in_doc(&doc))
+}
+
+fn servers_in_doc(doc: &serde_json::Value) -> Vec<McpServerConfig> {
     let Some(map) = doc.get("mcp").and_then(|m| m.as_object()) else {
-        return Ok(vec![]);
+        return vec![];
     };
     let mut out: Vec<McpServerConfig> = map
         .iter()
+        .filter(|(id, _)| !is_fixed(id))
         .filter_map(|(k, v)| entry_to_config(k, v))
         .collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(out)
+    out
 }
 
+#[cfg(test)]
 pub(crate) fn save_file_server_in(
     path: &std::path::Path,
     cfg: &McpServerConfig,
 ) -> Result<Vec<McpServerConfig>, String> {
+    write_file_server(path, cfg, false, None)
+}
+
+pub(crate) fn rename_file_server(
+    path: Option<&std::path::Path>,
+    old_id: &str,
+    cfg: &McpServerConfig,
+) -> Result<Vec<McpServerConfig>, String> {
+    let resolved;
+    let path = if let Some(path) = path {
+        path
+    } else {
+        resolved = vicuna_config_path()?;
+        &resolved
+    };
+    write_file_server(path, cfg, true, Some(old_id))
+}
+
+fn write_file_server(
+    path: &std::path::Path,
+    cfg: &McpServerConfig,
+    preserve_default: bool,
+    old_id: Option<&str>,
+) -> Result<Vec<McpServerConfig>, String> {
     let name = cfg.name.trim();
+    if is_fixed(name) || old_id.is_some_and(is_fixed) {
+        return Err("vicuna-mcp is managed by Vicuna".into());
+    }
+    let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
     if name.is_empty() || name.len() > 100 {
         return Err("mcp: server name is required".to_string());
     }
@@ -1544,7 +1726,14 @@ pub(crate) fn save_file_server_in(
     if !map.is_object() {
         *map = serde_json::json!({});
     }
+    let previous = old_id.unwrap_or(name);
+    let enabled = if preserve_default {
+        map.get(previous).and_then(|entry| entry_to_config(previous, entry)).is_some_and(|prev| prev.enabled)
+    } else {
+        cfg.enabled
+    };
     let stored = McpServerConfig {
+        enabled,
         id: name.to_string(),
         name: name.to_string(),
         ..cfg.clone()
@@ -1556,7 +1745,7 @@ pub(crate) fn save_file_server_in(
     let mut merged = config_to_entry(&stored);
     if let (Some(obj), Some(prev)) = (
         merged.as_object_mut(),
-        map.get(name).and_then(|v| v.as_object()),
+        map.get(previous).and_then(|v| v.as_object()),
     ) {
         for (k, v) in prev {
             if !KNOWN.contains(&k.as_str()) {
@@ -1564,14 +1753,23 @@ pub(crate) fn save_file_server_in(
             }
         }
     }
-    map.as_object_mut()
-        .expect("object")
-        .insert(name.to_string(), merged);
+    let map = map.as_object_mut().expect("object");
+    if previous != name {
+        if map.contains_key(name) {
+            return Err(format!("mcp: server '{name}' already exists"));
+        }
+        map.remove(previous);
+    }
+    map.insert(name.to_string(), merged);
     write_doc_in(path, &doc)?;
     list_file_servers_in(path)
 }
 
 pub(crate) fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<Vec<McpServerConfig>, String> {
+    if is_fixed(id) {
+        return Err("vicuna-mcp is managed by Vicuna".into());
+    }
+    let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
     let mut doc = read_doc_in(path);
     if let Some(map) = doc.get_mut("mcp").and_then(|m| m.as_object_mut()) {
         map.remove(id);
@@ -1585,6 +1783,38 @@ pub(crate) fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<
 mod config_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mcp_session_switches_and_saved_defaults() {
+        let path = tmp_config("session-defaults");
+        std::fs::write(&path, r#"{
+            "unrelated": "preserved",
+            "mcp": {
+                "one": {"command": ["one"], "extra": "preserved"},
+                "two": {"type": "remote", "url": "https://example.invalid/mcp", "enabled": false}
+            }
+        }"#).unwrap();
+        let original = defaults_in(Some(&path));
+        let mut session_a = SessionSelection::default();
+        let mut session_b = SessionSelection::default();
+        session_b.enabled = Some(original.clone());
+        session_a.set_enabled(&original, "one", false);
+        session_a.set_enabled(&original, BROWSER_ID, true);
+        assert_eq!(defaults_in(Some(&path)), original);
+        assert!(session_b.is_enabled("one", false));
+        assert!(!session_b.is_enabled(BROWSER_ID, false));
+
+        set_defaults_in(&path, &session_a.resolve(&original)).unwrap();
+        let saved = defaults_in(Some(&path));
+        assert_eq!(saved, HashMap::from([
+            (BROWSER_ID.into(), true), ("one".into(), false), ("two".into(), false)
+        ]));
+        assert_eq!(SessionSelection::default().resolve(&saved), saved);
+        assert_eq!(session_b.resolve(&saved), original);
+        assert_eq!(read_doc_in(&path)["mcp"]["one"]["extra"], "preserved");
+        assert_eq!(read_doc_in(&path)["unrelated"], "preserved");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     fn tmp_config(tag: &str) -> PathBuf {
         let n = SystemTime::now()

@@ -58,6 +58,10 @@ pub enum WorkAgentEvent {
     ScheduleControl { req_id: String, action: String, args: serde_json::Value, lead: bool },
     #[serde(rename = "sessioncontrol")]
     SessionControl { req_id: String, action: String, args: serde_json::Value },
+    McpChanged {
+        enabled: Option<crate::mcp::EnabledMap>,
+        wake: Option<(String, Option<usize>)>,
+    },
     Done { stopped: bool },
     Error { message: String },
 }
@@ -133,6 +137,8 @@ pub struct TurnState {
     /// result after this many seconds, for engines that time MCP calls out
     /// with no way to raise the limit (agy: 3 minutes)
     pub ask_poll_secs: AtomicU64,
+    pub(crate) mcp: std::sync::OnceLock<crate::vicuna_mcp::TurnMcp>,
+    pub(crate) mcp_wakes: Mutex<Vec<(String, Option<usize>)>>,
 }
 
 pub struct ParkedAsk {
@@ -179,6 +185,8 @@ impl TurnState {
             done: AtomicBool::new(false),
             ask_parked: Mutex::new(Vec::new()),
             ask_poll_secs: AtomicU64::new(0),
+            mcp: Default::default(),
+            mcp_wakes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -290,6 +298,8 @@ pub async fn work_agent_start(
     fresh_session: Option<bool>,
     engine: Option<String>,
     lead: Option<bool>,
+    mcp_enabled: Option<crate::mcp::EnabledMap>,
+    mcp_only: Option<Vec<String>>,
     on_event: Channel<WorkAgentEvent>,
     agent_state: State<'_, WorkAgentState>,
 ) -> Result<String, String> {
@@ -301,13 +311,17 @@ pub async fn work_agent_start(
     let turn = Arc::new(TurnState::new());
     turn.lead.store(lead.unwrap_or(false), Ordering::Relaxed);
     let turn_id = agent_state.next_turn(turn.clone());
-    // the MCP dialog's servers (+ built-in browser) go to opencode
-    let mcp_snapshot = crate::acp::McpSnapshot::capture(
-        &app.state::<crate::mcp::McpManager>(),
-        app.path().resource_dir().ok().as_deref(),
-    )
-    .await;
+    let mgr = app.state::<crate::mcp::McpManager>().inner().clone();
+    let resources = app.path().resource_dir().ok();
+    let selection = crate::mcp::SessionSelection { enabled: mcp_enabled, only: mcp_only };
+    let mut mcp_snapshot = crate::acp::McpSnapshot::capture(&mgr, resources.as_deref(), &selection).await;
+    let _ = turn.mcp.set(crate::vicuna_mcp::TurnMcp::new(mgr, resources.clone(), selection, None));
     tokio::spawn(async move {
+        if mcp_snapshot.uses_builtin_browser() {
+            let browser = app.state::<crate::browser::BrowserState>();
+            let _ = crate::browser::browser_start_logic(resources, &browser).await;
+            mcp_snapshot.update_browser_url();
+        }
         let acp = app.state::<crate::acp::AcpState>();
         crate::acp::run_turn(
             turn,

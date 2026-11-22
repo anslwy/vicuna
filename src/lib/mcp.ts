@@ -7,8 +7,52 @@
 // HTTP); in a plain browser only remote (http) servers can connect, via
 // direct fetch.
 
-import { isTauriRuntime } from "./ollama";
-import { invokeOrBridge } from "./bridge";
+async function invokeMcp<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  const { invokeOrBridge } = await import("./bridge");
+  return invokeOrBridge<T>(command, args);
+}
+
+export type McpEnabledMap = Record<string, boolean>;
+
+export interface McpSelection {
+  mcpEnabled?: McpEnabledMap;
+  mcpOnly?: string[];
+}
+
+type McpSwitch = Pick<McpServerConfig, "id" | "enabled">;
+
+export function isFixedMcp(id: string): boolean {
+  return id.trim().toLowerCase() === "vicuna-mcp";
+}
+
+export function isMcpEnabled(server: McpSwitch, session?: McpSelection | null): boolean {
+  if (isFixedMcp(server.id)) return true;
+  const map = session?.mcpEnabled;
+  if (map && Object.hasOwn(map, server.id)) return map[server.id];
+  return session?.mcpOnly?.includes(server.id) ?? server.enabled;
+}
+
+export function resolveMcpEnabled(servers: readonly McpSwitch[], session?: McpSelection | null): McpEnabledMap {
+  return Object.fromEntries(servers.filter((server) => !isFixedMcp(server.id))
+    .map((server) => [server.id, isMcpEnabled(server, session)]));
+}
+
+export function toggleMcpEnabled(
+  servers: readonly McpSwitch[],
+  session: McpSelection,
+  id: string,
+  enabled: boolean
+): McpEnabledMap {
+  const current = session.mcpEnabled ?? resolveMcpEnabled(servers, session);
+  return isFixedMcp(id) ? current : { ...current, [id]: enabled };
+}
+
+export async function saveMcpDefaults(
+  servers: readonly McpSwitch[],
+  session?: McpSelection | null
+): Promise<McpServerConfig[]> {
+  return invokeMcp<McpServerConfig[]>("mcp_set_defaults", { enabled: resolveMcpEnabled(servers, session) });
+}
 
 export interface McpOAuthCreds {
   client_id: string;
@@ -100,15 +144,16 @@ export function parseStringMap(raw: string): Record<string, string> | undefined 
 /** All servers from ~/vicuna/config/vicuna.json (desktop or bridge). */
 export async function listMcpServers(): Promise<McpServerConfig[]> {
   try {
-    const list = await invokeOrBridge<McpServerConfig[]>("mcp_list_servers", {});
+    const list = await invokeMcp<McpServerConfig[]>("mcp_list_servers", {});
     return Array.isArray(list) ? list : [];
   } catch {
     return [];
   }
 }
 
-export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig[]> {
-  return await invokeOrBridge<McpServerConfig[]>("mcp_save_server", {
+export async function saveMcpServer(c: McpServerConfig, previousId: string | null = null): Promise<McpServerConfig[]> {
+  return await invokeMcp<McpServerConfig[]>("mcp_save_server", {
+    previousId,
     config: {
       id: c.name.trim(),
       name: c.name.trim(),
@@ -124,7 +169,7 @@ export async function saveMcpServer(c: McpServerConfig): Promise<McpServerConfig
 }
 
 export async function deleteMcpServer(id: string): Promise<McpServerConfig[]> {
-  return await invokeOrBridge<McpServerConfig[]>("mcp_delete_server", { id });
+  return await invokeMcp<McpServerConfig[]>("mcp_delete_server", { id });
 }
 
 /** True when a backend error means "this server needs browser sign-in"
@@ -136,7 +181,7 @@ export function isAuthError(msg: string | null | undefined): boolean {
 
 /** Resolve with the connected server once OAuth and the loopback callback finish. */
 export async function signInServer(c: McpServerConfig, sidePanelBrowser: boolean): Promise<McpServerInfo> {
-  return await invokeOrBridge<McpServerInfo>("mcp_signin", {
+  return await invokeMcp<McpServerInfo>("mcp_signin", {
     sidePanelBrowser,
     config: {
       id: c.id,
@@ -155,7 +200,7 @@ export async function signInServer(c: McpServerConfig, sidePanelBrowser: boolean
 /** Forget the stored OAuth login and drop the connection, if any. */
 export async function signOutServer(id: string): Promise<void> {
   try {
-    await invokeOrBridge("mcp_signout", { id });
+    await invokeMcp("mcp_signout", { id });
   } catch {
     // nothing held browser-side; bridge-down is a no-op too
   }
@@ -164,7 +209,7 @@ export async function signOutServer(id: string): Promise<void> {
 /** Whether an OAuth login is stored for the server. */
 export async function loginPresent(id: string): Promise<boolean> {
   try {
-    return await invokeOrBridge<boolean>("mcp_login_present", { id });
+    return await invokeMcp<boolean>("mcp_login_present", { id });
   } catch {
     return false;
   }
@@ -188,11 +233,11 @@ function mcpConfigArgs(c: McpServerConfig): Record<string, any> {
 
 export async function connectServer(c: McpServerConfig): Promise<McpServerInfo> {
   try {
-    return await invokeOrBridge<McpServerInfo>("mcp_connect", mcpConfigArgs(c));
+    return await invokeMcp<McpServerInfo>("mcp_connect", mcpConfigArgs(c));
   } catch (e) {
     // Tauri errors surface as-is (row error / sign-in routing); browsers
     // without a bridge fall back to the remote-only path below
-    if (isTauriRuntime()) throw e;
+    if ((await import("./ollama")).isTauriRuntime()) throw e;
   }
   // plain browser: no process spawning — only remote servers can connect
   if (c.transport !== "http" || !c.url) {
@@ -204,7 +249,7 @@ export async function connectServer(c: McpServerConfig): Promise<McpServerInfo> 
 
 export async function disconnectServer(id: string, _transport: "stdio" | "http"): Promise<void> {
   try {
-    await invokeOrBridge("mcp_disconnect", { id });
+    await invokeMcp("mcp_disconnect", { id });
   } catch {
     // nothing held browser-side; bridge-down is a no-op too
   }
@@ -212,9 +257,9 @@ export async function disconnectServer(id: string, _transport: "stdio" | "http")
 
 export async function listServerTools(c: McpServerConfig): Promise<McpTool[]> {
   try {
-    return await invokeOrBridge<McpTool[]>("mcp_list_tools", { id: c.id });
+    return await invokeMcp<McpTool[]>("mcp_list_tools", { id: c.id });
   } catch (e) {
-    if (isTauriRuntime()) throw e;
+    if ((await import("./ollama")).isTauriRuntime()) throw e;
   }
   if (c.transport !== "http" || !c.url) throw new Error("not connected");
   return await remoteRequest<McpTool[]>(c.url, c.headers ?? {}, "tools/list", {});
@@ -222,14 +267,14 @@ export async function listServerTools(c: McpServerConfig): Promise<McpTool[]> {
 
 export async function callServerTool(c: McpServerConfig, tool: string, args: unknown): Promise<string> {
   try {
-    const res = await invokeOrBridge<McpCallResult>("mcp_call_tool", {
+    const res = await invokeMcp<McpCallResult>("mcp_call_tool", {
       serverId: c.id,
       tool,
       args: (args ?? {}) as Record<string, unknown>
     });
     return res.is_error ? `Tool error: ${res.content}` : res.content;
   } catch (e) {
-    if (isTauriRuntime()) throw e;
+    if ((await import("./ollama")).isTauriRuntime()) throw e;
   }
   if (c.transport !== "http" || !c.url) {
     throw new Error(`"${c.name}" is a local command server: use the Vicuna desktop app.`);

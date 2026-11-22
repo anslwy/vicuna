@@ -1,3 +1,4 @@
+import type { McpEnabledMap, McpSelection } from "./mcp";
 // Vicuna Work mode: the user's opencode CLI, driven by the backend over ACP
 // (src-tauri/src/acp.rs). This module holds the IPC wrappers (turns, engine
 // detection, opencode's model list), the workspace/file-explorer helpers and
@@ -493,6 +494,7 @@ export type WorkAgentEvent =
   | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "contextcompacted"; note: string }
+  | { type: "mcpchanged"; enabled: McpEnabledMap | null; wake: [string, number | null] | null }
   | { type: "done"; stopped: boolean }
   | { type: "error"; message: string };
 
@@ -535,7 +537,7 @@ export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> 
   return await invokeCmd<WorkEngineInfo>("work_engine_select", { engine });
 }
 
-export interface WorkTurnParams {
+export interface WorkTurnParams extends McpSelection {
   /** "opencode" | "claude" | "codex" | "fx" | "agy" | "pi" (absent = the backend's saved choice) */
   engine?: string;
   /** engine model id; empty = saved pick / engine default */
@@ -567,6 +569,8 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     messages: p.messages,
     sessionId: p.sessionId ?? null,
     lead: p.lead ?? false,
+    mcpEnabled: p.mcpEnabled ?? null,
+    mcpOnly: p.mcpOnly ?? null,
     // server mode (ignored elsewhere): see WorkTurnParams.persist
     ...(p.persist ? { persistChat: p.persist.chat, persistIndex: p.persist.index, reportTo: p.reportTo ?? null } : {}),
     tzOffsetMin: -new Date().getTimezoneOffset()

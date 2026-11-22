@@ -440,7 +440,58 @@ pub(crate) async fn clear_other_leads(db: &Pool, keep_id: &str) -> Result<Vec<St
 /// Create a chat the server starts on its own (a scheduled send into a new
 /// session). Same payload shape as a client save row.
 pub async fn create_chat(pool: &SqlitePool, chat: &Value) -> Result<(), String> {
-    merge_chats(pool, parse_rows(&Value::Array(vec![chat.clone()]))?, vec![], &Default::default()).await.map(|_| ())
+    let mut rows = parse_rows(&json!([chat]))?;
+    for row in &mut rows {
+        if row.mode.as_deref() == Some("work") {
+            let mut extra = crate::mcp::extra_object(row.extra.as_deref());
+            let selection = crate::mcp::SessionSelection::from_extra(&extra);
+            if selection.enabled.is_none() {
+                extra["mcpEnabled"] = json!(selection.resolve(&crate::mcp::defaults()));
+                row.extra = Some(extra.to_string());
+            }
+        }
+    }
+    merge_chats(pool, rows, vec![], &Default::default()).await.map(|_| ())
+}
+
+pub(crate) async fn session_mcp(
+    pool: &Pool,
+    id: &str,
+) -> Result<Option<crate::mcp::SessionSelection>, String> {
+    let raw: Option<Option<String>> = sqlx::query_scalar("SELECT extra FROM chats WHERE id = $1 AND mode = 'work'")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("load session MCP settings: {e}"))?;
+    Ok(raw.map(|raw| crate::mcp::SessionSelection::from_extra(&crate::mcp::extra_object(raw.as_deref()))))
+}
+
+pub(crate) async fn set_session_mcp(
+    pool: &Pool,
+    id: &str,
+    server_id: &str,
+    enabled: bool,
+) -> Result<crate::mcp::SessionSelection, String> {
+    let err = |e: sqlx::Error| format!("update session MCP settings: {e}");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
+    let raw: Option<String> = sqlx::query_scalar("SELECT extra FROM chats WHERE id = $1 AND mode = 'work'")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(err)?
+        .ok_or("Work session no longer exists")?;
+    let mut extra = crate::mcp::extra_object(raw.as_deref());
+    let mut selection = crate::mcp::SessionSelection::from_extra(&extra);
+    let defaults = selection.enabled.is_none().then(crate::mcp::defaults).unwrap_or_default();
+    extra["mcpEnabled"] = json!(selection.set_enabled(&defaults, server_id, enabled));
+    sqlx::query("UPDATE chats SET extra = $2, rev = COALESCE(rev, 0) + 1 WHERE id = $1")
+        .bind(id)
+        .bind(extra.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+    tx.commit().await.map_err(err)?;
+    Ok(selection)
 }
 
 pub async fn meta_get(pool: &SqlitePool, key: &str) -> Result<Option<String>, String> {
@@ -615,6 +666,29 @@ mod tests {
             "id": id, "title": title, "createdAt": 1, "updatedAt": 2, "mode": "work", "workspace": "/srv/p",
             "messages": msgs.iter().map(|(r, c)| json!({ "role": r, "content": c, "thinking": "", "images": null })).collect::<Vec<_>>(),
         })
+    }
+
+    #[tokio::test]
+    async fn mcp_session_changes_preserve_the_transcript_and_other_sessions() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&db).await.unwrap();
+        for id in ["a", "b"] {
+            let mut chat = row(id, id, &[("user", "hi")]);
+            chat["extra"] = json!(r#"{"engine":"pi","mcpEnabled":{"browser":false,"custom":true}}"#);
+            create_chat(&db, &chat).await.unwrap();
+        }
+
+        set_session_mcp(&db, "a", "browser", true).await.unwrap();
+        set_session_mcp(&db, "a", "custom", false).await.unwrap();
+
+        let a = session_mcp(&db, "a").await.unwrap().unwrap();
+        let b = session_mcp(&db, "b").await.unwrap().unwrap();
+        assert!(a.is_enabled("browser", false) && !a.is_enabled("custom", true));
+        assert!(!b.is_enabled("browser", true) && b.is_enabled("custom", false));
+        let chat = load_chat(&db, "a").await.unwrap().unwrap();
+        assert_eq!(crate::mcp::extra_object(chat["extra"].as_str())["engine"], "pi");
+        assert_eq!(chat["messages"][0]["content"], "hi");
+        assert_eq!(chat["rev"], 3);
     }
 
     /// `load_chats` yields `forkedFrom` as an object while the frontend sends
