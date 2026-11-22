@@ -89,11 +89,7 @@ pub(super) async fn compact(st: &Arc<BridgeState>, args: &Value) -> Result<Value
     if messages != original {
         return Ok(json!({"notice": "Session changed during compaction — try again."}));
     }
-    for msg in &mut messages {
-        if let Some(obj) = msg.as_object_mut() {
-            obj.remove("summary");
-        }
-    }
+    // Keep older summaries identifiable. History starts at the latest one.
     messages.push(
         json!({"role": "assistant", "content": summary.trim(), "model": model, "summary": true}),
     );

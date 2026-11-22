@@ -812,6 +812,7 @@ mod tests {
         assert_eq!(strip_harness_markup(a), "Done.\n\nAlso Asked the user: Which? — they answered: Kiwi & lime. end");
         let h = compacted_history(&[
             json!({"role": "user", "content": "old"}),
+            json!({"role": "assistant", "content": "earlier summary", "summary": true}),
             json!({"role": "assistant", "content": "summary", "summary": true}),
             json!({"role": "user", "content": "new", "images": ["x"]}),
         ]);

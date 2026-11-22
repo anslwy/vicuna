@@ -77,22 +77,29 @@ export interface HandoffInfo {
   workspace?: { from: string; to: string };
 }
 
+export function latestSummaryIndex(messages: readonly { summary?: boolean }[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].summary) return i;
+  }
+  return -1;
+}
+
 /** A reply that runs on a different harness or workspace than the previous
  *  reply: the new harness or workspace starts its own engine session and only
  *  gets Vicuna's transcript, so the thread shows a "Context handoff" divider. */
 export function handoffAt(
-  messages: readonly { role: string; model?: string | null; workspace?: string | null }[],
+  messages: readonly { role: string; model?: string | null; workspace?: string | null; summary?: boolean }[],
   i: number
 ): HandoffInfo | null {
   const m = messages[i];
-  if (!m || m.role !== "assistant") return null;
+  if (!m || m.role !== "assistant" || m.summary) return null;
 
   let engine: { from: string; to: string } | undefined;
   const toEngine = labelHarness(m.model);
   if (toEngine) {
     for (let k = i - 1; k >= 0; k--) {
       const p = messages[k];
-      if (p.role !== "assistant") continue;
+      if (p.role !== "assistant" || p.summary) continue;
       const fromEngine = labelHarness(p.model);
       if (!fromEngine) continue;
       if (fromEngine !== toEngine) {
@@ -107,7 +114,7 @@ export function handoffAt(
   if (toWs) {
     for (let k = i - 1; k >= 0; k--) {
       const p = messages[k];
-      if (p.role !== "assistant") continue;
+      if (p.role !== "assistant" || p.summary) continue;
       const fromWs = normWorkspace(p.workspace);
       if (!fromWs) continue;
       if (fromWs !== toWs) {
