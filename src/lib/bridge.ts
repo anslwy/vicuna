@@ -140,6 +140,7 @@ export const DESKTOP_CMDS = new Set([
   "server_connect",
   "server_touch",
   "server_remove",
+  "server_rename",
   "server_call",
   "server_download_file",
   "server_lb_proxy_url",
@@ -375,6 +376,12 @@ export async function touchServer(id: string): Promise<void> {
 export async function removeServer(id: string): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("server_remove", { id });
+}
+
+/** Rename a saved server locally without reconnecting (`""` resets to host:port). */
+export async function renameServer(id: string, name: string): Promise<ServerInfo> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<ServerInfo>("server_rename", { id, name });
 }
 
 /** One cross-host search hit, shaped for the Cmd+P palette (no message bodies). */

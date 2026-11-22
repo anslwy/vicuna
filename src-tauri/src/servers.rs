@@ -237,6 +237,21 @@ pub fn remove(id: &str) -> Result<(), String> {
     save(&l)
 }
 
+fn rename_in(list: &mut [ServerEntry], id: &str, name: Option<&str>) -> Result<ServerInfo, String> {
+    let entry = list.iter_mut().find(|s| s.id == id).ok_or("That server is no longer in your list.")?;
+    entry.name = resolve_name(&entry.url, Some(name.unwrap_or("")), Some(&entry.name));
+    Ok(ServerInfo::from(&*entry))
+}
+
+/// Update a saved server's display name locally without reconnecting.
+/// Passing `None` or an empty/whitespace string resets it to `host[:port]`.
+pub fn rename(id: &str, name: Option<String>) -> Result<ServerInfo, String> {
+    let mut l = load();
+    let info = rename_in(&mut l, id, name.as_deref())?;
+    save(&l)?;
+    Ok(info)
+}
+
 /// Forward one call to server `id`: `path` is `/invoke` (with body) or
 /// `/poll/<channel>` (GET). Returns the server's JSON as-is.
 pub async fn call(id: &str, path: &str, body: Option<Value>, timeout_ms: Option<u64>) -> Result<Value, String> {
@@ -695,6 +710,24 @@ mod tests {
         assert_eq!(resolve_name(url, None, Some("Deck 8446")), "Deck 8446");
         assert_eq!(resolve_name(url, Some("Deck Dev"), Some("Deck 8446")), "Deck Dev");
         assert_eq!(resolve_name(url, Some(""), Some("Deck 8446")), "steamdeck.tail6986be.ts.net:8446");
+    }
+
+    #[test]
+    fn rename_updates_or_resets_without_reconnecting() {
+        let url = "https://steamdeck.tail6986be.ts.net:8446";
+        let mut list = vec![ServerEntry {
+            id: "abc".into(),
+            url: url.into(),
+            name: "steamdeck.tail6986be.ts.net:8446".into(),
+            token: "tok".into(),
+            last_used: 1,
+        }];
+        let renamed = rename_in(&mut list, "abc", Some("  Deck 8446  ")).unwrap();
+        assert_eq!(renamed.name, "Deck 8446");
+        assert_eq!(list[0].token, "tok");
+        let reset = rename_in(&mut list, "abc", Some("   ")).unwrap();
+        assert_eq!(reset.name, "steamdeck.tail6986be.ts.net:8446");
+        assert!(rename_in(&mut list, "missing", Some("X")).is_err());
     }
 
     /// Live round trip against a running `vicuna serve` (opt-in):
