@@ -62,6 +62,11 @@
   import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import SkillsModal from "$lib/SkillsModal.svelte";
+  import EngineIcon from "$lib/EngineIcon.svelte";
+  import UsageModal from "$lib/UsageModal.svelte";
+  import ServerDialogModal from "$lib/ServerDialogModal.svelte";
+  import GotoPaletteModal from "$lib/GotoPaletteModal.svelte";
+  import ScheduleModals from "$lib/ScheduleModals.svelte";
   import { enabledSkillCount, listSkills, newSkillSelection, removeSkill, resolveSkills, saveSkill, saveSkillDefaults, skillSwitches, type SkillsEnabledMap, type SkillSummary } from "$lib/skills";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, browserThemeParams, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, resolveTerminalColors, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
@@ -9977,48 +9982,8 @@
     </div>
   {/if}
 {/snippet}
-{#snippet scheduledRows(actions: boolean)}
-  <div class="sched-list" data-testid="scheduled-list">
-    {#each scheduledSorted as it (it.id)}
-      <div class="sched-row {it.missed ? 'missed' : ''}" data-testid="scheduled-row">
-        <div class="sched-row-main">
-          <div class="sched-row-when">
-            {#if it.missed}<span class="sched-missed-tag">{it.error ? "Not sent" : "Missed"}</span>{/if}
-            {formatWhen(it.at, scheduleNow)}
-            <span class="sched-row-target">· {scheduleTarget(it)}</span>
-          </div>
-          <div class="sched-row-text">{previewText(it, 140)}{#if it.images?.length && it.text}{" "}· {it.images.length} image{it.images.length === 1 ? "" : "s"}{/if}</div>
-          {#if it.error}<div class="sched-row-err">{it.error}</div>{/if}
-        </div>
-        {#if actions}
-          <div class="sched-row-actions">
-            <button class="mini-btn primary" data-testid="scheduled-send-now" onclick={() => void deliverScheduled(it.id)}>Send now</button>
-            <button class="mini-btn" data-testid="scheduled-reschedule" onclick={() => openScheduleCustom(it.id)}>Reschedule</button>
-            <button class="mini-btn danger" data-testid="scheduled-delete" onclick={() => removeScheduled(it.id)}>Delete</button>
-          </div>
-        {/if}
-      </div>
-    {/each}
-  </div>
-{/snippet}
 {#snippet engineIcon(id: string)}
-  {#if id === "claude"}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
-  {:else if id === "codex"}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={CODEX_ICON_OUTLINE_PATH}/><path d={CODEX_ICON_PROMPT_PATH}/></svg>
-  {:else if id === "fx"}
-    <svg class="engine-ico" data-engine-icon="fx" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={FX_ICON_PATH}/></svg>
-  {:else if id === "pi"}
-    <svg class="engine-ico" data-engine-icon="pi" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={PI_ICON_PATH}/></svg>
-  {:else if id.startsWith("plugin:") && pluginEngineIcon(id, workEngineList)}
-    <img class="engine-ico" src={pluginEngineIcon(id, workEngineList)!} width="14" height="14" alt="" aria-hidden="true" />
-  {:else if id.startsWith("plugin:")}
-    <svg class="engine-ico" data-engine-icon="plugin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z"/></svg>
-  {:else if id === "agy"}
-    <svg class="engine-ico" data-engine-icon="agy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={AGY_ICON_PATH}/></svg>
-  {:else}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
-  {/if}
+  <EngineIcon {id} {workEngineList} />
 {/snippet}
 {#snippet serverMenu()}
   <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => { srvMenuOpen = false; srvMenuRenaming = false; }}></button>
@@ -12355,59 +12320,31 @@
   {/if}
 {/if}
 {#if srvDialogOpen}
-  <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
-  <div class="confirm-card srv-card" data-testid="server-dialog" role="dialog" aria-modal="true" aria-label="Connect to server">
-    <label class="srv-field-label" for="srv-url">Server URL</label>
-    <input id="srv-url" class="srv-input" data-testid="server-url-input" placeholder="https://my-vps.tailnet.ts.net:8443" autocomplete="off" spellcheck="false"
-      bind:value={srvUrlDraft} disabled={srvBusy}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    <label class="srv-field-label" for="srv-token">Token</label>
-    <input id="srv-token" class="srv-input" data-testid="server-token-input" type="password" placeholder="printed by vicuna serve (kept for saved servers)" autocomplete="off"
-      bind:value={srvTokenDraft} disabled={srvBusy}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    <label class="srv-field-label" for="srv-name">Display name <span class="srv-optional">(optional)</span></label>
-    <input id="srv-name" class="srv-input" data-testid="server-name-input" placeholder="defaults to host:port" autocomplete="off" spellcheck="false"
-      bind:value={srvNameDraft} disabled={srvBusy}
-      oninput={() => (srvNameTouched = true)}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    {#if srvErr}<p class="goto-error" data-testid="server-error">{srvErr}</p>{/if}
-    <button class="srv-connect-btn" data-testid="server-connect-btn" disabled={srvBusy || srvUrlDraft.trim() === ""} onclick={() => void submitServer()}>{srvBusy ? "Connecting…" : "Connect"}</button>
-    {#if srvList.length}
-      <div class="srv-recent-label">Recent servers</div>
-      {#each srvList as sv (sv.id)}
-        <div class="srv-recent-row" data-testid="server-recent">
-          {#if srvEditingId === sv.id}
-            <input class="srv-recent-input" data-testid="server-rename-input" placeholder={defaultServerName(sv.url)} autocomplete="off" spellcheck="false"
-              bind:value={srvEditDraft} disabled={srvRenaming}
-              onkeydown={(e) => { if (e.key === "Enter") void saveRenameServer(); else if (e.key === "Escape") cancelRenameServer(); }} />
-            <button class="srv-recent-icon" data-testid="server-rename-save" aria-label="Save name" title="Save" disabled={srvRenaming} onclick={() => void saveRenameServer()}>✓</button>
-            <button class="srv-recent-icon" data-testid="server-rename-cancel" aria-label="Cancel rename" title="Cancel" disabled={srvRenaming} onclick={cancelRenameServer}>×</button>
-          {:else}
-            <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => fillRecentServer(sv)}>{sv.name}</button>
-            <button class="srv-recent-icon" data-testid="server-rename" aria-label="Rename {sv.name}" title="Rename" onclick={() => startRenameServer(sv)}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
-            </button>
-            <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
-              {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
-            </button>
-            <button class="srv-recent-icon" data-testid="server-forget" aria-label="Remove {sv.name}" title="Remove" onclick={() => void forgetServer(sv.id)}>×</button>
-          {/if}
-        </div>
-      {/each}
-    {/if}
-    <p class="srv-help">Set up a server: run this on that machine. It prints the URL and token to paste above.</p>
-    <div class="srv-cmd" data-testid="server-setup-cmd">
-      <pre>{SERVER_SETUP_CMD}</pre>
-      <button class="srv-cmd-copy" data-testid="server-setup-copy" aria-label="Copy commands" title={srvCmdCopied ? "Copied" : "Copy"} onclick={() => void copyServerSetup()}>
-        {#if srvCmdCopied}
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-        {:else}
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-        {/if}
-      </button>
-    </div>
-    <p class="srv-help">Work sessions, files and agents then run there; Chat mode keeps using this computer's Ollama.</p>
-  </div>
+  <ServerDialogModal
+    bind:srvUrlDraft
+    bind:srvTokenDraft
+    bind:srvNameDraft
+    bind:srvNameTouched
+    {srvBusy}
+    {srvErr}
+    {srvList}
+    {srvEditingId}
+    bind:srvEditDraft
+    {srvRenaming}
+    {srvCopied}
+    {srvCmdCopied}
+    setupCmd={SERVER_SETUP_CMD}
+    {defaultServerName}
+    onClose={() => (srvDialogOpen = false)}
+    onSubmit={() => void submitServer()}
+    onFillRecent={fillRecentServer}
+    onStartRename={startRenameServer}
+    onSaveRename={() => void saveRenameServer()}
+    onCancelRename={cancelRenameServer}
+    onCopyUrl={(url) => void copyServerUrl(url)}
+    onForget={(id) => void forgetServer(id)}
+    onCopySetup={() => void copyServerSetup()}
+  />
 {/if}
 {#if leadDeleteAsk}
   <button class="confirm-backdrop" aria-label="Cancel" tabindex="-1" onclick={() => leadDeleteAsk?.resolve(false)}></button>
@@ -12490,254 +12427,57 @@
   </div>
 {/if}
 {#if usageOpen}
-  {@const installedEngines = usageTabs(workEngines, usageEngine).tabs}
-  <button class="confirm-backdrop sched-dim" data-testid="usage-backdrop" aria-label="Close" onclick={closeUsageModal} tabindex="-1"></button>
-  <div class="confirm-card sched-card usage-card" data-testid="usage-dialog" role="dialog" aria-modal="true" aria-label="Harness usage">
-    <button class="modal-x" data-testid="usage-close" aria-label="Close" onclick={closeUsageModal}>×</button>
-    <div class="usage-head">
-      <div class="usage-title-row">
-        <p class="confirm-text sched-title">Usage</p>
-        {#if usageReport?.plan}
-          <span class="usage-plan">{usageReport.plan}</span>
-        {/if}
-        <span class="usage-title-right">
-          {#if usageUpdatedAt && usageReport}
-            <span class="usage-updated" data-testid="usage-updated">Updated {formatUsageAge(usageUpdatedAt, usageNow)}</span>
-          {/if}
-          <button class="usage-refresh" data-testid="usage-refresh" disabled={usageLoading} onclick={() => void fetchUsageEngine(usageEngine, { force: true })} title="Refresh usage">
-            {usageLoading ? "Refreshing…" : "Refresh"}
-          </button>
-        </span>
-      </div>
-      {#if installedEngines.length > 1}
-        <div class="usage-tabs" role="tablist" aria-label="Work harnesses">
-          {#each installedEngines as eng (eng.id)}
-            <button
-              class="usage-tab {usageEngine === eng.id ? 'sel' : ''}"
-              data-testid="usage-tab-{eng.id}"
-              role="tab"
-              aria-selected={usageEngine === eng.id}
-              onclick={() => selectUsageTab(eng.id)}
-            >{@render engineIcon(eng.id)}{eng.label}</button>
-          {/each}
-        </div>
-      {/if}
-    </div>
-    <div class="usage-body">
-      {#if usageReport}
-        {#if usageReport.account}
-          <p class="usage-account" data-testid="usage-account">{usageReport.account}</p>
-        {/if}
-        {#if usageError}
-          <p class="sched-warn" data-testid="usage-error">{usageError}</p>
-        {/if}
-        {#if usageReport.groups.length}
-          <div class="usage-groups">
-            {#each usageReport.groups as grp}
-              <div class="usage-group">
-                <div class="usage-group-title">{grp.title}</div>
-                {#if grp.subtitle}
-                  <div class="usage-group-sub">{grp.subtitle}</div>
-                {/if}
-                <div class="usage-meters">
-                  {#each grp.meters as m}
-                    {@const tone = usageMeterTone(m.percent, m.kind)}
-                    <div class="usage-meter" data-testid="usage-meter">
-                      <div class="usage-meter-top">
-                        <span class="usage-meter-label">{m.label}</span>
-                        <span class="usage-meter-val">{m.valueText}</span>
-                      </div>
-                      <div class="usage-bar">
-                        <div class="usage-fill {tone}" style="width: {Math.max(0, Math.min(100, m.percent))}%"></div>
-                      </div>
-                      {#if m.resetText}
-                        <div class="usage-meter-reset {tone}">{m.resetText}</div>
-                      {/if}
-                    </div>
-                  {/each}
-                </div>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if usageReport.stats.length}
-          <div class="usage-stats" data-testid="usage-stats">
-            {#each usageReport.stats as st}
-              <div class="usage-stat">
-                <span class="usage-stat-label">{st.label}</span>
-                <span class="usage-stat-val">{st.value}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if usageReport.note}
-          <p class="usage-note" data-testid="usage-note">{usageReport.note}</p>
-        {/if}
-        {#if !usageReport.groups.length && !usageReport.stats.length && !usageReport.note && !usageReport.raw}
-          <p class="sched-empty">No usage data returned for {usageReport.engineLabel}.</p>
-        {/if}
-        {#if usageReport.raw}
-          <details class="usage-raw" open={!usageReport.groups.length && !usageReport.stats.length}>
-            <summary>Raw output</summary>
-            <pre>{usageReport.raw}</pre>
-          </details>
-        {/if}
-      {:else if usageLoading}
-        <p class="usage-loading" data-testid="usage-loading">Fetching usage from {installedEngines.find((e) => e.id === usageEngine)?.label ?? usageEngine}…</p>
-      {:else if usageError}
-        <p class="sched-warn" data-testid="usage-error">{usageError}</p>
-      {/if}
-    </div>
-  </div>
+  <UsageModal
+    {workEngines}
+    {workEngineList}
+    {usageEngine}
+    {usageReport}
+    {usageUpdatedAt}
+    {usageNow}
+    {usageLoading}
+    {usageError}
+    onClose={closeUsageModal}
+    onSelectTab={selectUsageTab}
+    onRefresh={(eng) => void fetchUsageEngine(eng, { force: true })}
+  />
 {/if}
-{#if scheduleListOpen}
-  <button class="confirm-backdrop sched-dim" data-testid="scheduled-backdrop" aria-label="Close" onclick={() => (scheduleListOpen = false)} tabindex="-1"></button>
-  <div class="confirm-card sched-card" data-testid="scheduled-dialog" role="dialog" aria-modal="true" aria-label="Scheduled messages">
-    <button class="modal-x" data-testid="scheduled-close" aria-label="Close" onclick={() => (scheduleListOpen = false)}>×</button>
-    <p class="confirm-text sched-title">Scheduled messages</p>
-    <p class="sched-note" data-testid="scheduled-note">{scheduleNote}{serverPersist ? "" : " Closing the window keeps it running in the tray; quitting does not."}</p>
-    {#if scheduled.some((x) => x.missed)}
-      <p class="sched-warn" data-testid="scheduled-missed-note">Some messages were not sent at their time. Send them now, pick a new time, or delete them.</p>
-    {/if}
-    {#if scheduled.length === 0}
-      <p class="sched-empty" data-testid="scheduled-empty">Nothing scheduled. In Work mode, use the arrow next to the send button to schedule a message.</p>
-    {:else}
-      {@render scheduledRows(true)}
-    {/if}
-  </div>
-{/if}
-{#if quitPromptOpen}
-  <button class="confirm-backdrop sched-dim" data-testid="quit-prompt-backdrop" aria-label="Cancel" onclick={() => (quitPromptOpen = false)} tabindex="-1"></button>
-  <div class="confirm-card sched-card" data-testid="quit-prompt" role="alertdialog" aria-modal="true" aria-label="Quit Vicuna">
-    <p class="confirm-text sched-title">Quit Vicuna?</p>
-    <p class="sched-warn" data-testid="quit-prompt-warning">{scheduled.length === 1 ? "1 scheduled message" : `${scheduled.length} scheduled messages`} will not be sent while Vicuna is closed. {scheduled.length === 1 ? "It stays" : "They stay"} saved, and Vicuna will ask what to do with {scheduled.length === 1 ? "it" : "them"} the next time it opens.</p>
-    {@render scheduledRows(false)}
-    <div class="confirm-actions sched-actions">
-      <button class="confirm-cancel" data-testid="quit-prompt-cancel" onclick={() => (quitPromptOpen = false)}>Keep running</button>
-      <button class="confirm-ok sched-quit" data-testid="quit-prompt-confirm" onclick={() => void quitVicuna(true)}>Quit anyway</button>
-    </div>
-  </div>
-{/if}
-{#if scheduleCustom}
-  {@const sc = scheduleCustom}
-  <button class="confirm-backdrop sched-dim sched-top" data-testid="schedule-custom-backdrop" aria-label="Cancel" onclick={() => (scheduleCustom = null)} tabindex="-1"></button>
-  <div class="confirm-card sched-custom sched-top" data-testid="schedule-custom-dialog" role="dialog" aria-modal="true" aria-label="Schedule message">
-    <button class="modal-x" data-testid="schedule-custom-close" aria-label="Close" onclick={() => (scheduleCustom = null)}>×</button>
-    <p class="confirm-text sched-title">{sc.rescheduleId ? "Reschedule message" : "Schedule message"}</p>
-    {#if scheduleTz}<p class="sched-note">Time zone: {scheduleTz.replace(/_/g, " ")}</p>{/if}
-    <div class="sched-fields">
-      <input type="date" class="sched-input" data-testid="schedule-date" aria-label="Date" min={dateInputValue(scheduleNow)} value={sc.date} oninput={(e) => (scheduleCustom = { ...sc, date: e.currentTarget.value, error: null })} />
-      <input type="time" class="sched-input" data-testid="schedule-time" aria-label="Time" value={sc.time} oninput={(e) => (scheduleCustom = { ...sc, time: e.currentTarget.value, error: null })} onkeydown={(e) => { if (e.key === "Enter") void confirmScheduleCustom(); }} />
-    </div>
-    {#if sc.error}<p class="sched-row-err" data-testid="schedule-custom-error">{sc.error}</p>{/if}
-    <p class="sched-note">{scheduleNote}</p>
-    <div class="confirm-actions sched-actions">
-      <button class="confirm-cancel" data-testid="schedule-custom-cancel" onclick={() => (scheduleCustom = null)}>Cancel</button>
-      <button class="confirm-ok" data-testid="schedule-custom-confirm" onclick={() => void confirmScheduleCustom()}>{sc.rescheduleId ? "Reschedule" : "Schedule message"}</button>
-    </div>
-  </div>
-{/if}
+<ScheduleModals
+  bind:scheduleListOpen
+  bind:quitPromptOpen
+  bind:scheduleCustom
+  {scheduled}
+  {scheduledSorted}
+  {scheduleNow}
+  {scheduleNote}
+  {scheduleTz}
+  {serverPersist}
+  {scheduleTarget}
+  onDeliverScheduled={(id) => void deliverScheduled(id)}
+  onOpenCustom={(id) => openScheduleCustom(id)}
+  onRemoveScheduled={removeScheduled}
+  onConfirmCustom={() => void confirmScheduleCustom()}
+  onQuitAnyway={() => void quitVicuna(true)}
+/>
 {#if gotoOpen}
-  <button
-    class="confirm-backdrop"
-    data-testid="goto-backdrop"
-    aria-label="Cancel"
-    onclick={closeGoto}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card search-card"
-    data-testid="goto-dialog"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Search chats"
-  >
-    <div class="search-bar">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-      <input
-        class="search-input"
-        data-testid="goto-input"
-        placeholder="Search chats or paste a session link…"
-        bind:value={gotoInput}
-        autofocus
-        onkeydown={onSearchKey}
-      />
-      {#if gotoInput}
-        <button
-          class="search-clear"
-          data-testid="search-clear-btn"
-          aria-label="Clear search"
-          onclick={() => {
-            gotoInput = "";
-            document.querySelector<HTMLInputElement>("[data-testid=goto-input]")?.focus();
-          }}
-        >×</button>
-      {/if}
-    </div>
-    <div class="search-results" data-testid="search-results" role="listbox" aria-label="Matching chats">
-      {#each searchItems as it, idx (it.kind === "new" ? "new" : it.kind === "chat" ? it.chat.id : `${it.hit.serverId}:${it.hit.id}`)}
-        {#if it.kind === "new"}
-          <button
-            class="search-row {idx === gotoSel ? 'sel' : ''}"
-            role="option"
-            aria-selected={idx === gotoSel}
-            data-testid="search-new"
-            onclick={() => openSearchItem(it)}
-            onmousemove={() => (gotoSel = idx)}
-          >
-            <span class="search-ico"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg></span>
-            <span class="search-text"><span class="search-title">New</span></span>
-          </button>
-        {:else}
-          <button
-            class="search-row {idx === gotoSel ? 'sel' : ''}"
-            role="option"
-            aria-selected={idx === gotoSel}
-            data-testid="search-result"
-            data-id={it.kind === "chat" ? it.chat.id : it.hit.id}
-            data-host={it.kind === "remote" ? it.hit.serverName : srvLabel}
-            data-remote={it.kind === "remote" ? "true" : undefined}
-            onclick={() => openSearchItem(it)}
-            onpointerdown={() => { if (it.kind === "chat" && it.chat.partial) void ensureChatFull(it.chat, { silent: true }); }}
-            onmousemove={() => (gotoSel = idx)}
-          >
-            <span class="search-ico">
-              {#if it.kind === "remote"}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-              {:else}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg>
-              {/if}
-            </span>
-            <span class="search-text">
-              <span class="search-line">
-                <span class="search-title">{@html highlightHtml(it.kind === "chat" ? it.chat.title : it.hit.title, searchQuery)}</span>
-                {#if searchShowHosts}
-                  <span class="search-host" data-testid="search-host">{it.kind === "remote" ? it.hit.serverName : srvLabel}</span>
-                {/if}
-              </span>
-              <span class="search-snippet">{@html highlightHtml(it.kind === "chat" ? (it.snippet ?? searchSnippet(it.chat, searchQuery)) : it.hit.snippet, searchQuery)}</span>
-            </span>
-          </button>
-        {/if}
-      {:else}
-        <div class="no-match">No matching chats</div>
-      {/each}
-    </div>
-    {#if remoteSearching}
-      <p class="search-note" data-testid="search-remote-note">Searching connected servers…</p>
-    {:else if localServerSearching}
-      <p class="search-note" data-testid="search-local-note">Searching all messages…</p>
-    {/if}
-    {#each remoteFailures as f (f.serverName + f.message)}
-      <p class="search-note search-fail" data-testid="search-remote-error">{f.serverName}: {f.message}</p>
-    {/each}
-    {#each remoteNotices as n (n)}
-      <p class="search-note search-old" data-testid="search-remote-degraded">{n}: older Vicuna there — searched its session list directly (update the CLI for a faster search)</p>
-    {/each}
-    {#if gotoError}
-      <p class="goto-error" data-testid="goto-error">{gotoError}</p>
-    {/if}
-  </div>
+  <GotoPaletteModal
+    bind:gotoInput
+    bind:gotoSel
+    {gotoError}
+    {searchQuery}
+    {searchItems}
+    {searchShowHosts}
+    {srvLabel}
+    {remoteSearching}
+    {localServerSearching}
+    {remoteFailures}
+    {remoteNotices}
+    {searchSnippet}
+    {highlightHtml}
+    onClose={closeGoto}
+    onKeyDown={onSearchKey}
+    onOpenItem={openSearchItem}
+    onPrefetchChat={(chat) => void ensureChatFull(chat, { silent: true })}
+  />
 {/if}
 {#if settingsOpen}
   <button
@@ -13507,22 +13247,6 @@
   .goto:hover { background: var(--hover-2); }
   .side-footer { margin-top: auto; padding-top: 10px; display: flex; flex-direction: column; align-items: stretch; }
   .side-footer .goto { width: 100%; box-sizing: border-box; }
-  .confirm-card.search-card { width: min(720px, calc(100vw - 48px)); top: 14%; transform: translate(-50%, 0); padding: 10px; }
-  .search-bar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); color: var(--muted); }
-  .search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 16px; }
-  .search-input::placeholder { color: var(--faint); }
-  .search-clear { border: none; background: transparent; color: var(--icon-dim); font-size: 18px; line-height: 1; cursor: pointer; border-radius: 6px; padding: 2px 7px; }
-  .search-clear:hover { background: var(--hover); color: var(--text); }
-  .search-results { max-height: 360px; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
-  .search-row { display: flex; gap: 12px; align-items: flex-start; width: 100%; box-sizing: border-box; text-align: left; border: none; background: transparent; border-radius: 10px; padding: 10px 12px; cursor: pointer; color: var(--text); font: inherit; }
-  .search-row:hover, .search-row.sel { background: var(--hover-2); }
-  .search-ico { flex-shrink: 0; color: var(--muted-2); margin-top: 2px; display: flex; }
-  .search-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-  .search-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
-  .search-line .search-title { min-width: 0; }
-  .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .search-host { flex-shrink: 0; margin-left: auto; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--muted-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
-  .search-row.sel .search-host { color: var(--muted); border-color: var(--border-strong); }
   /* loading skeletons: grey blocks with a light sweep */
   .skel {
     height: 10px;
@@ -13540,13 +13264,6 @@
   .skel-bubble { align-self: flex-end; height: 38px; border-radius: 14px; }
   .skel-answer { display: flex; flex-direction: column; gap: 10px; }
   @media (prefers-reduced-motion: reduce) { .skel { animation: none; } }
-  .search-note { margin: 0; padding: 4px 18px 8px; font-size: 12px; color: var(--muted-2); }
-  .search-note.search-fail { color: var(--danger); }
-  .search-note.search-old { color: var(--muted-2); font-style: italic; }
-  .search-snippet { font-size: 13px; color: var(--muted-2); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
-  .search-snippet:empty { display: none; }
-  .search-card :global(.search-mark) { background: #f0bd76; color: #1e1e1e; border-radius: 3px; padding: 0 1px; }
-  .search-card .goto-error { margin: 4px 10px 6px 10px; }
   .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
   
   .scope-row { display: flex; align-items: center; gap: 6px; margin: 0 4px 10px 4px; }
@@ -13601,31 +13318,11 @@
   .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .confirm-card.srv-card { width: min(460px, calc(100vw - 48px)); display: flex; flex-direction: column; gap: 6px; }
-  .srv-field-label { font-size: 13.5px; font-weight: 600; color: var(--text); margin-top: 4px; }
-  .srv-optional { font-weight: 400; color: var(--muted); }
-  .srv-input { border: 1px solid var(--border-2); border-radius: 12px; padding: 10px 12px; font: inherit; font-size: 14.5px; background: transparent; color: var(--text); }
-  .srv-input:focus { outline: none; border-color: var(--accent); }
-  .srv-connect-btn { margin-top: 8px; border: 1px solid var(--border-2); border-radius: 12px; padding: 10px; font: inherit; font-size: 15px; font-weight: 600; background: transparent; color: var(--text); cursor: pointer; }
-  .srv-connect-btn:not(:disabled):hover { background: var(--hover-2); }
-  .srv-connect-btn:disabled { opacity: .55; cursor: default; }
-  .srv-recent-label { font-size: 13px; color: var(--muted); margin-top: 14px; }
-  .srv-recent-row { display: flex; gap: 6px; }
-  .srv-recent { flex: 1; min-width: 0; text-align: left; border: 1px solid var(--border-2); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .srv-recent-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); }
-  .srv-recent-input:focus { outline: none; }
-  .srv-recent:hover, .srv-recent-icon:hover { background: var(--hover-2); }
-  .srv-recent-icon { flex: none; width: 40px; border: 1px solid var(--border-2); border-radius: 12px; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
   .srv-menu-rename-row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
   .srv-menu-rename-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 13px; background: transparent; color: var(--text); }
   .srv-menu-rename-input:focus { outline: none; }
   .srv-menu-rename-ok { flex: none; width: 28px; height: 28px; border: 1px solid var(--border-2); border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; }
   .srv-menu-rename-ok:hover { background: var(--hover-3); }
-  .srv-help { font-size: 12px; color: var(--muted); margin: 12px 0 0; line-height: 1.5; }
-  .srv-cmd { position: relative; margin-top: 6px; border: 1px solid var(--border-2); border-radius: 12px; background: var(--hover-2, rgba(0,0,0,.03)); }
-  .srv-cmd pre { margin: 0; padding: 10px 44px 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
-  .srv-cmd-copy { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-2); border-radius: 8px; background: var(--card); color: var(--text-dim); cursor: pointer; }
-  .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
   .chat-item .work-badge.lead-badge { margin-right: auto; }
@@ -13986,74 +13683,6 @@
   .sched-menu-note { font-size: 11.5px; line-height: 1.4; color: var(--muted-2); padding: 6px 14px 8px 14px; border-top: 1px solid var(--border); margin-top: 4px; }
   .sched-count { margin-left: auto; min-width: 18px; height: 18px; box-sizing: border-box; padding: 0 6px; border-radius: 9px; background: var(--accent); color: var(--accent-fg); font-size: 11.5px; font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
   .sched-count.missed { background: var(--danger); color: #fff; }
-  .confirm-backdrop.sched-dim { background: rgba(0,0,0,.35); }
-  .sched-top.confirm-backdrop { z-index: 52; }
-  .sched-top.confirm-card { z-index: 53; }
-  .confirm-card.sched-card { width: min(560px, calc(100vw - 48px)); max-height: 76vh; top: 50%; display: flex; flex-direction: column; }
-  .confirm-card.usage-card { width: min(600px, calc(100vw - 48px)); height: min(640px, 80vh); max-height: 80vh; }
-  .usage-head { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .usage-title-row { display: flex; align-items: center; gap: 8px; padding-right: 28px; }
-  .usage-title-row .sched-title { margin-bottom: 0; }
-  .usage-plan { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--hover); color: var(--text-dim); white-space: nowrap; }
-  .usage-title-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
-  .usage-updated { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
-  .usage-refresh { border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
-  .usage-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-  .usage-refresh:disabled { opacity: .55; cursor: default; }
-  .usage-account { font-size: 12.5px; color: var(--muted); margin: 0 0 -4px 0; }
-  .usage-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-  .usage-tab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
-  .usage-tab:hover { background: var(--hover); color: var(--text); }
-  .usage-tab.sel { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  .usage-body { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
-  .usage-loading { font-size: 13.5px; color: var(--muted); margin: 8px 0; }
-  .usage-groups { display: flex; flex-direction: column; gap: 16px; }
-  .usage-group { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
-  .usage-group-title { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--text); }
-  .usage-group-sub { font-size: 12px; color: var(--muted); margin-top: -6px; line-height: 1.4; }
-  .usage-meters { display: flex; flex-direction: column; gap: 10px; }
-  .usage-meter { display: flex; flex-direction: column; gap: 4px; }
-  .usage-meter-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
-  .usage-meter-label { font-weight: 500; color: var(--text); }
-  .usage-meter-val { font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--text-dim); }
-  .usage-bar { height: 8px; border-radius: 999px; background: var(--hover); overflow: hidden; }
-  .usage-fill { height: 100%; border-radius: 999px; transition: width .2s ease; }
-  .usage-fill.ok { background: #16a34a; }
-  .usage-fill.warn { background: #b45309; }
-  .usage-fill.low { background: var(--danger); }
-  .usage-meter-reset { font-size: 11.5px; color: var(--muted); }
-  .usage-meter-reset.ok { color: #15803d; }
-  .usage-meter-reset.warn { color: #b45309; }
-  .usage-meter-reset.low { color: var(--danger); }
-  .usage-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
-  .usage-stat { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
-  .usage-stat-label { font-size: 11.5px; color: var(--muted); }
-  .usage-stat-val { font-size: 13.5px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
-  .usage-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); margin: 0; }
-  .usage-raw { font-size: 12px; color: var(--muted); }
-  .usage-raw summary { cursor: pointer; user-select: none; }
-  .usage-raw pre { margin: 8px 0 0 0; padding: 10px; border-radius: 8px; background: var(--hover); color: var(--text-dim); font-size: 11.5px; line-height: 1.4; overflow-x: auto; white-space: pre-wrap; user-select: text; }
-  .confirm-card.sched-custom { width: min(420px, calc(100vw - 48px)); }
-  .confirm-text.sched-title { margin-bottom: 6px; }
-  .sched-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); margin: 0 0 12px 0; }
-  .sched-warn { font-size: 13px; line-height: 1.45; color: var(--danger); margin: 0 0 12px 0; }
-  .sched-empty { font-size: 13.5px; line-height: 1.5; color: var(--text-dim); margin: 6px 0 4px 0; }
-  .sched-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; margin: 0 -6px; padding: 0 6px 2px 6px; }
-  .sched-row { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-  .sched-row.missed { border-color: var(--danger); }
-  .sched-row-main { min-width: 0; }
-  .sched-row-when { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sched-row-target { font-weight: 400; color: var(--muted); }
-  .sched-missed-tag { display: inline-block; font-size: 11px; font-weight: 600; color: #fff; background: var(--danger); border-radius: 6px; padding: 1px 6px; margin-right: 6px; }
-  .sched-row-text { font-size: 13.5px; line-height: 1.45; color: var(--text-dim); margin-top: 3px; overflow-wrap: anywhere; user-select: text; }
-  .sched-row-err { font-size: 12.5px; color: var(--danger); margin: 4px 0 0 0; overflow-wrap: anywhere; }
-  .sched-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .sched-fields { display: flex; gap: 10px; margin: 4px 0 12px 0; }
-  .sched-input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; padding: 9px 12px; font: inherit; font-size: 14.5px; background: var(--card); color: var(--text); color-scheme: light dark; }
-  .sched-input:focus { outline: none; border-color: var(--accent); }
-  .sched-actions { margin-top: 14px; }
-  .confirm-ok.sched-quit { background: var(--danger); color: #fff; }
-  .confirm-ok.sched-quit:hover { background: var(--danger); filter: brightness(.93); }
   .editbox { width: 100%; border: 1.5px solid var(--border-strong); border-radius: 16px; padding: 10px 12px 8px 12px; background: var(--card); }
   .editbox textarea { width: 100%; box-sizing: border-box; border: none; outline: none; resize: none; font: inherit; font-size: 14.5px; line-height: 1.5; background: transparent; color: var(--text); }
   .edit-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
