@@ -13,6 +13,10 @@
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/anslwy/vicuna?style=flat-square"></a>
 </p>
 
+<p align="center">
+  <img src="docs/assets/hero.jpg" alt="Vicuna Work mode showing a Lead session coordinating work on a remote server" width="900">
+</p>
+
 <p align="center"><a href="#install"><b>Install</b></a> · <a href="#features">Features</a> · <a href="#highlights">Highlights</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
 
 ## Why Vicuna
