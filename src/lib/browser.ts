@@ -7,7 +7,6 @@
 // or iframe an already-running daemon directly.
 
 import { invokeOrBridge } from "./bridge";
-import type { McpServerConfig } from "./mcp";
 
 export const LB_PORT = 18765;
 export const LB_URL = `http://127.0.0.1:${LB_PORT}`;
@@ -94,28 +93,6 @@ export async function browserTakeover(): Promise<BrowserStatus> {
   return await invokeOrBridge<BrowserStatus>("browser_takeover", {});
 }
 
-/** Absolute `lb mcp` argv for the default `browser` MCP entry. */
-export async function browserMcpCommand(): Promise<string[]> {
-  return await invokeOrBridge<string[]>("browser_mcp_command", {});
-}
-
-/** True when the id is the synthetic built-in browser row. */
 export function isBrowserMcpId(id: string): boolean {
   return id === BROWSER_MCP_ID;
-}
-
-/** Build the synthetic `browser` MCP config (in-memory only: connect takes
- *  any config, so no vicuna.json entry is needed and the row can never be
- *  deleted — it is available whenever the `lb` binary resolves). */
-export function browserMcpConfig(mcpArgv: string[], serverUrl: string): McpServerConfig {
-  return {
-    id: BROWSER_MCP_ID,
-    name: "browser",
-    transport: "stdio",
-    command: mcpArgv,
-    env: { LB_SERVER: serverUrl },
-    url: undefined,
-    headers: undefined,
-    enabled: true
-  };
 }

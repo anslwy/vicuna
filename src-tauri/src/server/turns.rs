@@ -100,8 +100,7 @@ pub struct LaunchParams {
     pub lead: bool,
     pub rec: Option<Recorder>,
     pub report_to: Option<String>,
-    /// per-session MCP pick (`extra.mcp`), None = the MCP dialog's servers
-    pub mcp_only: Option<Vec<String>>,
+    pub(crate) mcp_selection: crate::mcp::SessionSelection,
 }
 
 /// The live turn of a session, if one is still running.
@@ -126,8 +125,11 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     let turn = Arc::new(TurnState::new());
     turn.lead.store(p.lead, Ordering::Relaxed);
     let turn_id = st.agent.next_turn(turn.clone());
-    let mut mcp_snapshot = crate::acp::McpSnapshot::capture(&st.mcp, crate::server::test_resource_dir().as_deref()).await;
-    mcp_snapshot.only = p.mcp_only;
+    let resources = st.resource_dir.clone().or_else(crate::server::test_resource_dir);
+    let mut mcp_snapshot = crate::acp::McpSnapshot::capture(&st.mcp, resources.as_deref(), &p.mcp_selection).await;
+    let _ = turn.mcp.set(crate::vicuna_mcp::TurnMcp::new(
+        st.mcp.clone(), resources.clone(), p.mcp_selection, Some(Arc::downgrade(st)),
+    ));
     if let (Some(sid), Ok(mut m)) = (&p.session_id, st.session_turns.lock()) {
         m.insert(sid.clone(), (turn_id.clone(), p.uuid.clone(), now_ms() as u64));
         st.redo_history.clear(sid);
@@ -154,9 +156,14 @@ pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, St
     let acp = st.acp.clone();
     let session_turns = st.session_turns.clone();
     let live_key = p.session_id.clone().map(|sid| (sid, turn_id.clone()));
+    let browser = st.browser.clone();
     let (model, workspace, messages, session_id, fresh, engine) =
         (p.model, p.workspace, p.messages, p.session_id, p.fresh_session, p.engine);
     tokio::spawn(async move {
+        if mcp_snapshot.uses_builtin_browser() {
+            let _ = crate::browser::browser_start_logic(resources, &browser).await;
+            mcp_snapshot.update_browser_url();
+        }
         crate::acp::run_turn(
             turn, model, workspace, messages, session_id, None, fresh, on_event, &acp, mcp_snapshot, engine,
         )
@@ -323,7 +330,7 @@ async fn finalize(st: Arc<BridgeState>, rs: Arc<Mutex<RecState>>, uuid: String, 
         if let Some(lead) = report_to {
             report_to_lead(&st, &chat_id, &lead, &reply, stopped).await;
         }
-        let wakes = st.mcp_wakes.lock().ok().and_then(|mut m| m.remove(&chat_id)).unwrap_or_default();
+        let wakes = turn.mcp_wakes.lock().map(|mut w| std::mem::take(&mut *w)).unwrap_or_default();
         if !wakes.is_empty() && !stopped {
             let msg = json!({"role": "user", "content": persist::mcp_wake_message(&wakes)});
             if let Err(e) = deliver(&st, &chat_id, msg).await {
@@ -370,14 +377,18 @@ pub struct Extra {
     pub engine: Option<String>,
     pub work_model: Option<String>,
     pub lead: bool,
-    pub mcp: Option<Vec<String>>,
+    pub(crate) mcp: crate::mcp::SessionSelection,
 }
 
 pub fn parse_extra(chat: &Value) -> Extra {
-    let o: Value = chat.get("extra").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let o = crate::mcp::extra_object(chat.get("extra").and_then(Value::as_str));
     let s = |k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
-    let mcp = o.get("mcp").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
-    Extra { engine: s("engine"), work_model: s("workModel"), lead: o.get("role").and_then(Value::as_str) == Some("lead"), mcp }
+    Extra {
+        engine: s("engine"),
+        work_model: s("workModel"),
+        lead: o.get("role").and_then(Value::as_str) == Some("lead"),
+        mcp: crate::mcp::SessionSelection::from_extra(&o),
+    }
 }
 
 /// Send a message into a session the way a window would: queued into its
@@ -473,7 +484,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
             lead: extra.lead,
             rec: Some(rec),
             report_to,
-            mcp_only: extra.mcp,
+            mcp_selection: extra.mcp,
         },
     )
     .await

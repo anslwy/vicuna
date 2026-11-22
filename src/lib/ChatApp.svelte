@@ -78,10 +78,10 @@
     type AppUpdateStatus
   } from "$lib/appUpdate";
   import { CONTINUE_MODES, buildRawContinuePrompt, isRunawayRepetition, normalizeContinueMode, normalizePromptStyle, promptStyleForFamily, stripRunawayTail, useRawContinue, type ContinueMode, type PromptStyle } from "$lib/continue";
-  import { listMcpServers, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpServerConfig, type McpTool } from "$lib/mcp";
+  import { listMcpServers, saveMcpDefaults, resolveMcpEnabled, isMcpEnabled, toggleMcpEnabled, isFixedMcp, saveMcpServer, deleteMcpServer, connectServer as connectMcpBackend, disconnectServer as disconnectMcpBackend, listServerTools as listMcpServerTools, describeServer as describeMcpServer, validateServer as validateMcpServer, parseStringMap as parseMcpStringMap, sanitizeToolName, signInServer as signInMcpBackend, signOutServer as signOutMcpBackend, loginPresent as loginPresentBackend, isAuthError, type McpEnabledMap, type McpServerConfig, type McpTool } from "$lib/mcp";
   import { BUILT_IN_MCPS, builtinToConfig, type BuiltinMcp } from "$lib/mcp-builtins";
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
-  import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
+  import { LB_URL, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
   import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, resolveDraftWorkspace, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
@@ -386,32 +386,56 @@
   const workForceSettle = new Map<string, () => void>();
   // ---- MCP servers (Work mode only) ----
   // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
-  // file is the source of truth and the UI edits it via the backend.
-  // Connections are runtime-only in the Rust McpManager. Tools merge into
-  // the Work agent's native tool loop; chat mode never sees them.
+  // file stores shared definitions and defaults. Work sessions store their
+  // switches with chat metadata; connections are shared by the backend.
   let mcpServers = $state<McpServerConfig[]>([]);
   let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
-  /** browser-row touch left by the agent's mcp_enable/mcp_disable this turn
-   *  (consumed by syncMcpServersAfterTurn — the synthetic row has no file
-   *  entry, so the file diff can't see the change) */
-  let mcpBrowserTouch: "mcp_enable" | "mcp_disable" | null = null;
-  /** resolved `lb mcp` argv for the synthetic Browser row (null until the
-   *  `lb` binary resolves — bundled sidecar or PATH, via bridge or Tauri) */
-  let browserMcpArgv = $state<string[] | null>(null);
-  /** the built-in Browser row: in-memory only, never in vicuna.json, so it
-   *  shows in Added by default and can never be deleted. A file server
-   *  named `browser` wins over it (explicit config beats the default). */
-  const mcpBrowserSynthetic = $derived<McpServerConfig | null>(
-    browserMcpArgv && !mcpServers.some((s) => s.name.toLowerCase() === BROWSER_MCP_ID)
-      ? browserMcpConfig(browserMcpArgv, LB_URL)
-      : null
-  );
-  const mcpAllServers = $derived<McpServerConfig[]>(
-    mcpBrowserSynthetic ? [mcpBrowserSynthetic, ...mcpServers] : mcpServers
-  );
+  let homeMcpEnabled = $state<McpEnabledMap>();
+  let mcpDefaultFeedback = $state("");
+  let mcpSavingDefaults = $state(false);
+  let mcpDefaultTimer: ReturnType<typeof setTimeout> | undefined;
   function findMcpServer(id: string): McpServerConfig | undefined {
-    return mcpAllServers.find((s) => s.id === id);
+    return mcpServers.find((s) => s.id === id);
   }
+
+  function currentMcpSelection() {
+    return activeChat ?? { mcpEnabled: homeMcpEnabled };
+  }
+
+  async function newMcpEnabled(draft?: McpEnabledMap): Promise<McpEnabledMap> {
+    const defaults = await listMcpServers();
+    return resolveMcpEnabled(defaults, { mcpEnabled: draft });
+  }
+
+  async function setMcpForSession(sid: string | null, id: string, enabled: boolean) {
+    if (sid === null) {
+      homeMcpEnabled = toggleMcpEnabled([], { mcpEnabled: homeMcpEnabled }, id, enabled);
+      return true;
+    }
+    const updated = await serverAction("session_update", { id: sid, mcpToggle: { id, enabled } });
+    if (updated !== false) return updated !== null;
+    const chat = chats.find((c) => c.id === sid);
+    if (!chat) return false;
+    chat.mcpEnabled = toggleMcpEnabled(mcpServers, chat, id, enabled);
+    save();
+    return true;
+  }
+
+  async function setMcpDefaults() {
+    mcpSavingDefaults = true;
+    mcpDefaultFeedback = "";
+    clearTimeout(mcpDefaultTimer);
+    try {
+      mcpServers = await saveMcpDefaults(mcpServers, currentMcpSelection());
+      mcpDefaultFeedback = "Saved as default";
+      mcpDefaultTimer = setTimeout(() => { mcpDefaultFeedback = ""; }, 2500);
+    } catch (e) {
+      mcpDefaultFeedback = String(e);
+    } finally {
+      mcpSavingDefaults = false;
+    }
+  }
+
   /** ids with a connection op in flight (connect/disconnect/refresh/sign-in,
    *  or `builtin:<key>` while a Built-in Add saves). A single shared slot
    *  used to drop every launch reconnect after the first, so only one
@@ -468,9 +492,9 @@
   /** whether the server being edited has a stored OAuth login */
   let mcpHasLogin = $state(false);
   const mcpFiltered = $derived(
-    mcpAllServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
+    mcpServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
   );
-  const mcpConnectedCount = $derived(Object.values(mcpLive).filter((l) => l.connected).length);
+  const mcpEnabledCount = $derived(mcpServers.filter((s) => isMcpEnabled(s, currentMcpSelection())).length);
   const builtinShown = $derived(
     BUILT_IN_MCPS.filter(
       (b) =>
@@ -497,30 +521,24 @@
     if (builtinInstalled(b) || mcpIsBusy(`builtin:${b.key}`) || mcpIsBusy(b.name)) return;
     mcpBuiltinError = null;
     mcpMarkBusy(`builtin:${b.key}`);
+    const sid = activeId;
     try {
       mcpServers = await saveMcpServer(builtinToConfig(b));
+      if (!await setMcpForSession(sid, b.name, true)) return;
     } catch (e: any) {
-      mcpUnmarkBusy(`builtin:${b.key}`);
       mcpBuiltinError = e?.message ?? String(e);
       return;
+    } finally {
+      mcpUnmarkBusy(`builtin:${b.key}`);
     }
-    mcpUnmarkBusy(`builtin:${b.key}`);
-    await connectMcpServer(b.name);
+    if (sid === activeId) await connectMcpServer(b.name);
   }
 
-  /** primary row action for a Built-in: Add, Connect, or Sign in */
+  /** Add or toggle a server from the Built-in gallery. */
   async function builtinPrimary(b: BuiltinMcp) {
     const s = builtinInstalled(b);
     if (!s) {
       await addBuiltin(b);
-      return;
-    }
-    if (mcpLive[s.id]?.connected || !s.enabled) {
-      await toggleMcpServer(s.id);
-      return;
-    }
-    if (isAuthError(mcpLive[s.id]?.error)) {
-      await signInMcpServer(s.id);
       return;
     }
     await toggleMcpServer(s.id);
@@ -554,16 +572,14 @@
 
   function mcpStatusOf(s: McpServerConfig): { kind: "connected" | "disabled" | "error" | "idle"; label: string } {
     const live = mcpLive[s.id];
-    if (!s.enabled) return { kind: "disabled", label: "Disabled ○" };
-    if (live?.connected) return { kind: "connected", label: `Connected ✓` };
+    if (!isMcpEnabled(s, currentMcpSelection())) return { kind: "disabled", label: "Off" };
+    if (live?.connected) return { kind: "connected", label: "On · Connected" };
     if (live?.error) {
-      // an auth failure is an invitation, not a dead end: selecting the
-      // row starts the browser sign-in flow (see toggleMcpServer)
       if (isAuthError(live.error)) return { kind: "error", label: "Sign in required →" };
       return { kind: "error", label: "Error ✕" };
     }
     if (mcpIsBusy(s.id)) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
-    return { kind: "idle", label: "Disconnected ○" };
+    return { kind: "idle", label: "On" };
   }
 
   async function loadMcpServers() {
@@ -576,19 +592,8 @@
       mcpServers = [];
       return;
     }
-    // resolve the built-in Browser row's `lb mcp` argv (absent when no `lb`
-    // binary is available — then Added simply has no Browser row)
-    try {
-      browserMcpArgv = await browserMcpCommand();
-    } catch {
-      browserMcpArgv = null;
-    }
-    // reconnect launch-enabled servers (best-effort: failures surface as
-    // row errors in the popup instead of blocking startup). The synthetic
-    // Browser row is excluded: starting a browser daemon at every launch
-    // is too aggressive — it connects when the Browser tab opens instead.
     for (const s of mcpServers) {
-      if (s.enabled) void connectMcpServer(s.id);
+      if (!isBrowserMcpId(s.id) && isMcpEnabled(s, currentMcpSelection())) void connectMcpServer(s.id);
     }
   }
 
@@ -600,8 +605,12 @@
     try {
       // the Browser row drives the shared daemon: make sure it is up first
       // (adopt a running one or spawn ours) before `lb mcp` dials it
-      if (isBrowserMcpId(id)) await ensureBrowserDaemon();
-      const info = await connectMcpBackend(cfg);
+      let config = cfg;
+      if (isBrowserMcpId(id)) {
+        await ensureBrowserDaemon();
+        config = (await listMcpServers()).find((s) => s.id === id) ?? cfg;
+      }
+      const info = await connectMcpBackend(config);
       mcpLive[id] = { connected: true, tools: info.tools, error: null };
     } catch (e: any) {
       mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
@@ -625,45 +634,18 @@
 
   async function toggleMcpServer(id: string) {
     const cfg = findMcpServer(id);
-    if (!cfg || mcpIsBusy(id)) return;
-    if (mcpLive[id]?.connected) {
-      await disconnectMcpServer(id);
-      // disconnecting is the disable preference: persist it so a restart
-      // won't reconnect everything the user just turned off. The synthetic
-      // Browser row has no file entry, so there is nothing to persist.
-      if (isBrowserMcpId(id)) return;
-      mcpMarkBusy(id);
-      try {
-        mcpServers = await saveMcpServer({ ...cfg, enabled: false });
-      } catch (e: any) {
-        error = e?.message ?? String(e);
-      } finally {
-        mcpUnmarkBusy(id);
-      }
-      return;
-    }
-    // a server that failed with 401/403 isn't retried blindly — selecting
-    // it starts the browser sign-in flow instead (opencode parity)
-    if (isAuthError(mcpLive[id]?.error)) {
-      await signInMcpServer(id);
-      return;
-    }
-    if (!cfg.enabled) {
-      // enabling a disabled server persists the flip, then connects
-      mcpMarkBusy(id);
-      try {
-        const next = await saveMcpServer({ ...cfg, enabled: true });
-        mcpServers = next;
-      } catch (e: any) {
-        mcpUnmarkBusy(id);
-        mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
-        return;
-      }
+    if (!cfg || isFixedMcp(id) || mcpIsBusy(id)) return;
+    const sid = activeId;
+    const enable = !isMcpEnabled(cfg, currentMcpSelection());
+    mcpMarkBusy(id);
+    try {
+      if (!await setMcpForSession(sid, id, enable)) return;
+    } finally {
       mcpUnmarkBusy(id);
-      await connectMcpServer(id);
-      return;
     }
-    await connectMcpServer(id);
+    if (enable && sid === activeId && isMcpEnabled(cfg, currentMcpSelection()) && !mcpLive[id]?.connected) {
+      await connectMcpServer(id);
+    }
   }
 
   /** OAuth sign-in uses the side-panel browser in a remote window.
@@ -683,14 +665,6 @@
       }
       const info = await signInMcpBackend(cfg, onServer);
       mcpLive[id] = { connected: true, tools: info.tools, error: null };
-      // an explicit sign-in implies the user wants the server: enable it
-      if (!findMcpServer(id)?.enabled) {
-        try {
-          mcpServers = await saveMcpServer({ ...cfg, enabled: true });
-        } catch (e: any) {
-          error = e?.message ?? String(e);
-        }
-      }
     } catch (e: any) {
       const msg = e?.message ?? String(e);
       if (msg.includes("does not require sign-in")) {
@@ -729,10 +703,7 @@
     }
   }
 
-  /** Reconcile the MCP popup with agent-made changes after a work turn
-   *  settles: the agent saves + connects backend-side, so reload the file
-   *  list and sync each added/changed row (connect refreshes its tool
-   *  list); removed ids drop their live state. No-ops when nothing moved. */
+  /** Refresh shared definitions after agent changes and when the popup opens. */
   async function syncMcpServersAfterTurn() {
     let fresh: McpServerConfig[];
     try {
@@ -746,22 +717,10 @@
     for (const s of fresh) {
       const old = prev.get(s.id);
       if (old && JSON.stringify(old) === JSON.stringify(s)) continue;
-      if (s.enabled) void connectMcpServer(s.id);
-      else delete mcpLive[s.id];
+      if (isMcpEnabled(s, currentMcpSelection()) && !mcpLive[s.id]?.connected) void connectMcpServer(s.id);
     }
     for (const id of prev.keys()) {
       if (!next.has(id)) delete mcpLive[id];
-    }
-    if (mcpBrowserTouch) {
-      const op = mcpBrowserTouch;
-      mcpBrowserTouch = null;
-      if (op === "mcp_enable") {
-        // agent connected backend-side: full connect syncs the row's tools
-        // (and repairs the row if the agent's own connect failed)
-        void connectMcpServer(BROWSER_MCP_ID);
-      } else {
-        delete mcpLive[BROWSER_MCP_ID];
-      }
     }
   }
 
@@ -769,10 +728,9 @@
     mcpQuery = "";
     mcpSel = 0;
     mcpBuiltinSel = 0;
-    // default to the Added list when the user has servers, Discover only
-    // when there is nothing to show there yet (the built-in Browser row
-    // counts, so Added is the default whenever `lb` is available)
-    mcpView = mcpAllServers.length ? "custom" : "builtin";
+    // Open Added when there are servers to manage.
+    mcpView = mcpServers.length ? "custom" : "builtin";
+    mcpDefaultFeedback = "";
     mcpBuiltinError = null;
     mcpShowForm = false;
     mcpFormError = null;
@@ -797,7 +755,7 @@
         headersText: existing.headers ? JSON.stringify(existing.headers, null, 2) : "",
         oauthId: existing.oauth?.client_id ?? "",
         oauthSecret: existing.oauth?.client_secret ?? "",
-        enabled: existing.enabled
+        enabled: isMcpEnabled(existing, currentMcpSelection())
       };
       // does this server hold a browser login? (drives the Sign out row)
       const checkId = existing.id;
@@ -820,6 +778,7 @@
   }
 
   async function saveMcpForm() {
+    const sid = activeId;
     const err = validateMcpServer(mcpForm);
     if (err) {
       mcpFormError = err;
@@ -840,7 +799,7 @@
         : undefined,
       enabled: mcpForm.enabled
     };
-    if (mcpAllServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
+    if (mcpServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
       mcpFormError = "A server with that name already exists.";
       return;
     }
@@ -850,13 +809,18 @@
       /* replacing the config drops the old connection */
     }
     try {
-      mcpServers = await saveMcpServer(cfg);
+      mcpServers = await saveMcpServer(cfg, mcpEditingId);
+      if (!await setMcpForSession(sid, cfg.name, cfg.enabled)) {
+        mcpEditingId = cfg.name;
+        mcpFormError = "Server saved. The session switch could not be updated.";
+        return;
+      }
     } catch (e: any) {
       mcpFormError = e?.message ?? String(e);
       return;
     }
     closeMcpForm();
-    if (cfg.enabled) void connectMcpServer(cfg.id);
+    if (cfg.enabled) void connectMcpServer(cfg.name);
   }
 
   async function deleteMcpServerEntry(id: string) {
@@ -1581,6 +1545,7 @@
           updatedAt: Date.now(),
           messages: [msg, reply],
           mode: "work",
+          mcpEnabled: await newMcpEnabled(),
           workspace: ws
         };
         chats = [chat, ...chats];
@@ -1719,6 +1684,7 @@
           updatedAt: Date.now(),
           messages: msgs,
           mode: "work",
+          mcpEnabled: await newMcpEnabled(),
           workspace: ws,
           engine: engine || engineId(workEngineInfo),
           workModel: str("model") || null,
@@ -2072,6 +2038,7 @@
   }
 
   function newChat() {
+    homeMcpEnabled = undefined;
     // navigating never touches live turns: other sessions keep streaming or
     // working in the background (sidebar shimmer shows them)
     // the composer box is global: New never touches the textbox.
@@ -4183,6 +4150,7 @@
       updatedAt: Date.now(),
       messages: [],
       mode: "work",
+      mcpEnabled: serverSessionTools ? undefined : await newMcpEnabled(),
       workspace: canon
     };
     if (serverSessionTools) {
@@ -5326,6 +5294,7 @@
       forkedFrom: { id: c.id, title: c.title },
       forkFromIndex: i,
       mode: c.mode ?? "chat",
+      mcpEnabled: c.mode === "work" ? await newMcpEnabled() : undefined,
       workspace: c.workspace ?? null
     };
     if (!made) chats = [fork, ...chats];
@@ -6077,9 +6046,11 @@
           { role: "assistant", content: "", thinking: "", model: selectedModel }
         ],
         mode: effectiveMode,
+        mcpEnabled: effectiveMode === "work" ? await newMcpEnabled(homeMcpEnabled) : undefined,
         workspace: effectiveMode === "work" ? workRoot : null
       };
       chats = [chat, ...chats];
+      if (effectiveMode === "work") homeMcpEnabled = undefined;
       activeId = chat.id;
       isPinned = true;
       freshChat = true;
@@ -7085,13 +7056,6 @@
         if (sid) browserProxyUrl = await serverLbProxyUrl(sid);
       }
       browserDaemon = st;
-      if (!browserMcpArgv && st.bin) {
-        try {
-          browserMcpArgv = await browserMcpCommand();
-        } catch {
-          /* row stays hidden; the tab still views the daemon */
-        }
-      }
       return st;
     } catch (e: any) {
       // plain browser with no bridge: still allow viewing a manually-run
@@ -7299,25 +7263,7 @@
       sideTabs = [...sideTabs, { key: "browser", kind: "browser", title: "Browser" }];
       activeSideTab = "browser";
     }
-    // the daemon serves both the iframe and the agent: bring it up, then
-    // connect the built-in MCP row so Work tools appear in the same step
-    void (async () => {
-      if (!browserMcpArgv) {
-        try {
-          browserMcpArgv = await browserMcpCommand();
-        } catch {
-          browserMcpArgv = null;
-        }
-      }
-      try {
-        await ensureBrowserDaemon();
-      } catch {
-        return;
-      }
-      if (browserMcpArgv && !mcpLive[BROWSER_MCP_ID]?.connected) {
-        void connectMcpServer(BROWSER_MCP_ID);
-      }
-    })();
+    void ensureBrowserDaemon().catch(() => {});
   }
 
   function termTheme(): XTermTheme {
@@ -8854,16 +8800,25 @@
           }
           break;
         }
+        case "mcpchanged": {
+          const current = live();
+          if (current && ev.enabled) {
+            current.mcpEnabled = ev.enabled;
+            if (!serverPersist) save();
+          }
+          if (ev.wake && !serverPersist) {
+            const [name, tools] = ev.wake;
+            const list = pendingMcpWakes.get(chat.id) ?? [];
+            if (!list.some((item) => item.name === name)) list.push({ name, tools });
+            pendingMcpWakes.set(chat.id, list);
+          }
+          void syncMcpServersAfterTurn();
+          break;
+        }
         case "toolstart":
           clearStall();
           dropStallHint();
           pendingHead = { name: ev.name, args: ev.args };
-          // agent browser toggles need a row sync at settle (the synthetic
-          // row has no file entry, so the file diff can't see the change)
-          if ((ev.name === "mcp_enable" || ev.name === "mcp_disable") &&
-              String(ev.args?.name ?? "").toLowerCase() === BROWSER_MCP_ID) {
-            mcpBrowserTouch = ev.name;
-          }
           // `ask` (live card) and `say` (normal prose) own their display
           if (ev.name === "ask" || ev.name === "say") break;
           appendContent(formatToolCallHead(ev.name, ev.args));
@@ -9081,6 +9036,8 @@
         engine: turnEngine,
         model: turnPick ?? "",
         lead: own.role === "lead",
+        mcpEnabled: (live() ?? chat).mcpEnabled,
+        mcpOnly: (live() ?? chat).mcpOnly,
         freshSession: opts.freshSession ?? false,
         workspace,
         messages: native,
@@ -9152,6 +9109,7 @@
         { role: "assistant", content: "", thinking: "", model: selectedModel }
       ],
       mode: "work",
+      mcpEnabled: await newMcpEnabled(),
       workspace: ws || null,
       forkedFrom: { id: src.id, title: src.title },
       forkFromIndex: null
@@ -9416,8 +9374,6 @@
     // tray Quit / Cmd+Q with scheduled messages pending: the backend shows
     // the window and asks here instead of quitting
     let unlistenQuit: (() => void) | null = null;
-    let unlistenMcpChanged: (() => void) | null = null;
-    let unlistenMcpWake: (() => void) | null = null;
     if (isTauriRuntime()) {
       void import("@tauri-apps/api/event")
         .then(async ({ listen }) => {
@@ -9426,19 +9382,7 @@
             if (scheduled.length > 0) quitPromptOpen = true;
             else void quitVicuna(true);
           });
-          unlistenMcpChanged = await listen("vicuna-mcp-changed", () => {
-            void syncMcpServersAfterTurn();
-          });
-          unlistenMcpWake = await listen<{ sessionId?: string; name?: string; tools?: number | null }>("vicuna-mcp-wake", (ev) => {
-            const sid = ev.payload?.sessionId;
-            const name = ev.payload?.name;
-            if (!sid || !name) return;
-            const list = pendingMcpWakes.get(sid) ?? [];
-            if (!list.some((x) => x.name === name)) {
-              list.push({ name, tools: ev.payload?.tools ?? null });
-            }
-            pendingMcpWakes.set(sid, list);
-          });
+
         })
         .catch(() => {});
     }
@@ -9506,8 +9450,7 @@
       unlistenOpenChat?.();
       unlistenServersChanged?.();
       unlistenQuit?.();
-      unlistenMcpChanged?.();
-      unlistenMcpWake?.();
+      clearTimeout(mcpDefaultTimer);
       clearInterval(scheduleTimer);
       clearInterval(usagePollTimer);
       clearInterval(usageTickTimer);
@@ -11007,13 +10950,13 @@
               class="icon-btn mcp-btn"
               data-testid="mcp-btn"
               aria-label="MCP servers"
-              title={mcpConnectedCount ? `MCP servers (${mcpConnectedCount} connected)` : "MCP servers"}
+              title={mcpEnabledCount ? `MCP servers (${mcpEnabledCount} enabled)` : "MCP servers"}
               aria-pressed={mcpOpen}
               onclick={openMcpPopup}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
-              {#if mcpConnectedCount}
-                <span class="mcp-dot" data-testid="mcp-dot">{mcpConnectedCount}</span>
+              {#if mcpEnabledCount}
+                <span class="mcp-dot" data-testid="mcp-dot">{mcpEnabledCount}</span>
               {/if}
             </button>
             {@const rawWsPath = activeChat && activeChat.messages.length > 0 && activeChat.mode === "work" ? (activeChat.workspace ?? pendingWorkspace) : pendingWorkspace}
@@ -11369,7 +11312,7 @@
             } else if (e.key === " " && mcpQuery.trim() === "") {
               // Space activates too when there is nothing to search —
               // the filter trims, so a leading space could never match
-              // anything (and the footer advertises "connect space").
+              // anything (and the footer advertises Space to toggle).
               // With actual query text Space keeps typing normally.
               e.preventDefault();
               e.stopPropagation();
@@ -11474,8 +11417,14 @@
               }}
             >
               <span class="mcp-name">{s.name}</span>
-              <span class="mcp-tools-n">{live?.connected ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
+              <span class="mcp-tools-n">{st.kind === "connected" && live ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
               <span class="mcp-status {st.kind}">{st.label}</span>
+              {#if st.label === "Sign in required →"}
+                <button class="mcp-add" disabled={mcpIsBusy(s.id)} onclick={(e) => {
+                  e.stopPropagation();
+                  void signInMcpServer(s.id);
+                }}>Sign in</button>
+              {/if}
               {#if !isBrowserMcpId(s.id)}
               <span class="mcp-row-actions">
                 <button
@@ -11515,7 +11464,7 @@
               </span>
               {/if}
             </div>
-            {#if live?.error}
+            {#if st.kind === "error" && live?.error}
               <div class="mcp-row-error" title={live.error}>{live.error}</div>
             {/if}
           {:else}
@@ -11607,7 +11556,7 @@
               />
               <span class="setting-note">Servers like GitHub only talk to pre-registered apps: create an OAuth App in the provider's developer settings with callback URL http://127.0.0.1/callback (any port works), then paste its client ID here — or use a personal access token in Headers above instead.</span>
             {/if}
-            <label class="mcp-check"><input type="checkbox" data-testid="mcp-enabled-check" bind:checked={mcpForm.enabled} /> Connect automatically on launch</label>
+            <label class="mcp-check"><input type="checkbox" data-testid="mcp-enabled-check" bind:checked={mcpForm.enabled} /> Enable in this session</label>
             {#if mcpHasLogin}
               <div class="mcp-loginrow" data-testid="mcp-login-row">
                 <span class="setting-note">Signed in via browser</span>
@@ -11625,19 +11574,21 @@
         {/if}
         {/if}
         <div class="mcp-foot">
-          <span class="mcp-hint">connect <span class="mcp-key">space</span></span>
+          <span class="mcp-hint">toggle <span class="mcp-key">space</span></span>
           <span class="mcp-spacer"></span>
           {#if mcpShowForm}
             <span class="mcp-file">~/vicuna/config/vicuna.json</span>
           {:else if mcpView === "custom"}
-            <button class="mcp-add" data-testid="mcp-add-btn" onclick={() => openMcpForm()}>+ custom</button>
+            <button class="mcp-add" data-testid="mcp-add-btn" onclick={() => openMcpForm()}>+ Custom</button>
+            <button class="mcp-add" data-testid="mcp-set-default-btn" disabled={mcpSavingDefaults || mcpBusy.length > 0} onclick={() => void setMcpDefaults()}>Set default</button>
+            {#if mcpDefaultFeedback}<span role="status" class="mcp-file">{mcpDefaultFeedback}</span>{/if}
             <button
               class="mcp-add"
               data-testid="mcp-refresh-btn"
               title="Re-list tools on connected servers"
               disabled={mcpBusy.length > 0}
               onclick={() => {
-                for (const s of mcpAllServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
+                for (const s of mcpServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
               }}
             >refresh</button>
           {:else}

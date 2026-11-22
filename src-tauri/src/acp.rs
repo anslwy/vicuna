@@ -68,10 +68,9 @@ struct Proc {
 pub struct AcpState {
     sessions: Mutex<HashMap<String, String>>,
     loaded: AtomicBool,
-    /// (engine, workspace) -> warm process. The workspace is empty for
-    /// engines with one shared process (opencode); agy runs its tools in its
-    /// own working directory, so it gets one process per workspace.
-    procs: tokio::sync::Mutex<HashMap<(Engine, String), Proc>>,
+    /// Warm processes share connections only within the same MCP selection.
+    /// For agy and fx the workspace also scopes the process.
+    procs: tokio::sync::Mutex<HashMap<(Engine, String, String), Proc>>,
 }
 
 impl AcpState {
@@ -126,7 +125,7 @@ impl AcpState {
 
     /// The warm, initialized ACP client for `engine`; (re)spawned when there
     /// is none, it died, or detection now resolves a different binary.
-    async fn client(&self, engine: Engine, workspace: &str) -> Result<Arc<AcpClient>, String> {
+    async fn client(&self, engine: Engine, workspace: &str, mcp_scope: &str) -> Result<Arc<AcpClient>, String> {
         let ask_now = super::work_engine::approval_ask();
         let (bin, cmd, ws) = match engine {
             Engine::Opencode => {
@@ -156,7 +155,7 @@ impl AcpState {
             }
             _ => return Err(format!("{} does not run over ACP", engine.label())),
         };
-        let key = (engine, ws);
+        let key = (engine, ws, mcp_scope.to_owned());
         let mut guard = self.procs.lock().await;
         if let Some(p) = guard.get(&key) {
             if !p.client.closed.load(Ordering::Relaxed) && p.bin == bin && p.ask == ask_now {
@@ -164,6 +163,11 @@ impl AcpState {
             }
         }
         guard.remove(&key);
+        // Discard idle processes for earlier selections while keeping other
+        // sessions' active turns running.
+        guard.retain(|(eng, ws, _), proc| {
+            *eng != engine || *ws != key.1 || Arc::strong_count(&proc.client) > 1
+        });
         let (client, child) = start_initialized(cmd, engine_process_label(engine), &bin).await?;
         guard.insert(
             key,
@@ -180,23 +184,23 @@ impl AcpState {
 
     /// Drop a warm process (e.g. it failed to start a session) so the next
     /// call respawns it.
-    async fn discard(&self, engine: Engine, workspace: &str) {
+    async fn discard(&self, engine: Engine, workspace: &str, mcp_scope: &str) {
         let ws = process_workspace(engine, workspace).to_string();
-        self.procs.lock().await.remove(&(engine, ws));
+        self.procs.lock().await.remove(&(engine, ws, mcp_scope.to_owned()));
     }
 
     /// Stop for agy: end its whole process group (agy leaves the command a
     /// cancelled call started running), so nothing outlives the turn. The
     /// next turn respawns agy and resumes the saved session.
     /// The warm engine process's pid (agy: to watch its background commands).
-    async fn engine_pid(&self, engine: Engine, workspace: &str) -> Option<u32> {
+    async fn engine_pid(&self, engine: Engine, workspace: &str, mcp_scope: &str) -> Option<u32> {
         let ws = process_workspace(engine, workspace).to_string();
-        self.procs.lock().await.get(&(engine, ws)).and_then(|p| p.pid)
+        self.procs.lock().await.get(&(engine, ws, mcp_scope.to_owned())).and_then(|p| p.pid)
     }
 
-    async fn kill_tree(&self, engine: Engine, workspace: &str) {
+    async fn kill_tree(&self, engine: Engine, workspace: &str, mcp_scope: &str) {
         let ws = process_workspace(engine, workspace).to_string();
-        if let Some(p) = self.procs.lock().await.remove(&(engine, ws)) {
+        if let Some(p) = self.procs.lock().await.remove(&(engine, ws, mcp_scope.to_owned())) {
             super::agy::kill_group(p.pid);
             // dropping `p` kills agy itself (kill_on_drop)
         }
@@ -209,7 +213,7 @@ impl AcpState {
         // Only opencode is workspace-independent; fx/agy start once a workspace
         // is known so cached MCP connections cannot point at a different route.
         if engine == Engine::Opencode && engine.is_present() {
-            let _ = self.client(engine, "").await;
+            let _ = self.client(engine, "", "").await;
         }
     }
 }
@@ -325,36 +329,56 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
 pub const PROVIDER_TOOL_LIMIT: usize = 128;
 /// Headroom kept for the engine's own built-in tools (~20 today) plus slack.
 pub const OPENCODE_TOOL_RESERVE: usize = 32;
-/// The MCP dialog's id for the synthetic built-in browser row.
-pub const BROWSER_MCP_ID: &str = "browser";
-
-/// What Vicuna's MCP dialog currently shows, captured when a turn starts:
-/// connected server id -> advertised tool count, plus the absolute `lb mcp`
-/// argv for the built-in browser row (when `lb` resolves).
+/// The enabled servers and known tool counts captured at Work turn start.
 #[derive(Debug, Clone, Default)]
 pub struct McpSnapshot {
     pub tool_counts: HashMap<String, usize>,
-    pub browser_command: Option<Vec<String>>,
-    pub browser_server_url: String,
-    /// Per-session MCP pick (`vicuna session new --mcp a,b`): when set, only
-    /// these servers (by name or id, enabled or not) are handed over, plus
-    /// vicuna-mcp. `None` = the MCP dialog's enabled servers, as before.
-    pub only: Option<Vec<String>>,
+    servers: Vec<crate::mcp::McpServerConfig>,
+    builtin_browser: bool,
 }
 
 impl McpSnapshot {
-    pub async fn capture(mcp: &crate::mcp::McpManager, resource_dir: Option<&Path>) -> Self {
-        let tool_counts = mcp.tool_counts().await;
-        let browser_command = if tool_counts.contains_key(BROWSER_MCP_ID) {
-            crate::browser::browser_mcp_command(resource_dir).ok()
-        } else {
-            None
-        };
-        Self {
-            tool_counts,
-            browser_command,
-            browser_server_url: crate::browser::lb_server_url(),
-            only: None,
+    pub(crate) async fn capture(
+        mcp: &crate::mcp::McpManager,
+        resource_dir: Option<&Path>,
+        selection: &crate::mcp::SessionSelection,
+    ) -> Self {
+        let (mut servers, synthetic_browser) = crate::mcp::session_catalog(resource_dir).unwrap_or_default();
+        servers.retain(|s| selection.is_enabled(&s.id, s.enabled));
+        let builtin_browser = synthetic_browser && servers.iter().any(|s| s.id == crate::mcp::BROWSER_ID);
+        Self { tool_counts: mcp.tool_counts().await, servers, builtin_browser }
+    }
+
+    fn scope(&self) -> String {
+        if self.servers.is_empty() {
+            return String::new();
+        }
+        use sha2::{Digest, Sha256};
+        let mut servers: Vec<_> = self.servers.iter().collect();
+        servers.sort_by(|a, b| a.id.cmp(&b.id));
+        let configs: Vec<_> = servers.into_iter().map(|s| {
+            let ordered = |map: &Option<HashMap<String, String>>| {
+                let mut entries: Vec<_> = map.iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+                entries.sort_unstable();
+                entries
+            };
+            (&s.id, &s.transport, &s.command, &s.url, ordered(&s.env), ordered(&s.headers), &s.oauth)
+        }).collect();
+        let encoded = serde_json::to_vec(&configs).expect("MCP server configs serialize");
+        format!("{:x}", Sha256::digest(encoded))
+    }
+
+    pub(crate) fn uses_builtin_browser(&self) -> bool {
+        self.builtin_browser
+    }
+
+    pub(crate) fn update_browser_url(&mut self) {
+        for s in &mut self.servers {
+            if s.id == crate::mcp::BROWSER_ID {
+                if let Some(url) = s.env.as_mut().and_then(|env| env.get_mut("LB_SERVER")) {
+                    *url = crate::browser::lb_server_url();
+                }
+            }
         }
     }
 }
@@ -433,14 +457,10 @@ fn skipped_note(skipped: &[PlannedServer]) -> Option<String> {
     ))
 }
 
-/// Vicuna's MCP dialog, as opencode `mcpServers`: every enabled vicuna.json
-/// server plus the built-in browser row when it is connected, trimmed to
-/// the tool budget. Returns the entries and an optional note for the user.
+/// Build ACP-shaped entries from the turn snapshot, within the tool budget.
 pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Option<String>) {
-    let files = crate::mcp::list_file_servers().unwrap_or_default();
     let mut planned = Vec::new();
-    let picked = |id: &str, name: &str| snap.only.as_ref().map(|o| o.iter().any(|x| x == id || x == name));
-    for s in files.iter().filter(|s| picked(&s.id, &s.name).unwrap_or(s.enabled)) {
+    for s in &snap.servers {
         let tools = snap.tool_counts.get(&s.id).copied();
         let entry = if s.normalized_transport() == "stdio" {
             match s.command.as_deref().and_then(|c| stdio_entry(&s.name, c, s.env.clone())) {
@@ -452,19 +472,6 @@ pub(crate) async fn mcp_servers_for_turn(snap: &McpSnapshot) -> (Vec<Value>, Opt
             http_entry(&s.name, url, s.headers.clone(), crate::mcp::bearer_token(&s.name).await)
         };
         planned.push(PlannedServer { name: s.name.clone(), entry, tools });
-    }
-    let file_has_browser = files.iter().any(|s| s.id == BROWSER_MCP_ID || s.name == BROWSER_MCP_ID);
-    if !file_has_browser && picked(BROWSER_MCP_ID, BROWSER_MCP_ID) != Some(false) {
-        if let Some(cmd) = &snap.browser_command {
-            let env = HashMap::from([("LB_SERVER".to_string(), snap.browser_server_url.clone())]);
-            if let Some(entry) = stdio_entry(BROWSER_MCP_ID, cmd, Some(env)) {
-                planned.push(PlannedServer {
-                    name: BROWSER_MCP_ID.to_string(),
-                    entry,
-                    tools: snap.tool_counts.get(BROWSER_MCP_ID).copied(),
-                });
-            }
-        }
     }
     let budget = PROVIDER_TOOL_LIMIT - OPENCODE_TOOL_RESERVE - crate::vicuna_mcp::TOOL_COUNT;
     let (kept, skipped) = fit_tool_budget(planned, budget);
@@ -1539,7 +1546,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Read before overwriting a file. Prefer targeted reads/searches over dumping large files.\n\
 - When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 - Run commands with your own shell tool. For dev servers, watchers and other long-running jobs, use its background mode where it has one (or start them in the background from the shell), keep working on what does not depend on them, and check their output when you need it.\n\
-- To add, edit, list, enable, disable, or remove custom MCP servers in Vicuna (e.g. when the user gives an MCP URL endpoint), use the `manage_mcp` tool on vicuna-mcp (the fixed `vicuna-mcp` server itself cannot be modified or disabled). When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
+- Use `manage_mcp` on vicuna-mcp to list or switch MCP servers for this session or manage shared custom server definitions (e.g. when the user gives an MCP URL endpoint). The fixed `vicuna-mcp` server is always available. When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
 - To check back later (a slow deploy or CI run, a follow-up the user asks for at a certain time), call `schedule_wakeup` on vicuna-mcp with a `message` for yourself and `in_minutes` or a local `at` time, then end your turn: Vicuna sends that message into this session at the time.\n\
 - Before starting an expensive worker session (or when a harness call fails with a quota/limit error), call `usage_status` on vicuna-mcp to see each harness's remaining quota and reset time, and pick one that has quota left.\n\
 {session_info}\n{goal}",
@@ -1606,7 +1613,8 @@ pub async fn run_turn(
     if engine == Engine::Agy {
         turn.ask_poll_secs.store(crate::vicuna_mcp::AGY_ASK_POLL_SECS, Ordering::Relaxed);
     }
-    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx | Engine::Plugin(_)).then(|| format!("{}|{workspace}", engine_process_label(engine)));
+    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx | Engine::Plugin(_))
+        .then(|| format!("{}|{workspace}|{}", engine_process_label(engine), mcp_snapshot.scope()));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1731,6 +1739,7 @@ async fn open_session_retrying(
     saved: Option<String>,
     workspace: &str,
     mcp: &[Value],
+    mcp_scope: &str,
     on_event: &Channel<WorkAgentEvent>,
     stop: &AtomicBool,
 ) -> Result<(Arc<AcpClient>, (String, bool, Option<String>)), String> {
@@ -1748,8 +1757,8 @@ async fn open_session_retrying(
                 );
                 eprintln!("{}: {e}; retrying", engine_process_label(engine));
                 if attempt + 1 == attempts || client.closed.load(Ordering::Relaxed) {
-                    state.discard(engine, workspace).await;
-                    client = state.client(engine, workspace).await?;
+                    state.discard(engine, workspace, mcp_scope).await;
+                    client = state.client(engine, workspace, mcp_scope).await?;
                 }
                 attempt += 1;
             }
@@ -1805,13 +1814,18 @@ async fn run_turn_inner(
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
         .ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let client = state.client(engine, workspace).await?;
+    let mcp_scope = mcp_snapshot.scope();
+    let client = state.client(engine, workspace, &mcp_scope).await?;
 
+    // Some ACP agents retain MCP connections when resuming a saved session.
+    // Resume only within the selection that originally opened the session.
     let key = session_key(engine, session_id, workspace);
+    let scope_prefix = format!("mcp:{mcp_scope}|");
     let saved = if fresh_session {
         None
     } else {
         key.as_deref().and_then(|k| state.get(k))
+            .and_then(|saved| saved.strip_prefix(&scope_prefix).map(str::to_owned))
     };
     let (mcp, mcp_note) = mcp_servers_for_turn(mcp_snapshot).await;
     if let Some(note) = mcp_note {
@@ -1834,9 +1848,10 @@ async fn run_turn_inner(
         mcp
     };
     let (client, (acp_session, resumed, mut used_model)) =
-        open_session_retrying(engine, state, client, saved, workspace, &mcp, on_event, stop).await?;
+        open_session_retrying(engine, state, client, saved, workspace, &mcp, &mcp_scope, on_event, stop).await?;
+    let scoped_session_id = format!("{scope_prefix}{acp_session}");
     if let Some(k) = &key {
-        state.set(k.clone(), acp_session.clone());
+        state.set(k.clone(), scoped_session_id.clone());
     }
     let (mut updates, _route) = client.route(&acp_session);
 
@@ -1920,7 +1935,7 @@ async fn run_turn_inner(
         }
         // agy's processes before this round: whatever is new at its end
         // (and still alive) was started by this round's commands
-        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace).await } else { None };
+        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace, &mcp_scope).await } else { None };
         let agy_baseline = agy_pid.map(super::agy::descendants).unwrap_or_default();
         emit_ev(
             on_event,
@@ -1983,7 +1998,7 @@ async fn run_turn_inner(
             handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
         }
         if engine == Engine::Agy && cancelled && tool_running_at_stop {
-            state.kill_tree(engine, workspace).await;
+            state.kill_tree(engine, workspace, &mcp_scope).await;
             emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
         }
         let gen_ms = started.elapsed().as_millis() as u64;
@@ -2014,7 +2029,7 @@ async fn run_turn_inner(
                 // Also clear sessions poisoned by a tool in their first turn,
                 // even if Stop raced with the error. The next send rebuilds
                 // text context from Vicuna without replaying native tool media.
-                let reset = key.as_deref().is_some_and(|k| state.forget_poisoned_session(k, &acp_session, &e));
+                let reset = key.as_deref().is_some_and(|k| state.forget_poisoned_session(k, &scoped_session_id, &e));
                 if cancelled || stop.load(Ordering::Relaxed) {
                     stop.store(true, Ordering::Relaxed);
                     break;
@@ -2044,7 +2059,7 @@ async fn run_turn_inner(
                 emit_ev(on_event, stop, WorkAgentEvent::Status { label: None });
                 match waited {
                     BgWait::Stopped => {
-                        state.kill_tree(engine, workspace).await;
+                        state.kill_tree(engine, workspace, &mcp_scope).await;
                         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
                         break;
                     }
