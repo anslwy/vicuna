@@ -16,12 +16,16 @@ test("sidebar footer orders Server switcher, Plugins, then Settings", () => {
   assert.ok(settingsIdx > pluginsIdx, "settings-btn comes after plugins-btn");
 });
 
-test("collapsed rail includes Plugins button above Settings", () => {
+test("collapsed rail includes Server switcher, Plugins, then Settings", () => {
   const railStart = chatApp.indexOf('<div class="collapsed-rail">');
   assert.ok(railStart >= 0, "collapsed-rail exists");
+  const serverIdx = chatApp.indexOf('data-testid="server-btn-collapsed"', railStart);
   const pluginsIdx = chatApp.indexOf('data-testid="plugins-btn-collapsed"', railStart);
   const settingsIdx = chatApp.indexOf('data-testid="settings-btn-collapsed"', railStart);
-  assert.ok(pluginsIdx > railStart, "plugins-btn-collapsed in collapsed-rail");
+  const menuIdx = chatApp.indexOf('{@render serverMenu()}', railStart);
+  assert.ok(serverIdx > railStart, "server-btn-collapsed in collapsed-rail");
+  assert.ok(menuIdx > railStart && menuIdx < serverIdx, "collapsed-rail renders serverMenu popup");
+  assert.ok(pluginsIdx > serverIdx, "plugins-btn-collapsed comes after server-btn-collapsed");
   assert.ok(settingsIdx > pluginsIdx, "settings-btn-collapsed comes after plugins-btn-collapsed");
 });
 

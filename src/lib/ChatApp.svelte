@@ -9185,6 +9185,7 @@
 
   function setSidebar(open: boolean) {
     sidebarOpen = open;
+    srvMenuOpen = false;
     persistPrefs();
   }
 
@@ -9705,6 +9706,45 @@
     <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
   {/if}
 {/snippet}
+{#snippet serverMenu()}
+  <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => (srvMenuOpen = false)}></button>
+  <div class="srv-menu" data-testid="server-menu" role="menu">
+    <div class="srv-menu-label">Recents</div>
+    <button class="srv-item" data-testid="server-item-local" role="menuitem" onclick={() => requestServerSwitch(null)}>
+      <span class="srv-check">{#if !onServer}✓{/if}</span><span class="srv-item-name">This computer</span>
+    </button>
+    {#each srvList as sv (sv.id)}
+      <button class="srv-item" data-testid="server-item" role="menuitem" title={sv.url} onclick={() => requestServerSwitch(sv.id)}>
+        <span class="srv-check">{#if sv.id === activeServer}✓{/if}</span><span class="srv-item-name">{sv.name}</span>
+      </button>
+    {/each}
+    <div class="srv-sep"></div>
+    {#if onServer && srvVersion}
+      <div class="srv-version" data-testid="server-version">
+        <span>Server v{srvVersion} · App v{clientVersion}</span>
+        {#if srvVersionSkew && !srvUpgradeAvailable}<span class="srv-skew" title="The server and this app run different versions">differs</span>{/if}
+      </div>
+      {#if srvUpgradeAvailable && srvCanUpgrade}
+        <button class="srv-item srv-upgrade" data-testid="server-upgrade" role="menuitem" disabled={srvUpgrading} onclick={upgradeServer}>
+          {#if srvUpgrading}
+            <span class="srv-check"><span class="srv-spin" aria-hidden="true"></span></span>
+            <span class="srv-item-name srv-upgrade-prog" data-testid="server-upgrade-progress">
+              <span class="shimmer">{srvUpgradeStage ?? "Upgrading server…"}</span>
+              {#if srvUpgradePct != null}<span class="srv-upgrade-bar"><span style="width:{srvUpgradePct}%"></span></span>{/if}
+              {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
+            </span>
+          {:else}
+            <span class="srv-check">↑</span><span class="srv-item-name">Upgrade server to v{srvLatest}</span>
+          {/if}
+        </button>
+      {/if}
+      <div class="srv-sep"></div>
+    {/if}
+    <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
+      <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
+    </button>
+  </div>
+{/snippet}
 
 <div class="app">
   {#if sidebarOpen}
@@ -9895,43 +9935,7 @@
         {#if isTauriRuntime()}
           <div class="srv-pick">
             {#if srvMenuOpen}
-              <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => (srvMenuOpen = false)}></button>
-              <div class="srv-menu" data-testid="server-menu" role="menu">
-                <div class="srv-menu-label">Recents</div>
-                <button class="srv-item" data-testid="server-item-local" role="menuitem" onclick={() => requestServerSwitch(null)}>
-                  <span class="srv-check">{#if !onServer}✓{/if}</span><span class="srv-item-name">This computer</span>
-                </button>
-                {#each srvList as sv (sv.id)}
-                  <button class="srv-item" data-testid="server-item" role="menuitem" title={sv.url} onclick={() => requestServerSwitch(sv.id)}>
-                    <span class="srv-check">{#if sv.id === activeServer}✓{/if}</span><span class="srv-item-name">{sv.name}</span>
-                  </button>
-                {/each}
-                <div class="srv-sep"></div>
-                {#if onServer && srvVersion}
-                  <div class="srv-version" data-testid="server-version">
-                    <span>Server v{srvVersion} · App v{clientVersion}</span>
-                    {#if srvVersionSkew && !srvUpgradeAvailable}<span class="srv-skew" title="The server and this app run different versions">differs</span>{/if}
-                  </div>
-                  {#if srvUpgradeAvailable && srvCanUpgrade}
-                    <button class="srv-item srv-upgrade" data-testid="server-upgrade" role="menuitem" disabled={srvUpgrading} onclick={upgradeServer}>
-                      {#if srvUpgrading}
-                        <span class="srv-check"><span class="srv-spin" aria-hidden="true"></span></span>
-                        <span class="srv-item-name srv-upgrade-prog" data-testid="server-upgrade-progress">
-                          <span class="shimmer">{srvUpgradeStage ?? "Upgrading server…"}</span>
-                          {#if srvUpgradePct != null}<span class="srv-upgrade-bar"><span style="width:{srvUpgradePct}%"></span></span>{/if}
-                          {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
-                        </span>
-                      {:else}
-                        <span class="srv-check">↑</span><span class="srv-item-name">Upgrade server to v{srvLatest}</span>
-                      {/if}
-                    </button>
-                  {/if}
-                  <div class="srv-sep"></div>
-                {/if}
-                <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
-                  <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
-                </button>
-              </div>
+              {@render serverMenu()}
             {/if}
             <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
@@ -10103,6 +10107,17 @@
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="16" height="14" rx="2"/><line x1="8" y1="3" x2="8" y2="17"/></svg>
         </button>
         <div class="collapsed-rail-foot">
+          {#if isTauriRuntime()}
+            <div class="srv-pick">
+              {#if srvMenuOpen}
+                {@render serverMenu()}
+              {/if}
+              <button class="icon-btn srv-icon-btn {onServer ? 'remote' : ''}" data-testid="server-btn-collapsed" aria-label={onServer ? `Server: ${srvLabel}` : "Server: This computer"} title={onServer ? (srvCurrent?.url ? `${srvLabel} (${srvCurrent.url})` : srvLabel) : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+                {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
+              </button>
+            </div>
+          {/if}
           <button class="icon-btn" data-testid="plugins-btn-collapsed" aria-label="Open plugins" title="Plugins" onclick={openPlugins}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
           </button>
@@ -13197,8 +13212,13 @@
   .queue-hint { font-size: 11.5px; color: var(--faint); }
   .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
+  .collapsed-rail:has(.srv-menu) { z-index: 41; }
+  .collapsed-rail .srv-menu { left: 0; right: auto; width: 244px; }
   .collapsed-rail-foot { display: flex; flex-direction: column; gap: 4px; }
   .collapsed-rail .icon-btn { width: 100%; padding: 4px 0; border-radius: 8px; }
+  .srv-icon-btn { position: relative; }
+  .srv-icon-btn.remote { color: var(--accent); }
+  .srv-icon-btn .srv-dot { position: absolute; top: 3px; right: 9px; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
   .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
   .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
