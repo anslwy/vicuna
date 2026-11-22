@@ -1,8 +1,20 @@
-# Vicuna
+<p align="center">
+  <img src="src-tauri/icons/128x128@2x.png" alt="Vicuna" width="72">
+</p>
 
-**Local-first desktop app and headless server for the coding agent CLIs you already use.**
+<h1 align="center">Vicuna</h1>
 
-Drive Claude Code, Codex, Antigravity, OpenCode, `fx`, `pi`, and ACP plugin harnesses from one native cross-platform interface — with built-in Git diff, code editor, terminal, live browser, MCP hub, and mobile bridges. Optional **Chat mode** supports local [Ollama](https://ollama.com) and OpenRouter models.
+<p align="center"><b>Local-first desktop app and headless server for the coding agent CLIs you already use.</b></p>
+
+<p align="center">Drive Claude Code, Codex, Antigravity, OpenCode, <code>fx</code>, <code>pi</code>, and ACP plugin harnesses from one native cross-platform interface — with built-in Git diff, code editor, terminal, live browser, MCP hub, and mobile bridges. Optional <b>Chat mode</b> supports local <a href="https://ollama.com">Ollama</a> and OpenRouter models.</p>
+
+<p align="center">
+  <a href="https://github.com/anslwy/vicuna/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/anslwy/vicuna?include_prereleases&style=flat-square"></a>
+  <a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/github/license/anslwy/vicuna?style=flat-square"></a>
+  <a href="https://github.com/anslwy/vicuna"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/anslwy/vicuna?style=flat-square"></a>
+</p>
+
+<p align="center"><a href="#install"><b>Install</b></a> · <a href="#highlights">Highlights</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
 
 | ![Work mode with Fork-style Git diff](docs/assets/work-git-diff.jpg) | ![Built-in code editor with Vim mode](docs/assets/code-editor.jpg) |
 |:---:|:---:|
