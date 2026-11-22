@@ -13857,6 +13857,8 @@
   .ws-pill:is(:hover, :focus-visible) + .ws-tooltip,
   .ws-menu-opt:is(:hover, :focus-visible) + .ws-tooltip { visibility: visible; opacity: 1; }
   @container (max-width: 500px) {
+    .composer-bar:has(.ws-split) { position: relative; flex-wrap: wrap; }
+    .ws-split { position: static; }
     .ws-menu, .ws-tooltip { left: 0; right: auto; }
   }
   @media (prefers-reduced-motion: reduce) {
