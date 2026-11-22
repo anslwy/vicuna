@@ -1537,7 +1537,7 @@ pub async fn server_main(raw: &[String]) -> i32 {
         }
         Some("add") => {
             let url = a.pos.get(1).cloned().unwrap_or_else(|| usage_fail("server add needs a URL", SERVER_USAGE));
-            match servers::connect(&url, a.get(&["--token"])).await {
+            match servers::connect(&url, a.get(&["--token"]), a.get(&["--name"])).await {
                 Ok(s) => {
                     println!("Saved {} ({}). Use it with --server {}.", s.name, s.url, s.name);
                     0
