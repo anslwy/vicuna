@@ -62,6 +62,35 @@
   import BridgeModal from "$lib/BridgeModal.svelte";
   import PluginsPanel from "$lib/PluginsPanel.svelte";
   import SkillsModal from "$lib/SkillsModal.svelte";
+  import EngineIcon from "$lib/EngineIcon.svelte";
+  import UsageModal from "$lib/UsageModal.svelte";
+  import ServerDialogModal from "$lib/ServerDialogModal.svelte";
+  import GotoPaletteModal from "$lib/GotoPaletteModal.svelte";
+  import ScheduleModals from "$lib/ScheduleModals.svelte";
+  import McpPopup from "$lib/McpPopup.svelte";
+  import SettingsModal from "$lib/SettingsModal.svelte";
+  import SidePanel, { type SideTab } from "$lib/SidePanel.svelte";
+  import ConfirmModals from "$lib/ConfirmModals.svelte";
+  import {
+    ACCENTS,
+    formatDuration,
+    formatPullRate,
+    formatLiveElapsed,
+    cmpVersion,
+    defaultServerName,
+    stopWordsToText,
+    textToStopWords,
+    capLevel,
+    isMlxVariant,
+    formatSize,
+    stripHarnessMarkup,
+    toHistory,
+    compactedHistory,
+    displayWorkspace,
+    workspaceBase,
+    searchSnippet,
+    highlightHtml
+  } from "$lib/chatFormat";
   import { enabledSkillCount, listSkills, newSkillSelection, removeSkill, resolveSkills, saveSkill, saveSkillDefaults, skillSwitches, type SkillsEnabledMap, type SkillSummary } from "$lib/skills";
   import { parsePanelRequest, handlePanelRequest, panelUrl, THEME_VARS, type PanelHost, type PanelTheme, type PanelContext } from "$lib/pluginBridge";
   import { allThemes, browserThemeParams, themeKey, themeProperties, themeAccent, selectedAccent, reconcileActive, readActiveTheme, resolveTerminalColors, writeActiveTheme, readAccentMuted, writeAccentMuted, safeColor, type ActivePluginTheme, type InstalledPlugin } from "$lib/pluginTheme";
@@ -246,17 +275,6 @@
   let explorerWidth = $state(300);
   let expResizing = $state(false);
   /** side-panel tabs: one Files view max, one Browser max, one Git max, any number of terminals */
-  interface SideTab {
-    key: string;
-    kind: "files" | "terminal" | "browser" | "git" | "plugin";
-    title: string;
-    /** plugin panels: owning plugin + panel id (key is `plugin:<id>:<panel>`) */
-    pluginId?: string;
-    panelId?: string;
-    termId?: string;
-    dead?: boolean;
-    error?: string | null;
-  }
   let sideTabs = $state<SideTab[]>([{ key: "files", kind: "files", title: "Files" }]);
   let activeSideTab = $state("files");
   let sideTabSeq = 1;
@@ -1195,22 +1213,6 @@
   }
 
   // opencode-style run stats: "27m 48s", "8.1s" under a minute
-  function formatDuration(ms: number): string {
-    const s = ms / 1000;
-    if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ${Math.round(s % 60)}s`;
-    return `${Math.floor(m / 60)}h ${m % 60}m`;
-  }
-
-  function formatPullRate(bps: number): string {
-    if (!isFinite(bps) || bps <= 0) return "";
-    if (bps >= 1e9) return `${(bps / 1e9).toFixed(1)} GB/s`;
-    if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} MB/s`;
-    if (bps >= 1e3) return `${(bps / 1e3).toFixed(0)} KB/s`;
-    return `${Math.round(bps)} B/s`;
-  }
-
   const activeChat = $derived(chats.find((c) => c.id === activeId) ?? null);
   const activeSummaryIndex = $derived(latestSummaryIndex(activeChat?.messages ?? []));
   // composer reflects the starter toggle while starting (home or empty draft);
@@ -1289,19 +1291,6 @@
     return isChatStreaming(id) || isWorkRunning(id) || liveHintIds.includes(id);
   }
   // live elapsed ("32m 25s", "1h 32m", "3d 2h") since the task/query started
-  function formatLiveElapsed(ms: number): string {
-    const totalS = Math.max(0, Math.floor(ms / 1000));
-    const s = totalS % 60;
-    const totalM = Math.floor(totalS / 60);
-    const m = totalM % 60;
-    const totalH = Math.floor(totalM / 60);
-    const h = totalH % 24;
-    const d = Math.floor(totalH / 24);
-    if (d > 0) return `${d}d ${h}h`;
-    if (totalH > 0) return `${totalH}h ${m}m`;
-    if (totalM > 0) return `${totalM}m ${s}s`;
-    return `${s}s`;
-  }
   /** elapsed ms for a live session (work turn start wins between rounds);
    *  null when the session isn't live. Reads `now` so hover tooltips tick. */
   function liveElapsedMs(id: string): number | null {
@@ -2881,13 +2870,6 @@
   const srvVersionSkew = $derived(!!srvVersion && srvVersion !== clientVersion);
   const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && cmpVersion(srvLatest, srvVersion) > 0);
 
-  function cmpVersion(a: string, b: string): number {
-    const p = (v: string) => v.replace(/^v/, "").split(/[-+]/)[0].split(".").map((x) => Number(x) || 0);
-    const [x, y] = [p(a), p(b)];
-    for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) - (y[i] ?? 0);
-    return 0;
-  }
-
   async function loadServerVersion() {
     const info = await invokeOrBridge<{ version?: string; canUpgrade?: boolean }>("server_info", {}).catch(() => null);
     srvVersion = info?.version ?? null;
@@ -2985,10 +2967,6 @@
     srvDialogOpen = true;
     void refreshServers();
     requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-url-input]")?.focus());
-  }
-
-  function defaultServerName(url: string): string {
-    return url.split("://")[1] ?? url;
   }
 
   function fillRecentServer(sv: ServerInfo) {
@@ -3459,24 +3437,6 @@
   let ollamaBase = $state(initialPrefs.ollamaBase);
   let continueMode = $state<ContinueMode>(initialPrefs.continueMode);
 
-  function stopWordsToText(list: string[]): string {
-    return list.map((s) => s.replace(/\n/g, "\\n")).join("\n");
-  }
-
-  function textToStopWords(text: string): string[] {
-    return text
-      .split("\n")
-      .map((line) => line.trim().replace(/\\n/g, "\n"))
-      .filter((s) => s.length > 0);
-  }
-
-  const ACCENTS: Record<string, { label: string; light: { bg: string; hover: string; fg: string }; dark: { bg: string; hover: string; fg: string } }> = {
-    orange: { label: "Orange", light: { bg: "#ef6c00", hover: "#d96000", fg: "#ffffff" }, dark: { bg: "#ef6c00", hover: "#d96000", fg: "#ffffff" } },
-    black: { label: "Black", light: { bg: "#111111", hover: "#000000", fg: "#ffffff" }, dark: { bg: "#e8e8e8", hover: "#ffffff", fg: "#111111" } },
-    blue: { label: "Blue", light: { bg: "#2563eb", hover: "#1d4ed8", fg: "#ffffff" }, dark: { bg: "#3b82f6", hover: "#2563eb", fg: "#ffffff" } },
-    green: { label: "Green", light: { bg: "#16a34a", hover: "#15803d", fg: "#ffffff" }, dark: { bg: "#22c55e", hover: "#16a34a", fg: "#111111" } }
-  };
-
   // plugin themes (Plugins modal): the active one is cached whole in
   // localStorage per host (src/lib/pluginTheme.ts) and overrides the built-in palette.
   let plugins = $state<InstalledPlugin[]>([]);
@@ -3898,34 +3858,6 @@
       }, wait);
     });
   });
-
-  // excerpt centered on the first content match (or the opening message)
-  function searchSnippet(c: Chat, q: string): string {
-    const firstUser = c.messages.find((m) => m.role === "user")?.content ?? c.messages[0]?.content ?? "";
-    if (!q) return firstUser.slice(0, 140);
-    const low = q.toLowerCase();
-    const hit = c.messages.find((m) => m.content.toLowerCase().includes(low));
-    const src = hit?.content ?? firstUser;
-    const idx = src.toLowerCase().indexOf(low);
-    if (idx < 0) return src.slice(0, 140);
-    const start = Math.max(0, idx - 48);
-    const end = Math.min(src.length, idx + q.length + 96);
-    return (start > 0 ? "…" : "") + src.slice(start, end) + (end < src.length ? "…" : "");
-  }
-
-  function highlightHtml(text: string, q: string): string {
-    const esc = (s: string) =>
-      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-    const base = esc(text);
-    const needle = q.trim();
-    if (!needle) return base;
-    const pattern = esc(needle).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    try {
-      return base.replace(new RegExp(`(${pattern})`, "gi"), '<mark class="search-mark">$1</mark>');
-    } catch {
-      return base;
-    }
-  }
 
   function openSearchItem(it: SearchItem) {
     if (it.kind === "remote") {
@@ -4355,10 +4287,6 @@
   let thinkCanDisable = $state(false);
   let effortOpen = $state(false);
 
-  function capLevel(l: string): string {
-    return l.length > 0 ? l[0].toUpperCase() + l.slice(1) : l;
-  }
-
   async function refreshThinking() {
     const m = selectedModel;
     if (!m) {
@@ -4483,9 +4411,6 @@
   // discover tab: curated registry catalog with client-side search + filters
   const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small", "mlx"] as const;
   /** variant tags ending in -mlx are Apple-silicon builds (see refresh-catalog.py) */
-  function isMlxVariant(tag: string): boolean {
-    return /-mlx$/i.test(tag);
-  }
   const filteredCatalog = $derived.by(() => {
     const q = browseQuery.trim().toLowerCase();
     return catalog.filter((e) => {
@@ -6256,12 +6181,6 @@
     workStopIds.add(chatId);
     if (turnId) void stopWorkAgentTurn(turnId).catch(() => {});
     cancelPendingAsk(chatId, "(interrupted by a message sent now)");
-  }
-
-  function formatSize(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)}KB`;
-    return `${(n / (1024 * 1024)).toFixed(1)}MB`;
   }
 
   /** (re)load the explorer tree for the current work root */
@@ -8161,77 +8080,11 @@
     fileInput?.click();
   }
 
-  function decodeEntities(s: string): string {
-    return s
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&amp;/g, "&");
-  }
-
-  /** Harness markup (collapsed tool blocks, ask records) is display-only.
-   *  Models that see it in their own history imitate the HTML instead of
-   *  calling tools, so history sends a compact plain-text form instead:
-   *  tool blocks drop out, ask records become prose. */
-  function stripHarnessMarkup(content: string): string {
-    return content
-      .replace(/<details class="tool-result">[\s\S]*?<\/details>/g, "")
-      .replace(
-        /<div class="ask-log">\s*<div class="ask-log-q">([\s\S]*?)<\/div>\s*<div class="ask-log-a">([\s\S]*?)<\/div>\s*<\/div>/g,
-        (_m, q: string, a: string) => {
-          const answer = /ask-log-dismissed/.test(a)
-            ? "dismissed the question"
-            : `answered: ${decodeEntities(a.replace(/<[^>]+>/g, "").replace(/^Answer:\s*/, ""))}`;
-          return `Asked the user: ${decodeEntities(q)} — they ${answer}.`;
-        }
-      )
-      .replace(/<details class="tool-result">[\s\S]*$/g, "")
-      .replace(/<div class="ask-log">[\s\S]*$/g, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-
-  // history entries keep attached images so regenerate/continue/resume
-  // resend the same picture instead of silently dropping it; tool calls and
-  // tool names pass through for native agent histories
-  function toHistory(m: ChatMsg): ChatMsg {
-    const content = m.role === "assistant" ? stripHarnessMarkup(m.content) : m.content;
-    const base: ChatMsg = m.images?.length
-      ? { role: m.role, content, images: [...m.images] }
-      : { role: m.role, content };
-    if (m.tool_calls?.length) base.tool_calls = m.tool_calls;
-    if (m.tool_name) base.tool_name = m.tool_name;
-    return base;
-  }
-
-  /** Model-visible transcript: everything from the latest compaction
-   *  summary onward. Older messages stay on screen for the user (under a
-   *  "Session compacted" divider) but never reach the model again — the
-   *  summary carries their context instead. No-op for threads never
-   *  compacted, so every history-building site uses this. */
-  function compactedHistory(messages: ChatMsg[]): ChatMsg[] {
-    const from = Math.max(0, latestSummaryIndex(messages));
-    return messages.slice(from).map(toHistory);
-  }
-
   function noteImagesStripped() {
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
 
   const isWindows = typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "");
-  /** Strip Rust's Windows verbatim prefix (`\\?\C:\...`, `\\?\UNC\...`) so
-   *  older stored sessions display cleanly. New values are already clean
-   *  (the backend strips before returning), this covers stored ones. */
-  function displayWorkspace(p: string): string {
-    if (p.startsWith("\\\\?\\UNC\\")) return "\\" + p.slice("\\\\?\\UNC\\".length);
-    if (p.startsWith("\\\\?\\")) return p.slice("\\\\?\\".length);
-    return p;
-  }
-  /** Final path segment on any platform (`/` and `\` separators). */
-  function workspaceBase(p: string): string {
-    return displayWorkspace(p).trim().split(/[/\\]/).filter(Boolean).pop() ?? "";
-  }
 
   async function validateWorkspace(path: string): Promise<string | null> {
     const p = path.trim();
@@ -9977,48 +9830,8 @@
     </div>
   {/if}
 {/snippet}
-{#snippet scheduledRows(actions: boolean)}
-  <div class="sched-list" data-testid="scheduled-list">
-    {#each scheduledSorted as it (it.id)}
-      <div class="sched-row {it.missed ? 'missed' : ''}" data-testid="scheduled-row">
-        <div class="sched-row-main">
-          <div class="sched-row-when">
-            {#if it.missed}<span class="sched-missed-tag">{it.error ? "Not sent" : "Missed"}</span>{/if}
-            {formatWhen(it.at, scheduleNow)}
-            <span class="sched-row-target">· {scheduleTarget(it)}</span>
-          </div>
-          <div class="sched-row-text">{previewText(it, 140)}{#if it.images?.length && it.text}{" "}· {it.images.length} image{it.images.length === 1 ? "" : "s"}{/if}</div>
-          {#if it.error}<div class="sched-row-err">{it.error}</div>{/if}
-        </div>
-        {#if actions}
-          <div class="sched-row-actions">
-            <button class="mini-btn primary" data-testid="scheduled-send-now" onclick={() => void deliverScheduled(it.id)}>Send now</button>
-            <button class="mini-btn" data-testid="scheduled-reschedule" onclick={() => openScheduleCustom(it.id)}>Reschedule</button>
-            <button class="mini-btn danger" data-testid="scheduled-delete" onclick={() => removeScheduled(it.id)}>Delete</button>
-          </div>
-        {/if}
-      </div>
-    {/each}
-  </div>
-{/snippet}
 {#snippet engineIcon(id: string)}
-  {#if id === "claude"}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="#D97757" aria-hidden="true"><path d={CLAUDE_ICON_PATH}/></svg>
-  {:else if id === "codex"}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={CODEX_ICON_OUTLINE_PATH}/><path d={CODEX_ICON_PROMPT_PATH}/></svg>
-  {:else if id === "fx"}
-    <svg class="engine-ico" data-engine-icon="fx" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={FX_ICON_PATH}/></svg>
-  {:else if id === "pi"}
-    <svg class="engine-ico" data-engine-icon="pi" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={PI_ICON_PATH}/></svg>
-  {:else if id.startsWith("plugin:") && pluginEngineIcon(id, workEngineList)}
-    <img class="engine-ico" src={pluginEngineIcon(id, workEngineList)!} width="14" height="14" alt="" aria-hidden="true" />
-  {:else if id.startsWith("plugin:")}
-    <svg class="engine-ico" data-engine-icon="plugin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z"/></svg>
-  {:else if id === "agy"}
-    <svg class="engine-ico" data-engine-icon="agy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={AGY_ICON_PATH}/></svg>
-  {:else}
-    <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>
-  {/if}
+  <EngineIcon {id} {workEngineList} />
 {/snippet}
 {#snippet serverMenu()}
   <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => { srvMenuOpen = false; srvMenuRenaming = false; }}></button>
@@ -11430,806 +11243,108 @@
       </div>
     </div>
     {#if mcpOpen}
-      <button class="mcp-backdrop" data-testid="mcp-backdrop" aria-label="Close MCP servers" onclick={() => (mcpOpen = false)} tabindex="-1"></button>
-      <!-- opencode-style MCP popup: search + server list + custom management.
-           Source of truth is ~/vicuna/config/vicuna.json (opencode.json shape). -->
-      <div
-        class="mcp-popup"
-        data-testid="mcp-popup"
-        role="dialog"
-        aria-label="MCP servers"
-        onkeydown={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            mcpOpen = false;
-          } else if (e.key === "ArrowDown") {
-            e.preventDefault();
-            mcpMoveSel(1);
-          } else if (e.key === "ArrowUp") {
-            e.preventDefault();
-            mcpMoveSel(-1);
-          } else if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
-            e.preventDefault();
-            mcpActivateSelected();
-          }
-        }}
-        tabindex="-1"
-      >
-        <div class="mcp-head">
-          <span class="mcp-title">MCP servers</span>
-          <span class="mcp-esc">esc</span>
-        </div>
-        <div class="seg mcp-tabs" role="tablist" aria-label="MCP server lists">
-          <button
-            class="seg-btn {mcpView === 'builtin' ? 'sel' : ''}"
-            data-testid="mcp-tab-builtin"
-            role="tab"
-            aria-selected={mcpView === "builtin"}
-            onclick={() => {
-              mcpView = "builtin";
-              mcpBuiltinSel = 0;
-              mcpBuiltinError = null;
-            }}
-          >Discover</button>
-          <button
-            class="seg-btn {mcpView === 'custom' ? 'sel' : ''}"
-            data-testid="mcp-tab-custom"
-            role="tab"
-            aria-selected={mcpView === "custom"}
-            onclick={() => {
-              mcpView = "custom";
-              mcpSel = 0;
-            }}
-          >Added</button>
-        </div>
-        <input
-          class="mcp-search"
-          data-testid="mcp-search"
-          placeholder="Search"
-          bind:this={mcpSearchEl}
-          bind:value={mcpQuery}
-          oninput={() => {
-            mcpSel = 0;
-            mcpBuiltinSel = 0;
-          }}
-          spellcheck={false}
-          onkeydown={(e) => {
-            if (e.key === "Escape") {
-              e.stopPropagation();
-              mcpOpen = false;
-            } else if (e.key === "ArrowDown") {
-              e.preventDefault();
-              e.stopPropagation();
-              mcpMoveSel(1);
-            } else if (e.key === "ArrowUp") {
-              e.preventDefault();
-              e.stopPropagation();
-              mcpMoveSel(-1);
-            } else if (e.key === "Enter") {
-              // Enter always activates the selected row
-              e.preventDefault();
-              e.stopPropagation();
-              mcpActivateSelected();
-            } else if (e.key === " " && mcpQuery.trim() === "") {
-              // Space activates too when there is nothing to search —
-              // the filter trims, so a leading space could never match
-              // anything (and the footer advertises Space to toggle).
-              // With actual query text Space keeps typing normally.
-              e.preventDefault();
-              e.stopPropagation();
-              mcpActivateSelected();
-            }
-          }}
-        />
-        {#if mcpView === "builtin"}
-        <div class="mcp-list builtin-list" data-testid="builtin-list" role="listbox" aria-label="Discover MCP servers">
-          {#each builtinShown as b, i (b.key)}
-            {@const st = builtinStatus(b)}
-            {@const installed = builtinInstalled(b)}
-            <div
-              class="mcp-row builtin-row {i === mcpBuiltinSel ? 'sel' : ''}"
-              data-testid="builtin-row"
-              data-name={b.name}
-              role="option"
-              aria-selected={i === mcpBuiltinSel}
-              tabindex="0"
-              title={b.blurb}
-              onclick={() => {
-                mcpBuiltinSel = i;
-                void builtinPrimary(b);
-              }}
-              onkeydown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  mcpBuiltinSel = i;
-                  void builtinPrimary(b);
-                }
-              }}
-              onmousemove={() => {
-                if (mcpBuiltinSel !== i) mcpBuiltinSel = i;
-              }}
-            >
-              <span class="builtin-icon" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html b.icon}</svg></span>
-              <span class="builtin-info">
-                <span class="mcp-name">{b.name}</span>
-                <span class="builtin-blurb">{b.blurb}</span>
-              </span>
-              {#if st.kind === "add"}
-                <button
-                  class="builtin-add"
-                  data-testid="builtin-add-btn"
-                  data-name={b.name}
-                  disabled={mcpIsBusy(`builtin:${b.key}`) || mcpIsBusy(b.name)}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    void builtinPrimary(b);
-                  }}
-                >{mcpIsBusy(`builtin:${b.key}`) ? "Adding…" : "+ Add"}</button>
-              {:else if st.kind === "error" && st.label === "Sign in required →"}
-                <button
-                  class="builtin-add"
-                  data-testid="builtin-signin-btn"
-                  data-name={b.name}
-                  disabled={installed ? mcpIsBusy(installed.id) : false}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    if (installed) void signInMcpServer(installed.id);
-                  }}
-                >Sign in →</button>
-              {:else}
-                <span class="mcp-status {st.kind}">{st.kind === "connected" && installed && mcpLive[installed.id]?.tools.length ? `${mcpLive[installed.id].tools.length} · ` : ""}{st.label}</span>
-              {/if}
-            </div>
-          {:else}
-            <div class="mcp-empty">No matches for “{mcpQuery.trim()}”.</div>
-          {/each}
-        </div>
-        {#if mcpBuiltinError}
-          <p class="goto-error" data-testid="builtin-error">{mcpBuiltinError}</p>
-        {/if}
-        {:else}
-        <div class="mcp-list" data-testid="mcp-list" role="listbox" aria-label="MCP servers">
-          {#each mcpFiltered as s, i (s.id)}
-            {@const st = mcpStatusOf(s)}
-            {@const live = mcpLive[s.id]}
-            <div
-              class="mcp-row {i === mcpSel ? 'sel' : ''}"
-              data-testid="mcp-row"
-              data-name={s.name}
-              role="option"
-              aria-selected={i === mcpSel}
-              tabindex="0"
-              title={isBrowserMcpId(s.id) ? "Built-in shared browser (lb mcp) — same tabs as the Browser tab" : describeMcpServer(s)}
-              onclick={() => {
-                mcpSel = i;
-                void toggleMcpServer(s.id);
-              }}
-              onkeydown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  mcpSel = i;
-                  void toggleMcpServer(s.id);
-                }
-              }}
-              onmousemove={() => {
-                if (mcpSel !== i) mcpSel = i;
-              }}
-            >
-              <span class="mcp-name">{s.name}</span>
-              <span class="mcp-tools-n">{st.kind === "connected" && live ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
-              <span class="mcp-status {st.kind}">{st.label}</span>
-              {#if st.label === "Sign in required →"}
-                <button class="mcp-add" disabled={mcpIsBusy(s.id)} onclick={(e) => {
-                  e.stopPropagation();
-                  void signInMcpServer(s.id);
-                }}>Sign in</button>
-              {/if}
-              {#if !isBrowserMcpId(s.id)}
-              <span class="mcp-row-actions">
-                <button
-                  class="mcp-mini"
-                  data-testid="mcp-edit-btn"
-                  data-name={s.name}
-                  title="Edit server"
-                  aria-label="Edit {s.name}"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    openMcpForm(s);
-                  }}
-                >✎</button>
-                {#if mcpConfirmDelete === s.id}
-                  <button
-                    class="mcp-mini danger"
-                    data-testid="mcp-confirm-delete-btn"
-                    data-name={s.name}
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      void deleteMcpServerEntry(s.id);
-                    }}
-                  >Confirm?</button>
-                {:else}
-                  <button
-                    class="mcp-mini"
-                    data-testid="mcp-delete-btn"
-                    data-name={s.name}
-                    title="Delete server"
-                    aria-label="Delete {s.name}"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      void deleteMcpServerEntry(s.id);
-                    }}
-                  >×</button>
-                {/if}
-              </span>
-              {/if}
-            </div>
-            {#if st.kind === "error" && live?.error}
-              <div class="mcp-row-error" title={live.error}>{live.error}</div>
-            {/if}
-          {:else}
-            <div class="mcp-empty">
-              {#if !isTauriRuntime()}
-                MCP servers need the Vicuna desktop app — browsers can't spawn local commands.
-              {:else}
-                No MCP servers yet — add one below, or open the Browser tab for the built-in browser.
-              {/if}
-            </div>
-          {/each}
-        </div>
-        {#if mcpShowForm}
-          <div class="mcp-form" data-testid="mcp-form">
-            <input
-              class="pull-input"
-              data-testid="mcp-name-input"
-              placeholder="Name — e.g. live-browser"
-              bind:value={mcpForm.name}
-              spellcheck={false}
-            />
-            <div class="seg mcp-type" role="group" aria-label="Server type">
-              <button
-                class="seg-btn {mcpForm.transport === 'stdio' ? 'sel' : ''}"
-                data-testid="mcp-type-stdio"
-                onclick={() => (mcpForm.transport = "stdio")}
-              >Local command</button>
-              <button
-                class="seg-btn {mcpForm.transport === 'http' ? 'sel' : ''}"
-                data-testid="mcp-type-http"
-                onclick={() => (mcpForm.transport = "http")}
-              >Remote HTTP</button>
-            </div>
-            {#if mcpForm.transport === "stdio"}
-              <input
-                class="pull-input"
-                data-testid="mcp-command-input"
-                placeholder="Command — e.g. lb"
-                bind:value={mcpForm.command}
-                spellcheck={false}
-              />
-              <input
-                class="pull-input"
-                data-testid="mcp-args-input"
-                placeholder="Args, space-separated — e.g. mcp"
-                bind:value={mcpForm.args}
-                spellcheck={false}
-              />
-              <textarea
-                class="stopwords-input"
-                data-testid="mcp-env-input"
-                rows={2}
-                spellcheck={false}
-                placeholder={'Env JSON (optional) — e.g. {"KEY": "value"}'}
-                bind:value={mcpForm.envText}
-              ></textarea>
-              <span class="setting-note">Runs on this machine — desktop app only. Plain browsers can't spawn processes.</span>
-            {:else}
-              <input
-                class="pull-input"
-                data-testid="mcp-url-input"
-                placeholder="URL — e.g. https://example.com/mcp"
-                bind:value={mcpForm.url}
-                spellcheck={false}
-              />
-              <textarea
-                class="stopwords-input"
-                data-testid="mcp-headers-input"
-                rows={2}
-                spellcheck={false}
-                placeholder={'Headers JSON (optional) — e.g. {"Authorization": "Bearer …"}'}
-                bind:value={mcpForm.headersText}
-              ></textarea>
-              <input
-                class="pull-input"
-                data-testid="mcp-oauth-id-input"
-                placeholder="OAuth client ID (optional — for servers without open registration)"
-                bind:value={mcpForm.oauthId}
-                spellcheck={false}
-              />
-              <input
-                class="pull-input"
-                data-testid="mcp-oauth-secret-input"
-                type="password"
-                placeholder="OAuth client secret (optional, rarely needed)"
-                bind:value={mcpForm.oauthSecret}
-                spellcheck={false}
-                autocomplete="off"
-              />
-              <span class="setting-note">Servers like GitHub only talk to pre-registered apps: create an OAuth App in the provider's developer settings with callback URL http://127.0.0.1/callback (any port works), then paste its client ID here — or use a personal access token in Headers above instead.</span>
-            {/if}
-            <label class="mcp-check"><input type="checkbox" data-testid="mcp-enabled-check" bind:checked={mcpForm.enabled} /> Enable in this session</label>
-            {#if mcpHasLogin}
-              <div class="mcp-loginrow" data-testid="mcp-login-row">
-                <span class="setting-note">Signed in via browser</span>
-                <button class="mini-btn" data-testid="mcp-signout-btn" onclick={() => void signOutMcp()}>Sign out</button>
-              </div>
-            {/if}
-            {#if mcpFormError}
-              <p class="goto-error" data-testid="mcp-form-error">{mcpFormError}</p>
-            {/if}
-            <div class="confirm-actions">
-              <button class="confirm-cancel" data-testid="mcp-cancel-btn" onclick={closeMcpForm}>Cancel</button>
-              <button class="confirm-ok" data-testid="mcp-save-btn" onclick={() => void saveMcpForm()}>Save</button>
-            </div>
-          </div>
-        {/if}
-        {/if}
-        <div class="mcp-foot">
-          <span class="mcp-hint">toggle <span class="mcp-key">space</span></span>
-          <span class="mcp-spacer"></span>
-          {#if mcpShowForm}
-            <span class="mcp-file">~/vicuna/config/vicuna.json</span>
-          {:else if mcpView === "custom"}
-            <button class="mcp-add" data-testid="mcp-add-btn" onclick={() => openMcpForm()}>+ Custom</button>
-            <button class="mcp-add" data-testid="mcp-set-default-btn" disabled={mcpSavingDefaults || mcpBusy.length > 0} onclick={() => void setMcpDefaults()}>Set default</button>
-            {#if mcpDefaultFeedback}<span role="status" class="mcp-file">{mcpDefaultFeedback}</span>{/if}
-            <button
-              class="mcp-add"
-              data-testid="mcp-refresh-btn"
-              title="Re-list tools on connected servers"
-              disabled={mcpBusy.length > 0}
-              onclick={() => {
-                for (const s of mcpServers) if (mcpLive[s.id]?.connected) void refreshMcpTools(s.id);
-              }}
-            >refresh</button>
-          {:else}
-            <span class="mcp-file">~/vicuna/config/vicuna.json</span>
-          {/if}
-        </div>
-        {#if mcpPatFor}
-          {@const patCfg = findMcpServer(mcpPatFor ?? "")}
-          <div
-            class="mcp-pat-veil"
-            data-testid="mcp-pat-modal"
-            role="dialog"
-            aria-label="GitHub personal access token"
-            tabindex="-1"
-            onkeydown={(e) => {
-              if (e.key === "Escape") {
-                e.stopPropagation();
-                mcpPatFor = null;
-              }
-            }}
-          >
-            <div class="mcp-pat-card">
-              <div class="mcp-pat-title">Connect {patCfg?.name ?? "GitHub"}</div>
-              <p class="mcp-pat-body">
-                This server only talks to pre-registered apps, so the browser
-                sign-in can't start. Paste a personal access token instead —
-                it will be saved to this server's Headers and used from now on.
-              </p>
-              <a
-                class="mcp-pat-link"
-                href="https://github.com/settings/tokens/new"
-                target="_blank"
-                rel="noreferrer"
-                onclick={(e) => void openTokenPage(e)}
-              >Generate a token on github.com →</a>
-              <p class="mcp-pat-body dim">Classic token with the <code>repo</code> scope (add <code>workflow</code> for Actions).</p>
-              <input
-                class="pull-input"
-                data-testid="mcp-pat-input"
-                type="password"
-                placeholder="ghp_… or github_pat_…"
-                bind:value={mcpPatToken}
-                spellcheck={false}
-                autocomplete="off"
-                onkeydown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    void savePatAndConnect();
-                  } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-                    // keep caret/selection motion local to the field
-                    e.stopPropagation();
-                  }
-                }}
-              />
-              {#if mcpPatError}
-                <p class="goto-error" data-testid="mcp-pat-error">{mcpPatError}</p>
-              {/if}
-              <div class="confirm-actions">
-                <button class="confirm-cancel" data-testid="mcp-pat-cancel-btn" onclick={() => (mcpPatFor = null)}>Cancel</button>
-                <button class="confirm-ok" data-testid="mcp-pat-save-btn" onclick={() => void savePatAndConnect()}>Save &amp; Connect</button>
-              </div>
-            </div>
-          </div>
-        {/if}
-      </div>
+      <McpPopup
+        bind:mcpOpen
+        bind:mcpView
+        bind:mcpQuery
+        bind:mcpSel
+        bind:mcpBuiltinSel
+        bind:mcpBuiltinError
+        bind:mcpSearchEl
+        {mcpShowForm}
+        bind:mcpForm
+        {mcpFormError}
+        {mcpConfirmDelete}
+        {mcpHasLogin}
+        {mcpSavingDefaults}
+        {mcpDefaultFeedback}
+        {mcpBusy}
+        {mcpServers}
+        {mcpFiltered}
+        {mcpLive}
+        {builtinShown}
+        bind:mcpPatFor
+        bind:mcpPatToken
+        {mcpPatError}
+        {findMcpServer}
+        {builtinInstalled}
+        {builtinStatus}
+        {builtinPrimary}
+        {mcpIsBusy}
+        {mcpMoveSel}
+        {mcpActivateSelected}
+        {mcpStatusOf}
+        {toggleMcpServer}
+        {signInMcpServer}
+        {openMcpForm}
+        {closeMcpForm}
+        {saveMcpForm}
+        {deleteMcpServerEntry}
+        {signOutMcp}
+        {setMcpDefaults}
+        {refreshMcpTools}
+        {openTokenPage}
+        {savePatAndConnect}
+      />
     {/if}
   </main>
   {#if composerMode === "work"}
-    <aside
-      class="explorer {expResizing ? 'resizing' : ''}"
-      class:hidden={!explorerOpen}
-      data-testid="explorer"
-      style="width: {explorerWidth}px"
-      ondragover={(e) => e.preventDefault()}
-      ondrop={(e) => e.preventDefault()}
-    >
-      <div
-        class="exp-resize"
-        data-testid="explorer-resize"
-        role="slider"
-        aria-orientation="vertical"
-        aria-label="Resize side panel"
-        aria-valuenow={explorerWidth}
-        aria-valuemin={EXPLORER_MIN_W}
-        aria-valuemax={560}
-        tabindex="0"
-        title="Drag to resize · double-click to reset"
-        onpointerdown={onExpResizeStart}
-        ondblclick={() => (explorerWidth = EXPLORER_DEFAULT_W)}
-        onkeydown={onExpResizeKey}
-      ></div>
-      <div class="side-tabs" data-testid="side-tabs" role="tablist" aria-label="Side panel tabs">
-        {#each sideTabs as t (t.key)}
-          {@const tabTitle = t.kind === "files" || t.kind === "git" || t.kind === "plugin" ? explorerRootBase || t.title : t.title}
-          <!-- Files / Git follow the workspace: titled by its folder name, like terminal tabs -->
-          <div
-            class="side-tab {t.key === activeSideTab ? 'sel' : ''}"
-            data-testid="side-tab"
-            role="tab"
-            aria-selected={t.key === activeSideTab}
-            tabindex="0"
-            title={displayWorkspace(explorerRoot.trim()) || t.title}
-            onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                switchSideTab(t.key);
-              } else if (e.key === "Delete" || e.key === "Backspace") {
-                e.preventDefault();
-                closeSideTab(t.key);
-              }
-            }}
-            onmousedown={(e) => {
-              // middle-click must not autoscroll; auxclick below closes
-              if (e.button === 1) e.preventDefault();
-            }}
-            onauxclick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault();
-                closeSideTab(t.key);
-              }
-            }}
-          >
-            <button
-              class="side-tab-label"
-              aria-label={t.kind === "files" ? "Files tab" : t.kind === "git" ? "Git tab" : t.kind === "plugin" ? `${t.title} tab` : `${t.title} tab`}
-              title={t.kind === "plugin" ? t.title : undefined}
-              onclick={() => switchSideTab(t.key)}
-            >
-              {#if t.kind === "files"}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              {:else if t.kind === "plugin"}
-                {@const pn = pluginPanels.find((x) => x.key === t.key)}
-                {#if pn?.icon}
-                  <img class="plugin-tab-icon" src={pn.icon} width="13" height="13" alt="" referrerpolicy="no-referrer" />
-                {:else}
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
-                {/if}
-              {:else if t.kind === "git"}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
-              {:else if t.kind === "browser"}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-              {:else}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-              {/if}
-              <span class="side-tab-title">{tabTitle}</span>
-            </button>
-            <button
-              class="side-tab-x"
-              data-testid="side-tab-close"
-              aria-label="Close {tabTitle} tab"
-              title="Close tab"
-              onclick={(e) => {
-                e.stopPropagation();
-                closeSideTab(t.key);
-              }}
-            >×</button>
-          </div>
-        {/each}
-        <button
-          class="icon-btn side-add"
-          data-testid="side-add"
-          aria-label="New panel tab"
-          title="New tab: Explorer, Terminal, Browser or Git Diff"
-          onclick={() => (newTabMenu = !newTabMenu)}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-        <div class="spacer"></div>
-        {#if browserTabVisible}
-          <button
-            class="icon-btn exp-btn"
-            class:browser-restarting={browserStarting}
-            class:browser-kill-armed={browserKillArmed}
-            data-testid="browser-restart-tab-btn"
-            aria-label={browserKillArmed ? "Confirm browser takeover" : "Start, restart, or take over the browser engine"}
-            title={browserKillArmed
-              ? "Click again to confirm: force-stop the foreign browser and start Vicuna's own"
-              : "Start the browser when down · restart when owned · force-stop + start when foreign (asks first)"}
-            disabled={browserStarting}
-            onclick={() => void restartBrowserFromButton()}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
-          </button>
-        {/if}
-        <button
-          class="icon-btn exp-btn"
-          data-testid="explorer-close"
-          aria-label="Close side panel"
-          title="Close panel"
-          onclick={() => (explorerOpen = false)}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
-        </button>
-        {#if newTabMenu}
-          <button
-            class="ctx-backdrop"
-            data-testid="new-tab-backdrop"
-            aria-label="Close new tab menu"
-            onclick={() => (newTabMenu = false)}
-            tabindex="-1"
-          ></button>
-          <div class="ctx-menu new-tab-menu" data-testid="new-tab-menu">
-            <button class="ctx-item" data-testid="new-tab-explorer" onclick={openSideExplorer}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              <span>Explorer</span>
-            </button>
-            <button class="ctx-item" data-testid="new-tab-terminal" onclick={() => void openSideTerminal()}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-              <span>Terminal</span>
-            </button>
-            <button class="ctx-item" data-testid="new-tab-browser" onclick={openSideBrowser}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-              <span>Browser</span>
-            </button>
-            <button class="ctx-item" data-testid="new-tab-git" onclick={openSideGit}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
-              <span>Git Diff</span>
-            </button>
-            {#each pluginPanels as pn (pn.key)}
-              <button class="ctx-item" data-testid="new-tab-plugin-{pn.key.replaceAll(':', '-')}" title="From the {pn.pluginName} plugin" onclick={() => openSidePanel(pn.key)}>
-                {#if pn.icon}
-                  <img class="plugin-tab-icon" src={pn.icon} width="14" height="14" alt="" referrerpolicy="no-referrer" />
-                {:else}
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
-                {/if}
-                <span>{pn.title}</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </div>
-      {#if sideTabs.length === 0}
-        <div class="exp-empty">No tabs open — press + to add an Explorer, Terminal, Browser or Git Diff.</div>
-      {/if}
-      {#each sideTabs as t (t.key)}
-        <div class="side-view" class:hidden={t.key !== activeSideTab}>
-          {#if t.kind === "files"}
-            <div class="explorer-search">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-              <input
-                class="explorer-search-input"
-                data-testid="explorer-search"
-                placeholder="Search files"
-                bind:value={explorerQuery}
-                spellcheck={false}
-              />
-              <button
-                class="icon-btn exp-btn"
-                data-testid="explorer-refresh"
-                aria-label="Refresh files"
-                title="Refresh"
-                disabled={explorerLoading}
-                onclick={() => void loadExplorer()}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
-              </button>
-            </div>
-      <div class="explorer-list" data-testid="explorer-list">
-        {#if explorerLoading}
-          <div class="exp-empty">Loading…</div>
-        {:else if explorerError}
-          <div class="exp-empty">{explorerError}</div>
-        {:else if explorerVisible.length === 0}
-          <div class="exp-empty">{explorerQuery.trim() ? "No matching files." : "Empty folder."}</div>
-        {:else}
-          {#each explorerVisible as e (e.path)}
-            {#if expRenaming === e.path}
-              <div class="exp-row exp-renaming" style="padding-left: {10 + e.depth * 14}px">
-                {#if e.is_dir}
-                  <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1-2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                {:else}
-                  <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                {/if}
-                <input
-                  class="exp-rename"
-                  data-testid="explorer-rename"
-                  bind:value={expRenameDraft}
-                  aria-label="New name for {e.name}"
-                  onclick={(ev) => ev.stopPropagation()}
-                  onkeydown={(ev) => {
-                    if (ev.key === "Enter") {
-                      ev.preventDefault();
-                      void commitExpRename();
-                    } else if (ev.key === "Escape") {
-                      ev.preventDefault();
-                      ev.stopPropagation();
-                      cancelExpRename();
-                    }
-                  }}
-                  onblur={() => void commitExpRename()}
-                />
-              </div>
-            {:else if e.is_dir}
-              {@const collapsed = collapsedDirs.includes(e.path)}
-              <button
-                class="exp-row exp-dir"
-                style="padding-left: {10 + e.depth * 14}px"
-                data-testid="explorer-dir"
-                title={e.path}
-                onclick={() => toggleExplorerDir(e.path)}
-                oncontextmenu={(ev) => openExpCtx(ev, e.path, true)}
-              >
-                <span class="exp-chev">{collapsed ? "▸" : "▾"}</span>
-                <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                <span class="exp-name">{e.name}</span>
-              </button>
-            {:else}
-              <button
-                class="exp-row exp-file"
-                style="padding-left: {10 + e.depth * 14}px"
-                data-testid="explorer-file"
-                title={e.path}
-                onclick={() => void openInEditor(e.path)}
-                oncontextmenu={(ev) => openExpCtx(ev, e.path, false)}
-              >
-                <svg class="exp-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                <span class="exp-name">{e.name}</span>
-                {#if e.size != null}
-                  <span class="exp-size">{formatSize(e.size)}</span>
-                {/if}
-              </button>
-            {/if}
-          {/each}
-        {/if}
-      </div>
-          {:else if t.kind === "plugin"}
-            {@const pn = pluginPanels.find((x) => x.key === t.key)}
-            {#if pn?.url}
-              {#key pn.rev}
-                <!-- opaque origin: NO allow-same-origin; the server adds a CSP sandbox too -->
-                <iframe
-                  class="plugin-frame"
-                  data-testid="plugin-frame-{t.key.replaceAll(':', '-')}"
-                  title="{pn.title} ({pn.pluginName} plugin)"
-                  src={pn.url}
-                  sandbox="allow-scripts"
-                  referrerpolicy="no-referrer"
-                  allow=""
-                  use:panelFrame={{ key: t.key, pluginId: pn.pluginId }}
-                ></iframe>
-              {/key}
-            {:else}
-              <div class="exp-empty">This panel needs a Vicuna server to load from (desktop app, a connected server, or a bridged browser).</div>
-            {/if}
-          {:else if t.kind === "git"}
-            <GitPanel
-              root={explorerRoot.trim()}
-              active={explorerOpen && t.key === activeSideTab}
-              refreshTick={gitRefreshTick}
-              onopenfile={(p) => void openInEditor(p)}
-              onreveal={(p) => void revealWorkPath(p)}
-            />
-          {:else if t.kind === "browser"}
-            {#if browserDaemon?.running && (!onServer || browserProxyUrl)}
-              {#if browserDaemon.health?.ui_ok === false}
-                <div class="exp-empty browser-error" data-testid="browser-broken-ui">
-                  <span>Browser engine files changed while it was running (usually an app update) — the view can't load. Restart the browser to pick up the new files.{#if !browserDaemon.owned} Vicuna didn't start this daemon; taking it over asks first and loses its tabs.{/if}</span>
-                  {#if browserDaemon.owned}
-                    <button class="mini-btn" data-testid="browser-broken-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
-                  {:else}
-                    <button class="mini-btn" data-testid="browser-broken-takeover-btn" onclick={() => void restartBrowserFromButton()}>Take over &amp; restart</button>
-                  {/if}
-                </div>
-              {:else}
-              {#if browserDaemon.engine_stale}
-                <div class="browser-stale" data-testid="browser-stale" role="status">
-                  <span>{browserDaemon.warning ?? "Browser engine is outdated."}</span>
-                  {#if browserDaemon.owned}
-                    <button class="mini-btn" data-testid="browser-restart-btn" onclick={() => void restartBrowserDaemon()}>Restart browser</button>
-                  {:else}
-                    <button class="mini-btn" data-testid="browser-stale-takeover-btn" onclick={() => void restartBrowserFromButton()}>Take over &amp; restart</button>
-                  {/if}
-                </div>
-              {:else if browserDaemon.warning}
-                <!-- engine fallback (CloakBrowser unavailable → system Chromium):
-                     running is correct, but say which engine and how to retry -->
-                <div class="browser-stale" data-testid="browser-warning" role="status">
-                  <span>{browserDaemon.warning}</span>
-                  {#if browserDaemon.owned}
-                    <button class="mini-btn" data-testid="browser-fallback-retry" onclick={() => void restartBrowserDaemon()}>Retry built-in engine</button>
-                  {/if}
-                </div>
-              {/if}
-              <!-- allow-same-origin is load-bearing: without it the frame
-                   gets an opaque origin, lb's UI throws on localStorage at
-                   boot and its same-origin /api fetches go cross-origin — the tab stays
-                   blank white. The app is still contained: no
-                   allow-top-navigation, and tauri:// is a foreign origin. -->
-              {#key browserFrameRev}
-                <iframe
-                  class="browser-frame"
-                  data-testid="browser-frame"
-                  title="Shared browser"
-                  src={browserFrameSrc}
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"
-                ></iframe>
-              {/key}
-              {/if}
-            {:else if browserStarting}
-              <div class="exp-empty" data-testid="browser-starting">
-                <div>{browserStartDisplay}</div>
-                {#if browserDownload}
-                  {#if browserDownload.percent != null}
-                    <progress class="browser-dl-bar" max="100" value={browserDownload.percent}></progress>
-                  {/if}
-                  <div class="browser-start-hint">
-                    One-time download for the built-in browser engine.
-                  </div>
-                {:else if browserStartSeconds >= 20}
-                  <div class="browser-start-hint">
-                    First launch can take a minute while antivirus scans the engine. If this never finishes, the start
-                    path falls back to an installed Chrome/Edge automatically — retry from the restart button above.
-                  </div>
-                {/if}
-              </div>
-            {:else if browserError}
-              <div class="exp-empty browser-error" data-testid="browser-error">
-                <span>{browserError}</span>
-                <button class="mini-btn" data-testid="browser-retry" onclick={() => void ensureBrowserDaemon()}>Retry</button>
-              </div>
-            {:else}
-              <div class="exp-empty browser-error" data-testid="browser-start">
-                <span>Browser daemon not running.</span>
-                <button class="mini-btn" data-testid="browser-start-btn" onclick={() => void ensureBrowserDaemon()}>Start browser</button>
-              </div>
-            {/if}
-          {:else}
-            {#if t.error}
-              <div class="exp-empty">{t.error}</div>
-            {:else}
-              <div class="term-wrap" data-term={t.key} data-testid="terminal-view"></div>
-            {/if}
-          {/if}
-        </div>
-      {/each}
-      {#if expNotice}
-        <div class="explorer-toast" data-testid="explorer-notice" role="status">{expNotice}</div>
-      {/if}
-    </aside>
+    <SidePanel
+      bind:explorerOpen
+      bind:explorerWidth
+      {expResizing}
+      explorerMinW={EXPLORER_MIN_W}
+      explorerDefaultW={EXPLORER_DEFAULT_W}
+      {sideTabs}
+      {activeSideTab}
+      bind:newTabMenu
+      {explorerRoot}
+      {explorerRootBase}
+      bind:explorerQuery
+      {explorerLoading}
+      {explorerError}
+      {explorerVisible}
+      {expRenaming}
+      bind:expRenameDraft
+      {collapsedDirs}
+      {pluginPanels}
+      {gitRefreshTick}
+      {onServer}
+      {browserTabVisible}
+      {browserStarting}
+      {browserKillArmed}
+      {browserDaemon}
+      {browserProxyUrl}
+      {browserFrameRev}
+      {browserFrameSrc}
+      {browserStartDisplay}
+      {browserDownload}
+      {browserStartSeconds}
+      {browserError}
+      {expNotice}
+      {displayWorkspace}
+      {formatSize}
+      {panelFrame}
+      onExpResizeStart={onExpResizeStart}
+      onExpResizeKey={onExpResizeKey}
+      onSwitchSideTab={switchSideTab}
+      onCloseSideTab={closeSideTab}
+      onRestartBrowserFromButton={restartBrowserFromButton}
+      onRestartBrowserDaemon={restartBrowserDaemon}
+      onEnsureBrowserDaemon={ensureBrowserDaemon}
+      onOpenSideExplorer={openSideExplorer}
+      onOpenSideTerminal={openSideTerminal}
+      onOpenSideBrowser={openSideBrowser}
+      onOpenSideGit={openSideGit}
+      onOpenSidePanel={openSidePanel}
+      onLoadExplorer={loadExplorer}
+      onCommitExpRename={commitExpRename}
+      onCancelExpRename={cancelExpRename}
+      onToggleExplorerDir={toggleExplorerDir}
+      onOpenExpCtx={openExpCtx}
+      onOpenInEditor={openInEditor}
+      onRevealWorkPath={revealWorkPath}
+    />
   {/if}
 </div>
 {#if termCtx}
@@ -12355,1037 +11470,214 @@
   {/if}
 {/if}
 {#if srvDialogOpen}
-  <button class="confirm-backdrop" data-testid="server-dialog-backdrop" aria-label="Close" tabindex="-1" onclick={() => (srvDialogOpen = false)}></button>
-  <div class="confirm-card srv-card" data-testid="server-dialog" role="dialog" aria-modal="true" aria-label="Connect to server">
-    <label class="srv-field-label" for="srv-url">Server URL</label>
-    <input id="srv-url" class="srv-input" data-testid="server-url-input" placeholder="https://my-vps.tailnet.ts.net:8443" autocomplete="off" spellcheck="false"
-      bind:value={srvUrlDraft} disabled={srvBusy}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    <label class="srv-field-label" for="srv-token">Token</label>
-    <input id="srv-token" class="srv-input" data-testid="server-token-input" type="password" placeholder="printed by vicuna serve (kept for saved servers)" autocomplete="off"
-      bind:value={srvTokenDraft} disabled={srvBusy}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    <label class="srv-field-label" for="srv-name">Display name <span class="srv-optional">(optional)</span></label>
-    <input id="srv-name" class="srv-input" data-testid="server-name-input" placeholder="defaults to host:port" autocomplete="off" spellcheck="false"
-      bind:value={srvNameDraft} disabled={srvBusy}
-      oninput={() => (srvNameTouched = true)}
-      onkeydown={(e) => { if (e.key === "Enter") void submitServer(); else if (e.key === "Escape") srvDialogOpen = false; }} />
-    {#if srvErr}<p class="goto-error" data-testid="server-error">{srvErr}</p>{/if}
-    <button class="srv-connect-btn" data-testid="server-connect-btn" disabled={srvBusy || srvUrlDraft.trim() === ""} onclick={() => void submitServer()}>{srvBusy ? "Connecting…" : "Connect"}</button>
-    {#if srvList.length}
-      <div class="srv-recent-label">Recent servers</div>
-      {#each srvList as sv (sv.id)}
-        <div class="srv-recent-row" data-testid="server-recent">
-          {#if srvEditingId === sv.id}
-            <input class="srv-recent-input" data-testid="server-rename-input" placeholder={defaultServerName(sv.url)} autocomplete="off" spellcheck="false"
-              bind:value={srvEditDraft} disabled={srvRenaming}
-              onkeydown={(e) => { if (e.key === "Enter") void saveRenameServer(); else if (e.key === "Escape") cancelRenameServer(); }} />
-            <button class="srv-recent-icon" data-testid="server-rename-save" aria-label="Save name" title="Save" disabled={srvRenaming} onclick={() => void saveRenameServer()}>✓</button>
-            <button class="srv-recent-icon" data-testid="server-rename-cancel" aria-label="Cancel rename" title="Cancel" disabled={srvRenaming} onclick={cancelRenameServer}>×</button>
-          {:else}
-            <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => fillRecentServer(sv)}>{sv.name}</button>
-            <button class="srv-recent-icon" data-testid="server-rename" aria-label="Rename {sv.name}" title="Rename" onclick={() => startRenameServer(sv)}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
-            </button>
-            <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
-              {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
-            </button>
-            <button class="srv-recent-icon" data-testid="server-forget" aria-label="Remove {sv.name}" title="Remove" onclick={() => void forgetServer(sv.id)}>×</button>
-          {/if}
-        </div>
-      {/each}
-    {/if}
-    <p class="srv-help">Set up a server: run this on that machine. It prints the URL and token to paste above.</p>
-    <div class="srv-cmd" data-testid="server-setup-cmd">
-      <pre>{SERVER_SETUP_CMD}</pre>
-      <button class="srv-cmd-copy" data-testid="server-setup-copy" aria-label="Copy commands" title={srvCmdCopied ? "Copied" : "Copy"} onclick={() => void copyServerSetup()}>
-        {#if srvCmdCopied}
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-        {:else}
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-        {/if}
-      </button>
-    </div>
-    <p class="srv-help">Work sessions, files and agents then run there; Chat mode keeps using this computer's Ollama.</p>
-  </div>
+  <ServerDialogModal
+    bind:srvUrlDraft
+    bind:srvTokenDraft
+    bind:srvNameDraft
+    bind:srvNameTouched
+    {srvBusy}
+    {srvErr}
+    {srvList}
+    {srvEditingId}
+    bind:srvEditDraft
+    {srvRenaming}
+    {srvCopied}
+    {srvCmdCopied}
+    setupCmd={SERVER_SETUP_CMD}
+    {defaultServerName}
+    onClose={() => (srvDialogOpen = false)}
+    onSubmit={() => void submitServer()}
+    onFillRecent={fillRecentServer}
+    onStartRename={startRenameServer}
+    onSaveRename={() => void saveRenameServer()}
+    onCancelRename={cancelRenameServer}
+    onCopyUrl={(url) => void copyServerUrl(url)}
+    onForget={(id) => void forgetServer(id)}
+    onCopySetup={() => void copyServerSetup()}
+  />
 {/if}
-{#if leadDeleteAsk}
-  <button class="confirm-backdrop" aria-label="Cancel" tabindex="-1" onclick={() => leadDeleteAsk?.resolve(false)}></button>
-  <div class="confirm-card" data-testid="lead-delete-confirm" role="alertdialog" aria-modal="true" aria-label="Confirm lead delete">
-    <p class="confirm-text">"{leadDeleteAsk.leadTitle}" wants to delete the session "{leadDeleteAsk.title}". Allow it?</p>
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="lead-delete-deny" onclick={() => leadDeleteAsk?.resolve(false)}>Deny</button>
-      <button class="confirm-ok" data-testid="lead-delete-allow" onclick={() => leadDeleteAsk?.resolve(true)}>Delete</button>
-    </div>
-  </div>
-{/if}
-{#if pendingDeleteId}
-  <button
-    class="confirm-backdrop"
-    data-testid="delete-confirm-backdrop"
-    aria-label="Cancel"
-    onclick={() => (pendingDeleteId = null)}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card"
-    data-testid="delete-confirm"
-    role="alertdialog"
-    aria-modal="true"
-    aria-label="Confirm delete chat"
-  >
-    <p class="confirm-text">Are you sure you want to remove this chat?</p>
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="cancel-delete-btn" onclick={() => (pendingDeleteId = null)}>Cancel</button>
-      <button class="confirm-ok" data-testid="confirm-delete-btn" onclick={confirmDelete}>Confirm</button>
-    </div>
-  </div>
-{/if}
-{#if pendingMsgDelete != null && activeChat && activeChat.messages[pendingMsgDelete]}
-  {@const delTarget = activeChat.messages[pendingMsgDelete]}
-  {@const delCascadeNext = delTarget.role === "user" && activeChat.messages[pendingMsgDelete + 1]?.role === "assistant"}
-  {@const delCascadePrev = delTarget.role === "assistant" && pendingMsgDelete > 0 && activeChat.messages[pendingMsgDelete - 1]?.role === "user"}
-  <button
-    class="confirm-backdrop"
-    data-testid="delete-msg-backdrop"
-    aria-label="Cancel"
-    onclick={() => (pendingMsgDelete = null)}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card"
-    data-testid="delete-msg-confirm"
-    role="alertdialog"
-    aria-modal="true"
-    aria-label="Confirm delete message"
-  >
-    <p class="confirm-text">{delCascadeNext ? "Remove this message and the following reply?" : delCascadePrev ? "Remove this message and the question above it?" : "Are you sure you want to remove this message?"}</p>
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="cancel-msg-delete-btn" onclick={() => (pendingMsgDelete = null)}>Cancel</button>
-      <button class="confirm-ok" data-testid="confirm-msg-delete-btn" onclick={confirmMsgDelete}>Confirm</button>
-    </div>
-  </div>
-{/if}
-{#if pendingSaveConfirm && activeChat && editingIndex != null && editingIndex < activeChat.messages.length - 1}
-  {@const saveAfterCount = activeChat.messages.length - 1 - editingIndex}
-  <button
-    class="confirm-backdrop"
-    data-testid="edit-confirm-backdrop"
-    aria-label="Cancel"
-    onclick={cancelSaveConfirm}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card"
-    data-testid="edit-confirm"
-    role="alertdialog"
-    aria-modal="true"
-    aria-label="Confirm save"
-  >
-    <p class="confirm-text">{pendingSaveAction === "regen" ? "Regenerating" : "Saving"} here will permanently remove the {saveAfterCount} message{saveAfterCount === 1 ? "" : "s"} after it.</p>
-    <div class="confirm-actions">
-      <button class="confirm-cancel" data-testid="cancel-edit-choice-btn" onclick={cancelSaveConfirm}>Cancel</button>
-      <button class="confirm-ok" data-testid="confirm-save-btn" onclick={confirmSaveHere}>{pendingSaveAction === "regen" ? "Regenerate here" : "Save here"}</button>
-    </div>
-  </div>
-{/if}
+<ConfirmModals
+  {leadDeleteAsk}
+  bind:pendingDeleteId
+  bind:pendingMsgDelete
+  {activeChat}
+  {pendingSaveConfirm}
+  {editingIndex}
+  {pendingSaveAction}
+  onConfirmDelete={confirmDelete}
+  onConfirmMsgDelete={confirmMsgDelete}
+  onCancelSaveConfirm={cancelSaveConfirm}
+  onConfirmSaveHere={confirmSaveHere}
+/>
 {#if usageOpen}
-  {@const installedEngines = usageTabs(workEngines, usageEngine).tabs}
-  <button class="confirm-backdrop sched-dim" data-testid="usage-backdrop" aria-label="Close" onclick={closeUsageModal} tabindex="-1"></button>
-  <div class="confirm-card sched-card usage-card" data-testid="usage-dialog" role="dialog" aria-modal="true" aria-label="Harness usage">
-    <button class="modal-x" data-testid="usage-close" aria-label="Close" onclick={closeUsageModal}>×</button>
-    <div class="usage-head">
-      <div class="usage-title-row">
-        <p class="confirm-text sched-title">Usage</p>
-        {#if usageReport?.plan}
-          <span class="usage-plan">{usageReport.plan}</span>
-        {/if}
-        <span class="usage-title-right">
-          {#if usageUpdatedAt && usageReport}
-            <span class="usage-updated" data-testid="usage-updated">Updated {formatUsageAge(usageUpdatedAt, usageNow)}</span>
-          {/if}
-          <button class="usage-refresh" data-testid="usage-refresh" disabled={usageLoading} onclick={() => void fetchUsageEngine(usageEngine, { force: true })} title="Refresh usage">
-            {usageLoading ? "Refreshing…" : "Refresh"}
-          </button>
-        </span>
-      </div>
-      {#if installedEngines.length > 1}
-        <div class="usage-tabs" role="tablist" aria-label="Work harnesses">
-          {#each installedEngines as eng (eng.id)}
-            <button
-              class="usage-tab {usageEngine === eng.id ? 'sel' : ''}"
-              data-testid="usage-tab-{eng.id}"
-              role="tab"
-              aria-selected={usageEngine === eng.id}
-              onclick={() => selectUsageTab(eng.id)}
-            >{@render engineIcon(eng.id)}{eng.label}</button>
-          {/each}
-        </div>
-      {/if}
-    </div>
-    <div class="usage-body">
-      {#if usageReport}
-        {#if usageReport.account}
-          <p class="usage-account" data-testid="usage-account">{usageReport.account}</p>
-        {/if}
-        {#if usageError}
-          <p class="sched-warn" data-testid="usage-error">{usageError}</p>
-        {/if}
-        {#if usageReport.groups.length}
-          <div class="usage-groups">
-            {#each usageReport.groups as grp}
-              <div class="usage-group">
-                <div class="usage-group-title">{grp.title}</div>
-                {#if grp.subtitle}
-                  <div class="usage-group-sub">{grp.subtitle}</div>
-                {/if}
-                <div class="usage-meters">
-                  {#each grp.meters as m}
-                    {@const tone = usageMeterTone(m.percent, m.kind)}
-                    <div class="usage-meter" data-testid="usage-meter">
-                      <div class="usage-meter-top">
-                        <span class="usage-meter-label">{m.label}</span>
-                        <span class="usage-meter-val">{m.valueText}</span>
-                      </div>
-                      <div class="usage-bar">
-                        <div class="usage-fill {tone}" style="width: {Math.max(0, Math.min(100, m.percent))}%"></div>
-                      </div>
-                      {#if m.resetText}
-                        <div class="usage-meter-reset {tone}">{m.resetText}</div>
-                      {/if}
-                    </div>
-                  {/each}
-                </div>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if usageReport.stats.length}
-          <div class="usage-stats" data-testid="usage-stats">
-            {#each usageReport.stats as st}
-              <div class="usage-stat">
-                <span class="usage-stat-label">{st.label}</span>
-                <span class="usage-stat-val">{st.value}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        {#if usageReport.note}
-          <p class="usage-note" data-testid="usage-note">{usageReport.note}</p>
-        {/if}
-        {#if !usageReport.groups.length && !usageReport.stats.length && !usageReport.note && !usageReport.raw}
-          <p class="sched-empty">No usage data returned for {usageReport.engineLabel}.</p>
-        {/if}
-        {#if usageReport.raw}
-          <details class="usage-raw" open={!usageReport.groups.length && !usageReport.stats.length}>
-            <summary>Raw output</summary>
-            <pre>{usageReport.raw}</pre>
-          </details>
-        {/if}
-      {:else if usageLoading}
-        <p class="usage-loading" data-testid="usage-loading">Fetching usage from {installedEngines.find((e) => e.id === usageEngine)?.label ?? usageEngine}…</p>
-      {:else if usageError}
-        <p class="sched-warn" data-testid="usage-error">{usageError}</p>
-      {/if}
-    </div>
-  </div>
+  <UsageModal
+    {workEngines}
+    {workEngineList}
+    {usageEngine}
+    {usageReport}
+    {usageUpdatedAt}
+    {usageNow}
+    {usageLoading}
+    {usageError}
+    onClose={closeUsageModal}
+    onSelectTab={selectUsageTab}
+    onRefresh={(eng) => void fetchUsageEngine(eng, { force: true })}
+  />
 {/if}
-{#if scheduleListOpen}
-  <button class="confirm-backdrop sched-dim" data-testid="scheduled-backdrop" aria-label="Close" onclick={() => (scheduleListOpen = false)} tabindex="-1"></button>
-  <div class="confirm-card sched-card" data-testid="scheduled-dialog" role="dialog" aria-modal="true" aria-label="Scheduled messages">
-    <button class="modal-x" data-testid="scheduled-close" aria-label="Close" onclick={() => (scheduleListOpen = false)}>×</button>
-    <p class="confirm-text sched-title">Scheduled messages</p>
-    <p class="sched-note" data-testid="scheduled-note">{scheduleNote}{serverPersist ? "" : " Closing the window keeps it running in the tray; quitting does not."}</p>
-    {#if scheduled.some((x) => x.missed)}
-      <p class="sched-warn" data-testid="scheduled-missed-note">Some messages were not sent at their time. Send them now, pick a new time, or delete them.</p>
-    {/if}
-    {#if scheduled.length === 0}
-      <p class="sched-empty" data-testid="scheduled-empty">Nothing scheduled. In Work mode, use the arrow next to the send button to schedule a message.</p>
-    {:else}
-      {@render scheduledRows(true)}
-    {/if}
-  </div>
-{/if}
-{#if quitPromptOpen}
-  <button class="confirm-backdrop sched-dim" data-testid="quit-prompt-backdrop" aria-label="Cancel" onclick={() => (quitPromptOpen = false)} tabindex="-1"></button>
-  <div class="confirm-card sched-card" data-testid="quit-prompt" role="alertdialog" aria-modal="true" aria-label="Quit Vicuna">
-    <p class="confirm-text sched-title">Quit Vicuna?</p>
-    <p class="sched-warn" data-testid="quit-prompt-warning">{scheduled.length === 1 ? "1 scheduled message" : `${scheduled.length} scheduled messages`} will not be sent while Vicuna is closed. {scheduled.length === 1 ? "It stays" : "They stay"} saved, and Vicuna will ask what to do with {scheduled.length === 1 ? "it" : "them"} the next time it opens.</p>
-    {@render scheduledRows(false)}
-    <div class="confirm-actions sched-actions">
-      <button class="confirm-cancel" data-testid="quit-prompt-cancel" onclick={() => (quitPromptOpen = false)}>Keep running</button>
-      <button class="confirm-ok sched-quit" data-testid="quit-prompt-confirm" onclick={() => void quitVicuna(true)}>Quit anyway</button>
-    </div>
-  </div>
-{/if}
-{#if scheduleCustom}
-  {@const sc = scheduleCustom}
-  <button class="confirm-backdrop sched-dim sched-top" data-testid="schedule-custom-backdrop" aria-label="Cancel" onclick={() => (scheduleCustom = null)} tabindex="-1"></button>
-  <div class="confirm-card sched-custom sched-top" data-testid="schedule-custom-dialog" role="dialog" aria-modal="true" aria-label="Schedule message">
-    <button class="modal-x" data-testid="schedule-custom-close" aria-label="Close" onclick={() => (scheduleCustom = null)}>×</button>
-    <p class="confirm-text sched-title">{sc.rescheduleId ? "Reschedule message" : "Schedule message"}</p>
-    {#if scheduleTz}<p class="sched-note">Time zone: {scheduleTz.replace(/_/g, " ")}</p>{/if}
-    <div class="sched-fields">
-      <input type="date" class="sched-input" data-testid="schedule-date" aria-label="Date" min={dateInputValue(scheduleNow)} value={sc.date} oninput={(e) => (scheduleCustom = { ...sc, date: e.currentTarget.value, error: null })} />
-      <input type="time" class="sched-input" data-testid="schedule-time" aria-label="Time" value={sc.time} oninput={(e) => (scheduleCustom = { ...sc, time: e.currentTarget.value, error: null })} onkeydown={(e) => { if (e.key === "Enter") void confirmScheduleCustom(); }} />
-    </div>
-    {#if sc.error}<p class="sched-row-err" data-testid="schedule-custom-error">{sc.error}</p>{/if}
-    <p class="sched-note">{scheduleNote}</p>
-    <div class="confirm-actions sched-actions">
-      <button class="confirm-cancel" data-testid="schedule-custom-cancel" onclick={() => (scheduleCustom = null)}>Cancel</button>
-      <button class="confirm-ok" data-testid="schedule-custom-confirm" onclick={() => void confirmScheduleCustom()}>{sc.rescheduleId ? "Reschedule" : "Schedule message"}</button>
-    </div>
-  </div>
-{/if}
+<ScheduleModals
+  bind:scheduleListOpen
+  bind:quitPromptOpen
+  bind:scheduleCustom
+  {scheduled}
+  {scheduledSorted}
+  {scheduleNow}
+  {scheduleNote}
+  {scheduleTz}
+  {serverPersist}
+  {scheduleTarget}
+  onDeliverScheduled={(id) => void deliverScheduled(id)}
+  onOpenCustom={(id) => openScheduleCustom(id)}
+  onRemoveScheduled={removeScheduled}
+  onConfirmCustom={() => void confirmScheduleCustom()}
+  onQuitAnyway={() => void quitVicuna(true)}
+/>
 {#if gotoOpen}
-  <button
-    class="confirm-backdrop"
-    data-testid="goto-backdrop"
-    aria-label="Cancel"
-    onclick={closeGoto}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card search-card"
-    data-testid="goto-dialog"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Search chats"
-  >
-    <div class="search-bar">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-      <input
-        class="search-input"
-        data-testid="goto-input"
-        placeholder="Search chats or paste a session link…"
-        bind:value={gotoInput}
-        autofocus
-        onkeydown={onSearchKey}
-      />
-      {#if gotoInput}
-        <button
-          class="search-clear"
-          data-testid="search-clear-btn"
-          aria-label="Clear search"
-          onclick={() => {
-            gotoInput = "";
-            document.querySelector<HTMLInputElement>("[data-testid=goto-input]")?.focus();
-          }}
-        >×</button>
-      {/if}
-    </div>
-    <div class="search-results" data-testid="search-results" role="listbox" aria-label="Matching chats">
-      {#each searchItems as it, idx (it.kind === "new" ? "new" : it.kind === "chat" ? it.chat.id : `${it.hit.serverId}:${it.hit.id}`)}
-        {#if it.kind === "new"}
-          <button
-            class="search-row {idx === gotoSel ? 'sel' : ''}"
-            role="option"
-            aria-selected={idx === gotoSel}
-            data-testid="search-new"
-            onclick={() => openSearchItem(it)}
-            onmousemove={() => (gotoSel = idx)}
-          >
-            <span class="search-ico"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg></span>
-            <span class="search-text"><span class="search-title">New</span></span>
-          </button>
-        {:else}
-          <button
-            class="search-row {idx === gotoSel ? 'sel' : ''}"
-            role="option"
-            aria-selected={idx === gotoSel}
-            data-testid="search-result"
-            data-id={it.kind === "chat" ? it.chat.id : it.hit.id}
-            data-host={it.kind === "remote" ? it.hit.serverName : srvLabel}
-            data-remote={it.kind === "remote" ? "true" : undefined}
-            onclick={() => openSearchItem(it)}
-            onpointerdown={() => { if (it.kind === "chat" && it.chat.partial) void ensureChatFull(it.chat, { silent: true }); }}
-            onmousemove={() => (gotoSel = idx)}
-          >
-            <span class="search-ico">
-              {#if it.kind === "remote"}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-              {:else}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></svg>
-              {/if}
-            </span>
-            <span class="search-text">
-              <span class="search-line">
-                <span class="search-title">{@html highlightHtml(it.kind === "chat" ? it.chat.title : it.hit.title, searchQuery)}</span>
-                {#if searchShowHosts}
-                  <span class="search-host" data-testid="search-host">{it.kind === "remote" ? it.hit.serverName : srvLabel}</span>
-                {/if}
-              </span>
-              <span class="search-snippet">{@html highlightHtml(it.kind === "chat" ? (it.snippet ?? searchSnippet(it.chat, searchQuery)) : it.hit.snippet, searchQuery)}</span>
-            </span>
-          </button>
-        {/if}
-      {:else}
-        <div class="no-match">No matching chats</div>
-      {/each}
-    </div>
-    {#if remoteSearching}
-      <p class="search-note" data-testid="search-remote-note">Searching connected servers…</p>
-    {:else if localServerSearching}
-      <p class="search-note" data-testid="search-local-note">Searching all messages…</p>
-    {/if}
-    {#each remoteFailures as f (f.serverName + f.message)}
-      <p class="search-note search-fail" data-testid="search-remote-error">{f.serverName}: {f.message}</p>
-    {/each}
-    {#each remoteNotices as n (n)}
-      <p class="search-note search-old" data-testid="search-remote-degraded">{n}: older Vicuna there — searched its session list directly (update the CLI for a faster search)</p>
-    {/each}
-    {#if gotoError}
-      <p class="goto-error" data-testid="goto-error">{gotoError}</p>
-    {/if}
-  </div>
+  <GotoPaletteModal
+    bind:gotoInput
+    bind:gotoSel
+    {gotoError}
+    {searchQuery}
+    {searchItems}
+    {searchShowHosts}
+    {srvLabel}
+    {remoteSearching}
+    {localServerSearching}
+    {remoteFailures}
+    {remoteNotices}
+    {searchSnippet}
+    {highlightHtml}
+    onClose={closeGoto}
+    onKeyDown={onSearchKey}
+    onOpenItem={openSearchItem}
+    onPrefetchChat={(chat) => void ensureChatFull(chat, { silent: true })}
+  />
 {/if}
 {#if settingsOpen}
-  <button
-    class="confirm-backdrop"
-    data-testid="settings-backdrop"
-    aria-label="Close settings"
-    onclick={() => (settingsOpen = false)}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card settings-card settings-split"
-    data-testid="settings-modal"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Settings"
-  >
-    <button class="modal-x settings-close" data-testid="close-settings-btn" aria-label="Close settings" onclick={() => (settingsOpen = false)}>×</button>
-    <div class="settings-layout">
-      <div class="settings-nav" role="tablist" aria-label="Settings sections" aria-orientation="vertical">
-        <p class="settings-nav-title">Settings</p>
-
-        <div class="settings-nav-group">
-          <span class="settings-nav-label">App</span>
-          <button
-            class="settings-nav-btn {settingsTab === 'general' ? 'sel' : ''}"
-            data-testid="settings-tab-general"
-            role="tab"
-            aria-selected={settingsTab === "general"}
-            onclick={() => (settingsTab = "general")}
-          >
-            <span class="nav-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
-            <span>General</span>
-            {#if appUpdateStatus === "available" || appUpdateStatus === "installed"}
-              <span class="nav-dot" title="Update available"></span>
-            {/if}
-          </button>
-        </div>
-
-        <div class="settings-nav-group">
-          <span class="settings-nav-label">Work mode</span>
-          <button
-            class="settings-nav-btn {settingsTab === 'work' ? 'sel' : ''}"
-            data-testid="settings-tab-work"
-            role="tab"
-            aria-selected={settingsTab === "work"}
-            onclick={() => (settingsTab = "work")}
-          >
-            <span class="nav-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></span>
-            <span>Work</span>
-          </button>
-        </div>
-
-        <div class="settings-nav-group" data-testid="settings-nav-chat">
-          <span class="settings-nav-label">Chat mode</span>
-          <button
-            class="settings-nav-btn {settingsTab === 'models' ? 'sel' : ''}"
-            data-testid="settings-tab-ollama"
-            role="tab"
-            aria-selected={settingsTab === "models"}
-            onclick={openModelsTab}
-          >
-            <span class="nav-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OLLAMA_ICON_PATH}/></svg></span>
-            <span>Ollama</span>
-          </button>
-          <button
-            class="settings-nav-btn {settingsTab === 'openrouter' ? 'sel' : ''}"
-            data-testid="settings-tab-openrouter"
-            role="tab"
-            aria-selected={settingsTab === "openrouter"}
-            onclick={openOpenRouterTab}
-          >
-            <span class="nav-ico" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d={OPENROUTER_ICON_PATH}/></svg></span>
-            <span>OpenRouter</span>
-          </button>
-          <button
-            class="settings-nav-btn {settingsTab === 'chat' ? 'sel' : ''}"
-            data-testid="settings-tab-chat"
-            role="tab"
-            aria-selected={settingsTab === "chat"}
-            onclick={() => (settingsTab = "chat")}
-          >
-            <span class="nav-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
-            <span>Continue &amp; stops</span>
-          </button>
-        </div>
-      </div>
-
-      <div class="settings-main">
-        <div class="settings-pane-head">
-          <div class="settings-pane-title-row">
-            <h2 class="settings-pane-title">
-              {#if settingsTab === "general"}General
-              {:else if settingsTab === "work"}Work
-              {:else if settingsTab === "models"}Ollama
-              {:else if settingsTab === "openrouter"}OpenRouter
-              {:else}Continue &amp; stops{/if}
-            </h2>
-            {#if settingsTab === "models" || settingsTab === "openrouter" || settingsTab === "chat"}
-              <span class="settings-scope-badge" data-testid="settings-scope-chat">Chat mode only</span>
-            {:else if settingsTab === "work"}
-              <span class="settings-scope-badge" data-testid="settings-scope-work">Work mode</span>
-            {/if}
-          </div>
-          {#if settingsTab === "models"}
-            <p class="settings-pane-sub">Local models via Ollama for Chat mode. Work mode uses its own CLI engines.</p>
-          {:else if settingsTab === "openrouter"}
-            <p class="settings-pane-sub">Cloud models via OpenRouter for Chat mode. Work mode uses its own CLI engines.</p>
-          {:else if settingsTab === "chat"}
-            <p class="settings-pane-sub">Controls how Chat mode continues partial replies.</p>
-          {:else if settingsTab === "work"}
-            <p class="settings-pane-sub">Coding agents, tool permissions, and the built-in browser engine.</p>
-          {/if}
-        </div>
-
-        <div class="settings-pane-body {settingsTab === 'models' || settingsTab === 'openrouter' ? 'flex-pane' : ''}">
-          {#if settingsTab === "general"}
-            <section class="settings-group" data-testid="settings-updates-section">
-              <div class="settings-group-head">
-                <div class="settings-group-head-text">
-                  <span class="setting-label">App updates</span>
-                  {#if buildInfo}
-                    <span class="setting-note" data-testid="app-version">v{buildInfo.version} · built {formatBuildDate(buildInfo.builtAtUnix) || "date unknown"}</span>
-                  {:else}
-                    <span class="setting-note">Current version unknown.</span>
-                  {/if}
-                </div>
-                {#if isTauriRuntime()}
-                  <button class="mini-btn {appUpdateStatus === 'available' || appUpdateStatus === 'installed' ? 'primary' : ''}" data-testid="update-check-btn" disabled={appUpdateStatus === "checking"} onclick={() => void openAppUpdate()}>{appUpdateLabel}</button>
-                {:else}
-                  <button class="mini-btn" data-testid="update-check-btn" disabled={updateOp !== null} onclick={checkForUpdates}>{updateOp === "check" ? "Checking…" : "Check for updates"}</button>
-                {/if}
-              </div>
-              {#if isTauriRuntime()}
-                {#if appUpdateStatus === "up_to_date"}
-                  <span class="setting-note" data-testid="update-uptodate">You're up to date.</span>
-                {/if}
-                {#if appUpdateStatus === "error" && appUpdateError && !showUpdatePrompt}
-                  <p class="goto-error" data-testid="update-error">Update check failed: {appUpdateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => { appUpdateError = null; appUpdateStatus = "idle"; }}>×</button></p>
-                {/if}
-                <label class="setting-note approval-row" data-testid="update-autocheck">
-                  <input type="checkbox" data-testid="update-autocheck-toggle" checked={autoCheckAppUpdatesEnabled} onchange={(e) => setAutoCheckAppUpdates((e.currentTarget as HTMLInputElement).checked)} />
-                  Check for updates automatically on startup.
-                </label>
-                <span class="setting-note">Signed updates from the newest <a href={APP_UPDATE_RELEASES_URL} onclick={(e) => { e.preventDefault(); void openExternal(APP_UPDATE_RELEASES_URL); }}>GitHub release</a> — install in-app, then restart.</span>
-              {:else}
-                {#if updateRelease}
-                  {@const platform = currentPlatform()}
-                  {@const stamp = releaseTimestamp(updateRelease, platform)}
-                  {@const behind = !buildInfo || isNewerRelease(stamp, buildInfo.builtAtUnix)}
-                  {@const asset = pickAssetForPlatform(updateRelease.assets, platform)}
-                  <span class="setting-note" data-testid="update-latest">Latest: {updateRelease.tag} · installer built {formatBuildDate(Math.floor(Date.parse(stamp) / 1000)) || "date unknown"}</span>
-                  {#if behind && asset}
-                    <div class="browse-actions">
-                      <button class="mini-btn primary" data-testid="update-install-btn" disabled={updateOp !== null} onclick={applyUpdate}>{updateOp === "download" ? "Downloading…" : `Download ${asset.name} (${formatAssetSize(asset.size)})`}</button>
-                      <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
-                    </div>
-                  {:else if behind}
-                    <span class="setting-note">No installer for this platform in {updateRelease.tag} — see the release notes.</span>
-                    <div class="browse-actions">
-                      <button class="mini-btn" data-testid="update-notes-btn" onclick={() => void openExternal(updateRelease?.htmlUrl ?? "https://github.com/anslwy/vicuna/releases/latest")}>Release notes</button>
-                    </div>
-                  {:else}
-                    <span class="setting-note" data-testid="update-uptodate">You're up to date.</span>
-                  {/if}
-                {/if}
-                {#if updateNote}<span class="setting-note" data-testid="update-note">{updateNote}</span>{/if}
-                {#if updateError}<p class="goto-error" data-testid="update-error">{updateError} <button type="button" class="err-x" data-testid="update-error-dismiss" aria-label="Dismiss update error" title="Dismiss" onclick={() => (updateError = null)}>×</button></p>{/if}
-                <span class="setting-note">Compares your build date against the rolling <code>latest</code> prerelease.</span>
-              {/if}
-            </section>
-
-            <section class="settings-group" data-testid="settings-appearance-section">
-              <span class="settings-group-kicker">Appearance</span>
-              <div class="setting-row setting-row-wrap">
-                <span class="setting-label">Theme</span>
-                <div class="seg theme-seg">
-                  <button class="seg-btn {!pluginTheme && theme === 'light' ? 'sel' : ''}" data-testid="theme-light-btn" onclick={() => setTheme("light")}>Light</button>
-                  <button class="seg-btn {!pluginTheme && theme === 'dark' ? 'sel' : ''}" data-testid="theme-dark-btn" onclick={() => setTheme("dark")}>Dark</button>
-                  {#each pluginThemeChoices as t (t.key)}
-                    <button class="seg-btn {pluginTheme?.key === t.key ? 'sel' : ''}" data-testid="theme-plugin-{t.key.replace('/', '-')}" title="From the {t.pluginName} plugin" onclick={() => setPluginTheme(t)}>{t.name}</button>
-                  {/each}
-                </div>
-              </div>
-              <div class="setting-row">
-                <span class="setting-label">Accent color</span>
-                <div class="swatches">
-                  {#if pluginTheme && pluginAccent}
-                    <button
-                      class="swatch {accentSel === 'theme' ? 'sel' : ''}"
-                      data-testid="accent-theme"
-                      aria-label="{pluginTheme.name} accent"
-                      title="{pluginTheme.name} accent (from the theme)"
-                      style="background: {pluginAccent.bg}"
-                      onclick={() => setAccent("theme")}
-                    >{#if accentSel === "theme"}<span class="swatch-check" style="color: {pluginAccent.fg}">✓</span>{/if}</button>
-                  {/if}
-                  {#each Object.entries(ACCENTS) as [key, a]}
-                    <button
-                      class="swatch {accentSel === key ? 'sel' : ''}"
-                      data-testid="accent-{key}"
-                      aria-label={a.label}
-                      title={a.label}
-                      style="background: {themeBase === 'dark' ? a.dark.bg : a.light.bg}"
-                      onclick={() => setAccent(key)}
-                    >{#if accentSel === key}<span class="swatch-check">✓</span>{/if}</button>
-                  {/each}
-                </div>
-              </div>
-              <div class="setting-row">
-                <span class="setting-label">Font size</span>
-                <div class="seg">
-                  <button class="seg-btn" data-testid="font-decrease" aria-label="Decrease font size" onclick={() => setFontSize(fontSize - 1)}>−</button>
-                  <span class="font-val" data-testid="font-size-value">{fontSize}px</span>
-                  <button class="seg-btn" data-testid="font-increase" aria-label="Increase font size" onclick={() => setFontSize(fontSize + 1)}>+</button>
-                </div>
-              </div>
-            </section>
-
-            <section class="settings-group">
-              <span class="settings-group-kicker">Notifications</span>
-              <label class="setting-note approval-row" data-testid="notify-turns">
-                <input type="checkbox" data-testid="notify-turns-toggle" checked={notifyTurns} onchange={(e) => { notifyTurns = (e.currentTarget as HTMLInputElement).checked; setNotifyEnabled(notifyTurns); }} />
-                Notify when a Chat or Work turn finishes while Vicuna isn't in front (not when you press Stop).
-              </label>
-              <label class="setting-note approval-row" data-testid="notify-sound">
-                <input type="checkbox" data-testid="notify-sound-toggle" checked={notifySound} disabled={!notifyTurns} onchange={(e) => { notifySound = (e.currentTarget as HTMLInputElement).checked; setNotifySound(notifySound); if (notifySound) void playChime(notifySoundChoice); }} />
-                Play a sound with the notification.
-              </label>
-              <div class="browse-actions notify-sound-pick">
-                <select
-                  class="browse-variant"
-                  data-testid="notify-sound-select"
-                  aria-label="Notification sound"
-                  value={notifySoundChoice}
-                  disabled={!notifyTurns || !notifySound}
-                  onchange={(e) => { notifySoundChoice = e.currentTarget.value; setNotifySoundChoice(notifySoundChoice); void playChime(notifySoundChoice); }}
-                >
-                  {#each CHIME_OPTIONS as s}
-                    <option value={s.id}>{s.label}</option>
-                  {/each}
-                </select>
-                <button class="mini-btn" data-testid="notify-sound-preview" disabled={!notifyTurns || !notifySound} onclick={() => void playChime(notifySoundChoice)}>▶ Preview</button>
-              </div>
-            </section>
-
-            {#if isTauriRuntime()}
-              <section class="settings-group">
-                <span class="settings-group-kicker">Desktop &amp; CLI</span>
-                <div class="setting-stacked">
-                  <span class="setting-label">Vicuna CLI</span>
-                  <!-- the `vicuna` binary (bridge/ crate) replaced the old launcher script:
-                       one command for `vicuna open [path]` and `vicuna serve` (server) -->
-                  <div class="browse-actions">
-                    <code class="cli-oneliner" data-testid="cli-oneliner">{CLI_INSTALL_CMD}</code>
-                    <button class="mini-btn" data-testid="cli-copy-btn" onclick={() => void copyCliInstall()}>{cliCopied ? "Copied" : "Copy"}</button>
-                  </div>
-                  {#if cliState?.found}
-                    <span class="setting-note" data-testid="cli-status">
-                      {#if cliState.managed}Found the old launcher at {cliState.found}: the command above replaces it.{:else}Found `{cliState.exe_name}` at {cliState.found}.{/if}
-                    </span>
-                  {/if}
-                  <span class="setting-note">Run in a terminal (macOS/Linux, no sudo). Then <code>vicuna [path]</code> opens a folder here, and <code>vicuna serve --tailscale</code> exposes this machine as a server.</span>
-                </div>
-                <div class="setting-row quit-row">
-                  <div class="settings-group-head-text">
-                    <span class="setting-label">Quit Vicuna</span>
-                    <span class="setting-note">Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.</span>
-                  </div>
-                  <button class="mini-btn danger" data-testid="quit-app-btn" onclick={() => void quitVicuna()}>Quit Vicuna</button>
-                </div>
-              </section>
-            {/if}
-
-          {:else if settingsTab === "work"}
-            <section class="settings-group">
-              <div class="settings-group-head">
-                <span class="setting-label">Work engine</span>
-                <button class="mini-btn" data-testid="work-engine-refresh" onclick={() => void refreshWorkEngine()}>Refresh</button>
-              </div>
-              {#if (workEngineInfo?.engines ?? []).length > 0}
-                <div class="engine-switch settings-engines" data-testid="settings-engine-picker" role="radiogroup" aria-label="Work engine">
-                  {#each workEngineInfo?.engines ?? [] as eng (eng.id)}
-                    <button class="engine-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="radio" aria-checked={eng.id === engineId(workEngineInfo)} data-testid="settings-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={eng.installed ? `${eng.label} ${eng.version ?? ""}` : (eng.missing ?? "not installed")} onclick={() => void pickWorkEngine(eng.id)}>{eng.label}{eng.installed ? "" : " (not installed)"}</button>
-                  {/each}
-                </div>
-              {/if}
-              <span class="setting-note" data-testid="work-engine-status">
-                {#if workEngineInfo?.installed}
-                  {workEngineLabel} {workEngineInfo.version ?? ""} · {workEngineInfo.path}
-                  {#if workEngineInfo.warning}
-                    <br /><span data-testid="work-engine-warning">⚠ {workEngineInfo.warning}</span>
-                  {/if}
-                  {#if (workEngineInfo.others ?? []).length > 0}
-                    <br /><span data-testid="work-engine-others">Also found (not used; the newest version wins): {(workEngineInfo.others ?? []).join(", ")}</span>
-                  {/if}
-                {:else if workEngineInfo}
-                  {workEngineInfo.missing ?? `${workEngineLabel} not found, install it: ${workEngineInfo.installUrl}`}
-                {:else}
-                  Checking…
-                {/if}
-              </span>
-              {#each (workEngineInfo?.engines ?? []).filter((e) => !e.installed && e.id !== engineId(workEngineInfo)) as eng (eng.id)}
-                <span class="setting-note" data-testid="settings-engine-missing" data-engine={eng.id}>{eng.missing}</span>
-              {/each}
-              <label class="setting-note approval-row settings-divider-top" data-testid="work-approval">
-                <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void toggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
-                Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.
-              </label>
-              <details class="setting-details">
-                <summary>How engines &amp; binary overrides work</summary>
-                <p class="setting-note">Work mode runs your installed CLI (<code>opencode acp</code>, <code>claude -p</code>, <code>codex app-server</code>, <code>agy acp</code>, <code>fx acp</code>, or <code>pi --mode rpc</code>) with your own login and config. Vicuna searches your login-shell PATH and common install folders, picking the newest version. Models and credentials come from the engine.</p>
-                <p class="setting-note">Override binaries with <code>VICUNA_OPENCODE_BIN</code>, <code>VICUNA_CLAUDE_BIN</code>, <code>VICUNA_CODEX_BIN</code>, <code>VICUNA_AGY_BIN</code>, <code>VICUNA_FX_BIN</code>, or <code>VICUNA_PI_BIN</code>. <code>fx</code> exposes <code>provider/model</code> from its logins and <code>~/.fx/settings.json</code>; <code>pi</code> loads extensions from <code>~/vicuna/config/pi/extensions</code>.</p>
-              </details>
-            </section>
-
-            <section class="settings-group" data-testid="browser-engine">
-              <span class="setting-label">Browser engine</span>
-              {#if browserDaemon?.lb_version}
-                <span class="setting-note" data-testid="browser-engine-version">lb {browserDaemon.lb_version} · {browserDaemon.source === "bundled" ? "bundled with Vicuna" : "system PATH"} · port {new URL(browserDaemon.url).port}</span>
-                <span class="setting-note work-path" data-testid="browser-engine-path" title={browserDaemon.bin ?? ""}>{browserDaemon.bin ?? "path unknown"}</span>
-              {:else}
-                <span class="setting-note">Not found: no bundled lb and none on PATH.</span>
-              {/if}
-            </section>
-
-          {:else if settingsTab === "chat"}
-            <section class="settings-group">
-              <span class="setting-label">Continue method</span>
-              <div class="seg" data-testid="continue-mode">
-                {#each CONTINUE_MODES as m}
-                  <button
-                    class="seg-btn {continueMode === m.id ? 'sel' : ''}"
-                    data-testid="continue-mode-{m.id}"
-                    onclick={() => setContinueMode(m.id)}
-                  >{m.label}</button>
-                {/each}
-              </div>
-              <span class="setting-note">Raw prompt (default) works best for Gemma families and falls back to native chat for other models. Cloud models cannot continue.</span>
-              <details class="setting-details">
-                <summary>How each method works</summary>
-                <p class="setting-note"><strong>Raw prompt</strong> prefills the model's own prompt through <code>/api/generate</code> with <code>raw:true</code> — works for gemma4/gemma2/3 and falls back to native chat for other families. <strong>Auto</strong> uses the raw prompt for gemma4 only (its chat template closes the assistant turn, so native Continue starts a fresh greeting) and native chat otherwise. <strong>Native chat</strong> always resends the partial through <code>/api/chat</code>. Threads with images always use native chat, and raw continuations are cut off if the build degenerates into repetition.</p>
-              </details>
-            </section>
-
-            <section class="settings-group">
-              <span class="setting-label">Stop words <span class="setting-hint">· applied when continuing a reply</span></span>
-              <textarea
-                class="stopwords-input"
-                data-testid="stopwords-input"
-                rows="4"
-                spellcheck={false}
-                placeholder={"\\nUser:\\nAssistant:"}
-                bind:value={stopWordsText}
-                onblur={() => setStopWords(stopWordsText)}
-              ></textarea>
-              <span class="setting-note">One per line. Use <code>\n</code> for newlines. Generation stops when the model outputs one of these.</span>
-            </section>
-
-          {:else if settingsTab === "models"}
-            <div class="model-manage-list" data-testid="model-manage-list">
-              <div class="server-row" data-testid="ollama-server-row">
-                <div class="model-manage-info">
-                  <span class="model-manage-name">Ollama server</span>
-                  <span class="model-manage-sub">
-                    {#if ollamaVersion}
-                      <span class="dot-live"></span> Running · v{ollamaVersion}
-                    {:else if serverChecking || serverOp}
-                      <span class="dot-idle"></span> {serverOp === "start" ? "Starting…" : serverOp === "stop" ? "Stopping…" : "Checking…"}
-                    {:else}
-                      <span class="dot-idle"></span> Not reachable{serverError ? ` — ${serverError}` : ""}
-                    {/if}
-                    {#if serverChatTurns}
-                      <span>· http://localhost:11434 on connected server</span>
-                    {/if}
-                  </span>
-                </div>
-                <div class="model-manage-actions">
-                  {#if isTauriRuntime() && !(serverChatTurns && isRemoteServer())}
-                    {#if ollamaVersion}
-                      <button class="mini-btn" data-testid="stop-server-btn" disabled={serverOp !== null} onclick={stopServerFlow}>{serverOp === "stop" ? "…" : "Stop"}</button>
-                    {:else}
-                      <button class="mini-btn primary" data-testid="start-server-btn" disabled={serverOp !== null} onclick={startServerFlow}>{serverOp === "start" ? "…" : "Start"}</button>
-                    {/if}
-                  {/if}
-                </div>
-              </div>
-              {#if !serverChatTurns}
-                <div class="ollama-host-box">
-                  <span class="setting-label">Ollama host <span class="setting-hint">· browser mode only</span></span>
-                  <input
-                    class="pull-input"
-                    data-testid="ollama-host-input"
-                    placeholder="http://localhost:11434"
-                    bind:value={ollamaBase}
-                    onblur={() => setOllamaHost(ollamaBase)}
-                    onkeydown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                    spellcheck={false}
-                  />
-                  <span class="setting-note">Where this browser reaches Ollama. Empty = this machine. The desktop app always uses its local Ollama.</span>
-                </div>
-              {/if}
-              {#if serverError}
-                <p class="goto-error" data-testid="server-error">{serverError}</p>
-              {/if}
-              <div class="seg browse-tabs" role="tablist" aria-label="Model library sections">
-                <button class="seg-btn {browseView === 'installed' ? 'sel' : ''}" data-testid="browse-installed-btn" role="tab" onclick={() => (browseView = "installed")}>Installed</button>
-                <button class="seg-btn {browseView === 'discover' ? 'sel' : ''}" data-testid="browse-discover-btn" role="tab" onclick={() => (browseView = "discover")}>Discover</button>
-              </div>
-              {#if browseView === "installed"}
-              {#if runnersError}
-                <p class="goto-error" data-testid="models-error">{runnersError}</p>
-              {/if}
-              {#each sortedManageModels as name}
-                {@const running = runners.find((r) => r.name === name)}
-                <div class="model-manage-row" data-testid="model-row" data-name={name}>
-                  <div class="model-manage-info">
-                    <span class="model-manage-name">{name}{#if name === selectedModel} <span class="model-inuse" title="Used by current chat">• in use</span>{/if}</span>
-                    <span class="model-manage-sub">
-                      {#if running}
-                        <span class="dot-live"></span> Loaded · {(running.size_vram / 1e9).toFixed(1)} GB VRAM
-                      {:else if isCloudModel(name)}
-                        <span class="dot-live"></span> Cloud · ready, no load needed
-                      {:else}
-                        <span class="dot-idle"></span> Unloaded
-                      {/if}
-                    </span>
-                  </div>
-                  <div class="model-manage-actions">
-                    {#if !isCloudModel(name)}
-                      {#if running}
-                        <button class="mini-btn" data-testid="unload-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => toggleModelLoaded(name, true)}>{modelOp === name ? "…" : "Unload"}</button>
-                      {:else}
-                        <button class="mini-btn primary" data-testid="load-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => toggleModelLoaded(name, false)}>{modelOp === name ? "…" : "Load"}</button>
-                      {/if}
-                    {/if}
-                    {#if confirmDeleteModel === name}
-                      <button class="mini-btn danger" data-testid="confirm-delete-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => requestDeleteModel(name)}>{modelOp === name ? "…" : "Confirm?"}</button>
-                      <button class="mini-btn" data-testid="keep-model-btn" data-name={name} disabled={modelOp !== null} onclick={() => (confirmDeleteModel = null)}>Keep</button>
-                    {:else}
-                      <button class="mini-btn" data-testid="delete-model-btn" data-name={name} disabled={modelOp !== null || pulling !== null} onclick={() => requestDeleteModel(name)}>Delete</button>
-                    {/if}
-                  </div>
-                </div>
-              {:else}
-                <p class="no-match">No models installed.</p>
-              {/each}
-              {:else}
-              <div class="pull-row" data-testid="model-pull-row">
-                <input
-                  class="pull-input"
-                  data-testid="model-pull-input"
-                  placeholder="Pull by exact name, e.g. gemma4:e4b"
-                  bind:value={pullName}
-                  disabled={pulling !== null}
-                  onkeydown={(e) => { if (e.key === "Enter") void submitPull(); }}
-                />
-                {#if pulling !== null}
-                  <button class="mini-btn" data-testid="cancel-pull-btn" onclick={cancelPull}>Cancel</button>
-                {:else}
-                  <button class="mini-btn primary" data-testid="pull-model-btn" disabled={pullName.trim() === "" || modelOp !== null} onclick={() => void submitPull()}>Pull</button>
-                {/if}
-              </div>
-              {#if pulling !== null}
-                <div class="pull-progress" data-testid="model-pull-progress">
-                  <span class="pull-status">{pulling} · {pullStatus}</span>
-                  {#if pullTotal > 0}
-                    <div class="pull-bar"><div class="pull-fill" style="width: {Math.min(100, (pullDone / pullTotal) * 100).toFixed(1)}%"></div></div>
-                    <span class="pull-pct">{((pullDone / pullTotal) * 100).toFixed(0)}% · {(pullDone / 1e9).toFixed(1)} / {(pullTotal / 1e9).toFixed(1)} GB{#if pullRate > 0} · {formatPullRate(pullRate)}{/if}</span>
-                  {/if}
-                </div>
-              {/if}
-              <div class="pull-row" data-testid="model-search-row">
-                <input
-                  class="pull-input"
-                  data-testid="discover-search-input"
-                  placeholder="Search the library — try llama, code, vision…"
-                  bind:value={browseQuery}
-                />
-              </div>
-              <div class="chip-row" data-testid="discover-chips" role="group" aria-label="Filter by capability">
-                {#each BROWSE_CATS as c}
-                  <button class="chip {browseCat === c ? 'sel' : ''}" data-testid="discover-chip" data-cat={c} onclick={() => (browseCat = c)}>{c === "all" ? "All" : c === "mlx" ? "MLX" : c[0].toUpperCase() + c.slice(1)}</button>
-                {/each}
-              </div>
-              <p class="browse-count" data-testid="discover-count">{filteredCatalog.length} of {catalog.length} models · catalog {catalogUpdated}
-                {#if fetching}
-                  <span class="fetch-progress" data-testid="catalog-fetch-progress">Fetching {fetching.done}/{fetching.total}…</span>
-                {:else}
-                  <button class="mini-btn" data-testid="catalog-fetch-btn" onclick={fetchCatalog}>Fetch</button>
-                {/if}
-              </p>
-              {#if catalogError}
-                <p class="goto-error" data-testid="catalog-fetch-error">{catalogError}</p>
-              {/if}
-              {#each filteredCatalog.filter((e) => e.variants.length > 0) as entry}
-                {@const mlxFirst = entry.variants.find((v) => isMlxVariant(v.tag))?.tag}
-                {@const picked = pickedVariant(entry.name, browseCat === "mlx" && mlxFirst ? mlxFirst : entry.variants[0].tag)}
-                {@const fullName = `${entry.name}:${picked}`}
-                {@const installed = entry.variants.some((v) => models.includes(`${entry.name}:${v.tag}`))}
-                <div class="browse-card" data-testid="browse-card" data-name={entry.name}>
-                  <div class="browse-head">
-                    <span class="browse-name">{entry.name}</span>
-                    {#if installed}<span class="browse-installed" title="A variant of this model is in your library">In library</span>{/if}
-                  </div>
-                  <p class="browse-blurb">{entry.blurb}</p>
-                  <div class="browse-meta">
-                    {#each entry.cats as c}<span class="browse-cat">{c}</span>{/each}
-                    <span class="browse-params">{entry.params}</span>
-                  </div>
-                  <div class="browse-actions">
-                    <select
-                      class="browse-variant"
-                      data-testid="variant-select"
-                      aria-label="Variant of {entry.name}"
-                      value={picked}
-                      onchange={(e) => (variantPick = { ...variantPick, [entry.name]: e.currentTarget.value })}
-                    >
-                      {#each entry.variants as v}
-                        <option value={v.tag}>{v.tag} · {v.size}</option>
-                      {/each}
-                    </select>
-                    <button class="mini-btn primary" data-testid="browse-pull-btn" data-name={fullName} disabled={pulling !== null || modelOp !== null} onclick={() => void submitPullName(fullName)}>{pulling === fullName ? "…" : "Pull"}</button>
-                  </div>
-                </div>
-              {:else}
-                <p class="no-match">No matches — try another search, or pull by exact name above.</p>
-              {/each}
-              {/if}
-            </div>
-
-          {:else}
-            <div class="or-panel" data-testid="openrouter-panel">
-              <div class="server-row" data-testid="openrouter-key-row">
-                <div class="model-manage-info">
-                  <span class="model-manage-name">OpenRouter API key</span>
-                  <span class="model-manage-sub" data-testid="openrouter-key-status">
-                    {#if openrouterKeyBusy}
-                      <span class="dot-idle"></span> Checking key…
-                    {:else if openrouterKeyInfo}
-                      <span class="dot-live"></span> Connected{openrouterKeyInfo.isFreeTier ? " · free tier" : ""}{#if openrouterKey}{" · "}{maskKey(openrouterKey)}{/if}
-                    {:else if openrouterKey}
-                      <span class="dot-idle"></span> Saved · not verified
-                    {:else}
-                      <span class="dot-idle"></span> Not configured
-                    {/if}
-                  </span>
-                  {#if openrouterKeyInfo && openRouterUsageText(openrouterKeyInfo)}
-                    <span class="model-manage-sub or-usage">{openRouterUsageText(openrouterKeyInfo)}</span>
-                  {/if}
-                </div>
-                <div class="model-manage-actions">
-                  <button class="mini-btn" data-testid="openrouter-key-test" disabled={openrouterKeyBusy || !openrouterKey} onclick={() => void verifyOpenRouterKey()}>{openrouterKeyBusy ? "…" : "Test"}</button>
-                  {#if openrouterKey && !openrouterKeyEditing}
-                    <button class="mini-btn" data-testid="openrouter-key-change" disabled={openrouterKeyBusy} onclick={() => (openrouterKeyEditing = true)}>Change</button>
-                  {/if}
-                  {#if openrouterKey}
-                    <button class="mini-btn" data-testid="openrouter-key-clear" disabled={openrouterKeyBusy} onclick={clearOpenRouterKey}>Clear</button>
-                  {/if}
-                </div>
-              </div>
-              {#if !openrouterKey || openrouterKeyEditing}
-              <div class="pull-row" data-testid="openrouter-key-form">
-                <input
-                  class="pull-input"
-                  data-testid="openrouter-key-input"
-                  type={openrouterKeyVisible ? "text" : "password"}
-                  placeholder="sk-or-v1-…"
-                  bind:value={openrouterKeyDraft}
-                  spellcheck={false}
-                  autocomplete="off"
-                  disabled={openrouterKeyBusy}
-                  onkeydown={(e) => { if (e.key === "Enter") void saveOpenRouterKey(); }}
-                />
-                <button class="mini-btn" data-testid="openrouter-key-reveal" disabled={!openrouterKeyDraft} onclick={() => (openrouterKeyVisible = !openrouterKeyVisible)}>{openrouterKeyVisible ? "Hide" : "Show"}</button>
-                <button class="mini-btn primary" data-testid="openrouter-key-save" disabled={openrouterKeyBusy || (!openrouterKeyDirty && !openrouterKeyEditing)} onclick={() => void saveOpenRouterKey()}>Save</button>
-              </div>
-              <div class="or-note-row">
-                <span class="setting-note">Stored locally with your settings and only sent to openrouter.ai. The public catalog fetches without a key; a key verifies your account and usage.</span>
-                <button class="mini-btn" data-testid="openrouter-get-key" onclick={() => void openExternal("https://openrouter.ai/keys")}>Get a key</button>
-              </div>
-              {/if}
-              {#if openrouterKeyError}
-                <p class="goto-error" data-testid="openrouter-key-error">{openrouterKeyError}</p>
-              {/if}
-              <div class="pull-row" data-testid="openrouter-search-row">
-                <input
-                  class="pull-input"
-                  data-testid="openrouter-search-input"
-                  placeholder="Search models — try claude, free, vision…"
-                  bind:value={openrouterQuery}
-                  disabled={openrouterModels.length === 0}
-                />
-              </div>
-              <div class="chip-row" data-testid="openrouter-chips" role="group" aria-label="Filter OpenRouter models">
-                {#each OPENROUTER_FILTERS as c}
-                  <button class="chip {openrouterCat === c ? 'sel' : ''}" data-testid="openrouter-chip" data-cat={c} onclick={() => (openrouterCat = c)}>{c === "all" ? "All" : c[0].toUpperCase() + c.slice(1)}</button>
-                {/each}
-              </div>
-              <p class="browse-count" data-testid="openrouter-count">
-                {#if openrouterLoading}
-                  <span class="fetch-progress">Fetching the live OpenRouter catalog…</span>
-                {:else if openrouterModels.length > 0}
-                  {#if openrouterBrowsing}
-                    {filteredOpenRouterModels.length} of {openrouterModels.length} models{openrouterUpdated ? ` · updated ${formatCacheAge(openrouterUpdated)}` : ""}
-                  {:else}
-                    {filteredOpenRouterModels.length} added{openrouterUpdated ? ` · catalog updated ${formatCacheAge(openrouterUpdated)}` : ""}
-                  {/if}
-                {:else}
-                  No catalog loaded yet.
-                {/if}
-                <button class="mini-btn" data-testid="openrouter-fetch-btn" disabled={openrouterLoading} onclick={() => void fetchOpenRouterCatalog()}>{openrouterLoading ? "…" : "Fetch"}</button>
-              </p>
-              {#if openrouterError}
-                <p class="goto-error" data-testid="openrouter-error">{openrouterError}</p>
-              {/if}
-              <div class="model-manage-list or-models" data-testid="openrouter-models">
-                {#each filteredOpenRouterModels as m (m.id)}
-                  <div class="model-manage-row" data-testid="openrouter-model-row" data-id={m.id} title={m.description}>
-                    <div class="model-manage-info">
-                      <span class="model-manage-name">{displayOpenRouterId(m.id)}</span>
-                      <span class="model-manage-sub or-meta">
-                        <span>{formatContextLength(m.contextLength)} ctx</span>
-                        <span>·</span>
-                        <span>{formatModelPricing(m)}</span>
-                        {#if isFreeModel(m)}<span class="browse-cat">free</span>{/if}
-                        {#if supportsVision(m)}<span class="browse-cat">vision</span>{/if}
-                        {#if supportsTools(m)}<span class="browse-cat">tools</span>{/if}
-                        {#if m.reasoning}<span class="browse-cat">reasoning</span>{/if}
-                      </span>
-                    </div>
-                    <div class="model-manage-actions">
-                      {#if openrouterAddedSet.has(m.id)}
-                        <button class="mini-btn" data-testid="openrouter-remove-btn" data-id={m.id} title="Remove from your models" onclick={() => toggleOpenRouterAdded(m.id)}>Remove</button>
-                      {:else}
-                        <button class="mini-btn primary" data-testid="openrouter-add-btn" data-id={m.id} title="Add to your models" onclick={() => toggleOpenRouterAdded(m.id)}>Add</button>
-                      {/if}
-                    </div>
-                  </div>
-                {:else}
-                  <p class="no-match">{openrouterModels.length === 0 ? "Press Fetch to load the OpenRouter catalog." : openrouterBrowsing ? "No models match this search." : "No models added yet — search above to find models to add."}</p>
-                {/each}
-              </div>
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-  </div>
+  <SettingsModal
+    bind:settingsOpen
+    bind:settingsTab
+    {buildInfo}
+    bind:appUpdateStatus
+    bind:appUpdateError
+    {appUpdateLabel}
+    {showUpdatePrompt}
+    {autoCheckAppUpdatesEnabled}
+    {updateOp}
+    {updateRelease}
+    {updateNote}
+    bind:updateError
+    onOpenAppUpdate={openAppUpdate}
+    onSetAutoCheckAppUpdates={setAutoCheckAppUpdates}
+    onCheckForUpdates={checkForUpdates}
+    onApplyUpdate={applyUpdate}
+    onOpenExternal={openExternal}
+    {theme}
+    {themeBase}
+    {pluginTheme}
+    {pluginThemeChoices}
+    {pluginAccent}
+    {accentSel}
+    accents={ACCENTS}
+    {fontSize}
+    onSetTheme={setTheme}
+    onSetPluginTheme={setPluginTheme}
+    onSetAccent={setAccent}
+    onSetFontSize={setFontSize}
+    bind:notifyTurns
+    bind:notifySound
+    bind:notifySoundChoice
+    cliInstallCmd={CLI_INSTALL_CMD}
+    {cliCopied}
+    {cliState}
+    onCopyCliInstall={copyCliInstall}
+    onQuitVicuna={quitVicuna}
+    {workEngineInfo}
+    {workEngineLabel}
+    {browserDaemon}
+    onRefreshWorkEngine={refreshWorkEngine}
+    onPickWorkEngine={pickWorkEngine}
+    onToggleWorkApproval={toggleWorkApproval}
+    {continueMode}
+    bind:stopWordsText
+    onSetContinueMode={setContinueMode}
+    onSetStopWords={setStopWords}
+    {ollamaVersion}
+    {serverChecking}
+    {serverOp}
+    {serverError}
+    {serverChatTurns}
+    bind:ollamaBase
+    bind:browseView
+    {runnersError}
+    {sortedManageModels}
+    {runners}
+    {selectedModel}
+    {modelOp}
+    {pulling}
+    bind:confirmDeleteModel
+    bind:pullName
+    {pullStatus}
+    {pullDone}
+    {pullTotal}
+    {pullRate}
+    bind:browseQuery
+    bind:browseCat
+    browseCats={BROWSE_CATS}
+    {filteredCatalog}
+    {catalog}
+    {catalogUpdated}
+    {fetching}
+    {catalogError}
+    {models}
+    bind:variantPick
+    onOpenModelsTab={openModelsTab}
+    onStartServerFlow={startServerFlow}
+    onStopServerFlow={stopServerFlow}
+    onSetOllamaHost={setOllamaHost}
+    onToggleModelLoaded={toggleModelLoaded}
+    onRequestDeleteModel={requestDeleteModel}
+    onSubmitPull={submitPull}
+    onSubmitPullName={submitPullName}
+    onCancelPull={cancelPull}
+    onFetchCatalog={fetchCatalog}
+    {formatPullRate}
+    {isMlxVariant}
+    {pickedVariant}
+    {openrouterKey}
+    {openrouterKeyBusy}
+    {openrouterKeyInfo}
+    bind:openrouterKeyEditing
+    bind:openrouterKeyVisible
+    bind:openrouterKeyDraft
+    {openrouterKeyDirty}
+    {openrouterKeyError}
+    bind:openrouterQuery
+    bind:openrouterCat
+    {openrouterLoading}
+    {openrouterModels}
+    {openrouterBrowsing}
+    {filteredOpenRouterModels}
+    {openrouterUpdated}
+    {openrouterError}
+    {openrouterAddedSet}
+    {openRouterUsageText}
+    onOpenOpenRouterTab={openOpenRouterTab}
+    onVerifyOpenRouterKey={verifyOpenRouterKey}
+    onClearOpenRouterKey={clearOpenRouterKey}
+    onSaveOpenRouterKey={saveOpenRouterKey}
+    onFetchOpenRouterCatalog={fetchOpenRouterCatalog}
+    onToggleOpenRouterAdded={toggleOpenRouterAdded}
+  />
 {/if}
 {#if pluginsOpen}
   <button
@@ -13507,22 +11799,6 @@
   .goto:hover { background: var(--hover-2); }
   .side-footer { margin-top: auto; padding-top: 10px; display: flex; flex-direction: column; align-items: stretch; }
   .side-footer .goto { width: 100%; box-sizing: border-box; }
-  .confirm-card.search-card { width: min(720px, calc(100vw - 48px)); top: 14%; transform: translate(-50%, 0); padding: 10px; }
-  .search-bar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); color: var(--muted); }
-  .search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 16px; }
-  .search-input::placeholder { color: var(--faint); }
-  .search-clear { border: none; background: transparent; color: var(--icon-dim); font-size: 18px; line-height: 1; cursor: pointer; border-radius: 6px; padding: 2px 7px; }
-  .search-clear:hover { background: var(--hover); color: var(--text); }
-  .search-results { max-height: 360px; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
-  .search-row { display: flex; gap: 12px; align-items: flex-start; width: 100%; box-sizing: border-box; text-align: left; border: none; background: transparent; border-radius: 10px; padding: 10px 12px; cursor: pointer; color: var(--text); font: inherit; }
-  .search-row:hover, .search-row.sel { background: var(--hover-2); }
-  .search-ico { flex-shrink: 0; color: var(--muted-2); margin-top: 2px; display: flex; }
-  .search-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-  .search-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
-  .search-line .search-title { min-width: 0; }
-  .search-title { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .search-host { flex-shrink: 0; margin-left: auto; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--muted-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
-  .search-row.sel .search-host { color: var(--muted); border-color: var(--border-strong); }
   /* loading skeletons: grey blocks with a light sweep */
   .skel {
     height: 10px;
@@ -13540,13 +11816,6 @@
   .skel-bubble { align-self: flex-end; height: 38px; border-radius: 14px; }
   .skel-answer { display: flex; flex-direction: column; gap: 10px; }
   @media (prefers-reduced-motion: reduce) { .skel { animation: none; } }
-  .search-note { margin: 0; padding: 4px 18px 8px; font-size: 12px; color: var(--muted-2); }
-  .search-note.search-fail { color: var(--danger); }
-  .search-note.search-old { color: var(--muted-2); font-style: italic; }
-  .search-snippet { font-size: 13px; color: var(--muted-2); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
-  .search-snippet:empty { display: none; }
-  .search-card :global(.search-mark) { background: #f0bd76; color: #1e1e1e; border-radius: 3px; padding: 0 1px; }
-  .search-card .goto-error { margin: 4px 10px 6px 10px; }
   .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
   
   .scope-row { display: flex; align-items: center; gap: 6px; margin: 0 4px 10px 4px; }
@@ -13601,31 +11870,11 @@
   .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .confirm-card.srv-card { width: min(460px, calc(100vw - 48px)); display: flex; flex-direction: column; gap: 6px; }
-  .srv-field-label { font-size: 13.5px; font-weight: 600; color: var(--text); margin-top: 4px; }
-  .srv-optional { font-weight: 400; color: var(--muted); }
-  .srv-input { border: 1px solid var(--border-2); border-radius: 12px; padding: 10px 12px; font: inherit; font-size: 14.5px; background: transparent; color: var(--text); }
-  .srv-input:focus { outline: none; border-color: var(--accent); }
-  .srv-connect-btn { margin-top: 8px; border: 1px solid var(--border-2); border-radius: 12px; padding: 10px; font: inherit; font-size: 15px; font-weight: 600; background: transparent; color: var(--text); cursor: pointer; }
-  .srv-connect-btn:not(:disabled):hover { background: var(--hover-2); }
-  .srv-connect-btn:disabled { opacity: .55; cursor: default; }
-  .srv-recent-label { font-size: 13px; color: var(--muted); margin-top: 14px; }
-  .srv-recent-row { display: flex; gap: 6px; }
-  .srv-recent { flex: 1; min-width: 0; text-align: left; border: 1px solid var(--border-2); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .srv-recent-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); }
-  .srv-recent-input:focus { outline: none; }
-  .srv-recent:hover, .srv-recent-icon:hover { background: var(--hover-2); }
-  .srv-recent-icon { flex: none; width: 40px; border: 1px solid var(--border-2); border-radius: 12px; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
   .srv-menu-rename-row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
   .srv-menu-rename-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 13px; background: transparent; color: var(--text); }
   .srv-menu-rename-input:focus { outline: none; }
   .srv-menu-rename-ok { flex: none; width: 28px; height: 28px; border: 1px solid var(--border-2); border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; }
   .srv-menu-rename-ok:hover { background: var(--hover-3); }
-  .srv-help { font-size: 12px; color: var(--muted); margin: 12px 0 0; line-height: 1.5; }
-  .srv-cmd { position: relative; margin-top: 6px; border: 1px solid var(--border-2); border-radius: 12px; background: var(--hover-2, rgba(0,0,0,.03)); }
-  .srv-cmd pre { margin: 0; padding: 10px 44px 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
-  .srv-cmd-copy { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-2); border-radius: 8px; background: var(--card); color: var(--text-dim); cursor: pointer; }
-  .srv-cmd-copy:hover { color: var(--text); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
   .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
   .chat-item .work-badge.lead-badge { margin-right: auto; }
@@ -13986,74 +12235,6 @@
   .sched-menu-note { font-size: 11.5px; line-height: 1.4; color: var(--muted-2); padding: 6px 14px 8px 14px; border-top: 1px solid var(--border); margin-top: 4px; }
   .sched-count { margin-left: auto; min-width: 18px; height: 18px; box-sizing: border-box; padding: 0 6px; border-radius: 9px; background: var(--accent); color: var(--accent-fg); font-size: 11.5px; font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
   .sched-count.missed { background: var(--danger); color: #fff; }
-  .confirm-backdrop.sched-dim { background: rgba(0,0,0,.35); }
-  .sched-top.confirm-backdrop { z-index: 52; }
-  .sched-top.confirm-card { z-index: 53; }
-  .confirm-card.sched-card { width: min(560px, calc(100vw - 48px)); max-height: 76vh; top: 50%; display: flex; flex-direction: column; }
-  .confirm-card.usage-card { width: min(600px, calc(100vw - 48px)); height: min(640px, 80vh); max-height: 80vh; }
-  .usage-head { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .usage-title-row { display: flex; align-items: center; gap: 8px; padding-right: 28px; }
-  .usage-title-row .sched-title { margin-bottom: 0; }
-  .usage-plan { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--hover); color: var(--text-dim); white-space: nowrap; }
-  .usage-title-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
-  .usage-updated { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
-  .usage-refresh { border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
-  .usage-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-  .usage-refresh:disabled { opacity: .55; cursor: default; }
-  .usage-account { font-size: 12.5px; color: var(--muted); margin: 0 0 -4px 0; }
-  .usage-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-  .usage-tab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
-  .usage-tab:hover { background: var(--hover); color: var(--text); }
-  .usage-tab.sel { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  .usage-body { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
-  .usage-loading { font-size: 13.5px; color: var(--muted); margin: 8px 0; }
-  .usage-groups { display: flex; flex-direction: column; gap: 16px; }
-  .usage-group { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
-  .usage-group-title { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--text); }
-  .usage-group-sub { font-size: 12px; color: var(--muted); margin-top: -6px; line-height: 1.4; }
-  .usage-meters { display: flex; flex-direction: column; gap: 10px; }
-  .usage-meter { display: flex; flex-direction: column; gap: 4px; }
-  .usage-meter-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
-  .usage-meter-label { font-weight: 500; color: var(--text); }
-  .usage-meter-val { font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--text-dim); }
-  .usage-bar { height: 8px; border-radius: 999px; background: var(--hover); overflow: hidden; }
-  .usage-fill { height: 100%; border-radius: 999px; transition: width .2s ease; }
-  .usage-fill.ok { background: #16a34a; }
-  .usage-fill.warn { background: #b45309; }
-  .usage-fill.low { background: var(--danger); }
-  .usage-meter-reset { font-size: 11.5px; color: var(--muted); }
-  .usage-meter-reset.ok { color: #15803d; }
-  .usage-meter-reset.warn { color: #b45309; }
-  .usage-meter-reset.low { color: var(--danger); }
-  .usage-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
-  .usage-stat { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
-  .usage-stat-label { font-size: 11.5px; color: var(--muted); }
-  .usage-stat-val { font-size: 13.5px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
-  .usage-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); margin: 0; }
-  .usage-raw { font-size: 12px; color: var(--muted); }
-  .usage-raw summary { cursor: pointer; user-select: none; }
-  .usage-raw pre { margin: 8px 0 0 0; padding: 10px; border-radius: 8px; background: var(--hover); color: var(--text-dim); font-size: 11.5px; line-height: 1.4; overflow-x: auto; white-space: pre-wrap; user-select: text; }
-  .confirm-card.sched-custom { width: min(420px, calc(100vw - 48px)); }
-  .confirm-text.sched-title { margin-bottom: 6px; }
-  .sched-note { font-size: 12.5px; line-height: 1.45; color: var(--muted); margin: 0 0 12px 0; }
-  .sched-warn { font-size: 13px; line-height: 1.45; color: var(--danger); margin: 0 0 12px 0; }
-  .sched-empty { font-size: 13.5px; line-height: 1.5; color: var(--text-dim); margin: 6px 0 4px 0; }
-  .sched-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; margin: 0 -6px; padding: 0 6px 2px 6px; }
-  .sched-row { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-  .sched-row.missed { border-color: var(--danger); }
-  .sched-row-main { min-width: 0; }
-  .sched-row-when { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sched-row-target { font-weight: 400; color: var(--muted); }
-  .sched-missed-tag { display: inline-block; font-size: 11px; font-weight: 600; color: #fff; background: var(--danger); border-radius: 6px; padding: 1px 6px; margin-right: 6px; }
-  .sched-row-text { font-size: 13.5px; line-height: 1.45; color: var(--text-dim); margin-top: 3px; overflow-wrap: anywhere; user-select: text; }
-  .sched-row-err { font-size: 12.5px; color: var(--danger); margin: 4px 0 0 0; overflow-wrap: anywhere; }
-  .sched-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .sched-fields { display: flex; gap: 10px; margin: 4px 0 12px 0; }
-  .sched-input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; padding: 9px 12px; font: inherit; font-size: 14.5px; background: var(--card); color: var(--text); color-scheme: light dark; }
-  .sched-input:focus { outline: none; border-color: var(--accent); }
-  .sched-actions { margin-top: 14px; }
-  .confirm-ok.sched-quit { background: var(--danger); color: #fff; }
-  .confirm-ok.sched-quit:hover { background: var(--danger); filter: brightness(.93); }
   .editbox { width: 100%; border: 1.5px solid var(--border-strong); border-radius: 16px; padding: 10px 12px 8px 12px; background: var(--card); }
   .editbox textarea { width: 100%; box-sizing: border-box; border: none; outline: none; resize: none; font: inherit; font-size: 14.5px; line-height: 1.5; background: transparent; color: var(--text); }
   .edit-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
@@ -14067,54 +12248,6 @@
   .edit-save:disabled { opacity: .5; cursor: default; }
   .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
   .settings-card { width: 80vw; max-width: 900px; height: 80vh; max-height: 820px; top: 50%; display: flex; flex-direction: column; overflow-y: auto; }
-  .settings-card.settings-split { padding: 0; overflow: hidden; }
-  .settings-close { top: 14px; right: 14px; z-index: 2; }
-  .settings-layout { display: flex; flex: 1; min-height: 0; }
-  .settings-nav { width: 208px; flex-shrink: 0; padding: 20px 12px 16px 12px; border-right: 1px solid var(--border); background: color-mix(in srgb, var(--hover) 38%, var(--card)); display: flex; flex-direction: column; gap: 16px; overflow-y: auto; box-sizing: border-box; }
-  .settings-nav-title { font-size: 16px; font-weight: 700; color: var(--text); margin: 0 0 2px 8px; }
-  .settings-nav-group { display: flex; flex-direction: column; gap: 2px; }
-  .settings-nav-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted-2); padding: 0 10px 4px 10px; }
-  .settings-nav-btn { display: flex; align-items: center; gap: 9px; width: 100%; border: none; background: transparent; color: var(--text-dim); font: inherit; font-size: 13.5px; padding: 7px 10px; border-radius: 9px; cursor: pointer; text-align: left; }
-  .settings-nav-btn:hover { background: var(--hover); color: var(--text); }
-  .settings-nav-btn.sel { background: var(--card); color: var(--text); font-weight: 600; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
-  .nav-ico { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; color: var(--muted-2); flex-shrink: 0; }
-  .settings-nav-btn.sel .nav-ico { color: var(--accent); }
-  .nav-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-left: auto; flex-shrink: 0; }
-  .settings-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .settings-pane-head { padding: 18px 52px 12px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  .settings-pane-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .settings-pane-title { font-size: 17px; font-weight: 700; color: var(--text); margin: 0; }
-  .settings-scope-badge { font-size: 11px; font-weight: 600; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 999px; padding: 2px 9px; }
-  .settings-pane-sub { font-size: 12.5px; color: var(--muted); margin: 4px 0 0 0; line-height: 1.4; }
-  .settings-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 24px 24px 24px; display: flex; flex-direction: column; gap: 14px; }
-  .settings-pane-body.flex-pane { overflow: hidden; padding-bottom: 16px; }
-  .settings-group { border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; background: color-mix(in srgb, var(--hover) 24%, transparent); display: flex; flex-direction: column; gap: 10px; }
-  .settings-group-kicker { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted-2); margin-bottom: 2px; }
-  .settings-group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .settings-group-head-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .settings-group .setting-row { margin: 0; padding: 8px 0; border-top: 1px solid var(--border); }
-  .settings-group .setting-row:first-of-type { border-top: none; padding-top: 0; }
-  .settings-group .setting-row:last-child { padding-bottom: 0; }
-  .settings-group .quit-row { margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--border); }
-  .setting-row-wrap { flex-wrap: wrap; }
-  .theme-seg { flex-wrap: wrap; max-width: 100%; }
-  .settings-divider-top { padding-top: 10px; border-top: 1px solid var(--border); }
-  .setting-details { margin-top: 2px; font-size: 12px; color: var(--muted); }
-  .setting-details summary { cursor: pointer; color: var(--muted-2); user-select: none; font-weight: 500; }
-  .setting-details summary:hover { color: var(--text); }
-  .setting-details p { margin: 8px 0 0 0; line-height: 1.5; }
-  .ollama-host-box { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 14px; }
-  .font-val { font-size: 14px; min-width: 48px; text-align: center; color: var(--text); font-variant-numeric: tabular-nums; margin-top: 5px; }
-  .model-manage-list { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 4px; }
-  .server-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--composer); border-radius: 16px; }
-  .model-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
-  .model-manage-row:last-child { border-bottom: none; }
-  .model-manage-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .model-manage-name { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .model-inuse { color: var(--accent); font-weight: 500; }
-  .model-manage-sub { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
-  .dot-live { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; display: inline-block; }
-  .dot-idle { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); display: inline-block; }
   .mini-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; flex-shrink: 0; }
   .mini-btn:hover:not(:disabled) { background: var(--hover); }
   .mini-btn:disabled { opacity: .5; cursor: default; }
@@ -14122,56 +12255,13 @@
   .mini-btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
   .mini-btn.danger { border-color: var(--danger); color: var(--danger); }
   .mini-btn.danger:hover:not(:disabled) { background: var(--err-bg); }
-  .model-manage-actions { display: flex; gap: 6px; flex-shrink: 0; }
-  .pull-row { display: flex; gap: 8px; padding: 4px 4px 10px 4px; }
   .pull-input { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 13px; font-family: inherit; padding: 6px 14px; }
   .pull-input:focus { outline: none; border-color: var(--accent); }
   .pull-input:disabled { opacity: .5; }
-  .pull-progress { display: flex; flex-direction: column; gap: 6px; padding: 0 4px 10px 4px; font-size: 12px; color: var(--muted); }
-  .pull-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pull-bar { height: 6px; border-radius: 999px; background: var(--hover); overflow: hidden; }
-  .pull-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .2s; }
-  .pull-pct { font-variant-numeric: tabular-nums; }
-  .browse-tabs { margin-bottom: 8px; }
-  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 4px 8px 4px; }
-  .chip { border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 12px; font-family: inherit; cursor: pointer; }
-  .chip:hover { background: var(--hover); color: var(--text); }
-  .chip.sel { background: var(--text); border-color: transparent; color: var(--bg); }
-  .browse-count { font-size: 12px; color: var(--muted); margin: 0; padding: 0 4px 8px 4px; display: flex; align-items: center; gap: 8px; }
-  .fetch-progress { font-variant-numeric: tabular-nums; }
-  .browse-card { border: 1px solid var(--border); border-radius: 14px; padding: 10px 12px; margin: 0 0 8px 0; display: flex; flex-direction: column; gap: 6px; }
-  .browse-head { display: flex; align-items: center; gap: 8px; }
-  .browse-name { font-size: 13.5px; font-weight: 700; color: var(--text); }
-  .browse-installed { font-size: 11px; font-weight: 600; color: var(--ok); border: 1px solid var(--ok); border-radius: 999px; padding: 1px 8px; }
-  .browse-blurb { font-size: 12.5px; color: var(--text-dim); margin: 0; line-height: 1.4; }
-  .browse-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-  .browse-cat { font-size: 11px; color: var(--muted); background: var(--hover); border-radius: 999px; padding: 1px 8px; }
-  .browse-params { font-size: 11.5px; color: var(--muted); }
-  .browse-actions { display: flex; gap: 8px; align-items: center; }
-  .browse-variant { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 12.5px; font-family: inherit; padding: 5px 10px; }
-  .browse-variant:focus { outline: none; border-color: var(--accent); }
-  .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px 0; }
-  .quit-row { margin-top: 20px; margin-bottom: 6px; padding-top: 16px; border-top: 1px solid var(--border); }
-  .setting-label { font-size: 14px; color: var(--text); }
   .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }
   .seg-btn { border: none; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--text-dim); padding: 6px 16px; border-radius: 9px; }
   .seg-btn.sel { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-  .swatches { display: flex; gap: 10px; }
-  .swatch { width: 32px; height: 32px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #fff; padding: 0; }
-  .swatch.sel { border-color: var(--text); }
-  .swatch-check { line-height: 1; text-shadow: 0 1px 2px rgba(0,0,0,.4); }
-  .setting-stacked { display: flex; flex-direction: column; gap: 8px; margin: 0 0 4px 0; }
-  .setting-hint { color: var(--muted); font-weight: 400; }
-  .stopwords-input { width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--card); color: var(--text); font: inherit; font-size: 13px; line-height: 1.6; padding: 10px 12px; resize: vertical; outline: none; }
-  .stopwords-input:focus { border-color: var(--accent); }
-  .setting-note { font-size: 12px; color: var(--muted); }
-  .or-note-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 4px 10px 4px; }
-  .or-panel { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; }
-  .or-models { flex: 1; min-height: 120px; }
-  .or-note-row .setting-note { flex: 1; min-width: 0; }
   .or-id { font-size: 11.5px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .or-meta { flex-wrap: wrap; }
-  .or-usage { color: var(--muted-2); font-variant-numeric: tabular-nums; }
   .mode-toggle { margin-bottom: 18px; }
   .mode-toggle .seg-btn { min-width: 90px; }
   .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
@@ -14197,10 +12287,6 @@
   .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
   .engine-opt:disabled { opacity: .5; cursor: default; }
-  .approval-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
-  .approval-row input { margin-top: 2px; }
-  .notify-sound-pick { max-width: 320px; padding-left: 21px; }
-  .notify-sound-pick :disabled { opacity: 0.5; cursor: default; }
   .engine-ico { flex: none; display: block; width: 14px; height: 14px; object-fit: contain; }
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
@@ -14253,121 +12339,8 @@
   .work-composer-bar .workspace-input { flex: 1; min-width: 0; }
   .explorer-toggle-btn { position: absolute; top: 10px; right: 12px; z-index: 7; background: var(--bg); }
   .explorer-toggle-btn[aria-pressed="true"] { color: var(--accent); }
-  .explorer { width: 300px; flex: 0 0 auto; border-left: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
-  .explorer.hidden { display: none; }
-  .explorer.resizing { user-select: none; }
-  .exp-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; cursor: ew-resize; z-index: 5; touch-action: none; }
-  .exp-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: transparent; transition: background .15s; }
-  .exp-resize:hover::after, .explorer.resizing .exp-resize::after { background: var(--accent); }
-  .exp-resize:focus-visible { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
-  .exp-btn { width: 26px; height: 26px; }
-  .side-tabs { position: relative; display: flex; align-items: center; gap: 4px; padding: 10px 8px 8px 10px; border-bottom: 1px solid var(--border); }
-  .side-tab { display: flex; align-items: center; gap: 2px; min-width: 0; max-width: 150px; border: none; background: transparent; border-radius: 9px; padding: 3px 3px 3px 8px; cursor: pointer; color: var(--muted-2); }
-  .side-tab:hover { background: var(--hover-3); }
-  .side-tab.sel { background: var(--hover-3); color: var(--text); }
-  .side-tab-label { display: flex; align-items: center; gap: 6px; min-width: 0; border: none; background: transparent; color: inherit; font: inherit; font-size: 13px; padding: 2px 0; cursor: pointer; }
-  .plugin-frame { flex: 1; width: 100%; height: 100%; border: 0; display: block; background: var(--bg); }
-  .plugin-tab-icon { display: block; flex-shrink: 0; }
-  .side-tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .side-tab-x { flex-shrink: 0; border: none; background: transparent; color: var(--faint); font-size: 14px; line-height: 1; width: 20px; height: 20px; border-radius: 6px; cursor: pointer; padding: 0; }
-  .side-tab-x:hover { background: var(--hover); color: var(--text); }
-  .side-add { width: 26px; height: 26px; flex-shrink: 0; }
-  .new-tab-menu { position: absolute; left: 8px; top: calc(100% - 2px); z-index: 42; min-width: 160px; }
-  .new-tab-menu .ctx-item { display: flex; align-items: center; gap: 9px; }
-  .side-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  .side-view.hidden { display: none; }
-  .term-wrap { flex: 1; min-height: 0; padding: 8px 4px 8px 10px; background: var(--bg); }
-  .browser-frame { flex: 1; min-height: 0; width: 100%; border: none; background: var(--bg); }
-  .browser-stale { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 12.5px; color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--card)); border-bottom: 1px solid var(--border); }
-  .browser-stale span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .browser-start-hint { margin-top: 8px; font-size: 12px; line-height: 1.45; color: var(--muted); opacity: 0.85; }
-  .browser-dl-bar { margin-top: 10px; width: min(240px, 70%); height: 6px; accent-color: var(--accent); }
-  @keyframes browser-restart-spin { to { transform: rotate(360deg); } }
-  .browser-restarting svg { animation: browser-restart-spin 1s linear infinite; }
-  .browser-kill-armed { color: var(--danger); }
-  .exp-empty.browser-error { display: flex; flex-direction: column; align-items: center; gap: 10px; }
-  .exp-empty.browser-error span { overflow-wrap: anywhere; }
-  .explorer-search { display: flex; align-items: center; gap: 7px; margin: 10px 10px 8px 10px; padding: 7px 6px 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--muted); }
-  .explorer-search-input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding: 0; }
-  .explorer-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 6px 10px 6px; min-height: 0; }
-  .exp-row { display: flex; align-items: center; gap: 7px; width: 100%; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; padding-top: 5px; padding-bottom: 5px; padding-right: 8px; border-radius: 8px; cursor: pointer; text-align: left; min-width: 0; }
-  .exp-row:hover { background: var(--hover-3); }
-  .exp-rename { flex: 1; min-width: 0; font: inherit; font-size: 12.5px; color: var(--text); background: var(--bg); border: 1.5px solid var(--accent); border-radius: 6px; padding: 2px 6px; outline: none; }
-  .exp-chev { flex-shrink: 0; width: 12px; font-size: 10px; color: var(--muted); }
-  .exp-icon { flex-shrink: 0; color: var(--muted-2); }
-  .exp-dir .exp-icon { color: var(--accent); }
-  .exp-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .exp-file .exp-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
-  .exp-size { flex-shrink: 0; font-size: 11px; color: var(--faint); }
-  .exp-empty { padding: 18px 14px; font-size: 13px; color: var(--muted); text-align: center; }
-  .explorer-toast { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 20; background: var(--card); border: 1px solid var(--border-2); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 8px 12px; font-size: 12.5px; color: var(--text); pointer-events: none; text-align: center; animation: notice-in .14s ease-out; }
-  @media (prefers-reduced-motion: reduce) { .explorer-toast { animation: none; } }
   .mcp-btn { position: relative; }
   .mcp-dot { position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; }
-  .mcp-backdrop { position: fixed; inset: 0; z-index: 60; border: none; background: rgba(0,0,0,.45); cursor: default; padding: 0; }
-  .mcp-popup { position: fixed; z-index: 61; left: 50%; top: 16%; transform: translateX(-50%); width: min(560px, calc(100vw - 48px)); max-height: 70vh; overflow-y: auto; background: var(--bg); color: var(--text); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.4); padding: 18px 18px 12px 18px; box-sizing: border-box; }
-  .mcp-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
-  .mcp-title { font-size: 17px; font-weight: 800; }
-  .mcp-esc { font-size: 13px; color: var(--muted); }
-  .mcp-search { width: 100%; box-sizing: border-box; border: none; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 17px; padding: 4px 2px 10px 2px; }
-  .mcp-search::placeholder { color: var(--faint); }
-  .mcp-tabs { align-self: stretch; margin-bottom: 6px; }
-  .mcp-tabs .seg-btn { flex: 1; }
-  .mcp-tabs .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
-  .builtin-list { gap: 2px; }
-  .builtin-row { align-items: center; }
-  .builtin-icon { flex-shrink: 0; width: 32px; height: 32px; border-radius: 9px; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
-  .mcp-row.sel .builtin-icon { background: rgba(255,255,255,.22); color: inherit; }
-  .builtin-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-  .builtin-info .mcp-name { font-size: 15px; }
-  .builtin-blurb { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mcp-row.sel .builtin-blurb { color: inherit; opacity: .85; }
-  .builtin-add { flex-shrink: 0; border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 12px; font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
-  .builtin-add:hover:not(:disabled) { background: var(--hover); }
-  .builtin-add:disabled { opacity: .5; cursor: default; }
-  .mcp-row.sel .builtin-add { border-color: currentColor; color: inherit; }
-  .mcp-row.sel .builtin-add:hover:not(:disabled) { background: rgba(255,255,255,.22); }
-  .mcp-list { display: flex; flex-direction: column; }
-  .mcp-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; overflow: hidden; box-sizing: border-box; border: none; background: transparent; color: var(--text); font: inherit; font-size: 15.5px; padding: 5px 8px; border-radius: 8px; cursor: pointer; text-align: left; }
-  .mcp-row.sel { background: var(--accent); color: var(--accent-fg); }
-  .mcp-row.sel .mcp-status, .mcp-row.sel .mcp-tools-n, .mcp-row.sel .mcp-mini { color: inherit; opacity: .9; }
-  .mcp-name { font-weight: 700; min-width: 0; flex-shrink: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mcp-tools-n { font-size: 12px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
-  .mcp-status { margin-left: auto; min-width: 0; flex-shrink: 1; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14.5px; }
-  .mcp-status.connected { color: var(--accent); }
-  .mcp-row.sel .mcp-status.connected { color: inherit; }
-  .mcp-status.disabled { color: var(--muted); }
-  .mcp-status.error { color: #d9732b; }
-  .mcp-status.idle { color: var(--muted); }
-  .mcp-row-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
-  .mcp-mini { border: none; background: transparent; color: var(--faint); font-size: 13px; line-height: 1; width: 22px; height: 22px; border-radius: 6px; cursor: pointer; padding: 0; }
-  .mcp-mini:hover { background: rgba(127,127,127,.25); color: var(--text); }
-  .mcp-row.sel .mcp-mini:hover { background: rgba(255,255,255,.25); color: inherit; }
-  .mcp-mini.danger { width: auto; padding: 0 6px; font-size: 12px; }
-  .mcp-row-error { font-size: 12px; color: #d9732b; padding: 0 8px 6px 8px; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 4.5em; overflow-y: auto; }
-  .mcp-empty { padding: 12px 8px; font-size: 13.5px; color: var(--muted); }
-  .mcp-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 2px 4px 2px; }
-  .mcp-type { align-self: stretch; }
-  .mcp-type .seg-btn { flex: 1; }
-  .mcp-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); cursor: pointer; }
-  .mcp-check input { accent-color: var(--accent); }
-  .mcp-loginrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .mcp-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding-top: 10px; font-size: 14px; color: var(--text); }
-  .mcp-hint { color: var(--text); }
-  .mcp-key { color: var(--faint); }
-  .mcp-spacer { flex: 1; }
-  .mcp-add { border: none; background: transparent; color: var(--muted-2); font: inherit; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 6px; }
-  .mcp-add:hover { background: var(--hover); color: var(--text); }
-  .mcp-add:disabled { opacity: .5; cursor: default; }
-  .mcp-file { font-size: 11.5px; color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .mcp-pat-veil { position: absolute; inset: 0; z-index: 5; border-radius: 14px; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
-  .mcp-pat-card { width: 100%; max-width: 380px; background: var(--bg); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.4); padding: 18px; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; }
-  .mcp-pat-title { font-size: 16px; font-weight: 800; }
-  .mcp-pat-body { margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--text-dim); }
-  .mcp-pat-body.dim { font-size: 12.5px; color: var(--muted); }
-  .mcp-pat-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
-  .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
-  .mcp-pat-link:hover { text-decoration: underline; }
   /* Narrow main column (small window OR side panels open): shift the Work
    * banner right so the collapsed-rail toggle can't overlap them.
    * Viewport media queries can't see panel-driven narrowing, hence @container. */

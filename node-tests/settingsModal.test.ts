@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 
 const root = new URL("..", import.meta.url).pathname;
-const chatApp = readFileSync(root + "src/lib/ChatApp.svelte", "utf8");
+const chatApp = readFileSync(root + "src/lib/SettingsModal.svelte", "utf8");
 
 test("Settings General tab puts App updates first before Appearance", () => {
   const modalStart = chatApp.indexOf('data-testid="settings-modal"');
