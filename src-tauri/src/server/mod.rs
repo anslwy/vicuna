@@ -364,6 +364,7 @@ async fn dispatch(
                     lead: args.get("lead").and_then(|v| v.as_bool()).unwrap_or(false),
                     report_to: rec.as_ref().and(arg_opt_str(args, "reportTo")),
                     mcp_selection: selection,
+                    skills_enabled: crate::skills::selection(args),
                     rec,
                 },
             )
@@ -798,22 +799,26 @@ async fn dispatch(
         "skills_list" => Ok(serde_json::json!(crate::skills::list_skills()?)),
         "skills_read" => Ok(serde_json::json!(crate::skills::read_skill(&s("slug")?)?)),
         "skills_save" => {
-            let enabled = args.get("enabled").and_then(|v| v.as_bool());
-            Ok(serde_json::json!(crate::skills::save_skill(
-                &s("slug")?,
-                &s("content")?,
-                enabled
-            )?))
+            let _write = st.chat_lock.lock().await;
+            Ok(serde_json::json!(crate::skills::save_skill(&s("slug")?, &s("content")?)?))
         }
-        "skills_toggle" => {
-            let enabled = args
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .ok_or_else(|| "missing `enabled`".to_string())?;
-            Ok(serde_json::json!(crate::skills::toggle_skill(&s("slug")?, enabled)?))
+        "skills_set_defaults" => {
+            let enabled = crate::skills::selection(args).ok_or("Missing skill enabled states")?;
+            let _write = st.chat_lock.lock().await;
+            if let Some(db) = &st.db {
+                let defaults = crate::skills::defaults();
+                crate::server_store::update_skill_maps(db, |old| old.is_none().then(|| defaults.clone())).await?;
+            }
+            crate::skills::set_defaults(&enabled)?;
+            Ok(serde_json::Value::Null)
         }
         "skills_remove" => {
-            crate::skills::remove_skill(&s("slug")?)?;
+            let slug = s("slug")?;
+            let _write = st.chat_lock.lock().await;
+            crate::skills::remove_skill(&slug)?;
+            if let Some(db) = &st.db {
+                crate::server_store::remove_session_skill(db, &slug).await?;
+            }
             Ok(serde_json::Value::Null)
         }
         "mcp_connect" => {
@@ -1460,7 +1465,7 @@ pub const API_ACTIONS: &[&str] = &[
     "skills_read",
     "skills_remove",
     "skills_save",
-    "skills_toggle",
+    "skills_set_defaults",
     "telegram_list",
     "telegram_remove",
     "telegram_save",

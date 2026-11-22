@@ -5575,14 +5575,13 @@ async fn skills_read(slug: String) -> Result<skills::SkillDetail, String> {
 async fn skills_save(
     slug: String,
     content: String,
-    enabled: Option<bool>,
 ) -> Result<skills::SkillSummary, String> {
-    skills::save_skill(&slug, &content, enabled)
+    skills::save_skill(&slug, &content)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-async fn skills_toggle(slug: String, enabled: bool) -> Result<skills::SkillSummary, String> {
-    skills::toggle_skill(&slug, enabled)
+async fn skills_set_defaults(skills_enabled: skills::EnabledMap) -> Result<(), String> {
+    skills::set_defaults(&skills_enabled)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -5891,7 +5890,7 @@ pub fn run() {
             skills_list,
             skills_read,
             skills_save,
-            skills_toggle,
+            skills_set_defaults,
             skills_remove,
             browser_status,
             browser_start,

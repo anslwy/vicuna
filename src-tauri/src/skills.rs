@@ -3,11 +3,12 @@
 //! Each skill lives in its own folder under `~/vicuna/skills/<slug>/` with a
 //! `SKILL.md` file (YAML frontmatter `name:` + `description:` followed by
 //! Markdown instructions). Enabled/disabled state is stored in
-//! `~/vicuna/config/skills.json` (skills default to enabled when newly created
-//! or added on disk).
+//! Work session metadata. New sessions snapshot the defaults in
+//! `~/vicuna/config/skills.json`; unlisted skills are enabled.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Max `SKILL.md` size accepted by `save_skill` (matches `work_write_file_logic`).
@@ -32,10 +33,20 @@ pub struct SkillDetail {
     pub content: String,
 }
 
+pub type EnabledMap = BTreeMap<String, bool>;
+
+pub(crate) fn selection(extra: &serde_json::Value) -> Option<EnabledMap> {
+    serde_json::from_value(extra["skillsEnabled"].clone()).ok()
+}
+
+fn is_enabled(selection: &EnabledMap, slug: &str) -> bool {
+    selection.get(slug).copied().unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SkillsConfig {
     #[serde(default)]
-    enabled: BTreeMap<String, bool>,
+    enabled: EnabledMap,
 }
 
 /// Root folder for Vicuna-managed skills: `~/vicuna/skills`.
@@ -44,7 +55,7 @@ pub fn skills_dir() -> Result<PathBuf, String> {
     Ok(home.join("vicuna").join("skills"))
 }
 
-/// Config file storing per-skill enabled state: `~/vicuna/config/skills.json`.
+/// Config file storing defaults for new Work sessions: `~/vicuna/config/skills.json`.
 pub fn skills_config_path() -> Result<PathBuf, String> {
     let home = crate::opencode::home_dir().ok_or_else(|| "cannot locate home directory".to_string())?;
     Ok(home.join("vicuna").join("config").join("skills.json"))
@@ -145,8 +156,39 @@ fn write_config(path: &Path, cfg: &SkillsConfig) -> Result<(), String> {
     }
     let body = serde_json::to_string_pretty(cfg)
         .map_err(|e| format!("cannot serialize skills config: {e}"))?;
-    std::fs::write(path, format!("{body}\n"))
-        .map_err(|e| format!("cannot write skills config: {e}"))
+    let mut nonce = [0; 8];
+    getrandom::fill(&mut nonce).map_err(|e| format!("cannot prepare skills config: {e}"))?;
+    let temp = path.with_extension(format!("{:016x}.tmp", u64::from_ne_bytes(nonce)));
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        writeln!(file, "{body}")?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("cannot write skills config: {e}")
+    })
+}
+
+pub(crate) fn defaults_in(path: &Path) -> EnabledMap {
+    read_config(path).enabled
+}
+
+pub(crate) fn defaults() -> EnabledMap {
+    skills_config_path().map(|path| defaults_in(&path)).unwrap_or_default()
+}
+
+pub(crate) fn set_defaults_in(root: &Path, path: &Path, enabled: &EnabledMap) -> Result<(), String> {
+    let enabled = list_skills_in(root, enabled)?
+        .into_iter()
+        .map(|skill| (skill.slug, skill.enabled))
+        .collect();
+    write_config(path, &SkillsConfig { enabled })
+}
+
+pub(crate) fn set_defaults(enabled: &EnabledMap) -> Result<(), String> {
+    set_defaults_in(&skills_dir()?, &skills_config_path()?, enabled)
 }
 
 fn unquote_yaml_scalar(raw: &str) -> String {
@@ -273,16 +315,35 @@ fn summary_from_content(slug: &str, path: &Path, content: &str, enabled: bool) -
 
 /// List all valid skills in `~/vicuna/skills/`.
 pub fn list_skills() -> Result<Vec<SkillSummary>, String> {
-    list_skills_in(&skills_dir()?, &skills_config_path()?)
+    list_skills_in(&skills_dir()?, &defaults())
 }
 
-pub fn list_skills_in(skills_root: &Path, config_path: &Path) -> Result<Vec<SkillSummary>, String> {
+pub fn list_skills_in(root: &Path, selection: &EnabledMap) -> Result<Vec<SkillSummary>, String> {
+    find_skills(root, selection, None)
+}
+
+pub(crate) fn search_skills_in(
+    root: &Path,
+    selection: &EnabledMap,
+    query: &str,
+) -> Result<Vec<SkillSummary>, String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Err("manage_skills action 'search' requires a non-empty query".into());
+    }
+    find_skills(root, selection, Some(&query))
+}
+
+fn find_skills(
+    skills_root: &Path,
+    selection: &EnabledMap,
+    query: Option<&str>,
+) -> Result<Vec<SkillSummary>, String> {
     if !skills_root.exists() {
         return Ok(Vec::new());
     }
     let canon_root = std::fs::canonicalize(skills_root)
         .map_err(|e| format!("cannot read skills directory: {e}"))?;
-    let cfg = read_config(config_path);
     let entries = std::fs::read_dir(&canon_root)
         .map_err(|e| format!("cannot list skills directory: {e}"))?;
 
@@ -304,8 +365,14 @@ pub fn list_skills_in(skills_root: &Path, config_path: &Path) -> Result<Vec<Skil
         let Ok(content) = std::fs::read_to_string(&canon_file) else {
             continue;
         };
-        let enabled = *cfg.enabled.get(&fname).unwrap_or(&true);
-        out.push(summary_from_content(&fname, &canon_file, &content, enabled));
+        let summary = summary_from_content(&fname, &canon_file, &content, is_enabled(selection, &fname));
+        if query.is_none_or(|query| {
+            [&summary.slug, &summary.name, &summary.description, &content]
+                .iter()
+                .any(|field| field.to_lowercase().contains(query))
+        }) {
+            out.push(summary);
+        }
     }
     out.sort_by(|a, b| a.slug.cmp(&b.slug));
     Ok(out)
@@ -313,12 +380,12 @@ pub fn list_skills_in(skills_root: &Path, config_path: &Path) -> Result<Vec<Skil
 
 /// Read a single skill's `SKILL.md` content and metadata.
 pub fn read_skill(slug: &str) -> Result<SkillDetail, String> {
-    read_skill_in(&skills_dir()?, &skills_config_path()?, slug)
+    read_skill_in(&skills_dir()?, &defaults(), slug)
 }
 
 pub fn read_skill_in(
     skills_root: &Path,
-    config_path: &Path,
+    selection: &EnabledMap,
     slug: &str,
 ) -> Result<SkillDetail, String> {
     let file = skill_file_path(skills_root, slug)?;
@@ -328,9 +395,7 @@ pub fn read_skill_in(
     }
     let content = std::fs::read_to_string(&canon_file)
         .map_err(|e| format!("cannot read skill '{slug}': {e}"))?;
-    let cfg = read_config(config_path);
-    let enabled = *cfg.enabled.get(slug).unwrap_or(&true);
-    let summary = summary_from_content(slug, &canon_file, &content, enabled);
+    let summary = summary_from_content(slug, &canon_file, &content, is_enabled(selection, slug));
     Ok(SkillDetail {
         slug: summary.slug,
         name: summary.name,
@@ -341,18 +406,16 @@ pub fn read_skill_in(
     })
 }
 
-/// Create or overwrite a skill's `SKILL.md` and optionally set its enabled state.
-/// Newly created skills default to enabled (`true`) when `enabled` is `None`.
-pub fn save_skill(slug: &str, content: &str, enabled: Option<bool>) -> Result<SkillSummary, String> {
-    save_skill_in(&skills_dir()?, &skills_config_path()?, slug, content, enabled)
+/// Create or overwrite a shared skill definition.
+pub fn save_skill(slug: &str, content: &str) -> Result<SkillSummary, String> {
+    save_skill_in(&skills_dir()?, &defaults(), slug, content)
 }
 
 pub fn save_skill_in(
     skills_root: &Path,
-    config_path: &Path,
+    selection: &EnabledMap,
     slug: &str,
     content: &str,
-    enabled: Option<bool>,
 ) -> Result<SkillSummary, String> {
     validate_slug(slug)?;
     if content.len() > MAX_SKILL_BYTES {
@@ -366,44 +429,14 @@ pub fn save_skill_in(
     // Ensure folder itself isn't a symlink escaping skills_root.
     let canon_dir = verify_inside_root(skills_root, &dir)?;
     let file = canon_dir.join("SKILL.md");
+    if file.symlink_metadata().is_ok() {
+        verify_inside_root(skills_root, &file)?;
+    }
     std::fs::write(&file, content.as_bytes())
         .map_err(|e| format!("cannot write skill '{slug}': {e}"))?;
     let canon_file = verify_inside_root(skills_root, &file)?;
 
-    let mut cfg = read_config(config_path);
-    let is_enabled = match enabled {
-        Some(v) => {
-            cfg.enabled.insert(slug.to_string(), v);
-            v
-        }
-        None => *cfg.enabled.entry(slug.to_string()).or_insert(true),
-    };
-    write_config(config_path, &cfg)?;
-    Ok(summary_from_content(slug, &canon_file, content, is_enabled))
-}
-
-/// Enable or disable an existing skill.
-pub fn toggle_skill(slug: &str, enabled: bool) -> Result<SkillSummary, String> {
-    toggle_skill_in(&skills_dir()?, &skills_config_path()?, slug, enabled)
-}
-
-pub fn toggle_skill_in(
-    skills_root: &Path,
-    config_path: &Path,
-    slug: &str,
-    enabled: bool,
-) -> Result<SkillSummary, String> {
-    let file = skill_file_path(skills_root, slug)?;
-    let canon_file = verify_inside_root(skills_root, &file)?;
-    if !canon_file.is_file() {
-        return Err(format!("skill '{slug}' not found"));
-    }
-    let content = std::fs::read_to_string(&canon_file)
-        .map_err(|e| format!("cannot read skill '{slug}': {e}"))?;
-    let mut cfg = read_config(config_path);
-    cfg.enabled.insert(slug.to_string(), enabled);
-    write_config(config_path, &cfg)?;
-    Ok(summary_from_content(slug, &canon_file, &content, enabled))
+    Ok(summary_from_content(slug, &canon_file, content, is_enabled(selection, slug)))
 }
 
 /// Remove a skill directory and its config entry cleanly.
@@ -417,27 +450,27 @@ pub fn remove_skill_in(skills_root: &Path, config_path: &Path, slug: &str) -> Re
     if !dir.exists() {
         return Err(format!("skill '{slug}' not found"));
     }
-    let canon_dir = verify_inside_root(skills_root, &dir)?;
-    std::fs::remove_dir_all(&canon_dir)
+    verify_inside_root(skills_root, &dir)?;
+    std::fs::remove_dir_all(&dir)
         .map_err(|e| format!("cannot remove skill '{slug}': {e}"))?;
     let mut cfg = read_config(config_path);
     if cfg.enabled.remove(slug).is_some() {
-        let _ = write_config(config_path, &cfg);
+        write_config(config_path, &cfg)?;
     }
     Ok(())
 }
 
 /// Build the compact `<vicuna_skills>` prompt block injected into every Work
 /// harness's `system_prompt`. Returns an empty string when no skills are enabled.
-pub fn format_skills_prompt() -> String {
-    let (Ok(root), Ok(cfg)) = (skills_dir(), skills_config_path()) else {
+pub fn format_skills_prompt(selection: &EnabledMap) -> String {
+    let Ok(root) = skills_dir() else {
         return String::new();
     };
-    format_skills_prompt_in(&root, &cfg)
+    format_skills_prompt_in(&root, selection)
 }
 
-pub fn format_skills_prompt_in(skills_root: &Path, config_path: &Path) -> String {
-    let Ok(all) = list_skills_in(skills_root, config_path) else {
+pub fn format_skills_prompt_in(skills_root: &Path, selection: &EnabledMap) -> String {
+    let Ok(all) = list_skills_in(skills_root, selection) else {
         return String::new();
     };
     let enabled: Vec<SkillSummary> = all.into_iter().filter(|s| s.enabled).collect();
@@ -522,14 +555,15 @@ mod tests {
     #[test]
     fn crud_lifecycle_and_prompt_formatting() {
         let (base, root, cfg) = temp_env("crud");
+        let mut selection = EnabledMap::new();
 
         // Empty initially -> empty list and empty prompt
-        assert!(list_skills_in(&root, &cfg).unwrap().is_empty());
-        assert_eq!(format_skills_prompt_in(&root, &cfg), "");
+        assert!(list_skills_in(&root, &selection).unwrap().is_empty());
+        assert_eq!(format_skills_prompt_in(&root, &selection), "");
 
         // Save new skill (defaults to enabled)
         let md = "---\nname: PR Review\ndescription: Thorough code review checklist\n---\n\n# Steps\n1. Read diff\n";
-        let created = save_skill_in(&root, &cfg, "pr-review", md, None).unwrap();
+        let created = save_skill_in(&root, &selection, "pr-review", md).unwrap();
         assert_eq!(created.slug, "pr-review");
         assert_eq!(created.name, "PR Review");
         assert_eq!(created.description, "Thorough code review checklist");
@@ -537,30 +571,36 @@ mod tests {
         assert!(created.path.ends_with("pr-review/SKILL.md") || created.path.ends_with(r"pr-review\SKILL.md"));
 
         // Read back
-        let detail = read_skill_in(&root, &cfg, "pr-review").unwrap();
+        let detail = read_skill_in(&root, &selection, "pr-review").unwrap();
         assert_eq!(detail.content, md);
         assert!(detail.enabled);
 
         // Prompt includes enabled skill and ~/vicuna/skills/ note
-        let prompt = format_skills_prompt_in(&root, &cfg);
+        let prompt = format_skills_prompt_in(&root, &selection);
         assert!(prompt.contains("<vicuna_skills>"));
         assert!(prompt.contains("PR Review (`pr-review`): Thorough code review checklist"));
         assert!(prompt.contains("~/vicuna/skills/"));
 
-        // Disable -> prompt becomes empty again
-        let disabled = toggle_skill_in(&root, &cfg, "pr-review", false).unwrap();
-        assert!(!disabled.enabled);
-        assert_eq!(format_skills_prompt_in(&root, &cfg), "");
+        // A session switch leaves another session and the defaults alone.
+        let old_session = defaults_in(&cfg);
+        selection.insert("pr-review".into(), false);
+        assert_eq!(format_skills_prompt_in(&root, &selection), "");
+        assert_eq!(format_skills_prompt_in(&root, &old_session), prompt);
+        assert!(defaults_in(&cfg).is_empty());
+        assert_ne!(crate::acp::skills_scope(""), crate::acp::skills_scope(&prompt));
 
-        // Re-enable
-        let enabled = toggle_skill_in(&root, &cfg, "pr-review", true).unwrap();
-        assert!(enabled.enabled);
-        assert!(!format_skills_prompt_in(&root, &cfg).is_empty());
+        set_defaults_in(&root, &cfg, &selection).unwrap();
+        let new_session = defaults_in(&cfg);
+        assert_eq!(new_session, selection);
+        assert_eq!(format_skills_prompt_in(&root, &new_session), "");
+        assert_eq!(format_skills_prompt_in(&root, &old_session), prompt);
+        save_skill_in(&root, &new_session, "another", "# New").unwrap();
+        assert!(list_skills_in(&root, &new_session).unwrap()[0].enabled);
 
         // Remove cleans directory and config
         remove_skill_in(&root, &cfg, "pr-review").unwrap();
-        assert!(list_skills_in(&root, &cfg).unwrap().is_empty());
-        assert!(read_skill_in(&root, &cfg, "pr-review").is_err());
+        assert!(defaults_in(&cfg).is_empty());
+        assert!(read_skill_in(&root, &selection, "pr-review").is_err());
 
         let _ = std::fs::remove_dir_all(&base);
     }

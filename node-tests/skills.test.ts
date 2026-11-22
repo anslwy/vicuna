@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { chatExtraJson, parseChatExtra } from "../src/lib/leadSessions.ts";
 import {
   buildSkillTemplate,
   enabledSkillCount,
+  newSkillSelection,
+  resolveSkills,
+  skillSwitches,
   slugifySkillName,
   validateSkillSlug,
   type SkillSummary
@@ -44,4 +48,27 @@ test("enabledSkillCount counts only enabled skills", () => {
   ];
   assert.equal(enabledSkillCount(list), 2);
   assert.equal(enabledSkillCount([]), 0);
+});
+
+
+test("draft choices and saved session switches stay separate from defaults", () => {
+  const skill = (slug: string, enabled: boolean): SkillSummary => ({
+    slug, enabled, name: slug, description: "", path: `/tmp/${slug}/SKILL.md`
+  });
+  const defaults = [skill("review", true), skill("release", false)];
+  const sessionA = newSkillSelection(defaults, { review: false, release: true, removed: false });
+  const sessionB = newSkillSelection(defaults);
+  assert.deepEqual(sessionA, { review: false, release: true });
+  assert.deepEqual(sessionB, { review: true, release: false });
+  const metadata = { skillsEnabled: sessionA, mcpEnabled: { browser: true }, engine: "pi" };
+  assert.deepEqual(parseChatExtra(chatExtraJson(metadata)), metadata);
+  assert.deepEqual(parseChatExtra(chatExtraJson({ skillsEnabled: {} })), { skillsEnabled: {} });
+
+  const savedDefaults = resolveSkills(defaults, sessionA);
+  assert.deepEqual(skillSwitches(savedDefaults), sessionA);
+  assert.deepEqual(newSkillSelection(savedDefaults), sessionA);
+  assert.deepEqual(skillSwitches(resolveSkills(savedDefaults, sessionB)), sessionB);
+
+  const catalogAfterAdd = [...savedDefaults, skill("new", true)];
+  assert.deepEqual(skillSwitches(resolveSkills(catalogAfterAdd, sessionB)), { ...sessionB, new: true });
 });

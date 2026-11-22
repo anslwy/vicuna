@@ -1,3 +1,4 @@
+import type { SkillsEnabledMap } from "./skills";
 import type { McpEnabledMap, McpSelection } from "./mcp";
 // Vicuna Work mode: the user's opencode CLI, driven by the backend over ACP
 // (src-tauri/src/acp.rs). This module holds the IPC wrappers (turns, engine
@@ -494,6 +495,7 @@ export type WorkAgentEvent =
   | { type: "sessioncontrol"; req_id: string; action: string; args: Record<string, any> }
   | { type: "bgcompleted"; job_id: string; command: string; output: string }
   | { type: "contextcompacted"; note: string }
+  | { type: "skillschanged"; session_id: string; enabled: SkillsEnabledMap | null; removed: string | null }
   | { type: "mcpchanged"; enabled: McpEnabledMap | null; wake: [string, number | null] | null }
   | { type: "done"; stopped: boolean }
   | { type: "error"; message: string };
@@ -538,6 +540,7 @@ export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> 
 }
 
 export interface WorkTurnParams extends McpSelection {
+  skillsEnabled?: SkillsEnabledMap;
   /** "opencode" | "claude" | "codex" | "fx" | "agy" | "pi" (absent = the backend's saved choice) */
   engine?: string;
   /** engine model id; empty = saved pick / engine default */
@@ -570,6 +573,7 @@ export async function startWorkAgentTurn(p: WorkTurnParams): Promise<string> {
     sessionId: p.sessionId ?? null,
     lead: p.lead ?? false,
     mcpEnabled: p.mcpEnabled ?? null,
+    skillsEnabled: p.skillsEnabled ?? null,
     mcpOnly: p.mcpOnly ?? null,
     // server mode (ignored elsewhere): see WorkTurnParams.persist
     ...(p.persist ? { persistChat: p.persist.chat, persistIndex: p.persist.index, reportTo: p.reportTo ?? null } : {}),

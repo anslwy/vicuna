@@ -288,11 +288,11 @@ pub(crate) async fn merge_chats(
         sqlx::query("DELETE FROM messages WHERE chat_id = $1").bind(id).execute(&mut *tx).await.map_err(err)?;
         sqlx::query("DELETE FROM chats WHERE id = $1").bind(id).execute(&mut *tx).await.map_err(err)?;
     }
-    for chat in chats {
+    for mut chat in chats {
         if chat.id.is_empty() {
             continue;
         }
-        let current = sqlx::query("SELECT rev, server_recorded FROM chats WHERE id = $1")
+        let current = sqlx::query("SELECT rev, server_recorded, extra FROM chats WHERE id = $1")
             .bind(&chat.id)
             .fetch_optional(&mut *tx)
             .await
@@ -303,6 +303,16 @@ pub(crate) async fn merge_chats(
         if exists && (live.contains(&chat.id) || chat.base_rev.is_some_and(|b| b != cur_rev) || (recorded != 0 && chat.base_rev.is_none())) {
             refused.push(chat.id.clone());
             continue;
+        }
+        if chat.mode.as_deref() == Some("work") {
+            let mut extra = crate::mcp::extra_object(chat.extra.as_deref());
+            if crate::skills::selection(&extra).is_none() {
+                let old: Option<String> = current.as_ref().and_then(|row| row.try_get("extra").ok()).flatten();
+                let enabled = crate::skills::selection(&crate::mcp::extra_object(old.as_deref()))
+                    .unwrap_or_else(crate::skills::defaults);
+                extra["skillsEnabled"] = json!(enabled);
+                chat.extra = Some(extra.to_string());
+            }
         }
         let rev = cur_rev + 1;
         sqlx::query(
@@ -492,6 +502,82 @@ pub(crate) async fn set_session_mcp(
         .map_err(err)?;
     tx.commit().await.map_err(err)?;
     Ok(selection)
+}
+
+pub(crate) async fn session_skills(pool: &Pool, id: &str) -> Result<Option<crate::skills::EnabledMap>, String> {
+    let raw: Option<Option<String>> = sqlx::query_scalar("SELECT extra FROM chats WHERE id = $1 AND mode = 'work'")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("load session skills: {e}"))?;
+    Ok(raw.map(|raw| {
+        crate::skills::selection(&crate::mcp::extra_object(raw.as_deref())).unwrap_or_else(crate::skills::defaults)
+    }))
+}
+
+pub(crate) async fn set_session_skill(
+    pool: &Pool,
+    id: &str,
+    slug: &str,
+    enabled: bool,
+    defaults: &crate::skills::EnabledMap,
+) -> Result<crate::skills::EnabledMap, String> {
+    let err = |e: sqlx::Error| format!("update session skills: {e}");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
+    let raw: Option<String> = sqlx::query_scalar("SELECT extra FROM chats WHERE id = $1 AND mode = 'work'")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(err)?
+        .ok_or("Work session no longer exists")?;
+    let mut extra = crate::mcp::extra_object(raw.as_deref());
+    let mut selection = crate::skills::selection(&extra).unwrap_or_else(|| defaults.clone());
+    selection.insert(slug.into(), enabled);
+    extra["skillsEnabled"] = json!(selection);
+    write_skills_extra(&mut tx, id, &extra).await?;
+    tx.commit().await.map_err(err)?;
+    Ok(selection)
+}
+
+async fn write_skills_extra(tx: &mut sqlx::SqliteTransaction<'_>, id: &str, extra: &Value) -> Result<(), String> {
+    sqlx::query("UPDATE chats SET extra = $2, rev = COALESCE(rev, 0) + 1 WHERE id = $1")
+        .bind(id)
+        .bind(extra.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("update session skills: {e}"))?;
+    Ok(())
+}
+
+/// Preserve legacy Work sessions' effective selection before changing defaults,
+/// or forget a deleted definition's switch in all saved Work sessions.
+pub(crate) async fn update_skill_maps(
+    pool: &Pool,
+    mut update: impl FnMut(Option<crate::skills::EnabledMap>) -> Option<crate::skills::EnabledMap>,
+) -> Result<(), String> {
+    let err = |e: sqlx::Error| format!("update saved session skills: {e}");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(err)?;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, extra FROM chats WHERE mode = 'work'")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+    for (id, raw) in rows {
+        let mut extra = crate::mcp::extra_object(raw.as_deref());
+        if let Some(enabled) = update(crate::skills::selection(&extra)) {
+            extra["skillsEnabled"] = json!(enabled);
+            write_skills_extra(&mut tx, &id, &extra).await?;
+        }
+    }
+    tx.commit().await.map_err(err)?;
+    Ok(())
+}
+
+pub(crate) async fn remove_session_skill(pool: &Pool, slug: &str) -> Result<(), String> {
+    update_skill_maps(pool, |enabled| {
+        let mut enabled = enabled?;
+        enabled.remove(slug)?;
+        Some(enabled)
+    }).await
 }
 
 pub async fn meta_get(pool: &SqlitePool, key: &str) -> Result<Option<String>, String> {
@@ -689,6 +775,37 @@ mod tests {
         assert_eq!(crate::mcp::extra_object(chat["extra"].as_str())["engine"], "pi");
         assert_eq!(chat["messages"][0]["content"], "hi");
         assert_eq!(chat["rev"], 3);
+    }
+
+    #[tokio::test]
+    async fn skills_default_changes_preserve_existing_sessions_and_transcripts() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&db).await.unwrap();
+        for id in ["legacy", "configured"] {
+            let mut chat = row(id, id, &[("user", "hello")]);
+            chat["extra"] = json!(r#"{"engine":"pi","skillsEnabled":{"review":true},"mcpEnabled":{}}"#);
+            create_chat(&db, &chat).await.unwrap();
+        }
+        sqlx::query("UPDATE chats SET extra = $1 WHERE id = 'legacy'")
+            .bind(r#"{"engine":"pi"}"#)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let previous = crate::skills::EnabledMap::from([("review".into(), false)]);
+        update_skill_maps(&db, |old| old.is_none().then(|| previous.clone())).await.unwrap();
+        assert_eq!(session_skills(&db, "legacy").await.unwrap(), Some(previous));
+        assert_eq!(session_skills(&db, "configured").await.unwrap().unwrap()["review"], true);
+
+        set_session_skill(&db, "configured", "review", false, &Default::default()).await.unwrap();
+        remove_session_skill(&db, "review").await.unwrap();
+        for id in ["legacy", "configured"] {
+            let chat = load_chat(&db, id).await.unwrap().unwrap();
+            assert_eq!(chat["messages"][0]["content"], "hello");
+            let extra = crate::mcp::extra_object(chat["extra"].as_str());
+            assert_eq!(extra["engine"], "pi");
+            assert_eq!(extra["skillsEnabled"], json!({}));
+        }
     }
 
     /// `load_chats` yields `forkedFrom` as an object while the frontend sends

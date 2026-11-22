@@ -460,7 +460,13 @@ pub async fn run_turn_inner(
     let cli = crate::claude::find_claude().ok_or_else(|| Engine::Claude.missing_message())?;
     let last_user = acp::last_user_message(messages).ok_or_else(|| "Work mode: no user message to send".to_string())?;
     let key = acp::session_key(Engine::Claude, session_id, workspace);
-    let saved = if fresh_session { None } else { key.as_deref().and_then(|k| state.get(k)) };
+    let scope = acp::skills_scope(turn.skills_prompt());
+    let saved = if fresh_session {
+        None
+    } else {
+        key.as_deref().and_then(|k| state.get(k))
+            .and_then(|saved| saved.strip_prefix(&scope).map(str::to_owned))
+    };
 
     let (mcp, mcp_note) = acp::mcp_servers_for_turn(mcp_snapshot).await;
     if let Some(note) = mcp_note {
@@ -479,7 +485,7 @@ pub async fn run_turn_inner(
     let base_text = format!("{}{}", last_user.content, goal_note);
     let fresh_text = format!(
         "{}\n\n---\n{}{}",
-        acp::system_prompt(workspace, None, session_id).trim(),
+        acp::system_prompt(workspace, None, session_id, turn.skills_prompt()).trim(),
         acp::history_preamble(messages, last_user),
         base_text
     );
@@ -611,7 +617,7 @@ async fn run_process(
                     Some("system") if msg.get("subtype").and_then(|s| s.as_str()) == Some("init") => {
                         got_output = true;
                         if let (Some(k), Some(sid)) = (key, msg.get("session_id").and_then(|s| s.as_str())) {
-                            state.set(k.to_string(), sid.to_string());
+                            state.set(k.to_string(), format!("{}{sid}", acp::skills_scope(turn.skills_prompt())));
                         }
                         if model.is_none() {
                             if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {

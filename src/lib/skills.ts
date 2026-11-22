@@ -2,8 +2,35 @@
 //
 // Skills live in ~/vicuna/skills/<slug>/SKILL.md (YAML frontmatter `name:` +
 // `description:` followed by Markdown instructions); enabled/disabled state
-// lives in ~/vicuna/config/skills.json. Enabled skills are injected into every
-// Work harness automatically.
+// lives in Work session metadata. New sessions use ~/vicuna/config/skills.json.
+
+export type SkillsEnabledMap = Record<string, boolean>;
+
+/** A saved map is a snapshot. A definition added later starts enabled. */
+export function resolveSkills(
+  defaults: readonly SkillSummary[],
+  selection?: SkillsEnabledMap
+): SkillSummary[] {
+  if (!selection) return [...defaults];
+  return defaults.map((skill) => ({
+    ...skill,
+    enabled: Object.hasOwn(selection, skill.slug) ? selection[skill.slug] : true
+  }));
+}
+
+export function skillSwitches(skills: readonly SkillSummary[]): SkillsEnabledMap {
+  return Object.fromEntries(skills.map((skill) => [skill.slug, skill.enabled]));
+}
+
+export function newSkillSelection(
+  defaults: readonly SkillSummary[],
+  draft?: SkillsEnabledMap
+): SkillsEnabledMap {
+  return skillSwitches(defaults.map((skill) => ({
+    ...skill,
+    enabled: draft && Object.hasOwn(draft, skill.slug) ? draft[skill.slug] : skill.enabled
+  })));
+}
 
 export interface SkillSummary {
   slug: string;
@@ -77,13 +104,8 @@ export function enabledSkillCount(skills: readonly SkillSummary[]): number {
 }
 
 export async function listSkills(): Promise<SkillSummary[]> {
-  try {
-    const { invokeOrBridge } = await import("./bridge");
-    const list = await invokeOrBridge<SkillSummary[]>("skills_list", {});
-    return Array.isArray(list) ? list : [];
-  } catch {
-    return [];
-  }
+  const { invokeOrBridge } = await import("./bridge");
+  return await invokeOrBridge<SkillSummary[]>("skills_list", {});
 }
 
 export async function readSkill(slug: string): Promise<SkillDetail> {
@@ -93,20 +115,18 @@ export async function readSkill(slug: string): Promise<SkillDetail> {
 
 export async function saveSkill(
   slug: string,
-  content: string,
-  enabled?: boolean
+  content: string
 ): Promise<SkillSummary> {
   const { invokeOrBridge } = await import("./bridge");
   return await invokeOrBridge<SkillSummary>("skills_save", {
     slug,
-    content,
-    enabled: enabled ?? null
+    content
   });
 }
 
-export async function toggleSkill(slug: string, enabled: boolean): Promise<SkillSummary> {
+export async function saveSkillDefaults(skillsEnabled: SkillsEnabledMap): Promise<void> {
   const { invokeOrBridge } = await import("./bridge");
-  return await invokeOrBridge<SkillSummary>("skills_toggle", { slug, enabled });
+  await invokeOrBridge("skills_set_defaults", { skillsEnabled });
 }
 
 export async function removeSkill(slug: string): Promise<void> {

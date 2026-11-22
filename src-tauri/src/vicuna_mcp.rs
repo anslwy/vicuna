@@ -98,8 +98,8 @@ using a built-in question tool; it waits for the answer and returns it. Run comm
 (use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
-custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `manage_skills` to list, read, add, edit, \
-enable, disable, or remove Vicuna skills (`~/vicuna/skills/<slug>/SKILL.md`). Use `schedule_wakeup` to have Vicuna send you a \
+custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `manage_skills` to list, search, read, add, edit, \
+enable, disable, or remove Vicuna skills (`~/vicuna/skills/<slug>/SKILL.md`). Search takes `query`. Switches are per Work session; the lead can pass `session_id` to target another session. Use `schedule_wakeup` to have Vicuna send you a \
 message in this session later (check back on slow work, follow up at a time the user names); `manage_schedule` lists, reschedules or cancels scheduled items \
 (your own session's; the lead can manage every session's). In the user's lead session, \
 `manage_sessions` creates, messages, stops and removes worker sessions (each on its own harness/model); a worker's reply \
@@ -344,9 +344,13 @@ fn caller_session(msg: &Value) -> Option<&str> {
 /// ended → "did not answer"), and a turn registered under a different spelling
 /// of the folder leaves the route empty ("No Vicuna Work turn is running").
 /// When the agent names its session, the live turn of that session wins: on
-/// this route first, else on any route.
+/// this route first, else on any route. Skills calls use a session-bound
+/// route, where a named caller must match the session on that connection.
 fn target_for_call(registry: &SharedRegistry, token: &str, default: Option<Target>, msg: &Value) -> Option<Target> {
     let Some(sid) = caller_session(msg) else { return default };
+    if msg.pointer("/params/name").and_then(Value::as_str) == Some(MANAGE_SKILLS_TOOL) {
+        return default.filter(|target| target.session_id.as_deref() == Some(sid));
+    }
     let Ok(r) = registry.lock() else { return default };
     let mine = |t: &&Target| t.session_id.as_deref() == Some(sid);
     if let Some(t) = r.targets.get(token).and_then(|v| v.iter().rev().find(mine)) {
@@ -747,14 +751,22 @@ fn manage_skills_schema() -> Value {
     json!({
         "name": MANAGE_SKILLS_TOOL,
         "title": "Manage Vicuna skills",
-        "description": "List, read, add, edit, enable, disable, or remove Vicuna-managed skills stored in ~/vicuna/skills/<slug>/SKILL.md (YAML frontmatter `name:` and `description:` followed by Markdown instructions). Enabled skills are automatically injected into every Work harness.",
+        "description": "Manage shared Vicuna skill definitions (~/vicuna/skills/<slug>/SKILL.md) and per-session switches. Enabled skills are available in the target Work session's harness.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "read", "add", "edit", "enable", "disable", "remove"],
+                    "enum": ["list", "search", "read", "add", "edit", "enable", "disable", "remove"],
                     "description": "Operation to perform."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Work session whose enabled states to use. Defaults to the caller. Only the lead can target another session."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Required for search. Case-insensitive substring of slug, name, description, or SKILL.md body."
                 },
                 "slug": {
                     "type": "string",
@@ -766,7 +778,7 @@ fn manage_skills_schema() -> Value {
                 },
                 "enabled": {
                     "type": "boolean",
-                    "description": "Whether the skill is enabled (defaults to true on 'add'; preserves existing value on 'edit' if omitted)."
+                    "description": "Set the skill's switch in the target session. Omit to leave its switch unchanged. New definitions are enabled by default."
                 }
             },
             "required": ["action"]
@@ -1783,104 +1795,128 @@ async fn manage_mcp(target: Option<&Target>, args: &Value) -> Value {
     }
 }
 
-fn manage_skills_in(
-    skills_root: Option<&std::path::Path>,
-    config_path: Option<&std::path::Path>,
-    args: &Value,
-) -> Result<Value, String> {
-    let root = match skills_root {
-        Some(p) => p.to_path_buf(),
-        None => crate::skills::skills_dir()?,
-    };
-    let cfg = match config_path {
-        Some(p) => p.to_path_buf(),
-        None => crate::skills::skills_config_path()?,
-    };
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "manage_skills requires `action`".to_string())?;
-    let need_slug = || -> Result<String, String> {
-        let slug = args
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("manage_skills action '{action}' requires `slug`"))?;
-        crate::skills::validate_slug(slug)?;
-        Ok(slug.to_string())
-    };
-    match action {
-        "list" => {
-            let skills = crate::skills::list_skills_in(&root, &cfg)?;
-            Ok(json!({
-                "skills": skills,
-                "skills_dir": root.to_string_lossy()
-            }))
-        }
-        "read" => {
-            let slug = need_slug()?;
-            let detail = crate::skills::read_skill_in(&root, &cfg, &slug)?;
-            Ok(serde_json::to_value(detail).map_err(|e| e.to_string())?)
-        }
-        "add" => {
-            let slug = need_slug()?;
-            if crate::skills::read_skill_in(&root, &cfg, &slug).is_ok() {
-                return Err(format!("skill '{slug}' already exists; use action='edit' to update it"));
-            }
-            let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "manage_skills action 'add' requires `content`".to_string())?;
-            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-            let saved = crate::skills::save_skill_in(&root, &cfg, &slug, content, Some(enabled))?;
-            Ok(json!({ "ok": true, "action": "add", "skill": saved }))
-        }
-        "edit" => {
-            let slug = need_slug()?;
-            let _existing = crate::skills::read_skill_in(&root, &cfg, &slug)?;
-            let content = args.get("content").and_then(|v| v.as_str());
-            let enabled = args.get("enabled").and_then(|v| v.as_bool());
-            if content.is_none() && enabled.is_none() {
-                return Err("manage_skills action 'edit' requires `content` and/or `enabled`".to_string());
-            }
-            let updated = if let Some(c) = content {
-                crate::skills::save_skill_in(&root, &cfg, &slug, c, enabled)?
-            } else {
-                crate::skills::toggle_skill_in(&root, &cfg, &slug, enabled.unwrap())?
-            };
-            Ok(json!({ "ok": true, "action": "edit", "skill": updated }))
-        }
-        "enable" => {
-            let slug = need_slug()?;
-            let updated = crate::skills::toggle_skill_in(&root, &cfg, &slug, true)?;
-            Ok(json!({ "ok": true, "action": "enable", "skill": updated }))
-        }
-        "disable" => {
-            let slug = need_slug()?;
-            let updated = crate::skills::toggle_skill_in(&root, &cfg, &slug, false)?;
-            Ok(json!({ "ok": true, "action": "disable", "skill": updated }))
-        }
-        "remove" => {
-            let slug = need_slug()?;
-            crate::skills::remove_skill_in(&root, &cfg, &slug)?;
-            Ok(json!({ "ok": true, "action": "remove", "slug": slug }))
-        }
-        other => Err(format!(
-            "unknown action '{other}'; expected one of: list, read, add, edit, enable, disable, remove"
-        )),
+fn skills_target<'a>(target: &'a Target, args: &'a Value) -> Result<&'a str, String> {
+    let caller = target.session_id.as_deref().ok_or("manage_skills needs a Work session")?;
+    if target.turn.stop.load(Ordering::Relaxed) {
+        return Err("The user stopped the turn; nothing was done.".into());
     }
+    let session = args["session_id"].as_str().map(str::trim).filter(|id| !id.is_empty()).unwrap_or(caller);
+    if session != caller && !target.turn.lead.load(Ordering::Relaxed) {
+        return Err("Only the lead session can manage skills for another Work session.".into());
+    }
+    Ok(session)
 }
 
-fn manage_skills(args: &Value) -> Value {
-    match manage_skills_in(None, None, args) {
-        Ok(val) => {
-            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
-            text_result(&text, false)
+async fn manage_skills_in(
+    root: &std::path::Path,
+    config: &std::path::Path,
+    db: Option<&sqlx::SqlitePool>,
+    target: &Target,
+    args: &Value,
+) -> Result<Value, String> {
+    use crate::skills;
+    let sid = skills_target(target, args)?;
+    let defaults = skills::defaults_in(config);
+    let mut local = None;
+    let selection = if let Some(db) = db {
+        crate::server_store::session_skills(db, sid).await?.ok_or("Work session no longer exists")?
+    } else if target.session_id.as_deref() == Some(sid) {
+        local = Some(target.turn.skills_enabled.lock().await);
+        local.as_deref().unwrap().clone()
+    } else {
+        return Err("Targeting another Work session requires a session store".into());
+    };
+    let action = args["action"].as_str().unwrap_or("").trim();
+    if matches!(action, "list" | "search") {
+        let items = if action == "search" {
+            skills::search_skills_in(root, &selection, args["query"].as_str().unwrap_or(""))?
+        } else {
+            skills::list_skills_in(root, &selection)?
+        };
+        return Ok(json!({ "skills": items, "skills_dir": root.to_string_lossy(), "session_id": sid }));
+    }
+    if !matches!(action, "read" | "add" | "edit" | "enable" | "disable" | "remove") {
+        return Err("`action` must be one of list, search, read, add, edit, enable, disable, remove".into());
+    }
+    let slug = args["slug"].as_str().map(str::trim).filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("manage_skills action '{action}' requires `slug`"))?;
+    skills::validate_slug(slug)?;
+    let existing = skills::read_skill_in(root, &selection, slug);
+    if action == "read" {
+        return Ok(json!(existing?));
+    }
+    if action == "remove" {
+        skills::remove_skill_in(root, config, slug)?;
+        if let Some(db) = db {
+            crate::server_store::remove_session_skill(db, slug).await?;
+        } else if let Some(local) = local.as_mut() {
+            local.remove(slug);
         }
-        Err(e) => text_result(&e, true),
+        let _ = target.on_event.send(WorkAgentEvent::SkillsChanged {
+            session_id: sid.into(), enabled: None, removed: Some(slug.into()),
+        });
+        return Ok(json!({ "ok": true, "action": action, "slug": slug }));
+    }
+    let content = args["content"].as_str();
+    let enabled = match action {
+        "enable" => Some(true),
+        "disable" => Some(false),
+        _ => args["enabled"].as_bool(),
+    };
+    let mut skill = match action {
+        "add" => {
+            if existing.is_ok() {
+                return Err(format!("skill '{slug}' already exists; use action='edit' to update it"));
+            }
+            let content = content.ok_or("manage_skills action 'add' requires `content`")?;
+            json!(skills::save_skill_in(root, &selection, slug, content)?)
+        }
+        _ => {
+            let detail = existing?;
+            if let Some(content) = content.filter(|_| action == "edit") {
+                json!(skills::save_skill_in(root, &selection, slug, content)?)
+            } else if enabled.is_some() {
+                json!({
+                    "slug": detail.slug, "name": detail.name, "description": detail.description,
+                    "path": detail.path, "enabled": detail.enabled,
+                })
+            } else {
+                return Err("manage_skills action 'edit' requires `content` and/or `enabled`".into());
+            }
+        }
+    };
+    let mut changed = None;
+    if let Some(enabled) = enabled {
+        let updated = if let Some(db) = db {
+            crate::server_store::set_session_skill(db, sid, slug, enabled, &defaults).await?
+        } else {
+            let local = local.as_deref_mut().unwrap();
+            local.insert(slug.into(), enabled);
+            local.clone()
+        };
+        skill["enabled"] = json!(enabled);
+        changed = Some(updated);
+    }
+    let _ = target.on_event.send(WorkAgentEvent::SkillsChanged {
+        session_id: sid.into(), enabled: changed, removed: None,
+    });
+    Ok(json!({ "ok": true, "action": action, "skill": skill }))
+}
+
+async fn manage_skills(target: Option<&Target>, args: &Value) -> Value {
+    let result = async {
+        let target = target.ok_or("manage_skills needs a Work session")?;
+        let root = crate::skills::skills_dir()?;
+        let config = crate::skills::skills_config_path()?;
+        let server = target.turn.mcp.get().and_then(|mcp| mcp.server.as_ref()?.upgrade());
+        let desktop_db = if server.is_none() { db_pool_app().await.ok() } else { None };
+        let db = server.as_ref().and_then(|st| st.db.as_ref()).or(desktop_db.as_ref());
+        let _write = if let Some(st) = &server { Some(st.chat_lock.lock().await) } else { None };
+        manage_skills_in(&root, &config, db, target, args).await
+    }.await;
+    match result {
+        Ok(value) => text_result(&value.to_string(), false),
+        Err(error) => text_result(&error, true),
     }
 }
 
@@ -1914,7 +1950,7 @@ async fn handle_rpc(
             with_caller_arg(search_schema()),
             with_caller_arg(usage_schema()),
             manage_mcp_schema(),
-            manage_skills_schema(),
+            with_caller_arg(manage_skills_schema()),
             with_caller_arg(schedule_schema()),
             with_caller_arg(manage_sessions_schema()),
             with_caller_arg(manage_schedule_schema()),
@@ -1934,7 +1970,7 @@ async fn handle_rpc(
                 (_, SEARCH_TOOL) => search_sessions(&args).await,
                 (_, USAGE_TOOL) => usage_status(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
-                (_, MANAGE_SKILLS_TOOL) => manage_skills(&args),
+                (_, MANAGE_SKILLS_TOOL) => manage_skills(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
                 (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
@@ -2110,8 +2146,8 @@ async fn handle_conn(mut stream: TcpStream, registry: SharedRegistry) -> std::io
     // heartbeats keep idle timers from firing, then the result.
     let is_call = msg.get("method").and_then(Value::as_str) == Some("tools/call")
         && msg.get("id").is_some_and(|i| !i.is_null());
-    let target = target_for_call(&registry, &token, target, &msg);
     if is_call && req.accept.contains("text/event-stream") {
+        let target = target_for_call(&registry, &token, target, &msg);
         return stream_call(&msg, target.as_ref(), gone, &mut write_half).await;
     }
     let reply = match &msg {
@@ -2119,13 +2155,17 @@ async fn handle_conn(mut stream: TcpStream, registry: SharedRegistry) -> std::io
             let gone = futures_util::future::FutureExt::shared(Box::pin(gone));
             let mut out = Vec::new();
             for m in batch {
+                let target = target_for_call(&registry, &token, target.clone(), m);
                 if let Some(r) = handle_rpc(m, target.as_ref(), gone.clone()).await {
                     out.push(r);
                 }
             }
             (!out.is_empty()).then_some(Value::Array(out))
         }
-        m => handle_rpc(m, target.as_ref(), gone).await,
+        m => {
+            let target = target_for_call(&registry, &token, target, m);
+            handle_rpc(m, target.as_ref(), gone).await
+        }
     };
     let (status, payload) = match &reply {
         Some(v) => ("200 OK", v.to_string()),
@@ -2586,7 +2626,13 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, MANAGE_SKILLS_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
+        let properties = &tools.as_array().unwrap().iter()
+            .find(|tool| tool["name"] == MANAGE_SKILLS_TOOL).unwrap()["inputSchema"]["properties"];
+        for arg in [CALLER_ARG, "session_id", "query"] {
+            assert_eq!(properties[arg]["type"], "string");
+        }
+        assert!(properties["action"]["enum"].as_array().unwrap().contains(&json!("search")));
         assert!(!names.contains(&"run"), "the run tool was removed");
         // a stale client calling it gets a protocol error, not a crash
         let (_, r) = post(&reg.url, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run", "arguments": { "command": "true" } } })).await;
@@ -2918,96 +2964,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn manage_skills_crud() {
-        let dir = std::env::temp_dir().join(format!(
-            "vicuna-mcp-skills-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    #[tokio::test]
+    async fn manage_skills_crud_search_and_session_permissions() {
+        let dir = std::env::temp_dir().join(format!("vicuna-mcp-skills-test-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
         let root = dir.join("skills");
         let cfg = dir.join("config").join("skills.json");
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::server_store::init_schema(&db).await.unwrap();
+        for (id, mode) in [("lead", "work"), ("worker", "work"), ("chat", "chat")] {
+            crate::server_store::create_chat(&db, &json!({
+                "id": id, "title": id, "mode": mode, "createdAt": 1, "messages": [],
+                "extra": r#"{"skillsEnabled":{},"mcpEnabled":{}}"#,
+            })).await.unwrap();
+        }
+        let make_target = |id: &str, lead| {
+            let turn = Arc::new(TurnState::new());
+            turn.lead.store(lead, Ordering::Relaxed);
+            Target { seq: 0, workspace: ws(), session_id: Some(id.into()), turn, on_event: capture().0 }
+        };
+        let lead = make_target("lead", true);
+        let worker = make_target("worker", false);
+        let call = async |target: &Target, args: &Value| manage_skills_in(&root, &cfg, Some(&db), target, args).await;
 
-        // 1. list empty
-        let l0 = manage_skills_in(Some(&root), Some(&cfg), &json!({ "action": "list" })).unwrap();
-        assert_eq!(l0["skills"].as_array().unwrap().len(), 0);
+        let md = "---\nname: Release Checklist\ndescription: Ship safely\n---\n\n# Verify the changelog\n";
+        let add = json!({"action": "add", "slug": "deploy", "content": md, "enabled": false});
+        assert_eq!(call(&worker, &add).await.unwrap()["skill"]["enabled"], false);
+        assert!(call(&worker, &add).await.is_err());
+        assert!(call(&worker, &json!({"action": "add", "slug": "../bad", "content": md})).await.is_err());
+        assert_eq!(call(&worker, &json!({"action": "read", "slug": "deploy"})).await.unwrap()["content"], md);
+        for query in ["DePlOy", "CHECKLIST", "SHIP SAFELY", "CHANGELOG"] {
+            let search = json!({"action": "search", "query": query, "session_id": "worker"});
+            assert_eq!(call(&lead, &search).await.unwrap()["skills"][0]["enabled"], false);
+            assert_eq!(call(&worker, &search).await.unwrap()["skills"][0]["enabled"], false);
+        }
+        assert_eq!(call(&lead, &json!({"action": "list"})).await.unwrap()["skills"][0]["enabled"], true);
+        for action in ["list", "search", "enable", "disable"] {
+            let denied = json!({"action": action, "session_id": "lead", "slug": "deploy", "query": "release"});
+            assert!(call(&worker, &denied).await.unwrap_err().contains("Only the lead"));
+        }
+        assert!(call(&lead, &json!({"action": "list", "session_id": "chat"})).await.is_err());
+        assert!(call(&lead, &json!({"action": "search", "query": " "})).await.is_err());
+        assert!(call(&lead, &json!({"action": "search", "query": "unrelated"})).await.unwrap()["skills"].as_array().unwrap().is_empty());
 
-        // 2. add
-        let md = "---\nname: Deploy\ndescription: Ship safely\n---\n\n# Steps\n";
-        let added = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "add", "slug": "deploy", "content": md }),
-        )
-        .unwrap();
-        assert_eq!(added["skill"]["slug"], "deploy");
-        assert_eq!(added["skill"]["enabled"], true);
+        let enable = json!({"action": "enable", "slug": "deploy", "session_id": "worker"});
+        assert_eq!(call(&lead, &enable).await.unwrap()["skill"]["enabled"], true);
+        let edit = json!({"action": "edit", "slug": "deploy", "content": "---\nname: Deploy v2\n---", "enabled": false});
+        assert_eq!(call(&worker, &edit).await.unwrap()["skill"]["name"], "Deploy v2");
+        assert!(crate::skills::defaults_in(&cfg).is_empty());
 
-        // duplicate add rejected
-        assert!(manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "add", "slug": "deploy", "content": md }),
-        )
-        .is_err());
-
-        // invalid slug rejected
-        assert!(manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "add", "slug": "../bad", "content": md }),
-        )
-        .is_err());
-
-        // 3. read
-        let rd = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "read", "slug": "deploy" }),
-        )
-        .unwrap();
-        assert_eq!(rd["content"], md);
-
-        // 4. disable / enable
-        let dis = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "disable", "slug": "deploy" }),
-        )
-        .unwrap();
-        assert_eq!(dis["skill"]["enabled"], false);
-        let en = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "enable", "slug": "deploy" }),
-        )
-        .unwrap();
-        assert_eq!(en["skill"]["enabled"], true);
-
-        // 5. edit content
-        let md2 = "---\nname: Deploy v2\ndescription: Updated\n---\n\n# New\n";
-        let ed = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "edit", "slug": "deploy", "content": md2 }),
-        )
-        .unwrap();
-        assert_eq!(ed["skill"]["name"], "Deploy v2");
-
-        // 6. remove
-        let rem = manage_skills_in(
-            Some(&root),
-            Some(&cfg),
-            &json!({ "action": "remove", "slug": "deploy" }),
-        )
-        .unwrap();
-        assert_eq!(rem["slug"], "deploy");
-        let l1 = manage_skills_in(Some(&root), Some(&cfg), &json!({ "action": "list" })).unwrap();
-        assert_eq!(l1["skills"].as_array().unwrap().len(), 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        call(&lead, &json!({"action": "remove", "slug": "deploy"})).await.unwrap();
+        assert!(call(&worker, &json!({"action": "list"})).await.unwrap()["skills"].as_array().unwrap().is_empty());
+        assert_eq!(crate::server_store::session_skills(&db, "worker").await.unwrap(), Some(Default::default()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn manage_skills_caller_is_bound_to_its_route() {
+        let registry = SharedRegistry::default();
+        let worker = register_on(&registry, 0, None, "/tmp", Some("worker"), Arc::new(TurnState::new()), capture().0);
+        let _lead = register_on(&registry, 0, None, "/tmp", Some("lead"), Arc::new(TurnState::new()), capture().0);
+        let default = target_for(&registry, &worker.token).unwrap();
+        let call = |caller| json!({"method": "tools/call", "params": {"name": MANAGE_SKILLS_TOOL, "arguments": caller}});
+        assert!(target_for_call(&registry, &worker.token, default.clone(), &call(json!({"caller_session_id": "lead"}))).is_none());
+        assert_eq!(
+            target_for_call(&registry, &worker.token, default.clone(), &call(json!({"caller_session_id": "worker"}))).unwrap().session_id.as_deref(),
+            Some("worker")
+        );
+        assert_eq!(
+            target_for_call(&registry, &worker.token, default, &call(json!({}))).unwrap().session_id.as_deref(),
+            Some("worker")
+        );
+    }
+
 }

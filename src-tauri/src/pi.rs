@@ -602,7 +602,13 @@ pub async fn run_turn_inner(
     }
     let last_user = acp::last_user_message(messages).ok_or_else(|| "Work mode: no user message to send".to_string())?;
     let key = acp::session_key(Engine::Pi, session_id, workspace);
-    let saved = if fresh_session { None } else { key.as_deref().and_then(|k| state.get(k)) };
+    let scope = acp::skills_scope(turn.skills_prompt());
+    let saved = if fresh_session {
+        None
+    } else {
+        key.as_deref().and_then(|k| state.get(k))
+            .and_then(|saved| saved.strip_prefix(&scope).map(str::to_owned))
+    };
 
     let dir = pi_dir().ok_or("cannot locate home folder")?;
     let bridge = write_bridge(&dir)?;
@@ -634,7 +640,7 @@ pub async fn run_turn_inner(
     let base_text = format!("{}{}", last_user.content, goal_note);
     let fresh_text = format!(
         "{}\n\n---\n{}{}",
-        acp::system_prompt(workspace, None, session_id).trim(),
+        acp::system_prompt(workspace, None, session_id, turn.skills_prompt()).trim(),
         acp::history_preamble(messages, last_user),
         base_text
     );
@@ -782,7 +788,7 @@ async fn run_process(
                         let ok = msg.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
                         if msg.get("id").and_then(|i| i.as_str()) == Some("vicuna-state") {
                             if let (Some(k), Some(sid)) = (key, msg.pointer("/data/sessionId").and_then(|s| s.as_str())) {
-                                state.set(k.to_string(), sid.to_string());
+                                state.set(k.to_string(), format!("{}{sid}", acp::skills_scope(turn.skills_prompt())));
                             }
                             if spec.model.is_none() {
                                 if let (Some(p), Some(id)) = (msg.pointer("/data/model/provider").and_then(|s| s.as_str()), msg.pointer("/data/model/id").and_then(|s| s.as_str())) {

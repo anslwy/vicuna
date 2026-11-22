@@ -322,6 +322,13 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
     })
 }
 
+/// A native conversation retains its initial skill instructions. A changed
+/// list starts a new conversation using the visible Vicuna transcript.
+pub(crate) fn skills_scope(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("skills:{:x}|", Sha256::digest(prompt.as_bytes()))
+}
+
 // ---------- session parameters + MCP servers handed to opencode ----------
 
 /// Providers reject requests with more than this many tools (OpenAI-style
@@ -1514,11 +1521,11 @@ pub(crate) fn history_preamble(messages: &[ChatMessage], last_user: &ChatMessage
     format!("Conversation so far (for context):\n{joined}\n\n---\n")
 }
 
-pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Option<&str>) -> String {
+pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Option<&str>, skills: &str) -> String {
     let session_info = session_id
         .map(|id| {
             format!(
-                "- Session context: your Vicuna session ID is `{id}`; pass `caller_session_id: \"{id}\"` on every vicuna-mcp call (ask_user, schedule_wakeup, manage_sessions, read_session, get_session_id) so it reaches this session even when other sessions share the workspace. If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
+                "- Session context: your Vicuna session ID is `{id}`; pass `caller_session_id: \"{id}\"` on every vicuna-mcp call (ask_user, schedule_wakeup, manage_sessions, manage_skills, read_session, get_session_id) so it reaches this session even when other sessions share the workspace. If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
 Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."
             )
         })
@@ -1547,11 +1554,10 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - When you need a decision, a preference or missing information from the user, call the `ask_user` tool (vicuna-mcp server) with the question and a few short `choices`: it shows the user a question card and returns their answer. Do not ask such questions in plain text, and do not use any other question tool.\n\
 - Run commands with your own shell tool. For dev servers, watchers and other long-running jobs, use its background mode where it has one (or start them in the background from the shell), keep working on what does not depend on them, and check their output when you need it.\n\
 - Use `manage_mcp` on vicuna-mcp to list or switch MCP servers for this session or manage shared custom server definitions (e.g. when the user gives an MCP URL endpoint). The fixed `vicuna-mcp` server is always available. When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
-- To list, read, add, edit, enable, disable, or remove Vicuna skills (stored in `~/vicuna/skills/<slug>/SKILL.md`), use the `manage_skills` tool on vicuna-mcp.\n\
+- Use `manage_skills` on vicuna-mcp to list, search (with `query`), read, add, edit, enable, disable, or remove Vicuna skills. Switches apply to this Work session. The lead can pass `session_id` to target another Work session.\n\
 - To check back later (a slow deploy or CI run, a follow-up the user asks for at a certain time), call `schedule_wakeup` on vicuna-mcp with a `message` for yourself and `in_minutes` or a local `at` time, then end your turn: Vicuna sends that message into this session at the time.\n\
 - Before starting an expensive worker session (or when a harness call fails with a quota/limit error), call `usage_status` on vicuna-mcp to see each harness's remaining quota and reset time, and pick one that has quota left.\n\
 {session_info}\n{skills}{goal}",
-        skills = crate::skills::format_skills_prompt(),
         goal = goal
             .filter(|g| !g.trim().is_empty())
             .map(|g| format!(
@@ -1604,19 +1610,17 @@ pub async fn run_turn(
     engine: Engine,
 ) {
     let _done = crate::work_agent::TurnDoneGuard(turn.clone());
-    // vicuna-mcp's ask_user reaches this turn while `_ask` lives. opencode
-    // keeps MCP servers per workspace folder, so its route is the workspace;
-    // each claude process and each codex app-server gets its own.
-    // fx/agy: a resumed session keeps the MCP connections of the warm
-    // process (agy: one per workspace), so the same stable per-workspace
-    // route as opencode.
+    // Warm ACP processes retain their MCP connection across turns. Bind that
+    // connection to its Work session so session-scoped tools can trust the
+    // caller's identity. CLI harnesses connect to a new route each turn.
     // agy times every MCP call out after 3 minutes (no knob over ACP): a
     // waiting ask_user returns a "still waiting, call again" poll before that
     if engine == Engine::Agy {
         turn.ask_poll_secs.store(crate::vicuna_mcp::AGY_ASK_POLL_SECS, Ordering::Relaxed);
     }
+    let process_scope = format!("{}|{}", mcp_snapshot.scope(), session_id.as_deref().unwrap_or(""));
     let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx | Engine::Plugin(_))
-        .then(|| format!("{}|{workspace}|{}", engine_process_label(engine), mcp_snapshot.scope()));
+        .then(|| format!("{}|{workspace}|{process_scope}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1672,20 +1676,21 @@ pub async fn run_turn(
         .await
     } else {
         run_turn_inner(
-        engine,
-        &turn,
-        model.as_deref(),
-        &workspace,
-        &messages,
-        session_id.as_deref(),
-        goal_text.as_deref(),
-        fresh_session,
-        &on_event,
-        state,
-        &mcp_snapshot,
-        ask_url.as_deref(),
-    )
-    .await
+            engine,
+            &turn,
+            model.as_deref(),
+            &workspace,
+            &messages,
+            session_id.as_deref(),
+            goal_text.as_deref(),
+            fresh_session,
+            &on_event,
+            state,
+            &mcp_snapshot,
+            &process_scope,
+            ask_url.as_deref(),
+        )
+        .await
     };
     if let Err(message) = res {
         let _ = on_event.send(WorkAgentEvent::Error { message });
@@ -1811,18 +1816,18 @@ async fn run_turn_inner(
     on_event: &Channel<WorkAgentEvent>,
     state: &AcpState,
     mcp_snapshot: &McpSnapshot,
+    mcp_scope: &str,
     ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
     let last_user = last_user_message(messages)
         .ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let mcp_scope = mcp_snapshot.scope();
-    let client = state.client(engine, workspace, &mcp_scope).await?;
+    let client = state.client(engine, workspace, mcp_scope).await?;
 
     // Some ACP agents retain MCP connections when resuming a saved session.
     // Resume only within the selection that originally opened the session.
     let key = session_key(engine, session_id, workspace);
-    let scope_prefix = format!("mcp:{mcp_scope}|");
+    let scope_prefix = format!("mcp:{mcp_scope}|{}", skills_scope(turn.skills_prompt()));
     let saved = if fresh_session {
         None
     } else {
@@ -1850,7 +1855,7 @@ async fn run_turn_inner(
         mcp
     };
     let (client, (acp_session, resumed, mut used_model)) =
-        open_session_retrying(engine, state, client, saved, workspace, &mcp, &mcp_scope, on_event, stop).await?;
+        open_session_retrying(engine, state, client, saved, workspace, &mcp, mcp_scope, on_event, stop).await?;
     let scoped_session_id = format!("{scope_prefix}{acp_session}");
     if let Some(k) = &key {
         state.set(k.clone(), scoped_session_id.clone());
@@ -1921,7 +1926,7 @@ async fn run_turn_inner(
     } else {
         format!(
             "{}\n\n---\n{}{}",
-            system_prompt(workspace, None, session_id).trim(),
+            system_prompt(workspace, None, session_id, turn.skills_prompt()).trim(),
             history_preamble(messages, last_user),
             base_text
         )
@@ -1937,7 +1942,7 @@ async fn run_turn_inner(
         }
         // agy's processes before this round: whatever is new at its end
         // (and still alive) was started by this round's commands
-        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace, &mcp_scope).await } else { None };
+        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace, mcp_scope).await } else { None };
         let agy_baseline = agy_pid.map(super::agy::descendants).unwrap_or_default();
         emit_ev(
             on_event,
@@ -2000,7 +2005,7 @@ async fn run_turn_inner(
             handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
         }
         if engine == Engine::Agy && cancelled && tool_running_at_stop {
-            state.kill_tree(engine, workspace, &mcp_scope).await;
+            state.kill_tree(engine, workspace, mcp_scope).await;
             emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
         }
         let gen_ms = started.elapsed().as_millis() as u64;
@@ -2061,7 +2066,7 @@ async fn run_turn_inner(
                 emit_ev(on_event, stop, WorkAgentEvent::Status { label: None });
                 match waited {
                     BgWait::Stopped => {
-                        state.kill_tree(engine, workspace, &mcp_scope).await;
+                        state.kill_tree(engine, workspace, mcp_scope).await;
                         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
                         break;
                     }

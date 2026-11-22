@@ -1,3 +1,4 @@
+import type { SkillsEnabledMap } from "./skills";
 import type { McpSelection } from "./mcp";
 
 // Lead session (vicuna-mcp `manage_sessions`): pure text helpers. The lead
@@ -62,6 +63,7 @@ export function sessionListText(rows: SessionRow[], engines: string[], defaultEn
 }
 
 export interface ChatExtra extends McpSelection {
+  skillsEnabled?: SkillsEnabledMap;
   engine?: string | null;
   workModel?: string | null;
   role?: "lead" | null;
@@ -79,6 +81,7 @@ export function chatExtraJson(c: ChatExtra): string | null {
   if (c.leadId) o.leadId = c.leadId;
   if (c.pinned) o.pinned = true;
   if (c.archived) o.archived = true;
+  if (c.skillsEnabled) o.skillsEnabled = c.skillsEnabled;
   if (c.mcpEnabled) o.mcpEnabled = c.mcpEnabled;
   if (c.mcpOnly) o.mcp = c.mcpOnly;
   return Object.keys(o).length ? JSON.stringify(o) : null;
@@ -103,6 +106,11 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (o.archived === true) out.archived = true;
   if (o.mcpEnabled && typeof o.mcpEnabled === "object" && !Array.isArray(o.mcpEnabled)) {
     out.mcpEnabled = Object.fromEntries(Object.entries(o.mcpEnabled).filter(
+      (entry): entry is [string, boolean] => typeof entry[1] === "boolean"
+    ));
+  }
+  if (o.skillsEnabled && typeof o.skillsEnabled === "object" && !Array.isArray(o.skillsEnabled)) {
+    out.skillsEnabled = Object.fromEntries(Object.entries(o.skillsEnabled).filter(
       (entry): entry is [string, boolean] => typeof entry[1] === "boolean"
     ));
   }
