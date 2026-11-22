@@ -2222,6 +2222,18 @@ fn server_remove(id: String) -> Result<(), String> {
     servers::remove(&id)
 }
 
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn server_rename(app: AppHandle, id: String, name: Option<String>) -> Result<servers::ServerInfo, String> {
+    let sv = servers::rename(&id, name)?;
+    let label = format!("server-{id}");
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.set_title(&format!("{} — {}", app_title(), sv.name));
+    }
+    let _ = app.emit("vicuna-servers-changed", ());
+    Ok(sv)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 async fn server_call(
     id: String,
@@ -5728,6 +5740,7 @@ pub fn run() {
             server_connect,
             server_touch,
             server_remove,
+            server_rename,
             server_call,
             server_download_file,
             server_lb_proxy_url,

@@ -51,7 +51,7 @@
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
+  import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, renameServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError, mergeLocalServerHits } from "$lib/palette";
   import { isNewerRelease, pickAssetForPlatform, releaseTimestamp, currentPlatform, formatAssetSize, formatBuildDate, type ReleaseInfo } from "$lib/update";
@@ -2915,11 +2915,15 @@
 
   function toggleServerMenu() {
     srvMenuOpen = !srvMenuOpen;
+    srvMenuRenaming = false;
     if (srvMenuOpen) void refreshServers();
   }
 
   function openServerDialog() {
     srvMenuOpen = false;
+    srvMenuRenaming = false;
+    srvEditingId = null;
+    srvEditDraft = "";
     srvErr = null;
     srvUrlDraft = "";
     srvTokenDraft = "";
@@ -2974,7 +2978,65 @@
     }
   }
 
+  let srvEditingId = $state<string | null>(null);
+  let srvEditDraft = $state("");
+  let srvRenaming = $state(false);
+  let srvMenuRenaming = $state(false);
+
+  function startRenameServer(sv: ServerInfo) {
+    srvEditingId = sv.id;
+    srvEditDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-rename-input]")?.focus());
+  }
+
+  function cancelRenameServer() {
+    srvEditingId = null;
+    srvEditDraft = "";
+  }
+
+  async function saveRenameServer() {
+    if (srvRenaming || !srvEditingId) return;
+    srvRenaming = true;
+    srvErr = null;
+    try {
+      const sv = await renameServer(srvEditingId, srvEditDraft.trim());
+      srvEditingId = null;
+      srvEditDraft = "";
+      if (srvUrlDraft.trim() === sv.url) {
+        srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
+      }
+      await refreshServers();
+    } catch (e) {
+      srvErr = e instanceof Error ? e.message : String(e);
+    } finally {
+      srvRenaming = false;
+    }
+  }
+
+  function startMenuRenameServer() {
+    if (!srvCurrent) return;
+    srvEditDraft = srvCurrent.name === defaultServerName(srvCurrent.url) ? "" : srvCurrent.name;
+    srvMenuRenaming = true;
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-menu-rename-input]")?.focus());
+  }
+
+  async function saveMenuRenameServer() {
+    if (srvRenaming || !srvCurrent) return;
+    srvRenaming = true;
+    try {
+      await renameServer(srvCurrent.id, srvEditDraft.trim());
+      srvMenuRenaming = false;
+      srvMenuOpen = false;
+      await refreshServers();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      srvRenaming = false;
+    }
+  }
+
   async function forgetServer(id: string) {
+    if (srvEditingId === id) cancelRenameServer();
     await removeServer(id).catch(() => {});
     await refreshServers();
     // removed the server this window shows: back to the main window, close this one
@@ -9320,10 +9382,11 @@
     // the Cmd+P palette in another window can hand this one a session
     // (open_chat_window → emit_to; a fresh window gets ?chat= instead)
     let unlistenOpenChat: (() => void) | null = null;
+    let unlistenServersChanged: (() => void) | null = null;
     if (isTauriRuntime()) {
       void import("@tauri-apps/api/event")
-        .then(({ listen }) =>
-          listen<{ chatId?: string }>("vicuna-open-chat", (ev) => {
+        .then(({ listen }) => {
+          void listen<{ chatId?: string }>("vicuna-open-chat", (ev) => {
             const id = ev.payload?.chatId;
             if (!id) return;
             if (!ready) {
@@ -9332,10 +9395,14 @@
             }
             if (chats.some((c) => c.id === id)) selectChat(id);
             else flashNotice("That session isn't loaded in this window.");
-          })
-        )
-        .then((u) => {
-          unlistenOpenChat = u;
+          }).then((u) => {
+            unlistenOpenChat = u;
+          });
+          void listen("vicuna-servers-changed", () => {
+            void refreshServers();
+          }).then((u) => {
+            unlistenServersChanged = u;
+          });
         })
         .catch(() => {});
     }
@@ -9348,6 +9415,7 @@
       window.removeEventListener("keydown", onMessagesKeyDown);
       unlistenDeepLink?.();
       unlistenOpenChat?.();
+      unlistenServersChanged?.();
       unlistenQuit?.();
       unlistenMcpChanged?.();
       unlistenMcpWake?.();
@@ -9739,7 +9807,7 @@
   {/if}
 {/snippet}
 {#snippet serverMenu()}
-  <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => (srvMenuOpen = false)}></button>
+  <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => { srvMenuOpen = false; srvMenuRenaming = false; }}></button>
   <div class="srv-menu" data-testid="server-menu" role="menu">
     <div class="srv-menu-label">Recents</div>
     <button class="srv-item" data-testid="server-item-local" role="menuitem" onclick={() => requestServerSwitch(null)}>
@@ -9771,6 +9839,20 @@
         </button>
       {/if}
       <div class="srv-sep"></div>
+    {/if}
+    {#if onServer && srvCurrent}
+      {#if srvMenuRenaming}
+        <div class="srv-menu-rename-row" data-testid="server-menu-rename-form">
+          <input class="srv-menu-rename-input" data-testid="server-menu-rename-input" placeholder={defaultServerName(srvCurrent.url)} autocomplete="off" spellcheck="false"
+            bind:value={srvEditDraft} disabled={srvRenaming}
+            onkeydown={(e) => { if (e.key === "Enter") void saveMenuRenameServer(); else if (e.key === "Escape") srvMenuRenaming = false; }} />
+          <button class="srv-menu-rename-ok" data-testid="server-menu-rename-save" aria-label="Save name" title="Save" disabled={srvRenaming} onclick={() => void saveMenuRenameServer()}>✓</button>
+        </div>
+      {:else}
+        <button class="srv-item" data-testid="server-menu-rename" role="menuitem" onclick={startMenuRenameServer}>
+          <span class="srv-check">✎</span><span class="srv-item-name">Rename server…</span>
+        </button>
+      {/if}
     {/if}
     <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
       <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
@@ -11989,11 +12071,22 @@
       <div class="srv-recent-label">Recent servers</div>
       {#each srvList as sv (sv.id)}
         <div class="srv-recent-row" data-testid="server-recent">
-          <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => fillRecentServer(sv)}>{sv.name}</button>
-          <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
-            {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
-          </button>
-          <button class="srv-recent-icon" data-testid="server-forget" aria-label="Remove {sv.name}" title="Remove" onclick={() => void forgetServer(sv.id)}>×</button>
+          {#if srvEditingId === sv.id}
+            <input class="srv-recent-input" data-testid="server-rename-input" placeholder={defaultServerName(sv.url)} autocomplete="off" spellcheck="false"
+              bind:value={srvEditDraft} disabled={srvRenaming}
+              onkeydown={(e) => { if (e.key === "Enter") void saveRenameServer(); else if (e.key === "Escape") cancelRenameServer(); }} />
+            <button class="srv-recent-icon" data-testid="server-rename-save" aria-label="Save name" title="Save" disabled={srvRenaming} onclick={() => void saveRenameServer()}>✓</button>
+            <button class="srv-recent-icon" data-testid="server-rename-cancel" aria-label="Cancel rename" title="Cancel" disabled={srvRenaming} onclick={cancelRenameServer}>×</button>
+          {:else}
+            <button class="srv-recent" title="Fill in {sv.url} (its saved token is reused)" onclick={() => fillRecentServer(sv)}>{sv.name}</button>
+            <button class="srv-recent-icon" data-testid="server-rename" aria-label="Rename {sv.name}" title="Rename" onclick={() => startRenameServer(sv)}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+            </button>
+            <button class="srv-recent-icon" aria-label="Copy URL" title={srvCopied === sv.url ? "Copied" : "Copy URL"} onclick={() => void copyServerUrl(sv.url)}>
+              {#if srvCopied === sv.url}✓{:else}<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>{/if}
+            </button>
+            <button class="srv-recent-icon" data-testid="server-forget" aria-label="Remove {sv.name}" title="Remove" onclick={() => void forgetServer(sv.id)}>×</button>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -13193,8 +13286,15 @@
   .srv-recent-label { font-size: 13px; color: var(--muted); margin-top: 14px; }
   .srv-recent-row { display: flex; gap: 6px; }
   .srv-recent { flex: 1; min-width: 0; text-align: left; border: 1px solid var(--border-2); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srv-recent-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 12px; padding: 8px 12px; font: inherit; font-size: 14px; background: transparent; color: var(--text); }
+  .srv-recent-input:focus { outline: none; }
   .srv-recent:hover, .srv-recent-icon:hover { background: var(--hover-2); }
   .srv-recent-icon { flex: none; width: 40px; border: 1px solid var(--border-2); border-radius: 12px; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+  .srv-menu-rename-row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
+  .srv-menu-rename-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 13px; background: transparent; color: var(--text); }
+  .srv-menu-rename-input:focus { outline: none; }
+  .srv-menu-rename-ok { flex: none; width: 28px; height: 28px; border: 1px solid var(--border-2); border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; }
+  .srv-menu-rename-ok:hover { background: var(--hover-3); }
   .srv-help { font-size: 12px; color: var(--muted); margin: 12px 0 0; line-height: 1.5; }
   .srv-cmd { position: relative; margin-top: 6px; border: 1px solid var(--border-2); border-radius: 12px; background: var(--hover-2, rgba(0,0,0,.03)); }
   .srv-cmd pre { margin: 0; padding: 10px 44px 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
