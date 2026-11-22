@@ -27,6 +27,7 @@
     savePrefs,
     readLocalPrefs,
     readStartupPrefs,
+    normalizeStoredWorkspace,
     writePendingStream,
     readPendingStream,
     clearPendingStream,
@@ -82,7 +83,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, BROWSER_MCP_ID, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, browserMcpCommand, browserMcpConfig, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
+  import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, resolveDraftWorkspace, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
     captureViewAnchor,
     followAfterScroll,
@@ -136,7 +137,8 @@
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
   /** mode + workspace picker for the session being started (home or empty draft) */
   let pendingMode = $state<"chat" | "work">("chat");
-  let pendingWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
+  let pendingWorkspace = $state(resolveDraftWorkspace(initialPrefs.defaultWorkspace));
+  const continueWorkspace = $derived(defaultWorkspace || (isNoWorkspacePath(pendingWorkspace) ? "" : pendingWorkspace));
   let workspaceError = $state<string | null>(null);
   /** true while the in-thread workspace input is focused: keeps the picker
    *  mounted while typing (it hides once a workspace is set) */
@@ -2085,7 +2087,7 @@
       pendingWorkspace = NO_WORKSPACE_SENTINEL;
     } else {
       const scopeWs = workspaceOfFolderKey(sessionFilter);
-      if (scopeWs !== null) pendingWorkspace = scopeWs;
+      pendingWorkspace = scopeWs ?? resolveDraftWorkspace(pendingWorkspace || defaultWorkspace);
     }
     isPinned = true;
     editingIndex = null;
@@ -2116,7 +2118,7 @@
     workspaceEditing = false;
     if (c && c.messages.length === 0) {
       pendingMode = c.mode ?? "chat";
-      pendingWorkspace = c.workspace ?? defaultWorkspace ?? "";
+      pendingWorkspace = resolveDraftWorkspace(c.workspace || defaultWorkspace);
       workspaceError = null;
     }
   });
@@ -4000,19 +4002,19 @@
     e?.preventDefault();
     // the native dialog browses THIS machine; a server's folders need the
     // in-app picker (or, with no backend to list folders, a typed path)
+    const hint = continueWorkspace.trim();
     if (!isTauriRuntime() || onServer) {
       if (await canBrowseFolders()) {
-        openFolderPicker((defaultWorkspace || pendingWorkspace).trim(), "continue");
+        openFolderPicker(hint, "continue");
         return;
       }
-      workspaceDraft = (defaultWorkspace || pendingWorkspace).trim();
+      workspaceDraft = hint;
       workspaceError = null;
       workspacePickerOpen = true;
       return;
     }
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const hint = (defaultWorkspace || pendingWorkspace).trim();
       const picked = await open({
         directory: true,
         multiple: false,
@@ -9136,7 +9138,7 @@
     if (src.partial) return;
     ctxMenu = null;
     workspacePickerOpen = false;
-    const ws = defaultWorkspace || pendingWorkspace || "";
+    const ws = continueWorkspace;
     const seedContext: ChatMsg[] = [
       ...compactedHistory(src.messages.slice(-20)),
       { role: "user", content: ws ? `Continue the above in the workspace (${ws}).` : "Continue the above in a workspace." }
@@ -9560,15 +9562,8 @@
       stopWordsText = stopWordsToText(stopWords);
       ollamaBase = prefs.ollamaBase;
       setOllamaBase(ollamaBase);
-      defaultWorkspace = prefs.defaultWorkspace ?? "";
-      pendingWorkspace = prefs.defaultWorkspace ?? "";
-      // "/" was the old fresh-install default and is no longer a valid
-      // workspace (backend refuses the filesystem root), so treat a
-      // stored "/" as unset (pick a folder).
-      if (defaultWorkspace === "/" || pendingWorkspace === "/") {
-        defaultWorkspace = "";
-        pendingWorkspace = "";
-      }
+      defaultWorkspace = normalizeStoredWorkspace(prefs.defaultWorkspace);
+      pendingWorkspace = resolveDraftWorkspace(defaultWorkspace);
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
@@ -9602,9 +9597,9 @@
         serverSessionTools = info?.sessionTools === true;
         if (serverSessionTools) {
           const workspace = await invokeOrBridge<string | null>("work_default_workspace", {}).catch(() => null);
-          if (workspace !== null) {
-            pendingWorkspace = workspace;
-            defaultWorkspace = workspace;
+          if (workspace) {
+            defaultWorkspace = normalizeStoredWorkspace(workspace);
+            pendingWorkspace = resolveDraftWorkspace(defaultWorkspace);
           }
           lastDefaultWorkspace = workspace ?? "";
         }
@@ -10251,7 +10246,7 @@
               onclick={(e) => void pickContinueWorkspace(e)}
             >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              <span class="ctx-ws-name">{workspaceBase(defaultWorkspace || pendingWorkspace) || "Folder"}</span>
+              <span class="ctx-ws-name">{workspaceBase(continueWorkspace) || "Folder"}</span>
             </button>
           </div>
           {#if workspacePickerOpen && (!isTauriRuntime() || onServer)}

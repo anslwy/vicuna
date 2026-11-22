@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   ALL_FILTER,
   CHAT_FILTER,
+  NO_WORKSPACE_SENTINEL,
+  resolveDraftWorkspace,
   showWorkspaceBadge,
 } from "../src/lib/sidebar.ts";
 import type { Chat } from "../src/lib/store.ts";
@@ -18,6 +20,16 @@ function makeChat(id: string, workspace: string | null): Chat {
     workspace,
   };
 }
+
+test("fresh workspace prefs start Work drafts in No workspace", () => {
+  assert.equal(resolveDraftWorkspace(undefined), NO_WORKSPACE_SENTINEL);
+  assert.equal(resolveDraftWorkspace(""), NO_WORKSPACE_SENTINEL);
+  assert.equal(resolveDraftWorkspace("/"), NO_WORKSPACE_SENTINEL);
+});
+
+test("Work drafts retain a saved default workspace", () => {
+  assert.equal(resolveDraftWorkspace("/projects/vicuna"), "/projects/vicuna");
+});
 
 test("showWorkspaceBadge hides pill when session is already in the selected workspace scope", () => {
   const beta = makeChat("b", "/Users/me/projects/ollama-desktop");
