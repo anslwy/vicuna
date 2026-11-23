@@ -64,6 +64,7 @@
   import SkillsModal from "$lib/SkillsModal.svelte";
   import EngineIcon from "$lib/EngineIcon.svelte";
   import UsageModal from "$lib/UsageModal.svelte";
+  import { harnessUsageUrl } from "$lib/harnessUsageLinks";
   import ServerDialogModal from "$lib/ServerDialogModal.svelte";
   import GotoPaletteModal from "$lib/GotoPaletteModal.svelte";
   import ScheduleModals from "$lib/ScheduleModals.svelte";
@@ -10373,6 +10374,9 @@
                   </span>
                   <span>Click for details</span>
                 </span>
+                {#if harnessUsageUrl(usageHoverEngine)}
+                  <button class="usage-hover-refresh usage-provider-link" data-testid="usage-hover-provider-link" onclick={(e) => { e.stopPropagation(); void openExternal(harnessUsageUrl(usageHoverEngine)!); }}>Open usage page</button>
+                {/if}
               </span>
             </span>
           {/if}
@@ -11522,6 +11526,7 @@
     onClose={closeUsageModal}
     onSelectTab={selectUsageTab}
     onRefresh={(eng) => void fetchUsageEngine(eng, { force: true })}
+    onOpenExternal={(url) => void openExternal(url)}
   />
 {/if}
 <ScheduleModals

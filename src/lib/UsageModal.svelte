@@ -1,5 +1,6 @@
 <script lang="ts">
   import EngineIcon from "$lib/EngineIcon.svelte";
+  import { harnessUsageUrl } from "$lib/harnessUsageLinks";
   import {
     usageTabs,
     usageMeterTone,
@@ -19,7 +20,8 @@
     usageError,
     onClose,
     onSelectTab,
-    onRefresh
+    onRefresh,
+    onOpenExternal
   }: {
     workEngines: NonNullable<WorkEngineInfo["engines"]>;
     workEngineList: NonNullable<WorkEngineInfo["engines"]>;
@@ -32,9 +34,11 @@
     onClose: () => void;
     onSelectTab: (engine: string) => void;
     onRefresh: (engine: string) => void;
+    onOpenExternal: (url: string) => void;
   } = $props();
 
   let installedEngines = $derived(usageTabs(workEngines, usageEngine).tabs);
+  let providerUsageUrl = $derived(harnessUsageUrl(usageEngine));
 </script>
 
 <button class="confirm-backdrop sched-dim" data-testid="usage-backdrop" aria-label="Close" onclick={onClose} tabindex="-1"></button>
@@ -53,6 +57,9 @@
         <button class="usage-refresh" data-testid="usage-refresh" disabled={usageLoading} onclick={() => onRefresh(usageEngine)} title="Refresh usage">
           {usageLoading ? "Refreshing…" : "Refresh"}
         </button>
+        {#if providerUsageUrl}
+          <button class="usage-refresh" data-testid="usage-provider-link" onclick={() => onOpenExternal(providerUsageUrl!)}>Open usage page</button>
+        {/if}
       </span>
     </div>
     {#if installedEngines.length > 1}
