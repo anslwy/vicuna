@@ -2492,7 +2492,9 @@
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
   /** Short engine name for "<name> default" ("muse" for plugin:muse-acp/muse). */
   const workAccountLabel = $derived(workEngineInfo?.engines?.find((e) => e.id === engineId(workEngineInfo))?.account?.label ?? null);
-  const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : workAccountLabel ? `${baseEngineId(engineId(workEngineInfo))} · ${workAccountLabel}` : engineId(workEngineInfo));
+  const workEngineBase = $derived(baseEngineId(engineId(workEngineInfo)));
+  const workEngineName = $derived(isPluginEngine(workEngineBase) ? pluginHarnessName(workEngineBase) : workEngineBase);
+  const workEngineShort = $derived(workAccountLabel ? `${workEngineName} · ${workAccountLabel}` : workEngineName);
   const workEngines = $derived(workEngineChoices(workEngineInfo));
   const workEngineList = $derived(workEngineMenuItems(workEngineInfo));
   const enginesWithAccounts = $derived(new Set(workEngineList.filter((e) => e.account).map((e) => baseEngineId(e.id))));

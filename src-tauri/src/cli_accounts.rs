@@ -1,4 +1,4 @@
-// Extra Claude Code and Codex accounts use the CLIs' own config directories.
+// Account registry and the built-in CLI profile adapters.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -72,19 +72,6 @@ impl Harness {
         }
     }
 
-    fn registry(self, home: &Path) -> PathBuf {
-        home.join("vicuna")
-            .join("config")
-            .join(format!("{}-accounts.json", self.base().id()))
-    }
-
-    fn profile(self, home: &Path, id: &str) -> PathBuf {
-        home.join("vicuna")
-            .join("accounts")
-            .join(self.base().id())
-            .join(id)
-    }
-
     pub fn model_prefs(self, id: &str) -> Option<PathBuf> {
         Some(
             home_dir()?
@@ -94,54 +81,12 @@ impl Harness {
         )
     }
 
-    fn read(self, home: &Path) -> Result<Vec<Account>, String> {
-        match fs::read_to_string(self.registry(home)) {
-            Ok(text) => {
-                serde_json::from_str(&text).map_err(|e| format!("Invalid account registry: {e}"))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(format!("Cannot read account registry: {e}")),
-        }
-    }
-
-    fn write(self, home: &Path, accounts: &[Account]) -> Result<(), String> {
-        let path = self.registry(home);
-        fs::create_dir_all(path.parent().expect("registry has a parent"))
-            .map_err(|e| e.to_string())?;
-        let temp = path.with_extension("tmp");
-        fs::write(
-            &temp,
-            serde_json::to_vec_pretty(accounts).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        fs::rename(temp, path).map_err(|e| e.to_string())
-    }
-
     pub fn list(self) -> Vec<Account> {
-        home_dir()
-            .and_then(|home| self.read(&home).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| valid_id(&a.id))
-            .collect()
+        Registry::BuiltIn(self).list()
     }
 
     pub fn find(self, id: &str) -> Option<Account> {
-        self.list().into_iter().find(|a| a.id == id)
-    }
-
-    fn checked_profile(self, id: &str) -> Result<PathBuf, String> {
-        if self.find(id).is_none() {
-            return Err(format!(
-                "The {} account \"{id}\" was removed. Pick another account for this session.",
-                self.base().label()
-            ));
-        }
-        let dir = self.profile(&home_dir().ok_or("Cannot locate home folder.")?, id);
-        if !dir.is_dir() {
-            return Err(format!("Account directory is missing: {}", dir.display()));
-        }
-        Ok(dir)
+        Registry::BuiltIn(self).find(id)
     }
 
     pub fn environment(
@@ -150,7 +95,7 @@ impl Harness {
     ) -> Result<(&'static [&'static str], (&'static str, PathBuf)), String> {
         Ok((
             self.credential_overrides(),
-            (self.config_env(), self.checked_profile(id)?),
+            (self.config_env(), Registry::BuiltIn(self).checked_profile(id)?),
         ))
     }
 
@@ -188,18 +133,6 @@ impl Harness {
         }
     }
 
-    fn info(self, home: &Path, account: &Account, signed_in: bool) -> AccountInfo {
-        let dir = self.profile(home, &account.id);
-        AccountInfo {
-            id: account.id.clone(),
-            engine: format!("{}@{}", self.base().id(), account.id),
-            label: account.label.clone(),
-            home: dir.display().to_string(),
-            signed_in,
-            sign_in_command: self.sign_in_command(&dir),
-        }
-    }
-
     pub fn sign_in_hint(self, id: &str) -> String {
         let Some(home) = home_dir() else {
             return "Cannot locate home folder.".into();
@@ -207,7 +140,7 @@ impl Harness {
         format!(
             "To sign in to this {} account, run `{}` in a terminal on this machine.",
             self.base().label(),
-            self.sign_in_command(&self.profile(&home, id))
+            self.sign_in_command(&Registry::BuiltIn(self).profile(&home, id))
         )
     }
 
@@ -259,7 +192,7 @@ impl Harness {
                 Some(bin) => self.status(id, Path::new(bin)).await.is_some(),
                 None => false,
             };
-            let account = self.info(&home, &account, signed_in);
+            let account = Registry::BuiltIn(self).info(&home, &account, signed_in, |dir| self.sign_in_command(dir));
             info.config_path = Some(account.home.clone());
             if info.installed && !signed_in {
                 info.warning = Some(self.sign_in_hint(id));
@@ -274,6 +207,112 @@ impl Harness {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum Registry {
+    BuiltIn(Harness),
+    Plugin(&'static str),
+}
+
+impl Registry {
+    fn base(self) -> Engine {
+        match self {
+            Self::BuiltIn(h) => h.base(),
+            Self::Plugin(key) => Engine::Plugin(key),
+        }
+    }
+
+    fn registry(self, home: &Path) -> PathBuf {
+        let config = home.join("vicuna").join("config");
+        match self {
+            Self::Plugin(key) => config.join("plugin-accounts").join(key).with_extension("json"),
+            Self::BuiltIn(h) => config.join(format!("{}-accounts.json", h.base().id())),
+        }
+    }
+
+    fn profile(self, home: &Path, id: &str) -> PathBuf {
+        let accounts = home.join("vicuna").join("accounts");
+        match self {
+            Self::Plugin(key) => accounts.join("plugins").join(key).join(id),
+            Self::BuiltIn(h) => accounts.join(h.base().id()).join(id),
+        }
+    }
+
+    fn read(self, home: &Path) -> Result<Vec<Account>, String> {
+        match fs::read_to_string(self.registry(home)) {
+            Ok(text) => {
+                serde_json::from_str(&text).map_err(|e| format!("Invalid account registry: {e}"))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("Cannot read account registry: {e}")),
+        }
+    }
+
+    fn write(self, home: &Path, accounts: &[Account]) -> Result<(), String> {
+        let path = self.registry(home);
+        fs::create_dir_all(path.parent().expect("registry has a parent"))
+            .map_err(|e| e.to_string())?;
+        let temp = path.with_extension("tmp");
+        fs::write(
+            &temp,
+            serde_json::to_vec_pretty(accounts).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        fs::rename(temp, path).map_err(|e| e.to_string())
+    }
+
+    pub fn list(self) -> Vec<Account> {
+        home_dir()
+            .and_then(|home| self.read(&home).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| valid_id(&a.id))
+            .collect()
+    }
+
+    pub fn find(self, id: &str) -> Option<Account> {
+        self.list().into_iter().find(|a| a.id == id)
+    }
+
+    pub fn checked_profile(self, id: &str) -> Result<PathBuf, String> {
+        if self.find(id).is_none() {
+            return Err(format!(
+                "The {} account \"{id}\" was removed. Pick another account for this session.",
+                self.base().label()
+            ));
+        }
+        let dir = self.profile(&home_dir().ok_or("Cannot locate home folder.")?, id);
+        if !dir.is_dir() {
+            return Err(format!("Account directory is missing: {}", dir.display()));
+        }
+        Ok(dir)
+    }
+
+    fn info(self, home: &Path, account: &Account, signed_in: bool, command: impl FnOnce(&Path) -> String) -> AccountInfo {
+        let dir = self.profile(home, &account.id);
+        AccountInfo {
+            id: account.id.clone(),
+            engine: format!("{}@{}", self.base().id(), account.id),
+            label: account.label.clone(),
+            home: dir.display().to_string(),
+            signed_in,
+            sign_in_command: command(&dir),
+        }
+    }
+
+}
+
+pub fn plugin_info(
+    key: &'static str,
+    id: &str,
+    provider: crate::plugin_harness::AccountProvider,
+) -> Option<AccountInfo> {
+    let harness = Registry::Plugin(key);
+    let home = home_dir()?;
+    let account = harness.find(id)?;
+    let signed_in = provider.signed_in(&harness.profile(&home, id));
+    Some(harness.info(&home, &account, signed_in, |dir| provider.sign_in_command(dir)))
+}
+
 static REGISTRY: Mutex<()> = Mutex::new(());
 
 pub fn mutate(
@@ -281,6 +320,16 @@ pub fn mutate(
     action: &str,
     id: &str,
     label: &str,
+) -> Result<Option<AccountInfo>, String> {
+    mutate_with(Registry::BuiltIn(harness), action, id, label, |dir| harness.sign_in_command(dir))
+}
+
+pub fn mutate_with(
+    harness: Registry,
+    action: &str,
+    id: &str,
+    label: &str,
+    command: impl FnOnce(&Path) -> String,
 ) -> Result<Option<AccountInfo>, String> {
     let home = home_dir().ok_or("Cannot locate home folder.")?;
     let _guard = REGISTRY.lock().map_err(|e| e.to_string())?;
@@ -340,5 +389,5 @@ pub fn mutate(
         account
     };
     harness.write(&home, &accounts)?;
-    Ok(Some(harness.info(&home, &account, false)))
+    Ok(Some(harness.info(&home, &account, false, command)))
 }

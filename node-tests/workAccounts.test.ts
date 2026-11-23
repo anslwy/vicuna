@@ -54,3 +54,22 @@ test("Claude and Codex remember the account that produced each reply", () => {
     assert.equal(changesCliAccount(work, null), false);
   }
 });
+
+test("plugin accounts share one Usage tab and hand off between full plugin IDs", () => {
+  const base = "plugin:muse/muse";
+  const work = `${base}@work`;
+  const personal = `${base}@personal`;
+  const rows = [
+    { id: base, label: "Muse" },
+    { id: work, label: "Muse · Work" },
+    { id: personal, label: "Muse · Personal" },
+  ];
+  const view = usageAccountView(rows, work);
+  assert.deepEqual(view.harnessTabs.map(({ id }) => id), [base]);
+  assert.deepEqual(view.chips.map(({ id }) => id), [base, work, personal]);
+  const reply = workReplyModel(null, "muse-model", work);
+  assert.equal(reply, `${work}/muse-model`);
+  assert.equal(changesCliAccount(work, reply), false);
+  assert.equal(changesCliAccount(personal, reply), true);
+  assert.equal(changesCliAccount(base, reply), true);
+});

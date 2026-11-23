@@ -112,7 +112,7 @@ pub fn work_reply_model(reported: Option<&str>, picked: Option<&str>, engine: &s
     let Some(p) = picked.map(str::trim).filter(|p| !p.is_empty()) else {
         return engine.to_string();
     };
-    if matches!(engine, "claude" | "codex" | "fx" | "agy" | "pi") || engine.starts_with("claude@") || engine.starts_with("codex@") {
+    if matches!(engine, "claude" | "codex" | "fx" | "agy" | "pi") || engine.starts_with("claude@") || engine.starts_with("codex@") || (engine.starts_with("plugin:") && engine.contains('@')) {
         format!("{engine}/{p}")
     } else {
         p.to_string()

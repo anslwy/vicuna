@@ -91,7 +91,7 @@ pub fn declared_icon(dir: &Path, harness: Option<&str>, plugin: Option<&str>) ->
 
 pub fn engine_icon(id: &str) -> Option<String> {
     let key = id.strip_prefix("plugin:")?;
-    let (pid, hid) = key.split_once('/')?;
+    let (pid, hid) = crate::plugin_harness::split_account(key).0.split_once('/')?;
     let (manifest, dir) = crate::plugins::installed_manifest(pid)?;
     let harness = manifest.harnesses.iter().find(|h| h.id == hid)?;
     declared_icon(&dir, harness.icon.as_deref(), manifest.icon.as_deref())

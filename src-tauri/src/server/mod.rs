@@ -434,9 +434,14 @@ async fn dispatch(
                 }
             }
         }
-        "work_account_support" => Ok(serde_json::json!({
-            "engines": if cfg!(windows) { vec!["claude", "codex"] } else { vec!["claude", "codex", "agy"] },
-        })),
+        "work_account_support" => {
+            let mut engines = vec![String::from("claude"), String::from("codex")];
+            if !cfg!(windows) {
+                engines.push("agy".into());
+            }
+            engines.extend(crate::plugin_harness::account_bases());
+            Ok(serde_json::json!({ "engines": engines }))
+        },
         "work_account_add" | "work_account_rename" | "work_account_remove" => {
             let engine = arg_opt_str(args, "engine").unwrap_or_default();
             let label = arg_opt_str(args, "label").unwrap_or_default();
@@ -447,6 +452,15 @@ async fn dispatch(
                     "work_account_rename" => Ok(serde_json::to_value(crate::agy_accounts::rename_logic(&id, &label)?).map_err(|e| e.to_string())?),
                     _ => crate::agy_accounts::remove_logic(&id),
                 }
+            } else if let Some(key) = crate::plugin_harness::parse_engine(&engine)
+                .filter(|key| crate::plugin_harness::split_account(key).1.is_none())
+            {
+                let provider = crate::plugin_harness::account_provider(key)?;
+                let account = crate::cli_accounts::mutate_with(
+                    crate::cli_accounts::Registry::Plugin(key), cmd, &id, &label,
+                    |dir| provider.sign_in_command(dir),
+                )?;
+                Ok(serde_json::to_value(account).map_err(|e| e.to_string())?)
             } else {
                 let harness = crate::cli_accounts::Harness::parse(&engine).ok_or("This harness does not support extra accounts.")?;
                 Ok(serde_json::to_value(crate::cli_accounts::mutate(harness, cmd, &id, &label)?).map_err(|e| e.to_string())?)

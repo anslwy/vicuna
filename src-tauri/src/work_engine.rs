@@ -71,9 +71,15 @@ impl Engine {
 
     pub fn changes_cli_account(self, previous_model: Option<&str>) -> bool {
         previous_model.is_some_and(|model| {
-            let previous = model.split('/').next().unwrap_or_default();
-            previous != self.id() && (self.cli_account().is_some()
-                || previous.split_once('@').is_some_and(|(base, _)| Harness::parse(base).is_some()))
+            let previous = if model.starts_with(crate::plugin_harness::ENGINE_PREFIX) {
+                model.splitn(3, '/').take(2).collect::<Vec<_>>().join("/")
+            } else {
+                model.split('/').next().unwrap_or_default().to_owned()
+            };
+            let account = |id: &str| id.split_once('@').is_some_and(|(base, _)| {
+                Harness::parse(base).is_some() || base.starts_with(crate::plugin_harness::ENGINE_PREFIX)
+            });
+            previous != self.id() && (account(self.id()) || account(&previous))
         })
     }
 
@@ -190,6 +196,7 @@ impl Engine {
             Engine::Agy | Engine::AgyAccount(_) => format!("agy/{model}"),
             Engine::Fx => format!("fx/{model}"),
             Engine::Pi => format!("pi/{model}"),
+            Engine::Plugin(k) if crate::plugin_harness::split_account(k).1.is_some() => format!("{}/{model}", self.id()),
             Engine::Plugin(k) => format!("{}/{model}", crate::plugin_harness::split_key(k).1),
         }
     }
@@ -404,7 +411,11 @@ async fn engines_info_for(requested: Option<Engine>) -> WorkEngineInfo {
                 (e, info, account)
             } else {
                 let info = bases.iter().find(|(engine, _)| *engine == e).expect("installed harness info").1.clone();
-                (e, info, None)
+                let account = match e {
+                    Engine::Plugin(key) => crate::plugin_harness::account_info(key),
+                    _ => None,
+                };
+                (e, info, account)
             }
         }
     })).await;

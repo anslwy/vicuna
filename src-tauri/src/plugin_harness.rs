@@ -45,6 +45,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use crate::cli_accounts::Registry as AccountRegistry;
 use std::path::{Path, PathBuf};
 
 pub const ENGINE_PREFIX: &str = "plugin:";
@@ -86,6 +87,52 @@ pub struct Harness {
     /// output (see `UsageSpec`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageSpec>,
+    /// Opt into a Vicuna-supported account adapter. A manifest cannot set
+    /// its own environment variables or choose a sign-in command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<AccountProvider>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountProvider {
+    Muse,
+}
+
+impl AccountProvider {
+    fn environment(self, dir: &Path) -> [(&'static str, PathBuf); 4] {
+        [
+            ("XDG_CONFIG_HOME", dir.join("config")),
+            ("XDG_DATA_HOME", dir.join("data")),
+            ("XDG_STATE_HOME", dir.join("state")),
+            ("XDG_CACHE_HOME", dir.join("cache")),
+        ]
+    }
+
+    pub fn sign_in_command(self, dir: &Path) -> String {
+        let vars = self.environment(dir);
+        if cfg!(windows) {
+            let assignments = vars.iter().map(|(key, path)| {
+                format!("$env:{key} = '{}'; ", path.to_string_lossy().replace('\'', "''"))
+            }).collect::<String>();
+            format!("$env:META_API_KEY = $null; {assignments}muse login")
+        } else {
+            let assignments = vars.iter().map(|(key, path)| {
+                format!("{key}={}", crate::agy_accounts::shell_quote(&path.to_string_lossy()))
+            }).collect::<Vec<_>>().join(" ");
+            format!("env -u META_API_KEY {assignments} muse login")
+        }
+    }
+
+    pub fn signed_in(self, dir: &Path) -> bool {
+        // Muse writes the Meta provider entry on login and removes its
+        // credentials on logout. Checking it avoids network calls on refresh.
+        std::fs::read(dir.join("config/muse/auth.json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|auth| auth.pointer("/providers/meta")
+                .and_then(Value::as_object).map(|provider| !provider.is_empty()))
+            .unwrap_or(false)
+    }
 }
 
 /// `usage`: a command printing JSON (same rules as `acp`: bare program on
@@ -283,6 +330,12 @@ pub fn validate(list: &[Harness]) -> Result<(), String> {
         if let Some(u) = &h.usage {
             validate_usage(u).map_err(|e| format!("harness {}: {e}", h.id))?;
         }
+        if h.accounts == Some(AccountProvider::Muse)
+            && (h.acp.command != "muse" || h.acp.args.first().map(String::as_str) != Some("acp")
+                || h.usage.as_ref().is_some_and(|u| u.command != "muse" || u.args != ["usage", "--json"]))
+        {
+            return Err(format!("harness {}: Muse accounts require muse acp and, if provided, muse usage --json", h.id));
+        }
     }
     Ok(())
 }
@@ -299,6 +352,8 @@ pub struct Grant {
     /// The usage command approved with it (None = the harness had none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AcpLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<AccountProvider>,
 }
 
 pub type Consent = BTreeMap<String, Grant>;
@@ -313,7 +368,7 @@ fn write_consent(plugin_dir: &Path, c: &Consent) -> Result<(), String> {
 
 pub fn consented(consent: &Consent, h: &Harness) -> bool {
     consent.get(&h.id).is_some_and(|g| {
-        g.command == h.acp.command && g.args == h.acp.args && g.usage == h.usage.as_ref().map(UsageSpec::launch)
+        g.command == h.acp.command && g.args == h.acp.args && g.usage == h.usage.as_ref().map(UsageSpec::launch) && g.accounts == h.accounts
     })
 }
 
@@ -349,10 +404,12 @@ pub fn grant(plugin_dir: &Path, list: &[Harness], approved: &[Value], now: i64) 
             .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
         let usage = launch_of(a.get("usage"));
-        if cmd != h.acp.command || args != h.acp.args || usage != h.usage.as_ref().map(UsageSpec::launch) {
+        let accounts: Option<AccountProvider> = serde_json::from_value(a.get("accounts").cloned().unwrap_or(Value::Null))
+            .map_err(|_| format!("harness {hid}: invalid account provider"))?;
+        if accounts != h.accounts || cmd != h.acp.command || args != h.acp.args || usage != h.usage.as_ref().map(UsageSpec::launch) {
             return Err(format!("harness {hid}: the command changed since it was shown; review it again"));
         }
-        consent.insert(hid.to_string(), Grant { command: cmd.to_string(), args, granted_at: now, usage });
+        consent.insert(hid.to_string(), Grant { command: cmd.to_string(), args, granted_at: now, usage, accounts });
     }
     write_consent(plugin_dir, &consent)?;
     Ok(consent)
@@ -377,6 +434,7 @@ pub fn describe(h: &Harness, consent: &Consent, plugin_id: &str) -> Value {
         "command": h.acp.command, "args": h.acp.args, "models": h.models,
         "installHint": h.install_hint, "installUrl": h.install_url,
         "enabled": consented(consent, h),
+        "accounts": h.accounts,
         "installed": find_command(&h.acp.command).is_some(),
         "usage": h.usage.as_ref().map(|u| json!({"command": u.command, "args": u.args})),
     })
@@ -400,8 +458,14 @@ pub fn intern(s: &str) -> &'static str {
 /// `plugin:<plugin>/<harness>` -> interned `<plugin>/<harness>` key.
 pub fn parse_engine(s: &str) -> Option<&'static str> {
     let rest = s.trim().strip_prefix(ENGINE_PREFIX)?;
-    let (p, h) = rest.split_once('/')?;
-    (valid_id(p) && valid_id(h)).then(|| intern(rest))
+    let (base, account) = split_account(rest);
+    let (p, h) = base.split_once('/')?;
+    (valid_id(p) && valid_id(h) && account.is_none_or(crate::agy_accounts::valid_id))
+        .then(|| intern(rest))
+}
+
+pub fn split_account(key: &str) -> (&str, Option<&str>) {
+    key.split_once('@').map_or((key, None), |(base, id)| (base, Some(id)))
 }
 
 pub fn split_key(key: &str) -> (&str, &str) {
@@ -417,7 +481,7 @@ pub struct Resolved {
 }
 
 pub fn lookup(key: &str) -> Option<Resolved> {
-    let (pid, hid) = split_key(key);
+    let (pid, hid) = split_key(split_account(key).0);
     let (m, dir) = crate::plugins::installed_manifest(pid)?;
     let h = m.harnesses.iter().find(|h| h.id == hid)?.clone();
     let enabled = consented(&read_consent(&dir), &h);
@@ -429,11 +493,51 @@ pub fn all_keys() -> Vec<&'static str> {
     let mut out = Vec::new();
     for (m, _) in crate::plugins::installed_manifests() {
         for h in &m.harnesses {
-            out.push(intern(&format!("{}/{}", m.id, h.id)));
+            let key = intern(&format!("{}/{}", m.id, h.id));
+            out.push(key);
+            if h.accounts.is_some() {
+                out.extend(AccountRegistry::Plugin(key).list().iter()
+                    .map(|account| intern(&format!("{key}@{}", account.id))));
+            }
         }
     }
     out.sort();
     out
+}
+
+pub fn account_bases() -> Vec<String> {
+    all_keys().into_iter()
+        .filter(|key| split_account(key).1.is_none())
+        .filter(|key| account_provider(key).is_ok())
+        .map(|key| format!("{ENGINE_PREFIX}{key}"))
+        .collect()
+}
+
+pub fn account_provider(key: &str) -> Result<AccountProvider, String> {
+    lookup(key).filter(|r| r.enabled).and_then(|r| r.harness.accounts)
+        .ok_or_else(|| "Enable an installed harness that supports extra accounts in Settings → Plugins.".into())
+}
+
+pub fn account_info(key: &str) -> Option<crate::agy_accounts::AccountInfo> {
+    let (base, id) = split_account(key);
+    let provider = lookup(base)?.harness.accounts?;
+    crate::cli_accounts::plugin_info(intern(base), id?, provider)
+}
+
+fn account_profile(key: &str, r: &Resolved) -> Result<Option<(AccountProvider, PathBuf)>, String> {
+    let (base, id) = split_account(key);
+    let Some(id) = id else { return Ok(None) };
+    let provider = r.harness.accounts.ok_or("This plugin harness no longer supports extra accounts.")?;
+    let dir = AccountRegistry::Plugin(intern(base)).checked_profile(id)?;
+    Ok(Some((provider, dir)))
+}
+
+fn sign_in_hint(profile: Option<&(AccountProvider, PathBuf)>) -> Option<String> {
+    let (provider, dir) = profile?;
+    (!provider.signed_in(dir)).then(|| format!(
+        "To sign in to this account, run `{}` in a terminal on this machine.",
+        provider.sign_in_command(dir)
+    ))
 }
 
 /// Resolve a bare command on the terminal PATH + version-manager bins
@@ -460,6 +564,9 @@ pub fn unavailable(key: &str) -> Option<String> {
             r.harness.label, r.plugin_name
         ));
     }
+    if let Err(err) = account_profile(key, &r) {
+        return Some(err);
+    }
     if find_command(&r.harness.acp.command).is_none() {
         let hint = if r.harness.install_hint.trim().is_empty() {
             format!("Install `{}` so it is on your PATH.", r.harness.acp.command)
@@ -473,7 +580,17 @@ pub fn unavailable(key: &str) -> Option<String> {
 
 pub fn label(key: &str) -> &'static str {
     match lookup(key) {
-        Some(r) => intern(r.harness.label.trim()),
+        Some(r) => {
+            let (base, id) = split_account(key);
+            match id {
+                Some(id) => {
+                    let name = AccountRegistry::Plugin(intern(base)).find(id)
+                        .map(|a| a.label).unwrap_or_else(|| id.to_string());
+                    intern(&format!("{} · {name}", r.harness.label.trim()))
+                }
+                None => intern(r.harness.label.trim()),
+            }
+        }
         None => intern(&format!("{ENGINE_PREFIX}{key}")),
     }
 }
@@ -481,13 +598,20 @@ pub fn label(key: &str) -> &'static str {
 /// The launch for a turn. Refuses unless the user consented to exactly
 /// this command + args (re-checked here, at spawn time).
 pub fn launch(key: &str, workspace: &str) -> Result<(PathBuf, tokio::process::Command), String> {
-    if let Some(e) = unavailable(key) {
-        return Err(e);
+    let r = lookup(key).ok_or_else(|| format!("The plugin harness {ENGINE_PREFIX}{key} is no longer installed."))?;
+    if !r.enabled {
+        return Err("This harness is not enabled. Approve its commands in Settings → Plugins.".into());
     }
-    let r = lookup(key).ok_or("plugin harness disappeared")?;
+    let profile = account_profile(key, &r)?;
+    if let Some(hint) = sign_in_hint(profile.as_ref()) {
+        return Err(hint);
+    }
     let bin = find_command(&r.harness.acp.command).ok_or("command not found")?;
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&r.harness.acp.args);
+    if let Some((provider, dir)) = profile {
+        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+    }
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
     }
@@ -507,7 +631,7 @@ pub fn launch(key: &str, workspace: &str) -> Result<(PathBuf, tokio::process::Co
 
 /// Whether this harness reports usage (it has a usage map and is enabled).
 pub fn reports_usage(key: &str) -> bool {
-    lookup(key).is_some_and(|r| r.enabled && r.harness.usage.is_some())
+    lookup(key).is_some_and(|r| r.enabled && r.harness.usage.is_some() && account_profile(key, &r).is_ok())
 }
 
 /// Run the consented usage command and return (map, parsed JSON output).
@@ -522,17 +646,25 @@ pub fn run_usage(key: &str) -> Result<(UsageMap, Value), String> {
         ));
     }
     let bin = find_command(&u.command).ok_or_else(|| format!("the usage command `{}` was not found on PATH", u.command))?;
-    let out = run_capped(&bin, &u.args, USAGE_MAX_BYTES, std::time::Duration::from_secs(USAGE_TIMEOUT_SECS))?;
+    let profile = account_profile(key, &r)?;
+    if let Some(hint) = sign_in_hint(profile.as_ref()) {
+        return Err(hint);
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(&u.args);
+    if let Some((provider, dir)) = profile {
+        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+    }
+    let out = run_capped(cmd, &bin, USAGE_MAX_BYTES, std::time::Duration::from_secs(USAGE_TIMEOUT_SECS))?;
     let v: Value = serde_json::from_slice(&out).map_err(|_| format!("`{}` did not print JSON", u.command))?;
     Ok((u.map, v))
 }
 
 /// Spawn `bin args` (no shell, cwd = home), read at most `max` bytes of
 /// stdout and kill it after `timeout`.
-pub fn run_capped(bin: &Path, args: &[String], max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+fn run_capped(mut cmd: std::process::Command, bin: &Path, max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
     }
@@ -609,9 +741,9 @@ pub fn engine_info(key: &str) -> crate::opencode::WorkEngineInfo {
         version: r.as_ref().map(|r| format!("(plugin: {})", r.plugin_name)),
         install_url: r.as_ref().and_then(|r| r.harness.install_url.clone()).unwrap_or_default(),
         model: saved_model(key),
-        config_path: None,
+        config_path: account_info(key).map(|a| a.home),
         others: Vec::new(),
-        warning: None,
+        warning: sign_in_hint(r.as_ref().and_then(|r| account_profile(key, r).ok().flatten()).as_ref()),
         ask_permission: false,
     }
 }
@@ -652,6 +784,7 @@ mod tests {
             install_hint: String::new(),
             install_url: None,
             usage: None,
+            accounts: None,
         }
     }
 
@@ -782,16 +915,44 @@ mod tests {
     }
 
     #[test]
+    fn enabling_plugin_accounts_requires_fresh_consent() {
+        let dir = std::env::temp_dir().join(format!("vicuna-profile-consent-{}-{}", std::process::id(), crate::plugins::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut harness = h("muse", &["acp"]);
+        let old = json!({"id": "demo", "command": "muse", "args": ["acp"]});
+        grant(&dir, &[harness.clone()], &[old.clone()], 1).unwrap();
+
+        harness.accounts = Some(AccountProvider::Muse);
+        validate(&[harness.clone()]).unwrap();
+        assert!(!consented(&read_consent(&dir), &harness));
+        assert!(grant(&dir, &[harness.clone()], &[old], 2).is_err());
+        let approved = json!({"id": "demo", "command": "muse", "args": ["acp"], "accounts": "muse"});
+        let consent = grant(&dir, &[harness.clone()], &[approved], 2).unwrap();
+        assert!(consented(&consent, &harness));
+
+        harness.acp.command = "other-agent".into();
+        assert!(validate(&[harness]).is_err());
+        assert!(parse_engine("plugin:muse/muse@work").is_some());
+        assert!(parse_engine("plugin:muse/muse@../work").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_capped_enforces_size_and_time() {
         let sh = std::path::Path::new("/bin/sh");
         if !sh.exists() {
             return;
         }
+        fn test_command(sh: &Path, args: &[String]) -> std::process::Command {
+            let mut cmd = std::process::Command::new(sh);
+            cmd.args(args);
+            cmd
+        }
         let a = |s: &str| vec!["-c".to_string(), s.to_string()];
-        assert_eq!(run_capped(sh, &a("printf '{\"a\":1}'"), 1024, std::time::Duration::from_secs(5)).unwrap(), br#"{"a":1}"#);
-        assert!(run_capped(sh, &a("head -c 5000 /dev/zero"), 1024, std::time::Duration::from_secs(5)).unwrap_err().contains("larger"));
+        assert_eq!(run_capped(test_command(sh, &a("printf '{\"a\":1}'")), sh, 1024, std::time::Duration::from_secs(5)).unwrap(), br#"{"a":1}"#);
+        assert!(run_capped(test_command(sh, &a("head -c 5000 /dev/zero")), sh, 1024, std::time::Duration::from_secs(5)).unwrap_err().contains("larger"));
         let t = std::time::Instant::now();
-        assert!(run_capped(sh, &a("sleep 30"), 1024, std::time::Duration::from_millis(300)).unwrap_err().contains("longer"));
+        assert!(run_capped(test_command(sh, &a("sleep 30")), sh, 1024, std::time::Duration::from_millis(300)).unwrap_err().contains("longer"));
         assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 }

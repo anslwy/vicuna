@@ -124,7 +124,7 @@ export function workReplyModel(
   if (!p) return engine;
   // fx/agy ids that are not already engine-prefixed get the engine prefix to
   // keep them apart from the Codex engine's own `codex/<model>`
-  if (engine.startsWith("plugin:")) return `${engine.slice(7).split("/")[1] || engine}/${p}`;
+  if (engine.startsWith("plugin:")) return `${isAccountEngine(engine) ? engine : engine.slice(7).split("/")[1] || engine}/${p}`;
   if (engine.startsWith("claude@") || engine.startsWith("codex@")) return `${engine}/${p}`;
   return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" || engine === "pi" ? `${engine}/${p}` : p;
 }
@@ -254,15 +254,17 @@ const ACCOUNT_HARNESSES = ["claude", "codex", "agy"] as const;
 
 /** `claude@work` → `claude`; other harness IDs pass through. */
 export function baseEngineId(id: string): string {
+  if (id.startsWith("plugin:")) return id.split("@", 1)[0];
   return ACCOUNT_HARNESSES.find((base) => id.startsWith(`${base}@`)) ?? id;
 }
 
-/** A Claude or Codex account handoff replays the transcript in a fresh native
+/** A Claude, Codex or plugin account handoff replays the transcript in a fresh native
  *  session, including when the user returns to an earlier account. */
 export function changesCliAccount(engine: string, previousModel: string | null | undefined): boolean {
   if (!previousModel) return false;
-  const previous = previousModel.split("/", 1)[0];
-  const isCliAccount = (id: string) => id.startsWith("claude@") || id.startsWith("codex@");
+  const previous = previousModel.split("/", previousModel.startsWith("plugin:") ? 2 : 1).join("/");
+  const isCliAccount = (id: string) =>
+    id.startsWith("claude@") || id.startsWith("codex@") || (id.startsWith("plugin:") && isAccountEngine(id));
   return engine !== previous && (isCliAccount(engine) || isCliAccount(previous));
 }
 
