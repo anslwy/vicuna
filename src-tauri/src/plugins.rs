@@ -88,6 +88,9 @@ pub struct BridgeSpec {
     /// Placeholder text for the token input field.
     #[serde(default)]
     pub token_placeholder: String,
+    /// Authentication mode: `"token"` (default, bot token input) or `"qr"` (linked-device QR flow).
+    #[serde(default)]
+    pub auth_mode: Option<String>,
     /// Short setup instructions shown before saving a token.
     #[serde(default)]
     pub setup_steps: Vec<SetupStep>,
@@ -324,6 +327,11 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
         if let Some(p) = &b.icon_path {
             if !valid_icon_path(p) {
                 return Err("bridge: iconPath contains disallowed characters".into());
+            }
+        }
+        if let Some(mode) = &b.auth_mode {
+            if !matches!(mode.as_str(), "token" | "qr") {
+                return Err(format!("bridge: authMode must be \"token\" or \"qr\", got {mode:?}"));
             }
         }
         for step in &b.setup_steps {
@@ -1464,6 +1472,16 @@ mod tests {
 
         m.bridge.as_mut().unwrap().entrypoint = Some("bin/demo".into());
         m.bridge.as_mut().unwrap().color = Some("url(evil)".into());
+        assert!(validate(&m).is_err());
+
+        m.bridge.as_mut().unwrap().color = Some("#5865f2".into());
+        m.bridge.as_mut().unwrap().auth_mode = Some("qr".into());
+        assert!(validate(&m).is_ok());
+
+        m.bridge.as_mut().unwrap().auth_mode = Some("token".into());
+        assert!(validate(&m).is_ok());
+
+        m.bridge.as_mut().unwrap().auth_mode = Some("oauth".into());
         assert!(validate(&m).is_err());
     }
 }
