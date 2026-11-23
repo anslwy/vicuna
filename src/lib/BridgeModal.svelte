@@ -5,9 +5,11 @@
   import { invokeOrBridge } from "$lib/bridge";
   import { safeColor, type InstalledPlugin } from "$lib/pluginTheme";
   import {
+    bridgeAuthMode,
     bridgeConnState,
     bridgeDisplayName,
     safeIconPath,
+    safeQrDataUrl,
     type BridgeStatusSnapshot,
   } from "$lib/bridgePlugin";
 
@@ -46,11 +48,13 @@
 
   const bridge = $derived(plugin.bridge ?? {});
   const name = $derived(bridgeDisplayName(plugin));
+  const authMode = $derived(bridgeAuthMode(bridge));
   const iconPath = $derived(safeIconPath(bridge.iconPath));
   const brandColor = $derived(safeColor(bridge.color) ? bridge.color! : "var(--accent)");
   const pairPrefix = $derived(bridge.pairCommand?.trim() ? `${bridge.pairCommand.trim()} ` : "");
 
   let st = $state<BridgeStatusSnapshot | null>(null);
+  const qrSrc = $derived(safeQrDataUrl(st?.qrDataUrl));
   let token = $state("");
   let editing = $state(false);
   let busy = $state(false);
@@ -127,6 +131,12 @@
     }
   }
 
+  async function startLink() {
+    if (await run("bridge_save", { token: "" })) {
+      editing = false;
+    }
+  }
+
   async function whisper(cmd: "whisper_install" | "whisper_uninstall", model: string) {
     wsBusy = true;
     err = "";
@@ -180,7 +190,13 @@
   {#if !st}
     <div class="br-muted">Loading…</div>
   {:else if !st.configured || editing}
-    <div class="br-muted small">Each Work session can have its own {name} bot. Messages go directly to this session.</div>
+    <div class="br-muted small">
+      {#if authMode === "qr"}
+        Link your {name} account once, then pair this Work session to a chat or solo group.
+      {:else}
+        Each Work session can have its own {name} bot. Messages go directly to this session.
+      {/if}
+    </div>
     {#if bridge.setupSteps?.length}
       <ol class="br-steps">
         {#each bridge.setupSteps as step, i (i)}
@@ -193,48 +209,79 @@
         {/each}
       </ol>
     {/if}
-    <div class="br-row">
-      <input
-        class="br-input"
-        data-testid="bridge-token"
-        type="password"
-        autocomplete="off"
-        placeholder={bridge.tokenPlaceholder || "Paste bot token…"}
-        bind:value={token}
-        onkeydown={(e) => e.key === "Enter" && void save()}
-      />
-      <button class="br-btn primary" data-testid="bridge-save" disabled={busy || !token.trim()} onclick={save}>{busy ? "Checking…" : "Save"}</button>
-      {#if editing}<button class="br-btn" onclick={() => (editing = false)}>Cancel</button>{/if}
-    </div>
-    <div class="br-muted small">Stored on the server in <code>~/vicuna/config/plugins/{plugin.id}.json</code> (owner-only) and never shown again.</div>
+    {#if authMode === "qr"}
+      {#if qrSrc}
+        <div class="br-box" data-testid="bridge-qr-box">
+          <div class="br-qr-wrap">
+            <img class="br-qr" src={qrSrc} alt={`${name} link QR code`} data-testid="bridge-qr" />
+          </div>
+          <div class="br-muted small">Scan this QR code in {name} → Linked Devices. Waiting…</div>
+        </div>
+      {/if}
+      <div class="br-row">
+        <button class="br-btn primary" data-testid="bridge-link" disabled={busy} onclick={startLink}>
+          {busy ? "Starting…" : qrSrc ? "Refresh QR" : `Link ${name} device`}
+        </button>
+        {#if editing}<button class="br-btn" onclick={() => (editing = false)}>Cancel</button>{/if}
+      </div>
+      <div class="br-muted small">Session keys are stored locally in <code>~/vicuna/config/plugins/{plugin.id}.json</code> (owner-only).</div>
+    {:else}
+      <div class="br-row">
+        <input
+          class="br-input"
+          data-testid="bridge-token"
+          type="password"
+          autocomplete="off"
+          placeholder={bridge.tokenPlaceholder || "Paste bot token…"}
+          bind:value={token}
+          onkeydown={(e) => e.key === "Enter" && void save()}
+        />
+        <button class="br-btn primary" data-testid="bridge-save" disabled={busy || !token.trim()} onclick={save}>{busy ? "Checking…" : "Save"}</button>
+        {#if editing}<button class="br-btn" onclick={() => (editing = false)}>Cancel</button>{/if}
+      </div>
+      <div class="br-muted small">Stored on the server in <code>~/vicuna/config/plugins/{plugin.id}.json</code> (owner-only) and never shown again.</div>
+    {/if}
   {:else}
     {@const online = Boolean(st.connected ?? st.polling)}
     <div class="br-status" data-testid="bridge-status">
       <span class="br-dot" class:on={online && !!st.enabled && !!st.paired} class:off={!st.enabled}></span>
       {#if st.botUrl}
-        <a href={st.botUrl} target="_blank" rel="noreferrer">@{st.botUsername}</a>
+        <a href={st.botUrl} target="_blank" rel="noreferrer">{authMode === "qr" ? st.botUsername : `@${st.botUsername}`}</a>
       {:else if st.botUsername}
-        <span>@{st.botUsername}</span>
+        <span>{authMode === "qr" ? st.botUsername : `@${st.botUsername}`}</span>
       {/if}
       <span class="br-muted">{st.tokenTail}</span>
       <span class="br-spacer"></span>
-      <button class="br-btn small" onclick={() => (editing = true)}>Change token</button>
+      <button class="br-btn small" onclick={() => (editing = true)}>{authMode === "qr" ? "Relink" : "Change token"}</button>
     </div>
 
     {#if st.paired}
       <div class="br-box" data-testid="bridge-paired">
         <div>Paired with <b>{st.paired.name}</b>. Messages they send to this bot go to this session; its replies and questions come back.</div>
       </div>
+    {:else if qrSrc}
+      <div class="br-box" data-testid="bridge-qr-box">
+        <div class="br-qr-wrap">
+          <img class="br-qr" src={qrSrc} alt={`${name} link QR code`} data-testid="bridge-qr" />
+        </div>
+        <div class="br-row">
+          <div class="br-muted small">Scan this QR code in {name} → Linked Devices. Waiting…</div>
+          <span class="br-spacer"></span>
+          <button class="br-btn small" data-testid="bridge-link" disabled={busy} onclick={startLink}>{busy ? "Refreshing…" : "Refresh QR"}</button>
+        </div>
+      </div>
     {:else}
       <div class="br-box" data-testid="bridge-pairing">
-        {#if st.inviteUrl}
+        {#if st.pairingHint}
+          <div>{st.pairingHint}</div>
+        {:else if st.inviteUrl}
           <div>
             1. Add this bot to a server you're in so you can DM it:
             <a href={st.inviteUrl} target="_blank" rel="noreferrer" data-testid="bridge-invite-link">Invite @{st.botUsername || "bot"}</a>
           </div>
           <div>2. Send this in a DM to <b>@{st.botUsername || "the bot"}</b>:</div>
         {:else}
-          <div>Send this to <b>@{st.botUsername || "the bot"}</b>:</div>
+          <div>Send this to <b>{authMode === "qr" ? (st.botUsername || name) : `@${st.botUsername || "the bot"}`}</b>:</div>
         {/if}
         <div class="br-code-row">
           <div class="br-code" data-testid="bridge-code">{pairPrefix}{st.pairCode}</div>
@@ -251,7 +298,7 @@
       </label>
       <span class="br-spacer"></span>
       {#if st.paired}<button class="br-btn" data-testid="bridge-unpair" disabled={busy} onclick={() => run("bridge_unpair")}>Unpair</button>{/if}
-      <button class="br-btn danger" data-testid="bridge-remove" disabled={busy} onclick={() => run("bridge_remove")}>Remove bot</button>
+      <button class="br-btn danger" data-testid="bridge-remove" disabled={busy} onclick={() => run("bridge_remove")}>{authMode === "qr" ? "Disconnect" : "Remove bot"}</button>
     </div>
 
     {#if ws}
@@ -290,7 +337,13 @@
       </details>
     {/if}
 
-    <div class="br-muted small">Bound to this session (changing Lead won't move it). Use one bot token per session.</div>
+    <div class="br-muted small">
+      {#if authMode === "qr"}
+        Bound to this session (changing Lead won't move it). Pair each session to its own chat or solo group.
+      {:else}
+        Bound to this session (changing Lead won't move it). Use one bot token per session.
+      {/if}
+    </div>
   {/if}
 
   {#if otherBots.length > 0}
@@ -343,6 +396,8 @@
   .br-other-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .br-code-row { display: flex; align-items: center; gap: 10px; }
   .br-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 20px; letter-spacing: 1px; user-select: text; }
+  .br-qr-wrap { display: flex; justify-content: center; padding: 12px; background: #fff; border-radius: 10px; align-self: center; }
+  .br-qr { display: block; width: 200px; height: 200px; object-fit: contain; image-rendering: pixelated; }
   .br-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
   .br-dot.on { background: #3fb950; }
   .br-dot.off { background: var(--border-2); }

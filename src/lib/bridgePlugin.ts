@@ -7,11 +7,14 @@ export interface PluginSetupStep {
   linkUrl?: string | null;
 }
 
+export type BridgeAuthMode = "token" | "qr";
+
 export interface PluginBridgeDef {
   name?: string;
   color?: string | null;
   iconPath?: string | null;
   tokenPlaceholder?: string;
+  authMode?: BridgeAuthMode;
   setupSteps?: PluginSetupStep[];
   pairCommand?: string;
   supportsVoice?: boolean;
@@ -30,6 +33,10 @@ export interface BridgeStatusSnapshot {
   inviteUrl?: string;
   tokenTail?: string;
   pairCode?: string;
+  /** Optional base64 PNG/SVG data URL for linked-device QR pairing (`authMode: "qr"`). */
+  qrDataUrl?: string;
+  /** Optional custom instruction shown above the pair code box. */
+  pairingHint?: string;
   lastError?: string;
 }
 
@@ -37,6 +44,25 @@ export type BridgeConnState = "connected" | "disconnected" | "unconfigured";
 
 export const DEFAULT_BRIDGE_ICON =
   "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z";
+
+export function bridgeAuthMode(bridge: PluginBridgeDef | null | undefined): BridgeAuthMode {
+  return bridge?.authMode === "qr" ? "qr" : "token";
+}
+
+const MAX_QR_DATA_URL_LEN = 256 * 1024;
+const SAFE_QR_PREFIXES = ["data:image/png;base64,", "data:image/svg+xml;base64,"] as const;
+
+/** Validate a plugin-supplied QR data URL before rendering it in an `<img>`. */
+export function safeQrDataUrl(u: unknown): string | null {
+  if (typeof u !== "string") return null;
+  const s = u.trim();
+  if (!s || s.length > MAX_QR_DATA_URL_LEN) return null;
+  const prefix = SAFE_QR_PREFIXES.find((p) => s.startsWith(p));
+  if (!prefix) return null;
+  const body = s.slice(prefix.length);
+  if (!body || !/^[A-Za-z0-9+/=\s]+$/.test(body)) return null;
+  return s;
+}
 
 /** Defense-in-depth SVG `<path d="...">` check (matches server validation). */
 export function safeIconPath(p: unknown): string {
