@@ -8,6 +8,7 @@ import {
   bridgeDisplayName,
   DEFAULT_BRIDGE_ICON,
   safeIconPath,
+  safeInputPrompt,
   safeQrDataUrl,
 } from "../src/lib/bridgePlugin.ts";
 
@@ -71,4 +72,21 @@ test("safeQrDataUrl accepts base64 PNG/SVG data URLs and rejects unsafe values",
   assert.equal(safeQrDataUrl("data:image/png;base64,not valid!!"), null);
   assert.equal(safeQrDataUrl("data:image/png;base64,"), null);
   assert.equal(safeQrDataUrl(null), null);
+});
+
+test("safeInputPrompt normalizes plugin input steps", () => {
+  assert.equal(safeInputPrompt(null), null);
+  assert.equal(safeInputPrompt("x"), null);
+  assert.equal(safeInputPrompt({ label: "  ", placeholder: "" }), null);
+  assert.deepEqual(safeInputPrompt({ label: "Code from SMS\nsent", placeholder: "123456" }), {
+    label: "Code from SMS sent",
+    placeholder: "123456",
+    secret: false,
+    submitLabel: "Submit",
+  });
+  const p = safeInputPrompt({ label: "x".repeat(500), secret: true, submitLabel: "Verify" })!;
+  assert.equal(p.label.length, 300);
+  assert.equal(p.secret, true);
+  assert.equal(p.submitLabel, "Verify");
+  assert.equal(safeInputPrompt({ label: "a", secret: "yes" })!.secret, false);
 });
