@@ -10,6 +10,7 @@
     bridgeDisplayName,
     safeIconPath,
     safeQrDataUrl,
+    safeInputPrompt,
     type BridgeStatusSnapshot,
   } from "$lib/bridgePlugin";
 
@@ -55,6 +56,8 @@
 
   let st = $state<BridgeStatusSnapshot | null>(null);
   const qrSrc = $derived(safeQrDataUrl(st?.qrDataUrl));
+  const prompt = $derived(safeInputPrompt(st?.inputPrompt));
+  let promptValue = $state("");
   let token = $state("");
   let editing = $state(false);
   let busy = $state(false);
@@ -131,6 +134,14 @@
     }
   }
 
+  async function submitPrompt() {
+    if (!promptValue.trim()) return;
+    if (await run("bridge_save", { token: promptValue.trim() })) {
+      promptValue = "";
+      editing = false;
+    }
+  }
+
   async function startLink() {
     if (await run("bridge_save", { token: "" })) {
       editing = false;
@@ -156,6 +167,7 @@
     void plugin.id;
     st = null;
     token = "";
+    promptValue = "";
     editing = false;
     err = "";
     void refresh();
@@ -189,6 +201,26 @@
 
   {#if !st}
     <div class="br-muted">Loading…</div>
+  {:else if prompt}
+    <div class="br-box" data-testid="bridge-input-prompt">
+      {#if prompt.label}<div>{prompt.label}</div>{/if}
+      <div class="br-row">
+        <input
+          class="br-input"
+          data-testid="bridge-input"
+          type={prompt.secret ? "password" : "text"}
+          autocomplete="off"
+          placeholder={prompt.placeholder}
+          bind:value={promptValue}
+          onkeydown={(e) => e.key === "Enter" && void submitPrompt()}
+        />
+        <button class="br-btn primary" data-testid="bridge-input-submit" disabled={busy || !promptValue.trim()} onclick={submitPrompt}>{busy ? "Checking…" : prompt.submitLabel}</button>
+      </div>
+    </div>
+    <div class="br-row">
+      <span class="br-spacer"></span>
+      <button class="br-btn" data-testid="bridge-input-cancel" disabled={busy} onclick={() => run("bridge_remove")}>Start over</button>
+    </div>
   {:else if !st.configured || editing}
     <div class="br-muted small">
       {#if authMode === "qr"}

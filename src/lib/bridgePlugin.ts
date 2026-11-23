@@ -37,7 +37,35 @@ export interface BridgeStatusSnapshot {
   qrDataUrl?: string;
   /** Optional custom instruction shown above the pair code box. */
   pairingHint?: string;
+  /**
+   * Optional plugin-driven input step (e.g. phone number, then SMS code). While present the
+   * modal shows this field instead of its normal view and submits it via `bridge_save {token}`.
+   */
+  inputPrompt?: BridgeInputPrompt | null;
   lastError?: string;
+}
+
+export interface BridgeInputPrompt {
+  label: string;
+  placeholder: string;
+  secret: boolean;
+  submitLabel: string;
+}
+
+function cleanText(v: unknown, max: number): string {
+  if (typeof v !== "string") return "";
+  const s = v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/** Normalize a plugin-supplied input prompt; null when absent or empty. */
+export function safeInputPrompt(p: unknown): BridgeInputPrompt | null {
+  if (!p || typeof p !== "object") return null;
+  const o = p as Record<string, unknown>;
+  const label = cleanText(o.label, 300);
+  const placeholder = cleanText(o.placeholder, 120);
+  if (!label && !placeholder) return null;
+  return { label, placeholder, secret: o.secret === true, submitLabel: cleanText(o.submitLabel, 30) || "Submit" };
 }
 
 export type BridgeConnState = "connected" | "disconnected" | "unconfigured";
