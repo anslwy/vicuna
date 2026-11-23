@@ -49,7 +49,7 @@
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex } from "$lib/sessionEngine";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, listAgyAccounts, addAgyAccount, removeAgyAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, listAgyAccounts, addAgyAccount, renameAgyAccount, removeAgyAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { supportsAccounts, type AgyAccountInfo } from "$lib/agyAccounts";
@@ -2342,6 +2342,32 @@
       agyAccountBusy = false;
     }
   }
+  let agyRenameFor = $state<string | null>(null);
+  let agyRenameName = $state("");
+  function startAgyRename(acct: AgyAccountInfo) {
+    agyAddOpen = false;
+    agyAccountError = null;
+    agyRenameName = acct.label;
+    agyRenameFor = agyRenameFor === acct.id ? null : acct.id;
+  }
+  /** Changes only the label: the account's folder and login stay, so no new sign-in. */
+  async function renameAgyAccountRow() {
+    const id = agyRenameFor;
+    const label = agyRenameName.trim();
+    if (!id || !label || agyAccountBusy) return;
+    agyAccountBusy = true;
+    agyAccountError = null;
+    try {
+      const acct = await renameAgyAccount(id, label);
+      agyRenameFor = null;
+      if (agySignInFor?.id === id) agySignInFor = acct;
+      await refreshWorkEngine();
+    } catch (e: any) {
+      agyAccountError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      agyAccountBusy = false;
+    }
+  }
   async function removeAgyAccountRow(id: string) {
     if (agyRemoveArmed !== id) {
       agyRemoveArmed = id;
@@ -2357,11 +2383,19 @@
       agyAccountError = typeof e === "string" ? e : (e?.message ?? String(e));
     }
   }
+  /** Keep the sign-in card visible when it opens under an account row in the scrolling engine list. */
+  function revealCard(node: HTMLElement) {
+    requestAnimationFrame(() => node.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+  }
+
+  let agySignInCopiedTimer: ReturnType<typeof setTimeout> | undefined;
   async function copyAgySignIn() {
     if (!agySignInFor) return;
     try {
       await navigator.clipboard.writeText(agySignInFor.signInCommand);
       agySignInCopied = true;
+      clearTimeout(agySignInCopiedTimer);
+      agySignInCopiedTimer = setTimeout(() => (agySignInCopied = false), 2000);
     } catch {
       agyAccountError = "Could not copy: select the command and copy it by hand.";
     }
@@ -2445,6 +2479,8 @@
   const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : workAccountLabel ? `agy · ${workAccountLabel}` : engineId(workEngineInfo));
   const workEngines = $derived(workEngineChoices(workEngineInfo));
   const workEngineList = $derived(workEngineMenuItems(workEngineInfo));
+  /** With extra accounts listed, the base Antigravity row is the default account, not a group header. */
+  const hasAgyAccountRows = $derived(workEngineList.some((e) => !!e.account));
   /** quota harness the header meter icon summarizes (null hides the icon) */
   const usageHoverEngine = $derived(usageTabs(workEngines, engineId(workEngineInfo)).initial);
   /** Send gate: no engine → Work send disabled with the install hint. */
@@ -11166,13 +11202,41 @@
                           {@const acct = eng.account}
                           {@const needsSignIn = !!acct && !acct.signedIn}
                           <div class="engine-opt-row {acct ? 'is-account' : ''}">
-                            <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={needsSignIn ? "Not signed in yet: click for the sign-in command" : eng.installed ? `${eng.label} ${eng.version ?? ""}`.trim() : (eng.missing ?? "not installed")} onclick={() => { if (!eng.installed) return; if (needsSignIn) { agySignInFor = acct; return; } engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{acct ? acct.label : eng.label}{eng.installed ? "" : " (not installed)"}</span>{#if needsSignIn}<span class="engine-signin-hint" data-testid="agy-account-signin-hint">Sign in →</span>{/if}{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
+                            <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={needsSignIn ? "Not signed in yet: click for the sign-in command" : eng.installed ? `${eng.label} ${eng.version ?? ""}`.trim() : (eng.missing ?? "not installed")} onclick={() => { if (!eng.installed) return; if (needsSignIn) { agySignInCopied = false; agySignInFor = agySignInFor?.id === acct.id ? null : acct; return; } engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{acct ? acct.label : eng.label}{eng.installed ? "" : " (not installed)"}</span>{#if !acct && supportsAccounts(eng.id) && hasAgyAccountRows}<span class="engine-acct-tag" data-testid="agy-default-tag" title="Your normal Antigravity login">Default</span>{/if}{#if needsSignIn}<span class="engine-signin-hint" data-testid="agy-account-signin-hint">Sign in →</span>{/if}{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
                             {#if supportsAccounts(eng.id) && eng.installed && agyAccountsSupported}
                               <button class="engine-acct-btn" data-testid="agy-account-add" title="Add another Antigravity account" aria-label="Add another Antigravity account" onclick={() => { agyAddOpen = !agyAddOpen; agyAddName = ""; agyAccountError = null; }}>+</button>
                             {:else if acct}
+                              <button class="engine-acct-btn" data-testid="agy-account-rename" data-account={acct.id} title={`Rename ${acct.label} (keeps its sign-in)`} aria-label={`Rename Antigravity account ${acct.label}`} onclick={() => startAgyRename(acct)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M10.5 2.5l3 3L5 14H2v-3z"/></svg></button>
                               <button class="engine-acct-btn {agyRemoveArmed === acct.id ? 'armed' : ''}" data-testid="agy-account-remove" data-account={acct.id} title={agyRemoveArmed === acct.id ? "Click again to remove (its login stays on disk)" : `Remove ${acct.label} from Vicuna`} aria-label={`Remove Antigravity account ${acct.label}`} onclick={() => void removeAgyAccountRow(acct.id)}>{agyRemoveArmed === acct.id ? "Remove?" : "−"}</button>
                             {/if}
                           </div>
+                          {#if acct && agyRenameFor === acct.id}
+                            <form class="engine-acct-form" data-testid="agy-account-rename-form" onsubmit={(e) => { e.preventDefault(); void renameAgyAccountRow(); }}>
+                              <!-- svelte-ignore a11y_autofocus -->
+                              <input class="engine-acct-input" data-testid="agy-account-rename-name" maxlength="40" bind:value={agyRenameName} autofocus onfocus={(e) => (e.currentTarget as HTMLInputElement).select()} onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); agyRenameFor = null; } }} />
+                              <button class="mini-btn" type="submit" data-testid="agy-account-rename-save" disabled={!agyRenameName.trim() || agyRenameName.trim() === acct.label || agyAccountBusy}>Rename</button>
+                            </form>
+                          {/if}
+                          {#if acct && agySignInFor?.id === acct.id}
+                            <div class="engine-signin-card" data-testid="agy-signin-card" use:revealCard>
+                              <p class="engine-signin-title">Sign in to <b>{agySignInFor.label}</b></p>
+                              <p class="engine-signin-text">Run this in any terminal on {isRemoteServer() ? "the server" : "this computer"}, then sign in with that Google account. Your normal Antigravity login is not touched.</p>
+                              <div class="engine-signin-cmd-wrap">
+                                <code class="engine-signin-cmd" data-testid="agy-signin-command">{agySignInFor.signInCommand}</code>
+                                <button class="engine-signin-copy {agySignInCopied ? 'done' : ''}" data-testid="agy-signin-copy" title={agySignInCopied ? "Copied" : "Copy command"} aria-label={agySignInCopied ? "Copied" : "Copy command"} onclick={() => void copyAgySignIn()}>
+                                  {#if agySignInCopied}
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>
+                                  {:else}
+                                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>
+                                  {/if}
+                                </button>
+                              </div>
+                              <div class="engine-signin-actions">
+                                <button class="mini-btn" data-testid="agy-signin-check" onclick={() => void checkAgySignIn()}>I've signed in</button>
+                                <button class="mini-btn" data-testid="agy-signin-close" onclick={() => (agySignInFor = null)}>Later</button>
+                              </div>
+                            </div>
+                          {/if}
                           {#if supportsAccounts(eng.id) && agyAddOpen}
                             <form class="engine-acct-form" data-testid="agy-account-form" onsubmit={(e) => { e.preventDefault(); void addAgyAccountRow(); }}>
                               <!-- svelte-ignore a11y_autofocus -->
@@ -11182,18 +11246,6 @@
                           {/if}
                         {/each}
                         {#if agyAccountError}<div class="engine-acct-error" data-testid="agy-account-error">{agyAccountError}</div>{/if}
-                        {#if agySignInFor}
-                          <div class="engine-signin-card" data-testid="agy-signin-card">
-                            <p class="engine-signin-title">Sign in to <b>{agySignInFor.label}</b></p>
-                            <p class="engine-signin-text">Run this in any terminal on {isRemoteServer() ? "the server" : "this computer"}, then sign in with that Google account. Your normal Antigravity login is not touched.</p>
-                            <code class="engine-signin-cmd" data-testid="agy-signin-command">{agySignInFor.signInCommand}</code>
-                            <div class="engine-signin-actions">
-                              <button class="mini-btn" data-testid="agy-signin-copy" onclick={() => void copyAgySignIn()}>{agySignInCopied ? "Copied" : "Copy command"}</button>
-                              <button class="mini-btn" data-testid="agy-signin-check" onclick={() => void checkAgySignIn()}>I've signed in</button>
-                              <button class="mini-btn" data-testid="agy-signin-close" onclick={() => (agySignInFor = null)}>Later</button>
-                            </div>
-                          </div>
-                        {/if}
                       </div>
                     {/if}
                   </div>
@@ -12395,6 +12447,8 @@
   .engine-opt-row .engine-select-opt { flex: 1; min-width: 0; }
   .engine-opt-row.is-account .engine-select-opt { padding-left: 28px; }
   .engine-acct-btn { flex: none; min-width: 26px; height: 26px; padding: 0 6px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; font-size: 15px; line-height: 1; cursor: pointer; opacity: .65; }
+  .engine-acct-tag { flex: none !important; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .engine-acct-btn svg { display: block; margin: auto; }
   .engine-acct-btn:hover { opacity: 1; background: var(--hover); color: var(--text); }
   .engine-acct-btn.armed { opacity: 1; font-size: 11px; color: #e5484d; border-color: color-mix(in srgb, #e5484d 50%, transparent); }
   .engine-signin-hint { flex: none !important; font-size: 11px; color: var(--accent); }
@@ -12406,6 +12460,11 @@
   .engine-signin-text { margin: 0 0 8px; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
   .engine-signin-cmd { display: block; font-size: 11px; padding: 6px 8px; border-radius: 6px; background: var(--bg); word-break: break-all; }
   .engine-signin-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .engine-signin-cmd-wrap { position: relative; }
+  .engine-signin-cmd-wrap .engine-signin-cmd { padding-right: 30px; }
+  .engine-signin-copy { position: absolute; top: 3px; right: 3px; width: 24px; height: 24px; display: grid; place-items: center; border: none; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
+  .engine-signin-copy:hover { background: var(--hover); color: var(--text); }
+  .engine-signin-copy.done { color: var(--accent); }
   .engine-select-check { color: var(--accent); }
   .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
   .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }

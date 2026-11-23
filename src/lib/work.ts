@@ -541,6 +541,9 @@ export async function listAgyAccounts(): Promise<{ accounts: import("./agyAccoun
 export async function addAgyAccount(label: string): Promise<import("./agyAccounts").AgyAccountInfo> {
   return await invokeCmd("agy_account_add", { label });
 }
+export async function renameAgyAccount(id: string, label: string): Promise<import("./agyAccounts").AgyAccountInfo> {
+  return await invokeCmd("agy_account_rename", { id, label });
+}
 export async function removeAgyAccount(id: string): Promise<unknown> {
   return await invokeCmd("agy_account_remove", { id });
 }

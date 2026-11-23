@@ -1,12 +1,15 @@
 // Extra Antigravity (`agy`) accounts. agy has no config-folder flag or env
-// var: its login lives in `~/.gemini/antigravity-cli/antigravity-oauth-token` and
-// `~/.config/antigravity/`. So every extra account gets its own home folder
-// (`~/vicuna/accounts/agy/<id>/`) holding its own `.gemini/` and
-// `.config/antigravity/`, plus symlinks back to everything else in the real
-// home (`.gitconfig`, `.ssh`, `.npmrc`, …) so the commands agy runs still see
-// the user's normal setup. agy processes for that account run with
-// `HOME=<account home>`. Vicuna never reads or copies credentials: sign-in is
-// agy's own flow, run by the user as `HOME=<account home> agy`.
+// var: its login lives in `~/.gemini/antigravity-cli/antigravity-oauth-token`
+// (and on macOS, macOS Keychain via `~/Library/Keychains/login.keychain-db`)
+// plus `~/.config/antigravity/`. So every extra account gets its own home
+// folder (`~/vicuna/accounts/agy/<id>/`) holding its own `.gemini/`,
+// `.config/antigravity/`, and (on macOS) its own `Library/Keychains/` and
+// `Library/Application Support/{antigravity,Antigravity}`, plus symlinks back
+// to everything else in the real home (`.gitconfig`, `.ssh`, `.npmrc`, …) so
+// the commands agy runs still see the user's normal setup. agy processes for
+// that account run with `HOME=<account home>`. Vicuna never reads or copies
+// credentials: sign-in is agy's own flow, run by the user as
+// `HOME=<account home> agy`.
 //
 // The default account (the user's normal `~/.gemini` login) is plain
 // `Engine::Agy`; extra accounts are `Engine::AgyAccount(<id>)` with the
@@ -149,6 +152,21 @@ pub fn add_in(home: &Path, label: &str) -> Result<Account, String> {
     Ok(acct)
 }
 
+/// Changes only the display label. The id (folder, login, saved model and
+/// engine sessions) stays, so a renamed account needs no new sign-in.
+pub fn rename_in(home: &Path, id: &str, label: &str) -> Result<Account, String> {
+    let label = clean_label(label)?;
+    let mut accounts = read_in(home);
+    if label.eq_ignore_ascii_case("default") || accounts.iter().any(|a| a.id != id && a.label.eq_ignore_ascii_case(&label)) {
+        return Err(format!("An Antigravity account named \"{label}\" already exists."));
+    }
+    let acct = accounts.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("No Antigravity account \"{id}\"."))?;
+    acct.label = label;
+    let out = acct.clone();
+    write_in(home, &accounts)?;
+    Ok(out)
+}
+
 /// Removes the account from Vicuna only. Its folder (and agy's login in it)
 /// stays on disk, so re-adding the same name signs straight back in.
 pub fn remove_in(home: &Path, id: &str) -> Result<(), String> {
@@ -164,17 +182,114 @@ pub fn remove_in(home: &Path, id: &str) -> Result<(), String> {
 // ---------- account home ----------
 
 /// Build (or top up) an account home: own `.gemini/` and
-/// `.config/antigravity/`, and a symlink for every other entry of the real
-/// home (and of the real `~/.config`). Existing entries are left alone, so
-/// this is cheap to run before every spawn and picks up new dotfiles.
+/// `.config/antigravity/` (plus on macOS own `Library/Keychains/` and
+/// `Library/Application Support/{antigravity,Antigravity}` so macOS Keychain
+/// `keyringAuth` does not read the user's default login), and a symlink for
+/// every other entry of the real home (and of the real `~/.config` /
+/// `~/Library`). Existing entries are left alone, so this is cheap to run
+/// before every spawn and picks up new dotfiles.
 pub fn prepare_home(real_home: &Path, acct_home: &Path) -> Result<(), String> {
     let mk = |p: &Path| std::fs::create_dir_all(p).map_err(|e| format!("cannot create {}: {e}", p.display()));
     mk(&acct_home.join(".gemini"))?;
     mk(&acct_home.join(".config").join("antigravity"))?;
-    // `vicuna` holds the account homes themselves: linking it would loop
-    link_children(real_home, acct_home, &[".gemini", ".config", "vicuna"]);
+    // `vicuna` holds the account homes themselves: linking it would loop.
+    // On macOS, `Library` holds `Keychains/login.keychain-db` (read by agy's
+    // `keyringAuth` via `$HOME/Library/Keychains`) and `Application Support`.
+    let skip_root: &[&str] = if cfg!(target_os = "macos") {
+        &[".gemini", ".config", "vicuna", "Library"]
+    } else {
+        &[".gemini", ".config", "vicuna"]
+    };
+    link_children(real_home, acct_home, skip_root);
     link_children(&real_home.join(".config"), &acct_home.join(".config"), &["antigravity"]);
+    #[cfg(target_os = "macos")]
+    prepare_macos_library(real_home, acct_home)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_library(real_home: &Path, acct_home: &Path) -> Result<(), String> {
+    let mk = |p: &Path| std::fs::create_dir_all(p).map_err(|e| format!("cannot create {}: {e}", p.display()));
+    let lib = acct_home.join("Library");
+    // Migrate account homes created before Library isolation (where `Library`
+    // was a symlink straight to the user's real `~/Library`).
+    if lib.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(&lib).map_err(|e| format!("cannot unlink {}: {e}", lib.display()))?;
+    }
+    mk(&lib.join("Keychains"))?;
+    let app_sup = lib.join("Application Support");
+    mk(&app_sup.join("antigravity"))?;
+    mk(&app_sup.join("Antigravity"))?;
+    let real_lib = real_home.join("Library");
+    link_children(&real_lib, &lib, &["Keychains", "Application Support"]);
+    link_children(&real_lib.join("Application Support"), &app_sup, &["antigravity", "Antigravity"]);
+    ensure_keychain(&account_keychain(acct_home));
+    Ok(())
+}
+
+/// The account's own keychain. macOS makes `$HOME/Library/Keychains/login.keychain-db`
+/// the default keychain for that HOME, so agy's `keyringAuth` stores the login here.
+#[cfg(target_os = "macos")]
+fn account_keychain(acct_home: &Path) -> PathBuf {
+    acct_home.join("Library").join("Keychains").join("login.keychain-db")
+}
+
+/// Create the account keychain (empty password, no auto-lock) if missing, and
+/// unlock it. Without one, agy's first save pops macOS's "Keychain Not Found /
+/// Reset To Defaults" dialog (Cancel falls back to the token file).
+/// Best-effort: failures only bring that dialog back.
+#[cfg(target_os = "macos")]
+fn ensure_keychain(kc: &Path) {
+    let security = |args: &[&std::ffi::OsStr], home: Option<&Path>| {
+        let mut c = std::process::Command::new("/usr/bin/security");
+        c.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        // A scratch HOME keeps `security` from touching the user's real
+        // preferences (the account home's `Library/Preferences` links to them).
+        if let Some(h) = home {
+            c.env("HOME", h);
+        }
+        c.status().is_ok_and(|s| s.success())
+    };
+    let kc_os = kc.as_os_str();
+    let empty = std::ffi::OsStr::new("");
+    if !kc.exists() {
+        let scratch = std::env::temp_dir().join(format!("vicuna-agy-keychain-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&scratch);
+        let made = security(&["create-keychain".as_ref(), "-p".as_ref(), empty, kc_os], Some(&scratch));
+        let _ = std::fs::remove_dir_all(&scratch);
+        if !made {
+            return;
+        }
+        // No arguments = never auto-lock (no timeout, no lock on sleep).
+        security(&["set-keychain-settings".as_ref(), kc_os], None);
+    }
+    security(&["unlock-keychain".as_ref(), "-p".as_ref(), empty, kc_os], None);
+}
+
+/// agy keeps its macOS keychain login as generic password service `gemini`,
+/// account `antigravity`. Checks attributes only; the secret is never read.
+#[cfg(target_os = "macos")]
+fn keychain_has_login(acct_home: &Path) -> bool {
+    let kc = account_keychain(acct_home);
+    if !kc.is_file() {
+        return false;
+    }
+    std::process::Command::new("/usr/bin/security")
+        .args(["unlock-keychain", "-p", ""])
+        .arg(&kc)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok();
+    std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "gemini", "-a", "antigravity"])
+        .arg(&kc)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn link_children(from: &Path, to: &Path, skip: &[&str]) {
@@ -194,7 +309,14 @@ fn link_children(from: &Path, to: &Path, skip: &[&str]) {
 }
 
 pub fn signed_in_at(acct_home: &Path) -> bool {
-    acct_home.join(".gemini").join(TOKEN_FILE).is_file()
+    if acct_home.join(".gemini").join(TOKEN_FILE).is_file() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if keychain_has_login(acct_home) {
+        return true;
+    }
+    false
 }
 
 pub fn signed_in(id: &str) -> bool {
@@ -243,13 +365,25 @@ pub fn not_signed_in_message(id: &str) -> String {
 
 pub fn list_logic() -> Result<Value, String> {
     let home = home_dir().ok_or("cannot locate home folder")?;
-    let accounts: Vec<AccountInfo> = read_in(&home).iter().map(|a| info_in(&home, a)).collect();
+    let accounts: Vec<AccountInfo> = read_in(&home)
+        .iter()
+        .map(|a| {
+            let _ = prepare_home(&home, &account_home_in(&home, &a.id));
+            info_in(&home, a)
+        })
+        .collect();
     Ok(json!({ "accounts": accounts, "supported": !cfg!(windows) }))
 }
 
 pub fn add_logic(label: &str) -> Result<AccountInfo, String> {
     let home = home_dir().ok_or("cannot locate home folder")?;
     let a = add_in(&home, label)?;
+    Ok(info_in(&home, &a))
+}
+
+pub fn rename_logic(id: &str, label: &str) -> Result<AccountInfo, String> {
+    let home = home_dir().ok_or("cannot locate home folder")?;
+    let a = rename_in(&home, id, label)?;
     Ok(info_in(&home, &a))
 }
 
@@ -289,6 +423,14 @@ mod tests {
         let b = add_in(&home, "Work paid").unwrap();
         assert_eq!(read_in(&home).iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["free", "work-paid"]);
         assert!(!info_in(&home, &b).signed_in);
+        // rename keeps the id (folder + login); labels stay unique
+        assert!(rename_in(&home, "work-paid", "free").is_err(), "clashes with another label");
+        assert!(rename_in(&home, "work-paid", "default").is_err(), "reserved");
+        assert!(rename_in(&home, "nope", "X").is_err());
+        let b = rename_in(&home, "work-paid", "Pro").unwrap();
+        assert_eq!((b.id.as_str(), b.label.as_str()), ("work-paid", "Pro"));
+        assert_eq!(rename_in(&home, "work-paid", "pro").unwrap().label, "pro", "case-only change of its own name");
+        let b = rename_in(&home, "work-paid", "Pro").unwrap();
         remove_in(&home, "free").unwrap();
         assert!(remove_in(&home, "free").is_err());
         assert_eq!(read_in(&home), vec![b]);
@@ -321,5 +463,34 @@ mod tests {
         std::fs::write(acct.join(".gemini").join(TOKEN_FILE), "t").unwrap();
         assert!(signed_in_at(&acct));
         assert!(sign_in_command_for(&acct).starts_with("HOME='") && sign_in_command_for(&acct).ends_with("' agy"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_isolates_keychains_and_migrates_library_symlink() {
+        let real = tmp("mac-real");
+        std::fs::create_dir_all(real.join("Library").join("Keychains")).unwrap();
+        std::fs::write(real.join("Library").join("Keychains").join("login.keychain-db"), "secret").unwrap();
+        std::fs::create_dir_all(real.join("Library").join("Application Support").join("antigravity")).unwrap();
+        std::fs::write(real.join("Library").join("Application Support").join("antigravity").join("state"), "s").unwrap();
+        std::fs::create_dir_all(real.join("Library").join("Preferences")).unwrap();
+        std::fs::write(real.join("Library").join("Preferences").join("p.plist"), "ok").unwrap();
+
+        let acct = account_home_in(&real, "free");
+        std::fs::create_dir_all(&acct).unwrap();
+        // simulate pre-fix account home with a symlinked Library
+        std::os::unix::fs::symlink(real.join("Library"), acct.join("Library")).unwrap();
+
+        prepare_home(&real, &acct).unwrap();
+        assert!(!acct.join("Library").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!acct.join("Library").join("Keychains").symlink_metadata().unwrap().file_type().is_symlink());
+        // The account gets its own (fresh) keychain, never the real one.
+        let kc = acct.join("Library").join("Keychains").join("login.keychain-db");
+        assert!(!kc.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_ne!(std::fs::read(&kc).unwrap(), b"secret");
+        assert!(!signed_in_at(&acct), "an empty account keychain is not a login");
+        assert!(!acct.join("Library").join("Application Support").join("antigravity").join("state").exists());
+        assert!(acct.join("Library").join("Preferences").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(acct.join("Library").join("Preferences").join("p.plist")).unwrap(), "ok");
     }
 }

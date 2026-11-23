@@ -440,6 +440,11 @@ async fn dispatch(
             crate::agy_accounts::add_logic(arg_opt_str(args, "label").as_deref().unwrap_or(""))?,
         )
         .map_err(|e| e.to_string())?),
+        "agy_account_rename" => Ok(serde_json::to_value(crate::agy_accounts::rename_logic(
+            arg_opt_str(args, "id").as_deref().unwrap_or(""),
+            arg_opt_str(args, "label").as_deref().unwrap_or(""),
+        )?)
+        .map_err(|e| e.to_string())?),
         "agy_account_remove" => crate::agy_accounts::remove_logic(arg_opt_str(args, "id").as_deref().unwrap_or("")),
         "work_usage" => Ok(serde_json::to_value(
             crate::work_usage::fetch_usage_logic(arg_opt_str(args, "engine")).await?,
@@ -1555,6 +1560,7 @@ pub const API_ACTIONS: &[&str] = &[
     "work_usage",
     "agy_account_list",
     "agy_account_add",
+    "agy_account_rename",
     "agy_account_remove",
     "work_validate_root",
     "work_ensure_scratch_workspace",
