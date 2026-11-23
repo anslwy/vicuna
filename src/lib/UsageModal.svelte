@@ -1,7 +1,7 @@
 <script lang="ts">
   import EngineIcon from "$lib/EngineIcon.svelte";
   import { harnessUsageUrl } from "$lib/harnessUsageLinks";
-  import { usageAccountView } from "$lib/agyAccounts";
+  import { usageAccountView } from "$lib/workGate";
   import {
     usageTabs,
     usageMeterTone,

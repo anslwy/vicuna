@@ -151,16 +151,19 @@ pub fn parse_models(init_response: &Value) -> Vec<OpencodeModel> {
     out
 }
 
-pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
-    let cli = crate::claude::find_claude().ok_or_else(|| Engine::Claude.missing_message())?;
+pub async fn list_models(engine: Engine) -> Result<Vec<OpencodeModel>, String> {
+    let cli = crate::claude::find_claude().ok_or_else(|| engine.missing_message())?;
     if let Some((p, cached)) = MODELS.lock().ok().and_then(|g| g.clone()) {
-        if p == cli {
+        if engine == Engine::Claude && p == cli {
             return Ok(cached);
         }
     }
     let home = crate::opencode::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mut child = base_command(&cli, &home)
-        .spawn()
+    let mut cmd = base_command(&cli, &home);
+    if let Some((h, id)) = engine.cli_account() {
+        h.configure(id, &mut cmd)?;
+    }
+    let mut child = cmd.spawn()
         .map_err(|e| format!("cannot start claude ({}): {e}", cli.display()))?;
     let mut stdin = child.stdin.take().ok_or("claude: no stdin")?;
     let stdout = child.stdout.take().ok_or("claude: no stdout")?;
@@ -187,8 +190,10 @@ pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
     if models.is_empty() {
         return Err("Claude Code reported no models (is it logged in? run `claude` once and /login)".into());
     }
-    if let Ok(mut g) = MODELS.lock() {
-        *g = Some((cli, models.clone()));
+    if engine == Engine::Claude {
+        if let Ok(mut g) = MODELS.lock() {
+            *g = Some((cli, models.clone()));
+        }
     }
     Ok(models)
 }
@@ -444,6 +449,7 @@ fn result_error(msg: &Value) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn_inner(
+    engine: Engine,
     turn: &Arc<TurnState>,
     model: Option<&str>,
     workspace: &str,
@@ -457,9 +463,15 @@ pub async fn run_turn_inner(
     ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
-    let cli = crate::claude::find_claude().ok_or_else(|| Engine::Claude.missing_message())?;
+    let cli = crate::claude::find_claude().ok_or_else(|| engine.missing_message())?;
+    if let Some((h, id)) = engine.cli_account() {
+        h.environment(id)?;
+        if h.status(id, &cli).await.is_none() {
+            return Err(h.sign_in_hint(id));
+        }
+    }
     let last_user = acp::last_user_message(messages).ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let key = acp::session_key(Engine::Claude, session_id, workspace);
+    let key = acp::session_key(engine, session_id, workspace);
     let scope = acp::skills_scope(turn.skills_prompt());
     let saved = if fresh_session {
         None
@@ -473,9 +485,9 @@ pub async fn run_turn_inner(
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
     let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
-    let picked = acp::effective_model(Engine::Claude, model);
+    let picked = acp::effective_model(engine, model);
     if let Some(m) = &picked {
-        emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Claude.reply_label(m) });
+        emit_ev(on_event, stop, WorkAgentEvent::Model { model: engine.reply_label(m) });
     }
 
     let goal_note = goal_text
@@ -497,7 +509,7 @@ pub async fn run_turn_inner(
     };
     let mut last_err = String::new();
     for (resume, text) in attempts {
-        match run_process(&cli, workspace, resume.as_deref(), picked.as_deref(), &mcp, &text, last_user, turn, on_event, state, key.as_deref()).await {
+        match run_process(engine, &cli, workspace, resume.as_deref(), picked.as_deref(), &mcp, &text, last_user, turn, on_event, state, key.as_deref()).await {
             Ok(()) => {
                 emit_ev(on_event, stop, WorkAgentEvent::Done { stopped: stop.load(Ordering::Relaxed) });
                 return Ok(());
@@ -517,6 +529,7 @@ enum RunError {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_process(
+    engine: Engine,
     cli: &Path,
     workspace: &str,
     resume: Option<&str>,
@@ -531,6 +544,9 @@ async fn run_process(
 ) -> Result<(), RunError> {
     let stop = &turn.stop;
     let mut cmd = base_command(cli, Path::new(workspace));
+    if let Some((h, id)) = engine.cli_account() {
+        h.configure(id, &mut cmd).map_err(RunError::Fatal)?;
+    }
     if let Some(m) = model {
         cmd.args(["--model", m]);
     }
@@ -605,7 +621,7 @@ async fn run_process(
                         break Err(RunError::ResumeMissing(format!("claude could not resume the session: {tail}")));
                     }
                     if writer.is_none() { break Ok(()); }
-                    break Err(RunError::Fatal(acp::friendly_prompt_error(Engine::Claude,
+                    break Err(RunError::Fatal(acp::friendly_prompt_error(engine,
                         if tail.is_empty() { "claude exited unexpectedly".to_string() } else { format!("claude exited unexpectedly:\n{tail}") })));
                 };
                 let Ok(msg) = serde_json::from_str::<Value>(&l) else { continue };
@@ -621,7 +637,7 @@ async fn run_process(
                         }
                         if model.is_none() {
                             if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
-                                emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Claude.reply_label(m) });
+                                emit_ev(on_event, stop, WorkAgentEvent::Model { model: engine.reply_label(m) });
                             }
                         }
                     }
@@ -644,7 +660,7 @@ async fn run_process(
                         emit_ev(on_event, stop, WorkAgentEvent::RoundEnd { gen_ms, gen_tps, gen_cost });
                         if let Some(e) = result_error(&msg) {
                             if !stop.load(Ordering::Relaxed) && interrupted_at.is_none() {
-                                break Err(RunError::Fatal(acp::friendly_prompt_error(Engine::Claude, e)));
+                                break Err(RunError::Fatal(acp::friendly_prompt_error(engine, e)));
                             }
                         }
                         if stop.load(Ordering::Relaxed) {

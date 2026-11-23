@@ -49,10 +49,10 @@
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex } from "$lib/sessionEngine";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, listAgyAccounts, addAgyAccount, renameAgyAccount, removeAgyAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workAccountSupport, addWorkAccount, renameWorkAccount, removeWorkAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
-  import { supportsAccounts, type AgyAccountInfo } from "$lib/agyAccounts";
+  import { baseEngineId, changesCliAccount, type WorkAccountInfo } from "$lib/workGate";
   import { BridgeChannel, backendBaseUrl, invokeOrBridge, bridgeAvailable, isRemoteServer, isServerBacked, activeServerId, switchServer, listServers, connectServer, touchServer, removeServer, renameServer, serverLbProxyUrl, searchServerChats, openChatInWindow, type ServerInfo, type ServerChatHit } from "$lib/bridge";
   import { extractSessionId, sessionLinkAction } from "$lib/deepLink";
   import { orderPaletteRows, remoteQueryFor, sessionIdIn, showHostLabels, describeServerSearchError, mergeLocalServerHits } from "$lib/palette";
@@ -2276,16 +2276,21 @@
    *  on window focus, on Settings → Refresh and when the model menu opens,
    *  so installing an engine while Vicuna runs is picked up. */
   let workEngineChecked = $state(false);
+  let workEnginePicking = $state(false);
+  let engineRefreshSeq = 0;
   async function refreshWorkEngine() {
+    if (workEnginePicking) return;
+    const seq = ++engineRefreshSeq;
     try {
       const prev = workEngineInfo ? engineId(workEngineInfo) : null;
       const next = await fetchWorkEngineInfo();
+      if (seq !== engineRefreshSeq) return;
       applyWorkEngine(next, prev);
-      void loadAgyAccountSupport();
+      void loadWorkAccountSupport();
     } catch {
-      workEngineInfo = null;
+      if (seq === engineRefreshSeq) workEngineInfo = null;
     } finally {
-      workEngineChecked = true;
+      if (seq === engineRefreshSeq) workEngineChecked = true;
     }
   }
   /** Adopt fresh detection; a different engine brings its own model list
@@ -2303,84 +2308,95 @@
   /** Engine picker (composer model menu + Settings): lists every harness,
    *  disabling ones that are not installed. */
   async function pickWorkEngine(id: string) {
-    if (workEngineInfo && engineId(workEngineInfo) === id && !sessionEngineMissing) return;
+    if (workEnginePicking || (workEngineInfo && engineId(workEngineInfo) === id && !sessionEngineMissing)) return;
+    const targetChat = activeId;
+    const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+    ++engineRefreshSeq;
+    ++syncSeq;
+    workEnginePicking = true;
     try {
-      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
-      applyWorkEngine(await selectWorkEngine(id), prev);
+      const next = await selectWorkEngine(id);
+      if (activeId !== targetChat) return;
+      if (engineId(next) !== id) throw new Error(`Could not select ${id}.`);
+      applyWorkEngine(next, prev);
       sessionEngineMissing = null;
-      // the picker changes THIS session's harness (what its next turn runs on)
-      void pinActivePick();
+      // The session's persisted pick must land before it can send again.
+      await pinActivePick();
       if (modelOpen) void refreshOpencodeModels();
     } catch (e: any) {
       error = typeof e === "string" ? e : (e?.message ?? String(e));
-    }
-  }
-  // ---- extra Antigravity accounts (agy_accounts.rs) ----
-  let agyAccountsSupported = $state(true);
-  let agyAddOpen = $state(false);
-  let agyAddName = $state("");
-  let agyAccountBusy = $state(false);
-  let agyAccountError = $state<string | null>(null);
-  let agyRemoveArmed = $state<string | null>(null);
-  let agySignInFor = $state<AgyAccountInfo | null>(null);
-  let agySignInCopied = $state(false);
-  async function addAgyAccountRow() {
-    const label = agyAddName.trim();
-    if (!label || agyAccountBusy) return;
-    agyAccountBusy = true;
-    agyAccountError = null;
-    try {
-      const acct = await addAgyAccount(label);
-      agyAddOpen = false;
-      agyAddName = "";
-      await refreshWorkEngine();
-      agySignInCopied = false;
-      agySignInFor = acct.signedIn ? null : acct;
-    } catch (e: any) {
-      agyAccountError = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
-      agyAccountBusy = false;
+      workEnginePicking = false;
     }
   }
-  let agyRenameFor = $state<string | null>(null);
-  let agyRenameName = $state("");
-  function startAgyRename(acct: AgyAccountInfo) {
-    agyAddOpen = false;
-    agyAccountError = null;
-    agyRenameName = acct.label;
-    agyRenameFor = agyRenameFor === acct.id ? null : acct.id;
+  // ---- Work account picker ----
+  let accountEngines = $state<string[]>([]);
+  let accountAddFor = $state<string | null>(null);
+  let accountAddName = $state("");
+  let accountBusy = $state(false);
+  let accountError = $state<string | null>(null);
+  let accountRemoveArmed = $state<string | null>(null);
+  let accountSignInFor = $state<WorkAccountInfo | null>(null);
+  let accountSignInCopied = $state(false);
+  async function addWorkAccountRow() {
+    const engine = accountAddFor;
+    const label = accountAddName.trim();
+    if (!engine || !label || accountBusy) return;
+    accountBusy = true;
+    accountError = null;
+    try {
+      const acct = await addWorkAccount(engine, label);
+      accountAddFor = null;
+      accountAddName = "";
+      await refreshWorkEngine();
+      accountSignInCopied = false;
+      accountSignInFor = acct.signedIn ? null : acct;
+    } catch (e: any) {
+      accountError = typeof e === "string" ? e : (e?.message ?? String(e));
+    } finally {
+      accountBusy = false;
+    }
+  }
+  let accountRenameFor = $state<string | null>(null);
+  let accountRenameName = $state("");
+  function startWorkAccountRename(acct: WorkAccountInfo) {
+    accountAddFor = null;
+    accountError = null;
+    accountRenameName = acct.label;
+    accountRenameFor = accountRenameFor === acct.engine ? null : acct.engine;
   }
   /** Changes only the label: the account's folder and login stay, so no new sign-in. */
-  async function renameAgyAccountRow() {
-    const id = agyRenameFor;
-    const label = agyRenameName.trim();
-    if (!id || !label || agyAccountBusy) return;
-    agyAccountBusy = true;
-    agyAccountError = null;
+  async function renameWorkAccountRow() {
+    const account = workEngineList.find((e) => e.id === accountRenameFor)?.account;
+    const label = accountRenameName.trim();
+    if (!account || !label || accountBusy) return;
+    accountBusy = true;
+    accountError = null;
     try {
-      const acct = await renameAgyAccount(id, label);
-      agyRenameFor = null;
-      if (agySignInFor?.id === id) agySignInFor = acct;
+      const acct = await renameWorkAccount(baseEngineId(account.engine), account.id, label);
+      accountRenameFor = null;
+      if (accountSignInFor?.engine === account.engine) accountSignInFor = acct;
       await refreshWorkEngine();
     } catch (e: any) {
-      agyAccountError = typeof e === "string" ? e : (e?.message ?? String(e));
+      accountError = typeof e === "string" ? e : (e?.message ?? String(e));
     } finally {
-      agyAccountBusy = false;
+      accountBusy = false;
     }
   }
-  async function removeAgyAccountRow(id: string) {
-    if (agyRemoveArmed !== id) {
-      agyRemoveArmed = id;
-      setTimeout(() => { if (agyRemoveArmed === id) agyRemoveArmed = null; }, 6000);
+  async function removeWorkAccountRow(account: WorkAccountInfo) {
+    const id = account.engine;
+    if (accountRemoveArmed !== id) {
+      accountRemoveArmed = id;
+      setTimeout(() => { if (accountRemoveArmed === id) accountRemoveArmed = null; }, 6000);
       return;
     }
-    agyRemoveArmed = null;
+    accountRemoveArmed = null;
     try {
-      await removeAgyAccount(id);
-      if (agySignInFor?.id === id) agySignInFor = null;
+      await removeWorkAccount(baseEngineId(account.engine), account.id);
+      if (accountSignInFor?.engine === id) accountSignInFor = null;
       await refreshWorkEngine();
     } catch (e: any) {
-      agyAccountError = typeof e === "string" ? e : (e?.message ?? String(e));
+      accountError = typeof e === "string" ? e : (e?.message ?? String(e));
     }
   }
   /** Keep the sign-in card visible when it opens under an account row in the scrolling engine list. */
@@ -2388,35 +2404,35 @@
     requestAnimationFrame(() => node.scrollIntoView({ block: "nearest", behavior: "smooth" }));
   }
 
-  let agySignInCopiedTimer: ReturnType<typeof setTimeout> | undefined;
-  async function copyAgySignIn() {
-    if (!agySignInFor) return;
+  let accountSignInCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+  async function copyWorkAccountSignIn() {
+    if (!accountSignInFor) return;
     try {
-      await navigator.clipboard.writeText(agySignInFor.signInCommand);
-      agySignInCopied = true;
-      clearTimeout(agySignInCopiedTimer);
-      agySignInCopiedTimer = setTimeout(() => (agySignInCopied = false), 2000);
+      await navigator.clipboard.writeText(accountSignInFor.signInCommand);
+      accountSignInCopied = true;
+      clearTimeout(accountSignInCopiedTimer);
+      accountSignInCopiedTimer = setTimeout(() => (accountSignInCopied = false), 2000);
     } catch {
-      agyAccountError = "Could not copy: select the command and copy it by hand.";
+      accountError = "Could not copy: select the command and copy it by hand.";
     }
   }
-  async function checkAgySignIn() {
-    const want = agySignInFor?.id;
+  async function checkWorkAccountSignIn() {
+    const want = accountSignInFor?.engine;
     await refreshWorkEngine();
-    const row = workEngineInfo?.engines?.find((e) => e.account?.id === want);
+    const row = workEngineInfo?.engines?.find((e) => e.id === want);
     if (row?.account?.signedIn) {
-      agySignInFor = null;
-      agyAccountError = null;
+      accountSignInFor = null;
+      accountError = null;
       void pickWorkEngine(row.id);
     } else {
-      agyAccountError = "Not signed in yet: finish the sign-in in the terminal, then try again.";
+      accountError = "Not signed in yet: finish the sign-in in the terminal, then try again.";
     }
   }
-  async function loadAgyAccountSupport() {
+  async function loadWorkAccountSupport() {
     try {
-      agyAccountsSupported = (await listAgyAccounts()).supported;
+      accountEngines = await workAccountSupport();
     } catch {
-      agyAccountsSupported = false;
+      accountEngines = [];
     }
   }
   async function toggleWorkApproval(ask: boolean) {
@@ -2448,6 +2464,7 @@
    *  a session that stored one runs on it, so the view follows it. */
   let syncSeq = 0;
   $effect(() => {
+    if (workEnginePicking) return;
     const c = activeChat;
     const info = workEngineInfo;
     if (!c || !info || composerMode !== "work") return;
@@ -2457,7 +2474,7 @@
       const seq = ++syncSeq;
       const prev = engineId(info);
       void untrack(() => selectWorkEngine(pick.engine)).then((next) => {
-        if (seq !== syncSeq) return;
+        if (seq !== syncSeq || activeId !== c.id) return;
         // the backend fell back to another harness: this session's is gone
         if (engineId(next) !== pick.engine) { sessionEngineMissing = pick.engine; return; }
         sessionEngineMissing = null;
@@ -2465,7 +2482,7 @@
         workModel = pick.model;
         ocModels = null;
       }).catch(() => {
-        if (seq === syncSeq) sessionEngineMissing = pick.engine;
+        if (seq === syncSeq && activeId === c.id) sessionEngineMissing = pick.engine;
       });
       return;
     }
@@ -2474,18 +2491,18 @@
   });
   const workEngineLabel = $derived(engineLabel(workEngineInfo));
   /** Short engine name for "<name> default" ("muse" for plugin:muse-acp/muse). */
-  /** "agy · Paid" for an extra Antigravity account (its id is `agy@paid`) */
   const workAccountLabel = $derived(workEngineInfo?.engines?.find((e) => e.id === engineId(workEngineInfo))?.account?.label ?? null);
-  const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : workAccountLabel ? `agy · ${workAccountLabel}` : engineId(workEngineInfo));
+  const workEngineShort = $derived(isPluginEngine(engineId(workEngineInfo)) ? pluginHarnessName(engineId(workEngineInfo)) : workAccountLabel ? `${baseEngineId(engineId(workEngineInfo))} · ${workAccountLabel}` : engineId(workEngineInfo));
   const workEngines = $derived(workEngineChoices(workEngineInfo));
   const workEngineList = $derived(workEngineMenuItems(workEngineInfo));
-  /** With extra accounts listed, the base Antigravity row is the default account, not a group header. */
-  const hasAgyAccountRows = $derived(workEngineList.some((e) => !!e.account));
+  const enginesWithAccounts = $derived(new Set(workEngineList.filter((e) => e.account).map((e) => baseEngineId(e.id))));
   /** quota harness the header meter icon summarizes (null hides the icon) */
   const usageHoverEngine = $derived(usageTabs(workEngines, engineId(workEngineInfo)).initial);
   /** Send gate: no engine → Work send disabled with the install hint. */
   const workGate = $derived(
-    sessionEngineMissing
+    workEnginePicking
+      ? { blocked: true, reason: "Switching Work engine…" }
+      : sessionEngineMissing
       ? { blocked: true, reason: missingHarnessReason(sessionEngineMissing) }
       : workEngineChecked && workEngineInfo === null
       ? { blocked: true, reason: "Could not check for the Work engine (backend unavailable)." }
@@ -2493,26 +2510,31 @@
   );
   /** opencode's own model list (`opencode models`) for the Work picker. */
   let ocModels = $state<OpencodeModels | null>(null);
-  let ocModelsLoading = $state(false);
+  let modelsLoadingFor = $state<string | null>(null);
+  const ocModelsLoading = $derived(modelsLoadingFor === engineId(workEngineInfo));
+  let modelFetchSeq = 0;
   let ocModelsError = $state<string | null>(null);
   /** Work model pick, persisted backend-side (null = opencode's default). */
   let workModel = $state<string | null>(null);
   async function refreshOpencodeModels() {
     if (!workEngineInfo?.installed || ocModelsLoading) return;
-    ocModelsLoading = true;
-    ocModelsError = null;
     const eng = engineId(workEngineInfo);
+    const seq = ++modelFetchSeq;
+    modelsLoadingFor = eng;
+    ocModelsError = null;
     try {
       const list = await listWorkModels(eng);
-      if (engineId(workEngineInfo) !== eng) return; // switched engine mid-fetch
+      if (seq !== modelFetchSeq || engineId(workEngineInfo) !== eng) return;
       ocModels = list;
       // a session with its own pick keeps it; the list's current is the global one
       const own = activeChat?.engine ? activeChat : null;
       workModel = own ? (own.workModel ?? null) : list.current;
     } catch (e: any) {
-      ocModelsError = typeof e === "string" ? e : (e?.message ?? String(e));
+      if (seq === modelFetchSeq && engineId(workEngineInfo) === eng) {
+        ocModelsError = typeof e === "string" ? e : (e?.message ?? String(e));
+      }
     } finally {
-      ocModelsLoading = false;
+      if (seq === modelFetchSeq) modelsLoadingFor = null;
     }
   }
   async function pickWorkModel(id: string | null) {
@@ -4471,7 +4493,10 @@
    *  and ids stay precise across vendors. */
   function modelLabel(sel: string): string {
     if (!sel) return "";
-    return isOpenRouterSelection(sel) ? displayOpenRouterId(openRouterModelId(sel)) : sel;
+    if (isOpenRouterSelection(sel)) return displayOpenRouterId(openRouterModelId(sel));
+    const engine = sel.split("/", 1)[0];
+    const account = workEngineList.find((e) => e.id === engine && e.account);
+    return account ? account.label + sel.slice(engine.length) : sel;
   }
 
   interface ModelChoice {
@@ -8588,6 +8613,8 @@
     const own = chats.find((x) => x.id === chat.id) ?? chat;
     const turnEngine = own.engine || engineId(workEngineInfo);
     const turnPick: string | null = own.engine ? (own.workModel ?? null) : workModel;
+    const previousReply = own.messages.slice(0, index).findLast((m) => m.role === "assistant" && !m.summary);
+    const freshSession = opts.freshSession || changesCliAccount(turnEngine, previousReply?.model);
     // first turn of a session without its own harness: pin the last-used pick
     // so the session never silently changes agent later
     if (!own.engine) {
@@ -9178,7 +9205,7 @@
         mcpEnabled: (live() ?? chat).mcpEnabled,
         skillsEnabled: (live() ?? chat).skillsEnabled,
         mcpOnly: (live() ?? chat).mcpOnly,
-        freshSession: opts.freshSession ?? false,
+        freshSession,
         workspace,
         messages: native,
         sessionId: chat.id,
@@ -10484,8 +10511,8 @@
                   </span>
                   <span>Click for details</span>
                 </span>
-                {#if harnessUsageUrl(usageHoverEngine)}
-                  <button class="usage-hover-refresh usage-provider-link" data-testid="usage-hover-provider-link" onclick={(e) => { e.stopPropagation(); void openExternal(harnessUsageUrl(usageHoverEngine)!); }}>Open usage page</button>
+                {#if harnessUsageUrl(baseEngineId(usageHoverEngine))}
+                  <button class="usage-hover-refresh usage-provider-link" data-testid="usage-hover-provider-link" onclick={(e) => { e.stopPropagation(); void openExternal(harnessUsageUrl(baseEngineId(usageHoverEngine))!); }}>Open usage page</button>
                 {/if}
               </span>
             </span>
@@ -10650,7 +10677,7 @@
                     ? `The new workspace (${handoff.workspace.from} → ${handoff.workspace.to}) starts its own session: it gets Vicuna's transcript of this conversation, not the previous workspace's own context.`
                     : "The new harness starts its own session: it gets Vicuna's transcript of this conversation, not the previous harness's own context."}
                 <div class="compact-div handoff-div" data-testid="handoff-divider">
-                  <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {handoff.engine.from} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {handoff.engine.to}{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} → <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}{/if}</span></Tooltip>
+                  <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {modelLabel(handoff.engine.from)} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {modelLabel(handoff.engine.to)}{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} → <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}{/if}</span></Tooltip>
                 </div>
               {/if}
               {#if i === activeSummaryIndex}
@@ -10793,7 +10820,7 @@
                 </button>
                 {#if m.model}
                   {@const liveTurn = activeWorkRunning && isLast}
-                  <span class="model-tag" data-testid="msg-model" title="Generated by {m.model}">{modelLabel(m.model)}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
+                  <span class="model-tag" data-testid="msg-model" title="Generated by {modelLabel(m.model)}">{modelLabel(m.model)}{#if !liveTurn && m.genMs != null && m.genMs > 0}{" "}{formatDuration(m.genMs)}{#if m.genTps != null}{" "}{m.genTps.toFixed(1)} tok/s{/if}{/if}</span>
                 {/if}
               </div>
             </div>
@@ -11200,31 +11227,32 @@
                       <div class="engine-select-list" role="listbox" aria-label="Work engine">
                         {#each workEngineList as eng (eng.id)}
                           {@const acct = eng.account}
+                          {@const base = baseEngineId(eng.id)}
                           {@const needsSignIn = !!acct && !acct.signedIn}
                           <div class="engine-opt-row {acct ? 'is-account' : ''}">
-                            <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={needsSignIn ? "Not signed in yet: click for the sign-in command" : eng.installed ? `${eng.label} ${eng.version ?? ""}`.trim() : (eng.missing ?? "not installed")} onclick={() => { if (!eng.installed) return; if (needsSignIn) { agySignInCopied = false; agySignInFor = agySignInFor?.id === acct.id ? null : acct; return; } engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{acct ? acct.label : eng.label}{eng.installed ? "" : " (not installed)"}</span>{#if !acct && supportsAccounts(eng.id) && hasAgyAccountRows}<span class="engine-acct-tag" data-testid="agy-default-tag" title="Your normal Antigravity login">Default</span>{/if}{#if needsSignIn}<span class="engine-signin-hint" data-testid="agy-account-signin-hint">Sign in →</span>{/if}{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
-                            {#if supportsAccounts(eng.id) && eng.installed && agyAccountsSupported}
-                              <button class="engine-acct-btn" data-testid="agy-account-add" title="Add another Antigravity account" aria-label="Add another Antigravity account" onclick={() => { agyAddOpen = !agyAddOpen; agyAddName = ""; agyAccountError = null; }}>+</button>
+                            <button class="engine-select-opt {eng.id === engineId(workEngineInfo) ? 'sel' : ''}" role="option" aria-selected={eng.id === engineId(workEngineInfo)} data-testid="work-engine-opt" data-engine={eng.id} disabled={!eng.installed} title={needsSignIn ? "Not signed in yet: click for the sign-in command" : eng.installed ? `${eng.label} ${eng.version ?? ""}`.trim() : (eng.missing ?? "not installed")} onclick={() => { if (!eng.installed) return; if (needsSignIn) { accountSignInCopied = false; accountSignInFor = accountSignInFor?.engine === acct.engine ? null : acct; return; } engineMenuOpen = false; void pickWorkEngine(eng.id); }}>{@render engineIcon(eng.id)}<span>{acct ? acct.label : eng.label}{eng.installed ? "" : " (not installed)"}</span>{#if !acct && enginesWithAccounts.has(eng.id)}<span class="engine-acct-tag" data-testid={`${base}-default-tag`} title={`Your default ${eng.label} login`}>Default</span>{/if}{#if needsSignIn}<span class="engine-signin-hint" data-testid={`${base}-account-signin-hint`}>Sign in →</span>{/if}{#if eng.id === engineId(workEngineInfo)}<svg class="engine-select-check" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>{/if}</button>
+                            {#if eng.installed && accountEngines.includes(eng.id)}
+                              <button class="engine-acct-btn" data-testid={`${base}-account-add`} title={`Add another ${eng.label} account`} aria-label={`Add another ${eng.label} account`} onclick={() => { accountAddFor = accountAddFor === eng.id ? null : eng.id; accountRenameFor = null; accountAddName = ""; accountError = null; }}>+</button>
                             {:else if acct}
-                              <button class="engine-acct-btn" data-testid="agy-account-rename" data-account={acct.id} title={`Rename ${acct.label} (keeps its sign-in)`} aria-label={`Rename Antigravity account ${acct.label}`} onclick={() => startAgyRename(acct)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M10.5 2.5l3 3L5 14H2v-3z"/></svg></button>
-                              <button class="engine-acct-btn {agyRemoveArmed === acct.id ? 'armed' : ''}" data-testid="agy-account-remove" data-account={acct.id} title={agyRemoveArmed === acct.id ? "Click again to remove (its login stays on disk)" : `Remove ${acct.label} from Vicuna`} aria-label={`Remove Antigravity account ${acct.label}`} onclick={() => void removeAgyAccountRow(acct.id)}>{agyRemoveArmed === acct.id ? "Remove?" : "−"}</button>
+                              <button class="engine-acct-btn" data-testid={`${base}-account-rename`} data-account={acct.id} title={`Rename ${acct.label} (keeps its sign-in)`} aria-label={`Rename account ${acct.label}`} onclick={() => startWorkAccountRename(acct)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M10.5 2.5l3 3L5 14H2v-3z"/></svg></button>
+                              <button class="engine-acct-btn {accountRemoveArmed === acct.engine ? 'armed' : ''}" data-testid={`${base}-account-remove`} data-account={acct.id} title={accountRemoveArmed === acct.engine ? "Click again to remove (its login stays on disk)" : `Remove ${acct.label} from Vicuna`} aria-label={`Remove account ${acct.label}`} onclick={() => void removeWorkAccountRow(acct)}>{accountRemoveArmed === acct.engine ? "Remove?" : "−"}</button>
                             {/if}
                           </div>
-                          {#if acct && agyRenameFor === acct.id}
-                            <form class="engine-acct-form" data-testid="agy-account-rename-form" onsubmit={(e) => { e.preventDefault(); void renameAgyAccountRow(); }}>
+                          {#if acct && accountRenameFor === acct.engine}
+                            <form class="engine-acct-form" data-testid={`${base}-account-rename-form`} onsubmit={(e) => { e.preventDefault(); void renameWorkAccountRow(); }}>
                               <!-- svelte-ignore a11y_autofocus -->
-                              <input class="engine-acct-input" data-testid="agy-account-rename-name" maxlength="40" bind:value={agyRenameName} autofocus onfocus={(e) => (e.currentTarget as HTMLInputElement).select()} onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); agyRenameFor = null; } }} />
-                              <button class="mini-btn" type="submit" data-testid="agy-account-rename-save" disabled={!agyRenameName.trim() || agyRenameName.trim() === acct.label || agyAccountBusy}>Rename</button>
+                              <input class="engine-acct-input" data-testid={`${base}-account-rename-name`} maxlength="40" bind:value={accountRenameName} autofocus onfocus={(e) => (e.currentTarget as HTMLInputElement).select()} onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); accountRenameFor = null; } }} />
+                              <button class="mini-btn" type="submit" data-testid={`${base}-account-rename-save`} disabled={!accountRenameName.trim() || accountRenameName.trim() === acct.label || accountBusy}>Rename</button>
                             </form>
                           {/if}
-                          {#if acct && agySignInFor?.id === acct.id}
-                            <div class="engine-signin-card" data-testid="agy-signin-card" use:revealCard>
-                              <p class="engine-signin-title">Sign in to <b>{agySignInFor.label}</b></p>
-                              <p class="engine-signin-text">Run this in any terminal on {isRemoteServer() ? "the server" : "this computer"}, then sign in with that Google account. Your normal Antigravity login is not touched.</p>
+                          {#if acct && accountSignInFor?.engine === acct.engine}
+                            <div class="engine-signin-card" data-testid={`${base}-signin-card`} use:revealCard>
+                              <p class="engine-signin-title">Sign in to <b>{accountSignInFor.label}</b></p>
+                              <p class="engine-signin-text">Run this in any terminal on {isRemoteServer() ? "the server" : "this computer"}, then sign in with the account you want to use.{#if base !== "agy" && /\$env:/.test(accountSignInFor.signInCommand)} Use a new PowerShell window for this command.{/if}</p>
                               <div class="engine-signin-cmd-wrap">
-                                <code class="engine-signin-cmd" data-testid="agy-signin-command">{agySignInFor.signInCommand}</code>
-                                <button class="engine-signin-copy {agySignInCopied ? 'done' : ''}" data-testid="agy-signin-copy" title={agySignInCopied ? "Copied" : "Copy command"} aria-label={agySignInCopied ? "Copied" : "Copy command"} onclick={() => void copyAgySignIn()}>
-                                  {#if agySignInCopied}
+                                <code class="engine-signin-cmd" data-testid={`${base}-signin-command`}>{accountSignInFor.signInCommand}</code>
+                                <button class="engine-signin-copy {accountSignInCopied ? 'done' : ''}" data-testid={`${base}-signin-copy`} title={accountSignInCopied ? "Copied" : "Copy command"} aria-label={accountSignInCopied ? "Copied" : "Copy command"} onclick={() => void copyWorkAccountSignIn()}>
+                                  {#if accountSignInCopied}
                                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3 3 7-7"/></svg>
                                   {:else}
                                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>
@@ -11232,20 +11260,20 @@
                                 </button>
                               </div>
                               <div class="engine-signin-actions">
-                                <button class="mini-btn" data-testid="agy-signin-check" onclick={() => void checkAgySignIn()}>I've signed in</button>
-                                <button class="mini-btn" data-testid="agy-signin-close" onclick={() => (agySignInFor = null)}>Later</button>
+                                <button class="mini-btn" data-testid={`${base}-signin-check`} onclick={() => void checkWorkAccountSignIn()}>I've signed in</button>
+                                <button class="mini-btn" data-testid={`${base}-signin-close`} onclick={() => (accountSignInFor = null)}>Later</button>
                               </div>
                             </div>
                           {/if}
-                          {#if supportsAccounts(eng.id) && agyAddOpen}
-                            <form class="engine-acct-form" data-testid="agy-account-form" onsubmit={(e) => { e.preventDefault(); void addAgyAccountRow(); }}>
+                          {#if accountAddFor === eng.id}
+                            <form class="engine-acct-form" data-testid={`${base}-account-form`} onsubmit={(e) => { e.preventDefault(); void addWorkAccountRow(); }}>
                               <!-- svelte-ignore a11y_autofocus -->
-                              <input class="engine-acct-input" data-testid="agy-account-name" placeholder="Account name, e.g. Free or Work" maxlength="40" bind:value={agyAddName} autofocus onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); agyAddOpen = false; } }} />
-                              <button class="mini-btn" type="submit" data-testid="agy-account-create" disabled={!agyAddName.trim() || agyAccountBusy}>Add</button>
+                              <input class="engine-acct-input" data-testid={`${base}-account-name`} placeholder="Account name, e.g. Free or Work" maxlength="40" bind:value={accountAddName} autofocus onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); accountAddFor = null; } }} />
+                              <button class="mini-btn" type="submit" data-testid={`${base}-account-create`} disabled={!accountAddName.trim() || accountBusy}>Add</button>
                             </form>
                           {/if}
                         {/each}
-                        {#if agyAccountError}<div class="engine-acct-error" data-testid="agy-account-error">{agyAccountError}</div>{/if}
+                        {#if accountError}<div class="engine-acct-error" data-testid="work-account-error">{accountError}</div>{/if}
                       </div>
                     {/if}
                   </div>
