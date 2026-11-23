@@ -83,10 +83,29 @@ test("safeInputPrompt normalizes plugin input steps", () => {
     placeholder: "123456",
     secret: false,
     submitLabel: "Submit",
+    note: "",
+    capture: null,
   });
   const p = safeInputPrompt({ label: "x".repeat(500), secret: true, submitLabel: "Verify" })!;
   assert.equal(p.label.length, 300);
   assert.equal(p.secret, true);
   assert.equal(p.submitLabel, "Verify");
   assert.equal(safeInputPrompt({ label: "a", secret: "yes" })!.secret, false);
+});
+
+test("safeInputPrompt keeps a valid capture step and drops unsafe ones", () => {
+  const ok = safeInputPrompt({ label: "Solve it", note: "Downloading 3 of 9 MB", capture: { url: "https://signalcaptchas.org/registration/generate.html", scheme: "signalcaptcha", label: "Solve CAPTCHA" } })!;
+  assert.equal(ok.note, "Downloading 3 of 9 MB");
+  assert.deepEqual(ok.capture, { url: "https://signalcaptchas.org/registration/generate.html", scheme: "signalcaptcha", label: "Solve CAPTCHA" });
+  for (const capture of [
+    { url: "http://x.org", scheme: "signalcaptcha" },
+    { url: "https://x.org", scheme: "https" },
+    { url: "https://x.org", scheme: "javascript" },
+    { url: "https://x.org", scheme: "vicuna" },
+    { url: "https://x.org/a b", scheme: "abc" },
+    { url: "https://x.org", scheme: "Bad" },
+  ]) {
+    assert.equal(safeInputPrompt({ label: "x", capture })!.capture, null, JSON.stringify(capture));
+  }
+  assert.equal(safeInputPrompt({ label: "x" })!.capture, null);
 });

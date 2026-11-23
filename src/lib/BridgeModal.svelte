@@ -2,7 +2,7 @@
   // Generic per-session bridge modal for bridge plugins (Discord, etc.).
   // Mirrors TelegramModal.svelte, driven by the plugin's `bridge` manifest.
   import { onMount, onDestroy } from "svelte";
-  import { invokeOrBridge } from "$lib/bridge";
+  import { invokeOrBridge, isTauriRuntime } from "$lib/bridge";
   import { safeColor, type InstalledPlugin } from "$lib/pluginTheme";
   import {
     bridgeAuthMode,
@@ -142,6 +142,23 @@
     }
   }
 
+  let capturing = $state(false);
+  async function runCapture() {
+    if (!prompt?.capture || capturing) return;
+    capturing = true;
+    err = "";
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const got = await invoke<string>("capture_scheme_url", { url: prompt.capture.url, scheme: prompt.capture.scheme, title: name });
+      if (await run("bridge_save", { token: got })) promptValue = "";
+    } catch (e) {
+      const msg = String(e).replace(/^Error:\s*/, "");
+      if (msg !== "closed") err = msg;
+    } finally {
+      capturing = false;
+    }
+  }
+
   async function startLink() {
     if (await run("bridge_save", { token: "" })) {
       editing = false;
@@ -203,7 +220,20 @@
     <div class="br-muted">Loading…</div>
   {:else if prompt}
     <div class="br-box" data-testid="bridge-input-prompt">
+      {#if prompt.note}<div class="br-muted small" data-testid="bridge-input-note">{prompt.note}</div>{/if}
       {#if prompt.label}<div>{prompt.label}</div>{/if}
+      {#if prompt.capture}
+        <div class="br-row">
+          {#if isTauriRuntime()}
+            <button class="br-btn primary" data-testid="bridge-capture" disabled={busy || capturing} onclick={runCapture}>{capturing ? "Waiting for the page…" : prompt.capture.label}</button>
+          {:else}
+            <a class="br-btn primary" data-testid="bridge-capture-link" href={prompt.capture.url} target="_blank" rel="noreferrer">{prompt.capture.label}</a>
+          {/if}
+        </div>
+        <div class="br-muted small">
+          {#if isTauriRuntime()}It opens in a small window and continues by itself once you're done. Or paste the link here:{:else}When it finishes, right-click its “Open Signal” link, copy it and paste it here:{/if}
+        </div>
+      {/if}
       <div class="br-row">
         <input
           class="br-input"

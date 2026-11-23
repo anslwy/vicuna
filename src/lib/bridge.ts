@@ -129,6 +129,7 @@ export const DESKTOP_CMDS = new Set([
   "zoom_step",
   "open_server_window",
   "open_chat_window",
+  "capture_scheme_url",
   // this machine's files in the OS (open with the default app)
   "work_open_path",
   // the `vicuna` launcher on this machine

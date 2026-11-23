@@ -50,6 +50,33 @@ export interface BridgeInputPrompt {
   placeholder: string;
   secret: boolean;
   submitLabel: string;
+  /** Optional muted status line above the label (e.g. a download in progress). */
+  note: string;
+  /**
+   * Optional "open a page and catch its custom-scheme redirect" step: the desktop
+   * app opens `url` in its own window and submits the `<scheme>:…` URL the page
+   * navigates to (Signal's CAPTCHA → `signalcaptcha://…`). Browsers get a link.
+   */
+  capture: BridgeCapture | null;
+}
+
+export interface BridgeCapture {
+  url: string;
+  scheme: string;
+  label: string;
+}
+
+const CAPTURE_BLOCKED = new Set(["http", "https", "file", "data", "blob", "javascript", "about", "ftp", "ws", "wss", "vicuna", "tauri", "ipc", "asset", "http+unix", "mailto", "tel"]);
+
+/** Mirrors `capture_target_ok` in src-tauri/src/app_shell.rs. */
+export function safeCapture(c: unknown): BridgeCapture | null {
+  if (!c || typeof c !== "object") return null;
+  const o = c as Record<string, unknown>;
+  const url = typeof o.url === "string" ? o.url.trim() : "";
+  const scheme = typeof o.scheme === "string" ? o.scheme.trim() : "";
+  if (!url.startsWith("https://") || url.length > 2048 || /[\s\u0000-\u001f\u007f]/.test(url)) return null;
+  if (!/^[a-z][a-z0-9+.-]{1,31}$/.test(scheme) || CAPTURE_BLOCKED.has(scheme)) return null;
+  return { url, scheme, label: cleanText(o.label, 40) || "Open page" };
 }
 
 function cleanText(v: unknown, max: number): string {
@@ -65,7 +92,14 @@ export function safeInputPrompt(p: unknown): BridgeInputPrompt | null {
   const label = cleanText(o.label, 300);
   const placeholder = cleanText(o.placeholder, 120);
   if (!label && !placeholder) return null;
-  return { label, placeholder, secret: o.secret === true, submitLabel: cleanText(o.submitLabel, 30) || "Submit" };
+  return {
+    label,
+    placeholder,
+    secret: o.secret === true,
+    submitLabel: cleanText(o.submitLabel, 30) || "Submit",
+    note: cleanText(o.note, 300),
+    capture: safeCapture(o.capture),
+  };
 }
 
 export type BridgeConnState = "connected" | "disconnected" | "unconfigured";
