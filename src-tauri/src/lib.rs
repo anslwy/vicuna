@@ -16,6 +16,7 @@ use tauri::{AppHandle, Manager, WindowEvent};
 pub mod ipc;
 pub mod acp;
 pub mod agy;
+pub mod agy_accounts;
 pub mod browser;
 pub mod mcp;
 pub mod opencode;

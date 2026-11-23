@@ -534,6 +534,17 @@ export async function setWorkApproval(ask: boolean): Promise<WorkEngineInfo> {
   return await invokeCmd<WorkEngineInfo>("work_set_approval", { ask });
 }
 
+/** Extra Antigravity accounts (server API actions; agy_accounts.rs). */
+export async function listAgyAccounts(): Promise<{ accounts: import("./agyAccounts").AgyAccountInfo[]; supported: boolean }> {
+  return await invokeCmd("agy_account_list", {});
+}
+export async function addAgyAccount(label: string): Promise<import("./agyAccounts").AgyAccountInfo> {
+  return await invokeCmd("agy_account_add", { label });
+}
+export async function removeAgyAccount(id: string): Promise<unknown> {
+  return await invokeCmd("agy_account_remove", { id });
+}
+
 /** Switch the Work engine; returns fresh detection for the new choice. */
 export async function selectWorkEngine(engine: string): Promise<WorkEngineInfo> {
   return await invokeCmd<WorkEngineInfo>("work_engine_select", { engine });
