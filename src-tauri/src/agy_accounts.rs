@@ -335,7 +335,7 @@ pub fn env_for(id: &str) -> Result<Vec<(String, String)>, String> {
     ])
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

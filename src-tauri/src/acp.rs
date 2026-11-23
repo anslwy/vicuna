@@ -265,6 +265,7 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Opencode => "opencode acp",
         Engine::Claude => "claude",
         Engine::Codex => "codex app-server",
+        Engine::CliAccount(h, _) => engine_process_label(h.base()),
         Engine::Agy => "agy acp",
         // its own process + vicuna-mcp route per account
         Engine::AgyAccount(a) => crate::plugin_harness::intern(&format!("agy acp@{a}")),
@@ -327,7 +328,7 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Codex => format!("codex|{id}|{workspace}"),
         Engine::Agy => format!("agy|{id}|{workspace}"),
         // agy keeps conversations inside the account's own ~/.gemini
-        Engine::AgyAccount(a) => format!("agy@{a}|{id}|{workspace}"),
+        Engine::AgyAccount(_) | Engine::CliAccount(..) => format!("{}|{id}|{workspace}", engine.id()),
         Engine::Fx => format!("fx|{id}|{workspace}"),
         Engine::Pi => format!("pi|{id}|{workspace}"),
         Engine::Plugin(k) => format!("plugin|{k}|{id}|{workspace}"),
@@ -1641,8 +1642,9 @@ pub async fn run_turn(
         }
     };
     let ask_url = _ask.as_ref().map(|r| r.url.clone());
-    let res = if engine == Engine::Claude {
+    let res = if engine.base() == Engine::Claude {
         super::claude_cli::run_turn_inner(
+            engine,
             &turn,
             model.as_deref(),
             &workspace,
@@ -1671,8 +1673,9 @@ pub async fn run_turn(
             ask_url.as_deref(),
         )
         .await
-    } else if engine == Engine::Codex {
+    } else if engine.base() == Engine::Codex {
         super::codex_cli::run_turn_inner(
+            engine,
             &turn,
             model.as_deref(),
             &workspace,
@@ -1807,6 +1810,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
             Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
             Engine::AgyAccount(a) => format!("{e}\n{}", super::agy_accounts::not_signed_in_message(a)),
+            Engine::CliAccount(h, id) => format!("{e}\n{}", h.sign_in_hint(id)),
             Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
             Engine::Pi => format!("{e}\npi needs a signed-in provider for this model: run `pi` in a terminal once and /login (or set the provider's API key), or pick another model."),
             Engine::Plugin(_) => format!("{e}\n{} (plugin harness) needs credentials: sign in to its CLI in a terminal once, or pick another model.", engine.label()),

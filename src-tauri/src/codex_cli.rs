@@ -93,9 +93,12 @@ struct Server {
 }
 
 impl Server {
-    async fn start(cli: &Path, cwd: &Path) -> Result<Server, String> {
-        let mut child = base_command(cli, cwd)
-            .spawn()
+    async fn start(engine: Engine, cli: &Path, cwd: &Path) -> Result<Server, String> {
+        let mut cmd = base_command(cli, cwd);
+        if let Some((h, id)) = engine.cli_account() {
+            h.configure(id, &mut cmd)?;
+        }
+        let mut child = cmd.spawn()
             .map_err(|e| crate::work_engine::spawn_error("codex", cli, cwd, &e))?;
         let mut stdin = child.stdin.take().ok_or("codex: no stdin")?;
         let stdout = child.stdout.take().ok_or("codex: no stdout")?;
@@ -248,15 +251,15 @@ pub fn parse_models(pages: &[Value]) -> Vec<OpencodeModel> {
     out
 }
 
-pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
-    let cli = crate::codex::find_codex().ok_or_else(|| Engine::Codex.missing_message())?;
+pub async fn list_models(engine: Engine) -> Result<Vec<OpencodeModel>, String> {
+    let cli = crate::codex::find_codex().ok_or_else(|| engine.missing_message())?;
     if let Some((p, cached)) = MODELS.lock().ok().and_then(|g| g.clone()) {
-        if p == cli {
+        if engine == Engine::Codex && p == cli {
             return Ok(cached);
         }
     }
     let home = crate::opencode::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mut server = Server::start(&cli, &home).await?;
+    let mut server = Server::start(engine, &cli, &home).await?;
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
@@ -272,8 +275,10 @@ pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
     if models.is_empty() {
         return Err("Codex reported no models (is it logged in? run `codex login` in a terminal)".into());
     }
-    if let Ok(mut g) = MODELS.lock() {
-        *g = Some((cli, models.clone()));
+    if engine == Engine::Codex {
+        if let Ok(mut g) = MODELS.lock() {
+            *g = Some((cli, models.clone()));
+        }
     }
     Ok(models)
 }
@@ -736,6 +741,7 @@ async fn user_config(server: &mut Server, workspace: &str) -> Option<Value> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn_inner(
+    engine: Engine,
     turn: &Arc<TurnState>,
     model: Option<&str>,
     workspace: &str,
@@ -749,9 +755,15 @@ pub async fn run_turn_inner(
     ask_url: Option<&str>,
 ) -> Result<(), String> {
     let stop = &turn.stop;
-    let cli = crate::codex::find_codex().ok_or_else(|| Engine::Codex.missing_message())?;
+    let cli = crate::codex::find_codex().ok_or_else(|| engine.missing_message())?;
+    if let Some((h, id)) = engine.cli_account() {
+        h.environment(id)?;
+        if h.status(id, &cli).await.is_none() {
+            return Err(h.sign_in_hint(id));
+        }
+    }
     let last_user = acp::last_user_message(messages).ok_or_else(|| "Work mode: no user message to send".to_string())?;
-    let key = acp::session_key(Engine::Codex, session_id, workspace);
+    let key = acp::session_key(engine, session_id, workspace);
     let scope = acp::skills_scope(turn.skills_prompt());
     let saved = if fresh_session {
         None
@@ -765,9 +777,9 @@ pub async fn run_turn_inner(
         emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: format!("\n\n> {note}\n\n") });
     }
     let mcp = crate::vicuna_mcp::with_ask_server(mcp, ask_url);
-    let picked = acp::effective_model(Engine::Codex, model);
+    let picked = acp::effective_model(engine, model);
     if let Some(m) = &picked {
-        emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Codex.reply_label(m) });
+        emit_ev(on_event, stop, WorkAgentEvent::Model { model: engine.reply_label(m) });
     }
 
     let goal_note = goal_text
@@ -782,7 +794,7 @@ pub async fn run_turn_inner(
         base_text
     );
 
-    let mut server = Server::start(&cli, Path::new(workspace)).await.map_err(|e| acp::friendly_prompt_error(Engine::Codex, e))?;
+    let mut server = Server::start(engine, &cli, Path::new(workspace)).await.map_err(|e| acp::friendly_prompt_error(engine, e))?;
     let config = user_config(&mut server, workspace).await;
     let params = thread_params(workspace, crate::work_engine::approval_ask(), config.as_ref(), picked.as_deref(), &mcp);
 
@@ -803,7 +815,7 @@ pub async fn run_turn_inner(
             let r = server
                 .request("thread/start", params)
                 .await
-                .map_err(|e| acp::friendly_prompt_error(Engine::Codex, format!("Codex could not start a thread: {e}")))?;
+                .map_err(|e| acp::friendly_prompt_error(engine, format!("Codex could not start a thread: {e}")))?;
             let id = r.pointer("/thread/id").and_then(Value::as_str).ok_or("codex: thread/start returned no thread id")?.to_string();
             (id, r, fresh_text)
         }
@@ -814,11 +826,11 @@ pub async fn run_turn_inner(
     if picked.is_none() {
         // the user's config.toml default: label the reply with what runs
         if let Some(m) = opened_resp.get("model").and_then(Value::as_str) {
-            emit_ev(on_event, stop, WorkAgentEvent::Model { model: Engine::Codex.reply_label(m) });
+            emit_ev(on_event, stop, WorkAgentEvent::Model { model: engine.reply_label(m) });
         }
     }
 
-    let result = run_turns(&mut server, &thread, picked.as_deref(), &first_text, last_user, turn, on_event).await;
+    let result = run_turns(engine, &mut server, &thread, picked.as_deref(), &first_text, last_user, turn, on_event).await;
     server.shutdown().await;
     result?;
     emit_ev(on_event, stop, WorkAgentEvent::Done { stopped: stop.load(Ordering::Relaxed) });
@@ -839,6 +851,7 @@ fn turn_start_params(thread: &str, model: Option<&str>, input: Vec<Value>) -> Va
 /// turn/start, stream until turn/completed; queued messages run as further
 /// turns on the same thread.
 async fn run_turns(
+    engine: Engine,
     server: &mut Server,
     thread: &str,
     model: Option<&str>,
@@ -870,14 +883,14 @@ async fn run_turns(
                             turn_id = Some(t.to_string());
                         }
                     }
-                    Ok(Err(e)) => return Err(acp::friendly_prompt_error(Engine::Codex, format!("Codex rejected the turn: {e}"))),
-                    Err(_) => return Err(acp::friendly_prompt_error(Engine::Codex, server.exited_message("codex app-server exited"))),
+                    Ok(Err(e)) => return Err(acp::friendly_prompt_error(engine, format!("Codex rejected the turn: {e}"))),
+                    Err(_) => return Err(acp::friendly_prompt_error(engine, server.exited_message("codex app-server exited"))),
                 }
             }
             msg = server.events.recv() => {
                 let Some(msg) = msg else {
                     if stop.load(Ordering::Relaxed) { return Ok(()); }
-                    return Err(acp::friendly_prompt_error(Engine::Codex, server.exited_message("codex app-server exited unexpectedly")));
+                    return Err(acp::friendly_prompt_error(engine, server.exited_message("codex app-server exited unexpectedly")));
                 };
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -931,7 +944,7 @@ async fn run_turns(
                         if status == "failed" && !stop.load(Ordering::Relaxed) {
                             let detail = t.pointer("/error/message").and_then(Value::as_str).unwrap_or("").trim().to_string();
                             let msg = if detail.is_empty() { server.exited_message("Codex turn failed") } else { format!("Codex turn failed: {detail}") };
-                            return Err(acp::friendly_prompt_error(Engine::Codex, msg));
+                            return Err(acp::friendly_prompt_error(engine, msg));
                         }
                         if stop.load(Ordering::Relaxed) || status == "interrupted" {
                             return Ok(());

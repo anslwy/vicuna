@@ -25,7 +25,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::work_engine::{effective_engine, Engine};
+use crate::work_engine::{requested_engine, Engine};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -84,14 +84,19 @@ impl WorkUsageReport {
     }
 }
 
-thread_local! {
-    /// Extra env for usage CLIs on this thread: an extra Antigravity
-    /// account's HOME (set by [`fetch_usage_logic`] around one fetch).
-    static USAGE_ENV: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+#[derive(Default)]
+struct UsageEnvironment {
+    clear: &'static [&'static str],
+    set: Vec<(String, String)>,
 }
 
-fn usage_env() -> Vec<(String, String)> {
-    USAGE_ENV.with(|e| e.borrow().clone())
+impl UsageEnvironment {
+    fn apply(&self, cmd: &mut Command) {
+        for key in self.clear {
+            cmd.env_remove(key);
+        }
+        cmd.envs(self.set.iter().map(|(key, value)| (key, value)));
+    }
 }
 
 /// Drive an interactive CLI (`/usage`) inside a tall PTY so the full view fits without paging.
@@ -102,6 +107,7 @@ fn usage_env() -> Vec<(String, String)> {
 /// otherwise get stray keystrokes typed into its prompt while it works).
 fn run_pty_slash_usage(
     bin: &Path,
+    env: &UsageEnvironment,
     ready_markers: &[&str],
     done_markers: &[&str],
     usage_view_markers: &[&str],
@@ -119,8 +125,11 @@ fn run_pty_slash_usage(
         .map_err(|e| format!("failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new(bin);
-    for (k, v) in usage_env() {
-        cmd.env(k, v);
+    for key in env.clear {
+        cmd.env_remove(key);
+    }
+    for (key, value) in &env.set {
+        cmd.env(key, value);
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("NO_COLOR", "1");
@@ -623,9 +632,9 @@ const HEADLESS_FIRST: bool = false;
 
 /// Run a CLI's headless usage command and return its stdout. Same launch
 /// contract as the engine processes (terminal PATH, no console window).
-fn run_usage_command(bin: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+fn run_usage_command(bin: &Path, env: &UsageEnvironment, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(bin);
-    cmd.envs(usage_env());
+    env.apply(&mut cmd);
     cmd.args(args)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -1047,8 +1056,9 @@ fn codex_error_hint(msg: &str) -> Option<&'static str> {
     None
 }
 
-fn fetch_codex_usage(bin: &Path) -> Result<WorkUsageReport, String> {
+fn fetch_codex_usage(bin: &Path, env: &UsageEnvironment) -> Result<WorkUsageReport, String> {
     let mut cmd = Command::new(bin);
+    env.apply(&mut cmd);
     cmd.arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1157,9 +1167,10 @@ fn fetch_codex_usage(bin: &Path) -> Result<WorkUsageReport, String> {
 
 /// Interactive `/usage` view for Claude Code (older CLIs, and the fallback on
 /// platforms where ConPTY hands back nothing).
-fn claude_via_pty(bin: &Path) -> WorkUsageReport {
+fn claude_via_pty(bin: &Path, env: &UsageEnvironment) -> WorkUsageReport {
     let cap = match run_pty_slash_usage(
         bin,
+        env,
         &["Claude Code", "for agents"],
         &["Current week", "Current session"],
         &["Current session", "Current week", "Usage   Stats"],
@@ -1181,9 +1192,10 @@ fn claude_via_pty(bin: &Path) -> WorkUsageReport {
     r
 }
 
-fn agy_via_pty(bin: &Path) -> WorkUsageReport {
+fn agy_via_pty(bin: &Path, env: &UsageEnvironment) -> WorkUsageReport {
     let cap = match run_pty_slash_usage(
         bin,
+        env,
         &["for shortcuts"],
         &["Refreshes in", "Quota available"],
         // no retry: agy can spend ~12s loading quota, and a retyped "/usage"
@@ -1214,8 +1226,8 @@ fn agy_via_pty(bin: &Path) -> WorkUsageReport {
 
 /// Headless `/usage` for a CLI that supports it. A failure becomes a report
 /// carrying the CLI's own message, so the caller can decide to fall back.
-fn usage_via_command(engine: Engine, bin: &Path, parse: fn(&str) -> WorkUsageReport) -> WorkUsageReport {
-    match run_usage_command(bin, &["-p", "/usage"], Duration::from_secs(45)) {
+fn usage_via_command(engine: Engine, bin: &Path, env: &UsageEnvironment, parse: fn(&str) -> WorkUsageReport) -> WorkUsageReport {
+    match run_usage_command(bin, env, &["-p", "/usage"], Duration::from_secs(45)) {
         Ok(text) => parse(&text),
         Err(e) => {
             let mut r = WorkUsageReport::base(engine);
@@ -1253,39 +1265,46 @@ fn prefer_usage(
 }
 
 pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport, String> {
-    let eng = effective_engine(engine.as_deref());
-    tokio::task::spawn_blocking(move || {
-        // an extra account: same agy, its own HOME (own login, own quota)
-        let env = match eng.agy_account() {
-            Some(a) if !crate::agy_accounts::signed_in(a) => {
-                let mut r = WorkUsageReport::base(eng);
-                r.error = Some(crate::agy_accounts::not_signed_in_message(a));
-                return Ok(r);
-            }
-            Some(a) => crate::agy_accounts::env_for(a)?,
-            None => Vec::new(),
-        };
-        USAGE_ENV.with(|e| *e.borrow_mut() = env);
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                USAGE_ENV.with(|e| e.borrow_mut().clear());
-            }
+    let eng = requested_engine(engine.as_deref())?;
+    let mut env = UsageEnvironment::default();
+    let mut profile_status = None;
+    if let Some((harness, id)) = eng.cli_account() {
+        let (clear, (key, path)) = harness.environment(id)?;
+        env.clear = clear;
+        env.set.push((key.into(), path.to_string_lossy().into_owned()));
+        let bin = match harness {
+            crate::cli_accounts::Harness::Claude => crate::claude::find_claude(),
+            crate::cli_accounts::Harness::Codex => crate::codex::find_codex(),
+        }.ok_or_else(|| eng.missing_message())?;
+        profile_status = harness.status(id, &bin).await;
+        if profile_status.is_none() {
+            let mut report = WorkUsageReport::base(eng);
+            report.error = Some(harness.sign_in_hint(id));
+            return Ok(report);
         }
-        let _reset = Reset;
+    }
+    tokio::task::spawn_blocking(move || {
+        if let Some(id) = eng.agy_account() {
+            if !crate::agy_accounts::signed_in(id) {
+                let mut report = WorkUsageReport::base(eng);
+                report.error = Some(crate::agy_accounts::not_signed_in_message(id));
+                return Ok(report);
+            }
+            env.set = crate::agy_accounts::env_for(id)?;
+        }
         let report = match eng.base() {
-            Engine::AgyAccount(_) => unreachable!("base() maps accounts to Agy"),
+            Engine::AgyAccount(_) | Engine::CliAccount(..) => unreachable!("base() maps accounts to their harness"),
             Engine::Agy => {
                 let Some(bin) = crate::agy::find_agy() else {
                     let mut r = WorkUsageReport::base(eng);
                     r.error = Some(eng.missing_message());
                     return Ok(r);
                 };
-                let headless = || usage_via_command(Engine::Agy, &bin, parse_agy_usage_text);
+                let headless = || usage_via_command(eng, &bin, &env, parse_agy_usage_text);
                 if HEADLESS_FIRST {
-                    prefer_usage(headless, || agy_via_pty(&bin))
+                    prefer_usage(headless, || agy_via_pty(&bin, &env))
                 } else {
-                    prefer_usage(|| agy_via_pty(&bin), headless)
+                    prefer_usage(|| agy_via_pty(&bin, &env), headless)
                 }
             }
             Engine::Claude => {
@@ -1294,15 +1313,21 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                     r.error = Some(eng.missing_message());
                     return Ok(r);
                 };
-                let headless = || usage_via_command(Engine::Claude, &bin, parse_claude_usage_text);
+                let headless = || usage_via_command(eng, &bin, &env, parse_claude_usage_text);
                 let mut r = if HEADLESS_FIRST {
-                    prefer_usage(headless, || claude_via_pty(&bin))
+                    prefer_usage(headless, || claude_via_pty(&bin, &env))
                 } else {
-                    prefer_usage(|| claude_via_pty(&bin), headless)
+                    prefer_usage(|| claude_via_pty(&bin, &env), headless)
                 };
                 // the headless text names neither the plan nor the account;
                 // Claude Code records both in its own config
-                let (account, plan) = claude_account_info();
+                let (account, plan) = match &profile_status {
+                    Some(status) => {
+                        let field = |name| status.get(name).and_then(|v| v.as_str()).map(str::to_owned);
+                        (field("email"), field("subscriptionType"))
+                    }
+                    None => claude_account_info(),
+                };
                 if r.account.is_none() {
                     r.account = account;
                 }
@@ -1317,7 +1342,7 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
                     r.error = Some(eng.missing_message());
                     return Ok(r);
                 };
-                fetch_codex_usage(&bin)?
+                fetch_codex_usage(&bin, &env)?
             }
             Engine::Plugin(key) => match crate::plugin_harness::run_usage(key) {
                 Ok((map, out)) => map_plugin_usage(eng, &map, &out, now_epoch()),
@@ -1384,7 +1409,7 @@ pub const QUOTA_ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::A
 /// Built-in quota harnesses plus enabled plugin harnesses with a usage map.
 pub fn quota_engines() -> Vec<Engine> {
     let mut v = QUOTA_ENGINES.to_vec();
-    v.extend(Engine::all().into_iter().filter(|e| matches!(e, Engine::AgyAccount(_))));
+    v.extend(Engine::all().into_iter().filter(|e| matches!(e, Engine::AgyAccount(_) | Engine::CliAccount(..))));
     v.extend(
         crate::plugin_harness::all_keys()
             .into_iter()
@@ -1398,7 +1423,7 @@ pub fn quota_engines() -> Vec<Engine> {
 pub fn reports_usage(id: &str) -> bool {
     match Engine::parse(id) {
         Some(Engine::Plugin(k)) => crate::plugin_harness::reports_usage(k),
-        Some(Engine::AgyAccount(_)) => true,
+        Some(Engine::AgyAccount(_) | Engine::CliAccount(..)) => true,
         Some(e) => QUOTA_ENGINES.contains(&e),
         None => false,
     }

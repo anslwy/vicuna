@@ -363,6 +363,7 @@
           <div class="pl-muted">and, to read its subscription usage for the Usage view:</div>
           <code class="pl-cmd big" data-testid="harness-consent-usage-{h.id}">{commandLine(h.usage)}</code>
         {/if}
+        {#if h.accounts}<div class="pl-muted">Named accounts run these commands with separate sign-in and session storage.</div>{/if}
         <div class="pl-muted">{h.installed ? `Found \`${h.command}\` on this server's PATH.` : `\`${h.command}\` is not installed on this server yet. ${h.installHint ?? ""}`}</div>
       </div>
     {/each}

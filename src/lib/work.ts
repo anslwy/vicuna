@@ -534,18 +534,25 @@ export async function setWorkApproval(ask: boolean): Promise<WorkEngineInfo> {
   return await invokeCmd<WorkEngineInfo>("work_set_approval", { ask });
 }
 
-/** Extra Antigravity accounts (server API actions; agy_accounts.rs). */
-export async function listAgyAccounts(): Promise<{ accounts: import("./agyAccounts").AgyAccountInfo[]; supported: boolean }> {
-  return await invokeCmd("agy_account_list", {});
+/** Account management is provided by the server that runs Work turns. */
+export async function workAccountSupport(): Promise<string[]> {
+  try {
+    const result = await invokeCmd<{ engines: string[] }>("work_account_support", {});
+    return result.engines;
+  } catch {
+    // An older connected server can still offer Antigravity accounts.
+    const result = await invokeCmd<{ supported: boolean }>("agy_account_list", {});
+    return result.supported ? ["agy"] : [];
+  }
 }
-export async function addAgyAccount(label: string): Promise<import("./agyAccounts").AgyAccountInfo> {
-  return await invokeCmd("agy_account_add", { label });
+export async function addWorkAccount(engine: string, label: string): Promise<import("./workGate").WorkAccountInfo> {
+  return engine === "agy" ? invokeCmd("agy_account_add", { label }) : invokeCmd("work_account_add", { engine, label });
 }
-export async function renameAgyAccount(id: string, label: string): Promise<import("./agyAccounts").AgyAccountInfo> {
-  return await invokeCmd("agy_account_rename", { id, label });
+export async function renameWorkAccount(engine: string, id: string, label: string): Promise<import("./workGate").WorkAccountInfo> {
+  return engine === "agy" ? invokeCmd("agy_account_rename", { id, label }) : invokeCmd("work_account_rename", { engine, id, label });
 }
-export async function removeAgyAccount(id: string): Promise<unknown> {
-  return await invokeCmd("agy_account_remove", { id });
+export async function removeWorkAccount(engine: string, id: string): Promise<unknown> {
+  return engine === "agy" ? invokeCmd("agy_account_remove", { id }) : invokeCmd("work_account_remove", { engine, id });
 }
 
 /** Switch the Work engine; returns fresh detection for the new choice. */

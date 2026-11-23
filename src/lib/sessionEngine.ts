@@ -30,7 +30,7 @@ export function missingHarnessReason(stored: string): string {
 export function labelHarness(label: string | null | undefined): string | null {
   const l = label?.trim();
   if (!l) return null;
-  const i = l.indexOf("/");
+  const i = l.indexOf("/", l.startsWith("plugin:") ? l.indexOf("/") + 1 : 0);
   return i > 0 ? l.slice(0, i) : l;
 }
 

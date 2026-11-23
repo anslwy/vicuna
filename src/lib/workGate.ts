@@ -1,3 +1,15 @@
+export interface WorkAccountInfo {
+  id: string;
+  /** Engine ID including the account. */
+  engine: string;
+  label: string;
+  /** Profile directory on the machine running the turns. */
+  home: string;
+  signedIn: boolean;
+  /** CLI command to sign in on that machine. */
+  signInCommand: string;
+}
+
 // Pure Work-mode helpers (no imports, so `npm test` can load them with
 // Node's built-in test runner): the engine send gate, engine picker and the
 // model-picker rows. Re-exported from ./work.
@@ -13,8 +25,8 @@ export interface EngineSummary {
   missing: string | null;
   /** The Usage view has a tab for it (quota harness or plugin usage map). */
   usage?: boolean;
-  /** Set on an extra Antigravity account row (`agy@<id>`). */
-  account?: import("./agyAccounts").AgyAccountInfo | null;
+  /** Set on an extra account row. */
+  account?: WorkAccountInfo | null;
 }
 
 /** Work engine detection (re-run on every call: Refresh, window focus): the
@@ -112,7 +124,8 @@ export function workReplyModel(
   if (!p) return engine;
   // fx/agy ids that are not already engine-prefixed get the engine prefix to
   // keep them apart from the Codex engine's own `codex/<model>`
-  if (engine.startsWith("plugin:")) return `${engine.slice(7).split("/")[1] || engine}/${p}`;
+  if (engine.startsWith("plugin:")) return `${isAccountEngine(engine) ? engine : engine.slice(7).split("/")[1] || engine}/${p}`;
+  if (engine.startsWith("claude@") || engine.startsWith("codex@")) return `${engine}/${p}`;
   return engine === "claude" || engine === "codex" || engine === "fx" || engine === "agy" || engine === "pi" ? `${engine}/${p}` : p;
 }
 
@@ -235,4 +248,41 @@ export function usageMeterTone(percent: number, kind: string): "ok" | "warn" | "
     return pct >= 50 ? "ok" : pct >= 20 ? "warn" : "low";
   }
   return pct < 50 ? "ok" : pct < 80 ? "warn" : "low";
+}
+
+const ACCOUNT_HARNESSES = ["claude", "codex", "agy"] as const;
+
+/** `claude@work` → `claude`; other harness IDs pass through. */
+export function baseEngineId(id: string): string {
+  if (id.startsWith("plugin:")) return id.split("@", 1)[0];
+  return ACCOUNT_HARNESSES.find((base) => id.startsWith(`${base}@`)) ?? id;
+}
+
+/** A Claude, Codex or plugin account handoff replays the transcript in a fresh native
+ *  session, including when the user returns to an earlier account. */
+export function changesCliAccount(engine: string, previousModel: string | null | undefined): boolean {
+  if (!previousModel) return false;
+  const previous = previousModel.split("/", previousModel.startsWith("plugin:") ? 2 : 1).join("/");
+  const isCliAccount = (id: string) =>
+    id.startsWith("claude@") || id.startsWith("codex@") || (id.startsWith("plugin:") && isAccountEngine(id));
+  return engine !== previous && (isCliAccount(engine) || isCliAccount(previous));
+}
+
+export function isAccountEngine(id: string): boolean {
+  return baseEngineId(id) !== id;
+}
+
+/** Usage view: one tab per harness, plus account chips for the selected
+ *  harness when it has extra accounts (`Default` = the base engine). */
+export function usageAccountView<T extends { id: string; label: string; account?: WorkAccountInfo | null }>(
+  tabs: T[],
+  selected: string,
+): { harnessTabs: T[]; selectedBase: string; chips: { id: string; label: string }[] } {
+  const harnessTabs = tabs.filter((t) => !isAccountEngine(t.id));
+  const selectedBase = baseEngineId(selected);
+  const accounts = tabs.filter((t) => isAccountEngine(t.id) && baseEngineId(t.id) === selectedBase);
+  const chips = accounts.length
+    ? [{ id: selectedBase, label: "Default" }, ...accounts.map((a) => ({ id: a.id, label: a.account?.label ?? a.id.slice(selectedBase.length + 1) }))]
+    : [];
+  return { harnessTabs, selectedBase, chips };
 }

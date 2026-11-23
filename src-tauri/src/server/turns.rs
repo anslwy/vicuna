@@ -465,6 +465,11 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         return Err(engine.missing_message());
     }
     let mut messages: Vec<Value> = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let previous_model = messages.iter().rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("summary").and_then(Value::as_bool) != Some(true))
+        .and_then(|m| m.get("model").and_then(Value::as_str));
+    let fresh_session = engine.changes_cli_account(previous_model);
     messages.extend(user_msgs);
     let mut ph = persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id()));
     if !workspace.is_empty() {
@@ -485,7 +490,7 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
             workspace,
             messages: native,
             session_id: Some(chat_id.to_string()),
-            fresh_session: false,
+            fresh_session,
             lead: extra.lead,
             rec: Some(rec),
             report_to,
