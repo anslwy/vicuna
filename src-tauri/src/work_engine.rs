@@ -25,6 +25,9 @@ pub enum Engine {
     /// A harness a plugin adds (`plugin:<plugin-id>/<harness-id>`); holds the
     /// interned `<plugin-id>/<harness-id>` key. Driven over ACP.
     Plugin(&'static str),
+    /// An extra Antigravity account (`agy@<account-id>`, agy_accounts.rs):
+    /// agy with its own HOME, so its own login, models and quota.
+    AgyAccount(&'static str),
 }
 
 impl Engine {
@@ -33,8 +36,31 @@ impl Engine {
     /// Built-in engines plus every installed plugin harness.
     pub fn all() -> Vec<Engine> {
         let mut v = Engine::ALL.to_vec();
+        // extra accounts right after the default Antigravity row
+        let at = v.iter().position(|e| *e == Engine::Agy).map_or(v.len(), |i| i + 1);
+        let accts: Vec<Engine> = crate::agy_accounts::list()
+            .into_iter()
+            .map(|a| Engine::AgyAccount(crate::plugin_harness::intern(&a.id)))
+            .collect();
+        v.splice(at..at, accts);
         v.extend(crate::plugin_harness::all_keys().into_iter().map(Engine::Plugin));
         v
+    }
+
+    /// The CLI an engine runs: every Antigravity account is `agy`.
+    pub fn base(self) -> Engine {
+        match self {
+            Engine::AgyAccount(_) => Engine::Agy,
+            e => e,
+        }
+    }
+
+    /// The extra Antigravity account this engine runs on, if any.
+    pub fn agy_account(self) -> Option<&'static str> {
+        match self {
+            Engine::AgyAccount(a) => Some(a),
+            _ => None,
+        }
     }
 
     pub fn is_plugin(self) -> bool {
@@ -44,6 +70,7 @@ impl Engine {
     pub fn id(self) -> &'static str {
         match self {
             Engine::Plugin(k) => crate::plugin_harness::intern(&format!("{}{k}", crate::plugin_harness::ENGINE_PREFIX)),
+            Engine::AgyAccount(a) => crate::plugin_harness::intern(&format!("{}{a}", crate::agy_accounts::ENGINE_PREFIX)),
             Engine::Opencode => "opencode",
             Engine::Claude => "claude",
             Engine::Codex => "codex",
@@ -62,6 +89,10 @@ impl Engine {
             Engine::Fx => "fx",
             Engine::Pi => "pi",
             Engine::Plugin(k) => crate::plugin_harness::label(k),
+            Engine::AgyAccount(a) => {
+                let name = crate::agy_accounts::find(a).map(|x| x.label).unwrap_or_else(|| a.to_string());
+                crate::plugin_harness::intern(&format!("Antigravity · {name}"))
+            }
         }
     }
 
@@ -73,6 +104,10 @@ impl Engine {
             "agy" | "antigravity" => Some(Engine::Agy),
             "fx" => Some(Engine::Fx),
             "pi" | "pi-coding-agent" => Some(Engine::Pi),
+            low if low.starts_with(crate::agy_accounts::ENGINE_PREFIX) => {
+                let id = &low[crate::agy_accounts::ENGINE_PREFIX.len()..];
+                crate::agy_accounts::find(id).map(|a| Engine::AgyAccount(crate::plugin_harness::intern(&a.id)))
+            }
             _ => crate::plugin_harness::parse_engine(s).map(Engine::Plugin),
         }
     }
@@ -87,6 +122,7 @@ impl Engine {
             Engine::Fx => crate::fx::find_fx().is_some(),
             Engine::Pi => crate::pi::find_pi().is_some(),
             Engine::Plugin(k) => crate::plugin_harness::unavailable(k).is_none(),
+            Engine::AgyAccount(a) => crate::agy::find_agy().is_some() && crate::agy_accounts::find(a).is_some(),
         }
     }
 
@@ -99,6 +135,10 @@ impl Engine {
             Engine::Fx => crate::fx::missing_message(),
             Engine::Pi => crate::pi::missing_message(),
             Engine::Plugin(k) => crate::plugin_harness::unavailable(k).unwrap_or_default(),
+            Engine::AgyAccount(a) if crate::agy_accounts::find(a).is_none() => {
+                format!("The Antigravity account \"{a}\" was removed. Pick another harness for this session.")
+            }
+            Engine::AgyAccount(_) => crate::agy::missing_message(),
         }
     }
 
@@ -110,7 +150,7 @@ impl Engine {
             Engine::Opencode => model.to_string(),
             Engine::Claude => format!("claude/{model}"),
             Engine::Codex => format!("codex/{model}"),
-            Engine::Agy => format!("agy/{model}"),
+            Engine::Agy | Engine::AgyAccount(_) => format!("agy/{model}"),
             Engine::Fx => format!("fx/{model}"),
             Engine::Pi => format!("pi/{model}"),
             Engine::Plugin(k) => format!("{}/{model}", crate::plugin_harness::split_key(k).1),
@@ -126,6 +166,7 @@ impl Engine {
             Engine::Fx => crate::fx::saved_model(),
             Engine::Pi => crate::pi::saved_model(),
             Engine::Plugin(k) => crate::plugin_harness::saved_model(k),
+            Engine::AgyAccount(a) => read_model_from_opt(crate::agy_accounts::model_prefs_path(a)),
         }
     }
 
@@ -138,6 +179,10 @@ impl Engine {
             Engine::Fx => crate::fx::save_model(model),
             Engine::Pi => crate::pi::save_model(model),
             Engine::Plugin(k) => crate::plugin_harness::save_model(k, model),
+            Engine::AgyAccount(a) => {
+                let p = crate::agy_accounts::model_prefs_path(a).ok_or("cannot locate home folder")?;
+                crate::opencode::write_model_to(&p, model)
+            }
         }
     }
 
@@ -150,8 +195,13 @@ impl Engine {
             Engine::Fx => crate::fx::engine_info().await,
             Engine::Pi => crate::pi::engine_info().await,
             Engine::Plugin(k) => crate::plugin_harness::engine_info(k),
+            Engine::AgyAccount(a) => crate::agy::account_engine_info(a, self).await,
         }
     }
+}
+
+fn read_model_from_opt(p: Option<PathBuf>) -> Option<String> {
+    crate::opencode::read_model_from(&p?)
 }
 
 // ---------- persisted engine choice ----------
@@ -200,6 +250,11 @@ pub fn write_ask_to(path: &Path, ask: bool) -> Result<(), String> {
 
 pub fn approval_ask() -> bool {
     prefs_path().is_some_and(|p| read_ask_from(&p))
+}
+
+fn saved_engine_raw() -> Option<String> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(prefs_path()?).ok()?).ok()?;
+    Some(v.get("engine")?.as_str()?.to_string())
 }
 
 pub fn saved_engine() -> Option<Engine> {
@@ -304,6 +359,11 @@ pub async fn engines_info() -> WorkEngineInfo {
     info.ask_permission = approval_ask();
     // a saved plugin harness that was uninstalled (or lost consent): say so
     // instead of silently running another harness
+    if saved.is_none() {
+        if let Some(raw) = saved_engine_raw().filter(|r| r.starts_with(crate::agy_accounts::ENGINE_PREFIX)) {
+            info.warning = Some(format!("The Antigravity account \"{}\" was removed. Work is using {} instead.", &raw[crate::agy_accounts::ENGINE_PREFIX.len()..], chosen.label()));
+        }
+    }
     if let Some(Engine::Plugin(k)) = saved.filter(|s| *s != chosen) {
         if let Some(why) = crate::plugin_harness::unavailable(k) {
             let why = why.trim_end_matches(" Pick another harness for this session.");
@@ -346,6 +406,10 @@ pub async fn list_models(engine: Engine, acp: &crate::acp::AcpState) -> Result<O
         Engine::Pi => Ok(OpencodeModels {
             models: crate::pi::list_models().await?,
             current: crate::pi::saved_model(),
+        }),
+        Engine::AgyAccount(a) => Ok(OpencodeModels {
+            models: crate::agy::list_models_for(Some(a)).await?,
+            current: engine.saved_model(),
         }),
         Engine::Plugin(k) => {
             let mut models = crate::plugin_harness::manifest_models(k);

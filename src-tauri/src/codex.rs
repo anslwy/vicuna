@@ -101,6 +101,7 @@ pub fn summary(info: &WorkEngineInfo) -> EngineSummary {
         version: info.version.clone(),
         missing: info.missing.clone(),
         usage: crate::work_usage::reports_usage(&info.id),
+        account: None,
     }
 }
 

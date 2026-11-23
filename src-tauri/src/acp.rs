@@ -134,12 +134,20 @@ impl AcpState {
                 cmd.arg("acp");
                 (bin, cmd, process_workspace(engine, workspace).to_string())
             }
-            Engine::Agy => {
+            Engine::Agy | Engine::AgyAccount(_) => {
                 if let Some(e) = super::agy::workspace_error(Path::new(workspace)) {
                     return Err(e);
                 }
                 let bin = super::agy::find_agy().ok_or_else(super::agy::missing_message)?;
-                let cmd = super::agy::command(&bin, ask_now, Path::new(workspace));
+                if let Some(a) = engine.agy_account() {
+                    if super::agy_accounts::find(a).is_none() {
+                        return Err(engine.missing_message());
+                    }
+                    if !super::agy_accounts::signed_in(a) {
+                        return Err(super::agy_accounts::not_signed_in_message(a));
+                    }
+                }
+                let cmd = super::agy::command(&bin, ask_now, Path::new(workspace), engine.agy_account())?;
                 (bin, cmd, process_workspace(engine, workspace).to_string())
             }
             Engine::Fx => {
@@ -224,7 +232,7 @@ impl AcpState {
 fn process_workspace(engine: Engine, workspace: &str) -> &str {
     // plugin harnesses: one process per workspace, started in it (an unknown
     // agent may run tools in its process cwd like agy does)
-    if matches!(engine, Engine::Agy | Engine::Fx | Engine::Plugin(_)) { workspace } else { "" }
+    if matches!(engine, Engine::Agy | Engine::AgyAccount(_) | Engine::Fx | Engine::Plugin(_)) { workspace } else { "" }
 }
 
 /// Spawn an ACP agent and run `initialize`.
@@ -258,6 +266,8 @@ fn engine_process_label(engine: Engine) -> &'static str {
         Engine::Claude => "claude",
         Engine::Codex => "codex app-server",
         Engine::Agy => "agy acp",
+        // its own process + vicuna-mcp route per account
+        Engine::AgyAccount(a) => crate::plugin_harness::intern(&format!("agy acp@{a}")),
         Engine::Fx => "fx acp",
         Engine::Pi => "pi --mode rpc",
         Engine::Plugin(k) => k,
@@ -316,6 +326,8 @@ pub(crate) fn session_key(engine: Engine, session_id: Option<&str>, workspace: &
         Engine::Claude => format!("claude|{id}|{workspace}"),
         Engine::Codex => format!("codex|{id}|{workspace}"),
         Engine::Agy => format!("agy|{id}|{workspace}"),
+        // agy keeps conversations inside the account's own ~/.gemini
+        Engine::AgyAccount(a) => format!("agy@{a}|{id}|{workspace}"),
         Engine::Fx => format!("fx|{id}|{workspace}"),
         Engine::Pi => format!("pi|{id}|{workspace}"),
         Engine::Plugin(k) => format!("plugin|{k}|{id}|{workspace}"),
@@ -558,7 +570,7 @@ fn config_value(result: &Value, id: &str) -> Option<String> {
 /// is the full id it lists (`gemini-3.8-flash-medium`; its `model` config
 /// option drops the thinking level); the others report `configOptions.model`.
 fn acp_model(engine: Engine, result: &Value) -> Option<String> {
-    let model = if engine == Engine::Agy {
+    let model = if engine.base() == Engine::Agy {
         result
             .pointer("/models/currentModelId")
             .and_then(Value::as_str)
@@ -1615,11 +1627,11 @@ pub async fn run_turn(
     // caller's identity. CLI harnesses connect to a new route each turn.
     // agy times every MCP call out after 3 minutes (no knob over ACP): a
     // waiting ask_user returns a "still waiting, call again" poll before that
-    if engine == Engine::Agy {
+    if engine.base() == Engine::Agy {
         turn.ask_poll_secs.store(crate::vicuna_mcp::AGY_ASK_POLL_SECS, Ordering::Relaxed);
     }
     let process_scope = format!("{}|{}", mcp_snapshot.scope(), session_id.as_deref().unwrap_or(""));
-    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::Fx | Engine::Plugin(_))
+    let route = matches!(engine, Engine::Opencode | Engine::Agy | Engine::AgyAccount(_) | Engine::Fx | Engine::Plugin(_))
         .then(|| format!("{}|{workspace}|{process_scope}", engine_process_label(engine)));
     let _ask = match crate::vicuna_mcp::register(route.as_deref(), &workspace, session_id.as_deref(), turn.clone(), on_event.clone()).await {
         Ok(r) => Some(r),
@@ -1750,7 +1762,7 @@ async fn open_session_retrying(
     on_event: &Channel<WorkAgentEvent>,
     stop: &AtomicBool,
 ) -> Result<(Arc<AcpClient>, (String, bool, Option<String>)), String> {
-    let attempts = if engine == Engine::Agy { AGY_SESSION_ATTEMPTS } else { 1 };
+    let attempts = if engine.base() == Engine::Agy { AGY_SESSION_ATTEMPTS } else { 1 };
     let mut client = client;
     let mut attempt = 1;
     loop {
@@ -1794,6 +1806,7 @@ pub(crate) fn friendly_prompt_error(engine: Engine, e: String) -> String {
             Engine::Claude => format!("{e}\nClaude Code is not logged in: run `claude` in a terminal once and use /login."),
             Engine::Codex => format!("{e}\nCodex is not logged in: run `codex login` in a terminal once."),
             Engine::Agy => format!("{e}\nAntigravity is not logged in: run `agy` in a terminal once and sign in with Google."),
+            Engine::AgyAccount(a) => format!("{e}\n{}", super::agy_accounts::not_signed_in_message(a)),
             Engine::Fx => format!("{e}\nfx needs a signed-in provider: run `fx login codex` (or set the provider's auth environment variable in ~/.fx/settings.json), or pick another model."),
             Engine::Pi => format!("{e}\npi needs a signed-in provider for this model: run `pi` in a terminal once and /login (or set the provider's API key), or pick another model."),
             Engine::Plugin(_) => format!("{e}\n{} (plugin harness) needs credentials: sign in to its CLI in a terminal once, or pick another model.", engine.label()),
@@ -1862,7 +1875,7 @@ async fn run_turn_inner(
     }
     let (mut updates, _route) = client.route(&acp_session);
 
-    if let (Engine::Agy, Some(m)) = (engine, effective_model(engine, model)) {
+    if let (Engine::Agy, Some(m)) = (engine.base(), effective_model(engine, model)) {
         // agy lists full ids (`gemini-3.8-flash-medium`) for session/set_model;
         // its `model` config option only knows the family
         if used_model.as_deref() != Some(m.as_str()) {
@@ -1942,7 +1955,7 @@ async fn run_turn_inner(
         }
         // agy's processes before this round: whatever is new at its end
         // (and still alive) was started by this round's commands
-        let agy_pid = if engine == Engine::Agy { state.engine_pid(engine, workspace, mcp_scope).await } else { None };
+        let agy_pid = if engine.base() == Engine::Agy { state.engine_pid(engine, workspace, mcp_scope).await } else { None };
         let agy_baseline = agy_pid.map(super::agy::descendants).unwrap_or_default();
         emit_ev(
             on_event,
@@ -2004,7 +2017,7 @@ async fn run_turn_inner(
         while let Ok(msg) = updates.try_recv() {
             handle_session_update(&msg, on_event, stop, &mut tools, &mut output_chars);
         }
-        if engine == Engine::Agy && cancelled && tool_running_at_stop {
+        if engine.base() == Engine::Agy && cancelled && tool_running_at_stop {
             state.kill_tree(engine, workspace, mcp_scope).await;
             emit_ev(on_event, stop, WorkAgentEvent::DisplayNote { text: "\n> Stopped: ended the running command.\n".to_string() });
         }

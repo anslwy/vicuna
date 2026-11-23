@@ -84,6 +84,16 @@ impl WorkUsageReport {
     }
 }
 
+thread_local! {
+    /// Extra env for usage CLIs on this thread: an extra Antigravity
+    /// account's HOME (set by [`fetch_usage_logic`] around one fetch).
+    static USAGE_ENV: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn usage_env() -> Vec<(String, String)> {
+    USAGE_ENV.with(|e| e.borrow().clone())
+}
+
 /// Drive an interactive CLI (`/usage`) inside a tall PTY so the full view fits without paging.
 ///
 /// `usage_view_markers` names the strings that mean "the usage view is on
@@ -109,6 +119,9 @@ fn run_pty_slash_usage(
         .map_err(|e| format!("failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new(bin);
+    for (k, v) in usage_env() {
+        cmd.env(k, v);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("NO_COLOR", "1");
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
@@ -612,6 +625,7 @@ const HEADLESS_FIRST: bool = false;
 /// contract as the engine processes (terminal PATH, no console window).
 fn run_usage_command(bin: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(bin);
+    cmd.envs(usage_env());
     cmd.args(args)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -1241,7 +1255,26 @@ fn prefer_usage(
 pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport, String> {
     let eng = effective_engine(engine.as_deref());
     tokio::task::spawn_blocking(move || {
-        let report = match eng {
+        // an extra account: same agy, its own HOME (own login, own quota)
+        let env = match eng.agy_account() {
+            Some(a) if !crate::agy_accounts::signed_in(a) => {
+                let mut r = WorkUsageReport::base(eng);
+                r.error = Some(crate::agy_accounts::not_signed_in_message(a));
+                return Ok(r);
+            }
+            Some(a) => crate::agy_accounts::env_for(a)?,
+            None => Vec::new(),
+        };
+        USAGE_ENV.with(|e| *e.borrow_mut() = env);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                USAGE_ENV.with(|e| e.borrow_mut().clear());
+            }
+        }
+        let _reset = Reset;
+        let report = match eng.base() {
+            Engine::AgyAccount(_) => unreachable!("base() maps accounts to Agy"),
             Engine::Agy => {
                 let Some(bin) = crate::agy::find_agy() else {
                     let mut r = WorkUsageReport::base(eng);
@@ -1311,6 +1344,9 @@ pub async fn fetch_usage_logic(engine: Option<String>) -> Result<WorkUsageReport
         // Nothing at all: say so here, with the CLI named, instead of the
         // popup's generic "No usage data returned".
         let mut report = report;
+        // the parsers name the base CLI; the report belongs to this account
+        report.engine = eng.id().to_string();
+        report.engine_label = eng.label().to_string();
         if report.groups.is_empty()
             && report.stats.is_empty()
             && report.note.is_none()
@@ -1348,6 +1384,7 @@ pub const QUOTA_ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::A
 /// Built-in quota harnesses plus enabled plugin harnesses with a usage map.
 pub fn quota_engines() -> Vec<Engine> {
     let mut v = QUOTA_ENGINES.to_vec();
+    v.extend(Engine::all().into_iter().filter(|e| matches!(e, Engine::AgyAccount(_))));
     v.extend(
         crate::plugin_harness::all_keys()
             .into_iter()
@@ -1361,6 +1398,7 @@ pub fn quota_engines() -> Vec<Engine> {
 pub fn reports_usage(id: &str) -> bool {
     match Engine::parse(id) {
         Some(Engine::Plugin(k)) => crate::plugin_harness::reports_usage(k),
+        Some(Engine::AgyAccount(_)) => true,
         Some(e) => QUOTA_ENGINES.contains(&e),
         None => false,
     }

@@ -13,6 +13,8 @@ export interface EngineSummary {
   missing: string | null;
   /** The Usage view has a tab for it (quota harness or plugin usage map). */
   usage?: boolean;
+  /** Set on an extra Antigravity account row (`agy@<id>`). */
+  account?: import("./agyAccounts").AgyAccountInfo | null;
 }
 
 /** Work engine detection (re-run on every call: Refresh, window focus): the

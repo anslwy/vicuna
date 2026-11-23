@@ -182,6 +182,10 @@ pub struct EngineSummary {
     /// The Usage view has a tab for it (quota harness or plugin usage map).
     #[serde(default)]
     pub usage: bool,
+    /// Set on an extra Antigravity account row (`agy@<id>`): its label,
+    /// home folder, sign-in state and the command that signs it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<crate::agy_accounts::AccountInfo>,
 }
 
 pub fn not_installed_info() -> WorkEngineInfo {

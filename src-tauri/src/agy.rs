@@ -63,13 +63,25 @@ pub fn missing_message() -> String {
 /// The process leads its own process group so Stop can end the commands
 /// agy started: on session/cancel agy reports the call cancelled but leaves
 /// its child (e.g. `sleep 60`) running.
-pub fn command(bin: &Path, ask: bool, workspace: &Path) -> Command {
-    let mut cmd = crate::opencode::command(bin);
+pub fn command(bin: &Path, ask: bool, workspace: &Path, account: Option<&str>) -> Result<Command, String> {
+    let mut cmd = base_command(bin, account)?;
     cmd.args(acp_args(ask));
     cmd.current_dir(workspace);
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd
+    Ok(cmd)
+}
+
+/// `agy` with the terminal PATH, plus `HOME` pointed at the account's own
+/// home for an extra account (agy_accounts.rs).
+pub fn base_command(bin: &Path, account: Option<&str>) -> Result<Command, String> {
+    let mut cmd = crate::opencode::command(bin);
+    if let Some(a) = account {
+        for (k, v) in crate::agy_accounts::env_for(a)? {
+            cmd.env(k, v);
+        }
+    }
+    Ok(cmd)
 }
 
 /// Why a turn cannot start in `workspace` (agy would silently run in
@@ -179,9 +191,27 @@ pub async fn engine_info() -> WorkEngineInfo {
     }
 }
 
+/// An extra account's info: agy's own detection, with the account's id,
+/// label, saved model, and a warning while it is not signed in yet.
+pub async fn account_engine_info(account: &str, engine: crate::work_engine::Engine) -> WorkEngineInfo {
+    let mut info = engine_info().await;
+    info.id = engine.id().to_string();
+    info.label = engine.label().to_string();
+    info.model = engine.saved_model();
+    info.config_path = crate::agy_accounts::account_home(account).map(|p| p.display().to_string());
+    if crate::agy_accounts::find(account).is_none() {
+        info.installed = false;
+        info.missing = Some(engine.missing_message());
+    } else if info.installed && !crate::agy_accounts::signed_in(account) {
+        info.warning = Some(crate::agy_accounts::not_signed_in_message(account));
+    }
+    info
+}
+
 // ---------- models ----------
 
-static MODELS: Mutex<Option<(PathBuf, Vec<OpencodeModel>)>> = Mutex::new(None);
+/// Per (binary, account): free and paid accounts list different models.
+static MODELS: Mutex<Vec<(PathBuf, Option<String>, Vec<OpencodeModel>)>> = Mutex::new(Vec::new());
 
 fn provider_of(id: &str) -> &'static str {
     if id.starts_with("gemini") {
@@ -216,13 +246,21 @@ pub fn parse_models_output(out: &str) -> Vec<OpencodeModel> {
 }
 
 pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
+    list_models_for(None).await
+}
+
+pub async fn list_models_for(account: Option<&str>) -> Result<Vec<OpencodeModel>, String> {
     let cli = find_agy().ok_or_else(missing_message)?;
-    if let Some((p, cached)) = MODELS.lock().ok().and_then(|g| g.clone()) {
-        if p == cli {
-            return Ok(cached);
+    let acct = account.map(str::to_string);
+    if let Some(cached) = MODELS.lock().ok().and_then(|g| g.iter().find(|(p, a, _)| *p == cli && *a == acct).map(|x| x.2.clone())) {
+        return Ok(cached);
+    }
+    if let Some(a) = account {
+        if !crate::agy_accounts::signed_in(a) {
+            return Err(crate::agy_accounts::not_signed_in_message(a));
         }
     }
-    let mut cmd = crate::opencode::command(&cli);
+    let mut cmd = base_command(&cli, account)?;
     cmd.arg("models");
     let out = tokio::time::timeout(MODELS_TIMEOUT, cmd.output())
         .await
@@ -238,7 +276,8 @@ pub async fn list_models() -> Result<Vec<OpencodeModel>, String> {
         ));
     }
     if let Ok(mut g) = MODELS.lock() {
-        *g = Some((cli, models.clone()));
+        g.retain(|(p, a, _)| !(*p == cli && *a == acct));
+        g.push((cli, acct, models.clone()));
     }
     Ok(models)
 }

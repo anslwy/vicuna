@@ -100,6 +100,11 @@ pub fn summary(info: &WorkEngineInfo) -> EngineSummary {
         version: info.version.clone(),
         missing: info.missing.clone(),
         usage: crate::work_usage::reports_usage(&info.id),
+        account: info
+            .id
+            .strip_prefix(crate::agy_accounts::ENGINE_PREFIX)
+            .and_then(crate::agy_accounts::find)
+            .and_then(|a| Some(crate::agy_accounts::info_in(&crate::opencode::home_dir()?, &a))),
     }
 }
 

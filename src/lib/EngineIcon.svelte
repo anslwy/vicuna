@@ -33,7 +33,7 @@
   <img class="engine-ico" src={pluginEngineIcon(id, workEngineList)!} width="14" height="14" alt="" aria-hidden="true" />
 {:else if id.startsWith("plugin:")}
   <svg class="engine-ico" data-engine-icon="plugin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z"/></svg>
-{:else if id === "agy"}
+{:else if id === "agy" || id.startsWith("agy@")}
   <svg class="engine-ico" data-engine-icon="agy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={AGY_ICON_PATH}/></svg>
 {:else}
   <svg class="engine-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d={OPENCODE_ICON_PATH}/><path d={OPENCODE_ICON_INNER_PATH} opacity=".4"/></svg>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import EngineIcon from "$lib/EngineIcon.svelte";
   import { harnessUsageUrl } from "$lib/harnessUsageLinks";
+  import { usageAccountView } from "$lib/agyAccounts";
   import {
     usageTabs,
     usageMeterTone,
@@ -38,7 +39,8 @@
   } = $props();
 
   let installedEngines = $derived(usageTabs(workEngines, usageEngine).tabs);
-  let providerUsageUrl = $derived(harnessUsageUrl(usageEngine));
+  let acctView = $derived(usageAccountView(installedEngines, usageEngine));
+  let providerUsageUrl = $derived(harnessUsageUrl(acctView.selectedBase));
 </script>
 
 <button class="confirm-backdrop sched-dim" data-testid="usage-backdrop" aria-label="Close" onclick={onClose} tabindex="-1"></button>
@@ -62,16 +64,29 @@
         {/if}
       </span>
     </div>
-    {#if installedEngines.length > 1}
+    {#if acctView.harnessTabs.length > 1}
       <div class="usage-tabs" role="tablist" aria-label="Work harnesses">
-        {#each installedEngines as eng (eng.id)}
+        {#each acctView.harnessTabs as eng (eng.id)}
           <button
-            class="usage-tab {usageEngine === eng.id ? 'sel' : ''}"
+            class="usage-tab {acctView.selectedBase === eng.id ? 'sel' : ''}"
             data-testid="usage-tab-{eng.id}"
             role="tab"
-            aria-selected={usageEngine === eng.id}
+            aria-selected={acctView.selectedBase === eng.id}
             onclick={() => onSelectTab(eng.id)}
           ><EngineIcon id={eng.id} {workEngineList} />{eng.label}</button>
+        {/each}
+      </div>
+    {/if}
+    {#if acctView.chips.length}
+      <div class="usage-accounts" role="tablist" aria-label="Accounts" data-testid="usage-accounts">
+        {#each acctView.chips as chip (chip.id)}
+          <button
+            class="usage-acct {usageEngine === chip.id ? 'sel' : ''}"
+            data-testid="usage-account-{chip.id}"
+            role="tab"
+            aria-selected={usageEngine === chip.id}
+            onclick={() => onSelectTab(chip.id)}
+          >{chip.label}</button>
         {/each}
       </div>
     {/if}
@@ -169,6 +184,10 @@
   .usage-tab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 12px; cursor: pointer; }
   .usage-tab:hover { background: var(--hover); color: var(--text); }
   .usage-tab.sel { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .usage-accounts { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--border); }
+  .usage-acct { border: 1px solid var(--border); background: transparent; color: var(--text-dim); border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 11.5px; cursor: pointer; }
+  .usage-acct:hover { background: var(--hover); color: var(--text); }
+  .usage-acct.sel { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
   .usage-body { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; padding-right: 2px; }
   .usage-loading { font-size: 13.5px; color: var(--muted); margin: 8px 0; }
   .usage-groups { display: flex; flex-direction: column; gap: 16px; }
