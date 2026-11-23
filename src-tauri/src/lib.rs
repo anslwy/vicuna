@@ -201,6 +201,7 @@ pub fn run() {
             work_fs::fs_list_dirs,
             app_shell::open_server_window,
             app_shell::open_chat_window,
+            app_shell::capture_scheme_url,
             tauri_commands::server_list,
             tauri_commands::server_connect,
             tauri_commands::server_touch,

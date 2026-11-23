@@ -104,6 +104,98 @@ pub(crate) async fn open_chat_window(app: AppHandle, server_id: Option<String>, 
     Ok(())
 }
 
+/// Schemes a capture window may never claim: web, app-internal and the
+/// dangerous ones. Plugins name their own custom scheme (e.g. `signalcaptcha`).
+const CAPTURE_BLOCKED_SCHEMES: &[&str] = &[
+    "http", "https", "file", "data", "blob", "javascript", "about", "ftp", "ws", "wss",
+    "vicuna", "tauri", "ipc", "asset", "http+unix", "mailto", "tel",
+];
+
+/// Validate a capture request: an https page plus a plain custom scheme.
+pub(crate) fn capture_target_ok(url: &str, scheme: &str) -> Result<(), String> {
+    let scheme_ok = (2..=32).contains(&scheme.len())
+        && scheme.starts_with(|c: char| c.is_ascii_lowercase())
+        && scheme.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+        && !CAPTURE_BLOCKED_SCHEMES.contains(&scheme);
+    if !scheme_ok {
+        return Err("bad capture scheme".into());
+    }
+    if url.len() > 2048 || !url.starts_with("https://") || url.chars().any(|c| c.is_control() || c == ' ') {
+        return Err("capture page must be an https URL".into());
+    }
+    Ok(())
+}
+
+/// Open `url` in a separate, permission-less window and wait until the page
+/// navigates to `<scheme>:…` (e.g. Signal's CAPTCHA page redirecting to
+/// `signalcaptcha://…`, which the OS would otherwise hand to another app).
+/// The navigation is blocked, the window closes and the full captured URL is
+/// returned. Closing the window cancels. One capture window at a time.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub(crate) async fn capture_scheme_url(app: AppHandle, url: String, scheme: String, title: Option<String>) -> Result<String, String> {
+    use std::sync::Arc;
+    capture_target_ok(&url, &scheme)?;
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("bad capture URL: {e}"))?;
+    const LABEL: &str = "capture";
+    if let Some(w) = app.get_webview_window(LABEL) {
+        let _ = w.destroy();
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let send = {
+        let tx = tx.clone();
+        move |r: Result<String, String>| {
+            if let Some(s) = tx.lock().ok().and_then(|mut g| g.take()) {
+                let _ = s.send(r);
+            }
+        }
+    };
+    let nav_send = send.clone();
+    let nav_app = app.clone();
+    let window = tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::External(parsed))
+        .title(title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| app_title().to_string()))
+        .inner_size(520.0, 720.0)
+        .on_navigation(move |u| {
+            if u.scheme() == scheme {
+                nav_send(Ok(u.to_string()));
+                let app = nav_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(w) = app.get_webview_window(LABEL) {
+                        let _ = w.destroy();
+                    }
+                });
+                return false;
+            }
+            // stay on the web; never hand other schemes to the OS
+            matches!(u.scheme(), "https" | "about" | "blob" | "data")
+        })
+        .build()
+        .map_err(|e| format!("cannot open window: {e}"))?;
+    let close_send = send.clone();
+    window.on_window_event(move |e| {
+        if matches!(e, tauri::WindowEvent::Destroyed) {
+            close_send(Err("closed".into()));
+        }
+    });
+    rx.await.unwrap_or_else(|_| Err("closed".into()))
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::capture_target_ok;
+
+    #[test]
+    fn capture_requests_are_validated() {
+        assert!(capture_target_ok("https://signalcaptchas.org/registration/generate.html", "signalcaptcha").is_ok());
+        assert!(capture_target_ok("http://x.org", "signalcaptcha").is_err());
+        assert!(capture_target_ok("https://x.org/a b", "signalcaptcha").is_err());
+        for bad in ["https", "file", "javascript", "vicuna", "tauri", "Upper", "a", "1abc", "x/y"] {
+            assert!(capture_target_ok("https://x.org", bad).is_err(), "{bad}");
+        }
+    }
+}
+
 /// Window zoom level for Cmd/Ctrl +/−/0. Desktop shells don't zoom webviews
 /// on those keys the way browsers do natively, so the frontend catches the
 /// chord (Tauri only) and drives the webview zoom from here.
