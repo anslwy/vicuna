@@ -536,14 +536,23 @@ export async function setWorkApproval(ask: boolean): Promise<WorkEngineInfo> {
 
 /** Account management is provided by the server that runs Work turns. */
 export async function workAccountSupport(): Promise<string[]> {
+  let engines: string[] = [];
   try {
     const result = await invokeCmd<{ engines: string[] }>("work_account_support", {});
-    return result.engines;
+    engines = result?.engines ?? [];
   } catch {
-    // An older connected server can still offer Antigravity accounts.
-    const result = await invokeCmd<{ supported: boolean }>("agy_account_list", {});
-    return result.supported ? ["agy"] : [];
+    // Older servers may only expose the Antigravity-specific action.
   }
+  if (engines.includes("agy")) return engines;
+  try {
+    // A connected server can expose Antigravity accounts through the legacy
+    // action even when its generic capability list omits them.
+    const result = await invokeCmd<{ supported: boolean }>("agy_account_list", {});
+    if (result.supported) return [...engines, "agy"];
+  } catch {
+    // Keep any capabilities the generic action reported.
+  }
+  return engines;
 }
 export async function addWorkAccount(engine: string, label: string): Promise<import("./workGate").WorkAccountInfo> {
   return engine === "agy" ? invokeCmd("agy_account_add", { label }) : invokeCmd("work_account_add", { engine, label });

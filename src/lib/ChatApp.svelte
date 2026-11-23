@@ -11219,7 +11219,7 @@
             {#if modelOpen}
               <button class="model-backdrop" data-testid="model-backdrop" aria-label="Close model menu" onclick={() => (modelOpen = false)} tabindex="-1"></button>
               <div class="model-drop" data-testid="model-dropdown" data-engine={engineId(workEngineInfo)}>
-                {#if workEngineList.length > 1}
+                {#if workEngineList.length > 1 || (workEngineList[0]?.id === "agy" && workEngineList[0].installed && accountEngines.includes("agy"))}
                   <div class="engine-select" data-testid="work-engine-picker">
                     <button class="engine-select-btn" data-testid="work-engine-toggle" aria-haspopup="listbox" aria-expanded={engineMenuOpen} aria-label="Work engine" onclick={() => (engineMenuOpen = !engineMenuOpen)}>
                       {@render engineIcon(engineId(workEngineInfo))}<span>{workEngineLabel}</span>
