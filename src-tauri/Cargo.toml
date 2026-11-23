@@ -1,6 +1,6 @@
 [package]
 name = "vicuna"
-version = "0.0.69"
+version = "0.0.70"
 description = "Vicuna — minimal desktop chat client for Ollama"
 authors = ["you"]
 license = "Apache-2.0"
