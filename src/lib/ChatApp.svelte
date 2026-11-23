@@ -11600,7 +11600,12 @@
   <TelegramModal
     sessionId={lp.id}
     sessionTitle={chats.find((c) => c.id === lp.id)?.title ?? ""}
-    lead={{ prevTitle: lp.prevTitle, onConfirm: () => { leadPrompt = null; void toggleLead(lp.id).then(refreshTelegramStatus); } }}
+    lead={{ prevTitle: lp.prevTitle, onConfirm: () => {
+      // read the id BEFORE clearing: `lp` is a derived of leadPrompt and goes null with it
+      const id = lp.id;
+      leadPrompt = null;
+      void toggleLead(id).then(refreshTelegramStatus);
+    } }}
     onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
   />
 {/if}
