@@ -490,25 +490,27 @@ async fn manage_schedule(target: &Target, args: &Value, client_gone: impl std::f
 fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
-        "title": "Manage worker sessions (lead only; set_workspace on your own session works anywhere)",
-        "description": "Only works in the session the user marked as lead. Delegate work to other Vicuna Work sessions, each running its own harness (engine) and model. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle). When a worker you created or messaged finishes a turn, its reply reaches you as a message automatically (unless `report: false`), so after delegating, end your turn instead of polling.",
+        "title": "Manage worker sessions (lead controls; permissioned send)",
+        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` only. Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session, which works anywhere. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace"] },
+                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions"] },
+                "read": { "type": "boolean", "description": "permissions: allow reading other sessions' histories/state." },
+                "allow_message": { "type": "boolean", "description": "permissions: allow sending messages to other sessions." },
                 "include_archived": { "type": "boolean", "description": "list: include archived sessions, tagged [archived] (default false)." },
                 "status": { "type": "string", "enum": ["running", "idle", "any"], "description": "list: only running or idle sessions." },
                 "sort": { "type": "string", "enum": ["recent", "created", "title"], "description": "list: order (default recent = last activity, newest first)." },
                 "since": { "type": "string", "description": "list: only sessions active since then: `2h`, `3d`, `2026-11-19 14:30` (local) or epoch ms." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "list: max rows (default 20)." },
                 "offset": { "type": "integer", "minimum": 0, "description": "list: rows to skip." },
-                "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status/set_workspace; set_workspace defaults to your own)." },
+                "session_id": { "type": "string", "description": "Target session (send/stop/delete/archive/unarchive/status/set_workspace/permissions; set_workspace defaults to your own)." },
                 "title": { "type": "string", "description": "create: sidebar title for the worker." },
                 "workspace": { "type": "string", "description": "create: absolute workspace folder (default: the lead's). set_workspace: the new folder (required)." },
                 "engine": { "type": "string", "description": "create: harness, e.g. claude, codex, opencode, fx, agy, pi (default: the user's current pick). See `list` for installed ones." },
                 "model": { "type": "string", "description": "create: that engine's model id (default: the engine's default)." },
                 "message": { "type": "string", "description": "create/send: the prompt for the worker." },
-                "report": { "type": "boolean", "description": "create/send: send the worker's reply back to you when its turn ends (default true)." }
+                "report": { "type": "boolean", "description": "create/send: send the worker's reply back to you when its turn ends (default true for lead calls; non-lead send always forces false)." }
             },
             "required": ["action"]
         }
@@ -518,18 +520,27 @@ fn manage_sessions_schema() -> Value {
 /// Hand a session action to the window that runs this (lead) turn.
 async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace"].contains(&action.as_str()) {
-        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status, set_workspace.", true);
+    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status, set_workspace, permissions.", true);
     }
     let turn = &target.turn;
+    if action == "permissions" && !can_manage_permissions(turn.lead.load(Ordering::Relaxed)) {
+        return text_result("Only the lead session can view or change other sessions' permissions.", true);
+    }
     // moving your own session's folder needs no lead role
     let sid = args.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
     let own = action == "set_workspace" && (sid.is_empty() || Some(sid) == target.session_id.as_deref());
     if own && target.session_id.is_none() {
         return text_result("This turn has no Vicuna session, so there is nothing to move.", true);
     }
-    if !own && !turn.lead.load(Ordering::Relaxed) {
+    let messaging = action == "send" && may_message(&target.session_id).await;
+    if !can_manage_sessions_action(turn.lead.load(Ordering::Relaxed), own, &action, messaging) {
         return text_result("manage_sessions only works in the user's lead session. The user can make a session the lead from its sidebar menu (Make lead).", true);
+    }
+    let read_target = if action == "list" { "__all__" } else { sid };
+    let reads_other = action == "list" || action == "status";
+    if reads_other && !may_read_other(Some(target), read_target).await {
+        return text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true);
     }
     if turn.stop.load(Ordering::Relaxed) {
         return text_result("The user stopped the turn; nothing was done.", true);
@@ -560,7 +571,8 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
         "create" | "send" => 120,
         _ => 60,
     };
-    if target.on_event.send(WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: args.clone() }).is_err() {
+    let forwarded_args = forwarded_session_args(args, &action, turn.lead.load(Ordering::Relaxed));
+    if target.on_event.send(WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: forwarded_args }).is_err() {
         turn.stop.store(true, Ordering::Relaxed);
         turn.ask_pending.lock().ok().map(|mut m| m.remove(&req_id));
         return text_result("The app event channel is unavailable; the action was not dispatched.", true);
@@ -583,6 +595,38 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     } else {
         text_result(v.get("error").and_then(Value::as_str).unwrap_or("the app refused the action"), true)
     }
+}
+
+async fn may_message(session_id: &Option<String>) -> bool {
+    let Some(id) = session_id.as_deref() else { return false };
+    let Ok(pool) = db_pool().await else { return false };
+    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(&pool).await.ok().flatten();
+    let extra = row.and_then(|r| r.try_get::<Option<String>, _>("extra").ok().flatten()).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+    effective_permission(&extra, "message")
+}
+
+fn can_manage_permissions(is_lead: bool) -> bool { is_lead }
+
+fn forwarded_session_args(args: &Value, action: &str, is_lead: bool) -> Value {
+    let mut forwarded = args.clone();
+    if action == "send" && !is_lead {
+        forwarded["report"] = json!(false);
+    }
+    forwarded
+}
+
+fn can_manage_sessions_action(is_lead: bool, own: bool, action: &str, message_permission: bool) -> bool {
+    own || is_lead || (action == "send" && message_permission)
+}
+
+fn can_read_other(caller: Option<&str>, requested: &str, permission: Option<bool>) -> bool {
+    caller.is_none() || caller == Some(requested) || permission.unwrap_or(false)
+}
+
+fn effective_permission(extra: &Value, name: &str) -> bool {
+    extra.pointer(&format!("/permissions/{name}")).and_then(Value::as_bool).unwrap_or_else(|| {
+        name == "read" || (name == "message" && extra.get("role").and_then(Value::as_str) == Some("lead"))
+    })
 }
 
 fn get_session_schema() -> Value {
@@ -1206,6 +1250,9 @@ async fn read_session(target: Option<&Target>, args: &Value) -> Value {
     let Some(session_id) = requested else {
         return text_result("No `session_id` provided and current turn has no session_id.", true);
     };
+    if !may_read_other(target, &session_id).await {
+        return text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true);
+    }
     let pool = match db_pool().await {
         Ok(p) => p,
         Err(e) => return text_result(&e, true),
@@ -1214,6 +1261,17 @@ async fn read_session(target: Option<&Target>, args: &Value) -> Value {
         Ok(v) => text_result(&v.to_string(), false),
         Err(e) => text_result(&e, true),
     }
+}
+
+async fn may_read_other(target: Option<&Target>, requested: &str) -> bool {
+    let Some(t) = target else { return true };
+    if t.session_id.as_deref() == Some(requested) { return true; }
+    let Some(caller) = t.session_id.as_deref() else { return true };
+    let Ok(pool) = db_pool().await else { return false };
+    let Ok(row) = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(caller).fetch_optional(&pool).await else { return false };
+    let Some(row) = row else { return false };
+    let extra = row.try_get::<Option<String>, _>("extra").ok().flatten().and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+    can_read_other(Some(caller), requested, Some(effective_permission(&extra, "read")))
 }
 
 async fn list_sessions_from_pool(pool: &sqlx::SqlitePool, args: &Value) -> Result<Value, String> {
@@ -1969,9 +2027,9 @@ async fn handle_rpc(
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
                 (Some(t), MANAGE_SCHEDULE_TOOL) => manage_schedule(t, &args, client_gone).await,
-                (_, LIST_SESSIONS_TOOL) => list_sessions(&args).await,
-                (_, OVERVIEW_TOOL) => session_overview(&args).await,
-                (_, SEARCH_TOOL) => search_sessions(&args).await,
+                (t, LIST_SESSIONS_TOOL) => if may_read_other(t, "__all__").await { list_sessions(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
+                (t, OVERVIEW_TOOL) => if may_read_other(t, "__all__").await { session_overview(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
+                (t, SEARCH_TOOL) => if may_read_other(t, "__all__").await { search_sessions(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
                 (_, USAGE_TOOL) => usage_status(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (_, MANAGE_SKILLS_TOOL) => manage_skills(target, &args).await,
@@ -2236,6 +2294,32 @@ async fn stream_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_permission_defaults_and_explicit_overrides() {
+        assert!(effective_permission(&json!({}), "read"));
+        assert!(!effective_permission(&json!({}), "message"));
+        assert!(effective_permission(&json!({"role":"lead"}), "message"));
+        assert!(!effective_permission(&json!({"role":"lead", "permissions":{"message":false}}), "message"));
+        assert!(!effective_permission(&json!({"permissions":{"read":false}}), "read"));
+        assert!(can_read_other(Some("same"), "same", None), "own session reads are unconditional");
+        assert!(can_read_other(None, "other", None), "turns without a session id retain access");
+        assert!(!can_read_other(Some("worker"), "other", None), "a missing permission row denies");
+        assert!(!can_read_other(Some("worker"), "other", Some(false)));
+        assert!(can_read_other(Some("worker"), "other", Some(true)));
+        assert!(can_manage_permissions(true));
+        assert!(!can_manage_permissions(false));
+        assert_eq!(forwarded_session_args(&json!({"action":"send", "report":true}), "send", false)["report"], false);
+        assert_eq!(forwarded_session_args(&json!({"action":"send"}), "send", true)["report"], Value::Null);
+        assert_eq!(forwarded_session_args(&json!({"action":"stop", "report":true}), "stop", false)["report"], true);
+        assert!(can_manage_sessions_action(false, false, "send", true));
+        assert!(!can_manage_sessions_action(false, false, "send", false));
+        for action in ["create", "stop", "delete", "archive", "unarchive", "status", "list"] {
+            assert!(!can_manage_sessions_action(false, false, action, true), "{action} stays lead-only");
+            assert!(can_manage_sessions_action(true, false, action, false), "lead keeps {action}");
+        }
+        assert!(can_manage_sessions_action(false, true, "set_workspace", false));
+    }
     use crate::ipc::InvokeResponseBody;
 
     #[test]
@@ -2506,7 +2590,7 @@ mod tests {
         let turn = Arc::new(TurnState::new());
         turn.lead.store(true, Ordering::Relaxed);
         let target = Target { seq: 0, workspace: ws(), session_id: Some("lead".into()), turn: turn.clone(), on_event: ch };
-        let result = manage_sessions(&target, &json!({ "action": "status", "session_id": "w" }), std::future::pending()).await;
+        let result = manage_sessions(&target, &json!({ "action": "create", "engine": "codex", "message": "go" }), std::future::pending()).await;
         assert!(turn.stop.load(Ordering::Relaxed));
         assert!(turn.ask_pending.lock().unwrap().is_empty());
         assert!(result["content"][0]["text"].as_str().unwrap().contains("not dispatched"));

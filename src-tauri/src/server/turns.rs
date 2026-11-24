@@ -543,6 +543,34 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
             let reply = chat["messages"].as_array().map(|messages| persist::last_reply(messages)).unwrap_or("");
             Ok(format!("{id}: {}\nLast reply:\n{}", if live_turn(st,&id).is_some() {"running"} else {"idle"}, persist::tail_text(reply,3000)))
         }
+        "permissions" => {
+            let _write = st.chat_lock.lock().await;
+            let caller = crate::server_store::load_chat(db, lead_id).await?.ok_or("calling session no longer exists")?;
+            if extra_obj(&caller)["role"].as_str() != Some("lead") {
+                return Err("Only the lead session can view or change other sessions' permissions.".into());
+            }
+            let mut chat = crate::server_store::load_chat(db, &id).await?.ok_or("session no longer exists")?;
+            let mut extra = extra_obj(&chat);
+            let mut permissions = extra.get("permissions").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+            let mut changed = false;
+            if let Some(value) = args.get("read").and_then(Value::as_bool) {
+                permissions["read"] = json!(value);
+                changed = true;
+            }
+            if let Some(value) = args.get("allow_message").and_then(Value::as_bool) {
+                permissions["message"] = json!(value);
+                changed = true;
+            }
+            if changed {
+                extra["permissions"] = permissions.clone();
+                chat["extra"] = json!(extra.to_string());
+                crate::server_store::write_title_and_extra(db, &id, &chat).await?;
+            }
+            let read = permissions.get("read").and_then(Value::as_bool).unwrap_or(true);
+            let allow_message = permissions.get("message").and_then(Value::as_bool)
+                .unwrap_or(extra["role"].as_str() == Some("lead"));
+            Ok(json!({"session_id":id,"read":read,"allow_message":allow_message}).to_string())
+        }
         "send" => {
             let msg = arg("message");
             if msg.is_empty() { return Err("`message` is required.".into()); }
@@ -1464,6 +1492,64 @@ mod tests {
         assert!(turn.stop.load(Ordering::Relaxed));
         assert!(session_control(&st,"chat","send",&json!({"session_id":"chat","message":"no"})).await.is_err());
         st.db.as_ref().unwrap().close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manage_session_permissions_are_lead_only_and_persisted() {
+        let (st, _, _, dir) = recording().await;
+        let db = st.db.as_ref().unwrap();
+        crate::server_store::create_chat(db, &json!({
+            "id":"lead", "title":"Lead", "createdAt":1, "mode":"work",
+            "extra":r#"{"role":"lead"}"#, "messages":[]
+        })).await.unwrap();
+        crate::server_store::create_chat(db, &json!({
+            "id":"sender", "title":"Sender", "createdAt":1, "mode":"work",
+            "extra":r#"{}"#, "messages":[]
+        })).await.unwrap();
+
+        let denied = session_control(&st, "sender", "permissions", &json!({"session_id":"chat", "read":false})).await.unwrap_err();
+        assert!(denied.contains("Only the lead"));
+        let defaults: Value = serde_json::from_str(&session_control(&st, "lead", "permissions", &json!({"session_id":"chat"})).await.unwrap()).unwrap();
+        assert_eq!(defaults["read"], true);
+        assert_eq!(defaults["allow_message"], false);
+        session_control(&st, "lead", "permissions", &json!({"session_id":"chat", "read":false, "allow_message":true})).await.unwrap();
+        let saved: Value = serde_json::from_str(&session_control(&st, "lead", "permissions", &json!({"session_id":"chat"})).await.unwrap()).unwrap();
+        assert_eq!(saved["read"], false);
+        assert_eq!(saved["allow_message"], true);
+
+        db.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn permissioned_nonlead_send_runs_through_server_control_without_report_back() {
+        let (st, rs, target_turn, dir) = recording().await;
+        let db = st.db.as_ref().unwrap();
+        crate::server_store::create_chat(db, &json!({
+            "id":"sender", "title":"Sender", "createdAt":1, "mode":"work", "workspace":"/srv/p",
+            "extra":r#"{"permissions":{"message":true}}"#, "messages":[]
+        })).await.unwrap();
+
+        let caller_turn = Arc::new(TurnState::new());
+        st.agent.next_turn(caller_turn.clone());
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        caller_turn.ask_pending.lock().unwrap().insert("send-1".into(), answer_tx);
+        let ch = work_channel(st.clone(), "caller".into(), None, caller_turn.clone(), Some("sender".into()));
+        ch.send(WorkAgentEvent::SessionControl {
+            req_id: "send-1".into(),
+            action: "send".into(),
+            args: json!({"session_id":"chat", "message":"run this", "report":false}),
+        }).unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(2), answer_rx).await.unwrap().unwrap();
+        let reply: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert!(reply["text"].as_str().unwrap().contains("Queued into session chat"));
+        assert_eq!(target_turn.queue.lock().unwrap().len(), 1);
+        assert_eq!(rs.lock().unwrap().report_to, None, "the permissioned sender gets an acknowledgement only");
+
+        db.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 

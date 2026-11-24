@@ -70,6 +70,11 @@ export interface ChatExtra extends McpSelection {
   leadId?: string | null;
   pinned?: boolean;
   archived?: boolean;
+  permissions?: { read?: boolean; message?: boolean };
+}
+
+export function sessionPermissions(extra: Partial<Pick<ChatExtra, "role" | "permissions">>): { read: boolean; message: boolean } {
+  return { read: extra.permissions?.read ?? true, message: extra.permissions?.message ?? extra.role === "lead" };
 }
 
 /** persisted `extra` JSON column: per-session engine/model/lead/pin */
@@ -81,6 +86,7 @@ export function chatExtraJson(c: ChatExtra): string | null {
   if (c.leadId) o.leadId = c.leadId;
   if (c.pinned) o.pinned = true;
   if (c.archived) o.archived = true;
+  if (c.permissions) o.permissions = c.permissions;
   if (c.skillsEnabled) o.skillsEnabled = c.skillsEnabled;
   if (c.mcpEnabled) o.mcpEnabled = c.mcpEnabled;
   if (c.mcpOnly) o.mcp = c.mcpOnly;
@@ -104,6 +110,12 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (typeof o.leadId === "string" && o.leadId) out.leadId = o.leadId;
   if (o.pinned === true) out.pinned = true;
   if (o.archived === true) out.archived = true;
+  if (o.permissions && typeof o.permissions === "object") {
+    const permissions: { read?: boolean; message?: boolean } = {};
+    if (typeof o.permissions.read === "boolean") permissions.read = o.permissions.read;
+    if (typeof o.permissions.message === "boolean") permissions.message = o.permissions.message;
+    if (Object.keys(permissions).length) out.permissions = permissions;
+  }
   if (o.mcpEnabled && typeof o.mcpEnabled === "object" && !Array.isArray(o.mcpEnabled)) {
     out.mcpEnabled = Object.fromEntries(Object.entries(o.mcpEnabled).filter(
       (entry): entry is [string, boolean] => typeof entry[1] === "boolean"

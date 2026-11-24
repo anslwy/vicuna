@@ -239,6 +239,13 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                     extra[k] = json!(b);
                 }
             }
+            if let Some(p) = args.get("permissions").filter(|v| v.is_object()) {
+                for k in ["read", "message"] {
+                    if let Some(b) = p.get(k).and_then(Value::as_bool) {
+                        extra["permissions"][k] = json!(b);
+                    }
+                }
+            }
             let mut promoting_lead = false;
             let mut demoting_self = false;
             if let Some(r) = args.get("role") {
@@ -424,6 +431,9 @@ mod tests {
         let b1 = dispatch(&st, "session_update", &json!({"id": "b", "role": "lead"})).await.unwrap();
         assert_eq!(extra_of(&b1)["role"], "lead");
         assert_eq!(extra_of(&b1)["pinned"], true);
+
+        let b_perm = dispatch(&st, "session_update", &json!({"id": "b", "permissions": {"read": false, "message": false}})).await.unwrap();
+        assert_eq!(extra_of(&b_perm)["permissions"], json!({"read": false, "message": false}));
 
         let a2 = load(&st, "a").await.unwrap();
         assert!(extra_of(&a2).get("role").is_none(), "previous lead must be demoted: {}", a2["extra"]);
