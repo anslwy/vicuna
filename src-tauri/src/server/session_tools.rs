@@ -58,6 +58,21 @@ fn transcript(chat: &Value) -> Vec<Value> {
     chat["messages"].as_array().cloned().unwrap_or_default()
 }
 
+pub(super) async fn clear_context(st: &Arc<BridgeState>, args: &Value) -> Result<Value, String> {
+    let id = super::arg_str(args, "id")?;
+    let _write = st.chat_lock.lock().await;
+    let chat = work_chat(st, &id, args).await?;
+    let mut messages = transcript(&chat);
+    if persist::context_start_index(&messages) == messages.len() {
+        return Ok(json!({"notice": "There is no context to clear."}));
+    }
+    messages.push(json!({"role": "assistant", "content": "", "contextCleared": true}));
+    let db = st.db.as_ref().ok_or("no server db")?;
+    server_store::write_messages(db, &id, &messages, None).await?;
+    st.redo_history.clear(&id);
+    result(st, &id, None).await
+}
+
 pub(super) async fn compact(st: &Arc<BridgeState>, args: &Value) -> Result<Value, String> {
     let id = super::arg_str(args, "id")?;
     let model = super::arg_str(args, "model")?;
@@ -68,6 +83,9 @@ pub(super) async fn compact(st: &Arc<BridgeState>, args: &Value) -> Result<Value
             return Ok(json!({"notice": "Nothing to compact — the session has no messages yet."}));
         }
         let visible = persist::compacted_history(&original);
+        if visible.is_empty() {
+            return Ok(json!({"notice": "There are no messages in the current context."}));
+        }
         if visible.len() <= 1 && original.iter().any(|msg| msg["summary"] == true) {
             return Ok(json!({"notice": "Already compacted — send more messages first."}));
         }
@@ -109,7 +127,7 @@ pub(super) async fn change_turn(
     let chat = work_chat(st, &id, args).await?;
     let revision = chat["rev"].as_i64().unwrap_or_default();
     let mut messages = transcript(&chat);
-    let removed = if redo {
+    let (removed, context_only) = if redo {
         let history = st.redo_history.0.lock().unwrap();
         let Some(turn) = history
             .get(&id)
@@ -121,44 +139,53 @@ pub(super) async fn change_turn(
             );
         };
         messages.splice(turn.index..turn.index, turn.messages.clone());
-        None
+        (None, turn.messages.first().is_some_and(|msg| msg["contextCleared"] == true))
+    } else if messages.last().is_some_and(|msg| msg["contextCleared"] == true) {
+        let index = messages.len() - 1;
+        let marker = messages.pop().unwrap();
+        (Some(RemovedTurn { index, messages: vec![marker] }), true)
     } else {
         let Some(index) = messages.iter().rposition(|msg| msg["role"] == "user") else {
             return Ok(json!({"notice": "Nothing to undo — no user message yet."}));
         };
         if messages
             .get(index + 1)
-            .is_none_or(|msg| msg["role"] != "assistant" || msg["summary"] == true)
+            .is_none_or(|msg| !persist::is_assistant_reply(msg))
         {
             return Ok(json!({"notice": "Nothing to undo — last user message has no reply yet."}));
         }
-        Some(RemovedTurn {
+        (Some(RemovedTurn {
             index,
             messages: messages.drain(index..index + 2).collect(),
-        })
+        }), false)
     };
     let db = st.db.as_ref().ok_or("no server db")?;
-    let (notice, moved_files) = match apply_files(st, &id, redo).await {
-        Ok(msg) => (msg, true),
-        Err(err)
-            if err.starts_with(if redo {
-                "Nothing to redo"
-            } else {
-                "Nothing to undo"
-            }) =>
-        {
-            let msg = if redo {
-                "Redone last turn — no file changes to replay."
-            } else {
-                "Undone last turn — no file changes to revert."
-            };
-            (msg.to_owned(), false)
-        }
-        Err(err) => {
-            return Err(format!(
-                "{} failed: {err}",
-                if redo { "Redo" } else { "Undo" }
-            ));
+    let (notice, moved_files) = if context_only {
+        let notice = if redo { "Cleared context." } else { "Restored context." };
+        (notice.to_owned(), false)
+    } else {
+        match apply_files(st, &id, redo).await {
+            Ok(msg) => (msg, true),
+            Err(err)
+                if err.starts_with(if redo {
+                    "Nothing to redo"
+                } else {
+                    "Nothing to undo"
+                }) =>
+            {
+                let msg = if redo {
+                    "Redone last turn — no file changes to replay."
+                } else {
+                    "Undone last turn — no file changes to revert."
+                };
+                (msg.to_owned(), false)
+            }
+            Err(err) => {
+                return Err(format!(
+                    "{} failed: {err}",
+                    if redo { "Redo" } else { "Undo" }
+                ));
+            }
         }
     };
     let next_revision =
@@ -205,4 +232,55 @@ async fn result(st: &BridgeState, id: &str, notice: Option<String>) -> Result<Va
     let mut chat = actions::load(st, id).await?;
     st.redo_history.decorate(&mut chat);
     Ok(json!({"chat": chat, "notice": notice}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn undo_across_clear_preserves_file_history() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        server_store::init_schema(&db).await.unwrap();
+        let dir = std::env::temp_dir().join(format!("vicuna-clear-{}", turns::uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let workspace = dir.to_str().unwrap();
+        let path = dir.join("file.txt");
+        let before = vec![json!({"role": "user", "content": "old"}), json!({"role": "assistant", "content": "old reply"})];
+        server_store::create_chat(&db, &json!({
+            "id": "work", "title": "Work", "createdAt": 1, "mode": "work",
+            "workspace": workspace, "messages": before
+        })).await.unwrap();
+        let before = transcript(&server_store::load_chat(&db, "work").await.unwrap().unwrap());
+        let st = Arc::new(BridgeState { db: Some(db.clone()), ..Default::default() });
+        let args = json!({"id": "work"});
+        crate::undo_begin_turn(&st.undo, "work", workspace);
+        crate::undo_record_write(&st.undo, "work", "file.txt", false, vec![], b"before clear");
+        std::fs::write(&path, "before clear").unwrap();
+
+        let cleared = clear_context(&st, &args).await.unwrap();
+        let cleared_messages = transcript(&cleared["chat"]);
+        assert_eq!(cleared_messages.len(), 3);
+        assert_eq!(cleared_messages[2]["contextCleared"], true);
+        let repeated = clear_context(&st, &args).await.unwrap();
+        assert_eq!(repeated["notice"], "There is no context to clear.");
+
+        let undone = change_turn(&st, &args, false).await.unwrap();
+        assert_eq!(transcript(&undone["chat"]), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before clear");
+        let redone = change_turn(&st, &args, true).await.unwrap();
+        assert_eq!(transcript(&redone["chat"]), cleared_messages);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before clear");
+
+        let mut next = cleared_messages.clone();
+        next.extend([json!({"role": "user", "content": "new"}), json!({"role": "assistant", "content": "new reply"})]);
+        server_store::write_messages(&db, "work", &next, None).await.unwrap();
+        crate::undo_begin_turn(&st.undo, "work", workspace);
+        crate::undo_record_write(&st.undo, "work", "file.txt", true, b"before clear".to_vec(), b"after clear");
+        std::fs::write(&path, "after clear").unwrap();
+        let undone = change_turn(&st, &args, false).await.unwrap();
+        assert_eq!(transcript(&undone["chat"]), cleared_messages);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before clear");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

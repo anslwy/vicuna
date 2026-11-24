@@ -35,6 +35,7 @@ pub(crate) struct MsgSaveRow {
     pub(crate) gen_tps: Option<f64>,
     pub(crate) gen_cost: Option<f64>,
     pub(crate) summary: Option<bool>,
+    pub(crate) context_cleared: Option<bool>,
 }
 
 /// A string field that may also arrive as a JSON value: strings pass through,
@@ -118,7 +119,7 @@ pub(crate) async fn chats_save(
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
             sqlx::query(
-                "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(chat.id.clone())
             .bind(m.role.clone())
@@ -132,6 +133,7 @@ pub(crate) async fn chats_save(
             .bind(m.summary.map(|b| if b { 1 } else { 0 }))
             .bind(m.gen_cost)
             .bind(m.workspace.clone())
+            .bind(m.context_cleared.map(i64::from))
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("chats_save: {e}"))?;

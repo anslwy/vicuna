@@ -757,6 +757,7 @@ async fn dispatch(
             Ok(chat)
         }
         "session_compact" => session_tools::compact(st, args).await,
+        "session_clear_context" => session_tools::clear_context(st, args).await,
         "session_undo" => session_tools::change_turn(st, args, false).await,
         "session_redo" => session_tools::change_turn(st, args, true).await,
         "schedule_list" => turns::schedule_list(st).await,
@@ -1432,6 +1433,7 @@ pub const API_ACTIONS: &[&str] = &[
     "message_delete",
     "message_edit",
     "session_compact",
+    "session_clear_context",
     "session_create",
     "session_delete",
     "session_fork",

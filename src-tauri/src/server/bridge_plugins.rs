@@ -407,14 +407,9 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
         None => None,
     }
     .and_then(|c| {
-        c.get("messages")?
-            .as_array()?
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .cloned()
+        let messages = c["messages"].as_array()?;
+        Some(phone_text(super::persist::last_reply(messages)))
     })
-    .map(|m| phone_text(m.get("content").and_then(Value::as_str).unwrap_or("")))
     .unwrap_or_default();
 
     broadcast_notification(

@@ -324,7 +324,7 @@ function serializeImages(images: string[] | undefined): string | null {
 }
 
 /** exact payload shape for the Rust chats_save / server chats_merge commands (camelCase keys) */
-function toSavePayload(chats: Chat[]) {
+export function toSavePayload(chats: Chat[]) {
   return chats.map((c) => ({
     id: c.id,
     title: c.title,
@@ -346,7 +346,8 @@ function toSavePayload(chats: Chat[]) {
       genMs: m.genMs ?? null,
       genTps: m.genTps ?? null,
       genCost: m.genCost ?? null,
-      summary: m.summary ? true : null
+      summary: m.summary ? true : null,
+      contextCleared: m.contextCleared ? true : null
     }))
   }));
 }
@@ -387,7 +388,7 @@ async function createSqliteBackend(): Promise<Backend> {
     `CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, idx)`
   );
   // databases created before these columns existed lack them
-  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL", "workspace TEXT"]) {
+  for (const col of ["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL", "workspace TEXT", "context_cleared INTEGER"]) {
     try {
       await db.execute(`ALTER TABLE messages ADD COLUMN ${col}`);
     } catch {
@@ -415,8 +416,8 @@ async function createSqliteBackend(): Promise<Backend> {
         let i = 0;
         for (const m of c.messages) {
           await db.execute(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null, m.workspace ?? null]
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null, m.workspace ?? null, m.contextCleared ? 1 : null]
           );
         }
       }
@@ -468,8 +469,8 @@ async function createSqliteBackend(): Promise<Backend> {
       let i = 0;
       for (const m of c.messages) {
         await db.execute(
-          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null, m.workspace ?? null]
+          "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+          [c.id, m.role, m.content, m.thinking ?? "", m.model ?? null, i++, serializeImages(m.images), m.genMs ?? null, m.genTps ?? null, m.summary ? 1 : null, m.genCost ?? null, m.workspace ?? null, m.contextCleared ? 1 : null]
         );
       }
     }
@@ -482,9 +483,9 @@ async function createSqliteBackend(): Promise<Backend> {
       const chats: Chat[] = [];
       for (const r of rows) {
         const msgs = await db.select<
-          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null; summary: number | null; gen_cost: number | null; workspace: string | null }[]
+          { role: string; content: string; thinking: string; model: string | null; images: string | null; gen_ms: number | null; gen_tps: number | null; summary: number | null; context_cleared: number | null; gen_cost: number | null; workspace: string | null }[]
         >(
-          "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
+          "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared FROM messages WHERE chat_id = $1 ORDER BY idx ASC",
           [r.id]
         );
         chats.push({
@@ -508,7 +509,8 @@ async function createSqliteBackend(): Promise<Backend> {
           genMs: typeof m.gen_ms === "number" ? m.gen_ms : undefined,
           genTps: typeof m.gen_tps === "number" ? m.gen_tps : undefined,
           genCost: typeof m.gen_cost === "number" ? m.gen_cost : undefined,
-          summary: m.summary === 1 ? true : undefined
+          summary: m.summary === 1 ? true : undefined,
+          contextCleared: m.context_cleared === 1 ? true : undefined
         }))
         });
       }
@@ -626,7 +628,8 @@ export function normalizeServerChat(c: any): Chat {
       genMs: typeof m.genMs === "number" ? m.genMs : undefined,
       genTps: typeof m.genTps === "number" ? m.genTps : undefined,
       genCost: typeof m.genCost === "number" ? m.genCost : undefined,
-      summary: m.summary === true ? true : undefined
+      summary: m.summary === true ? true : undefined,
+      contextCleared: m.contextCleared === true ? true : undefined
     }))
   };
 }

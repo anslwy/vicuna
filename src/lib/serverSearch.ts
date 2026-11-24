@@ -11,6 +11,7 @@
 export interface LoadedChatMessage {
   role?: string;
   content?: string;
+  contextCleared?: boolean;
 }
 
 export interface LoadedChat {
@@ -54,7 +55,8 @@ export function excerpt(text: string, q: string): string {
 }
 
 function contents(c: LoadedChat): string[] {
-  return (c.messages ?? []).map((m) => m?.content ?? "").filter((s) => typeof s === "string" && s.length > 0);
+  return (c.messages ?? []).filter((m) => !m?.contextCleared)
+    .map((m) => m?.content ?? "").filter((s) => typeof s === "string" && s.length > 0);
 }
 
 function snippetFor(c: LoadedChat, q: string): string {

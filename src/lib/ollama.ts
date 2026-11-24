@@ -366,6 +366,8 @@ export interface ChatMsg {
   /** Work compaction summary. The latest summary marks the UI divider and
    *  the start of model-visible history. */
   summary?: boolean;
+  /** Durable boundary after which the Work engine starts with empty context. */
+  contextCleared?: boolean;
 }
 
 /** Raw base64 for Ollama: drop any `data:...;base64,` prefix. */
@@ -649,6 +651,7 @@ function isToolsUnsupportedError(e: unknown): boolean {
  */
 export function chatToTranscript(messages: ChatMsg[]): string {
   return messages
+    .filter((m) => !m.contextCleared)
     .map((m) => {
       const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : m.role === "tool" ? "Tool" : "System";
       return `${who}: ${m.content}`;

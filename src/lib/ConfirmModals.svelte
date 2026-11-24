@@ -64,7 +64,7 @@
 
 {#if pendingMsgDelete != null && activeChat && activeChat.messages[pendingMsgDelete]}
   {@const delTarget = activeChat.messages[pendingMsgDelete]}
-  {@const delCascadeNext = delTarget.role === "user" && activeChat.messages[pendingMsgDelete + 1]?.role === "assistant"}
+  {@const delCascadeNext = delTarget.role === "user" && activeChat.messages[pendingMsgDelete + 1]?.role === "assistant" && !activeChat.messages[pendingMsgDelete + 1].contextCleared}
   {@const delCascadePrev = delTarget.role === "assistant" && pendingMsgDelete > 0 && activeChat.messages[pendingMsgDelete - 1]?.role === "user"}
   <button
     class="confirm-backdrop"

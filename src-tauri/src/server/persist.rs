@@ -204,12 +204,7 @@ impl Recorder {
 
     /// The live assistant text (what a worker report quotes).
     pub fn last_reply(&self) -> String {
-        match self.messages.last() {
-            Some(m) if m.get("role").and_then(Value::as_str) == Some("assistant") => {
-                m.get("content").and_then(Value::as_str).unwrap_or("").to_string()
-            }
-            _ => String::new(),
-        }
+        last_reply(&self.messages).to_owned()
     }
 
     /// Apply one turn event. `raw` is its JSON text (for tool args order).
@@ -457,12 +452,20 @@ pub fn strip_harness_markup(content: &str) -> String {
     s.trim().to_string()
 }
 
-/// ChatApp `compactedHistory`: from the latest compaction summary on, with
+pub(crate) fn is_assistant_reply(message: &Value) -> bool {
+    message["role"] == "assistant" && message["summary"] != true && message["contextCleared"] != true
+}
+
+pub(crate) fn last_reply(messages: &[Value]) -> &str {
+    messages.iter().rfind(|m| is_assistant_reply(m))
+        .and_then(|m| m["content"].as_str()).unwrap_or("")
+}
+
+/// ChatApp `compactedHistory`: from the latest summary or clear boundary, with
 /// assistant markup stripped (only matters for a fresh engine session's
 /// history preamble — engines resume their own session context otherwise).
 pub fn compacted_history(messages: &[Value]) -> Vec<Value> {
-    let from = messages.iter().rposition(|m| m.get("summary").and_then(Value::as_bool) == Some(true)).unwrap_or(0);
-    messages[from..]
+    messages[context_start_index(messages)..]
         .iter()
         .map(|m| {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -475,6 +478,12 @@ pub fn compacted_history(messages: &[Value]) -> Vec<Value> {
             o
         })
         .collect()
+}
+
+pub(super) fn context_start_index(messages: &[Value]) -> usize {
+    let summary_from = messages.iter().rposition(|m| m["summary"] == true).unwrap_or(0);
+    let clear_from = messages.iter().rposition(|m| m["contextCleared"] == true).map_or(0, |i| i + 1);
+    summary_from.max(clear_from)
 }
 
 // ---------- messages the server sends on its own ----------
@@ -817,6 +826,17 @@ mod tests {
             json!({"role": "user", "content": "new", "images": ["x"]}),
         ]);
         assert_eq!(h, vec![json!({"role": "assistant", "content": "summary"}), json!({"role": "user", "content": "new", "images": ["x"]})]);
+    }
+
+    #[test]
+    fn context_clear_boundary_hides_all_earlier_messages() {
+        let h = compacted_history(&[
+            json!({"role": "user", "content": "private earlier context"}),
+            json!({"role": "assistant", "content": "earlier reply"}),
+            json!({"role": "assistant", "content": "", "contextCleared": true}),
+            json!({"role": "user", "content": "new request"}),
+        ]);
+        assert_eq!(h, vec![json!({"role": "user", "content": "new request"})]);
     }
 
     #[test]

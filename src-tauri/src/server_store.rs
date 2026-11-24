@@ -27,7 +27,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ];
 const CHAT_MIGRATIONS: &[&str] = &["forked_from TEXT", "fork_from_index INTEGER", "model TEXT", "mode TEXT", "workspace TEXT", "goal TEXT", "updated_at INTEGER", "extra TEXT", "rev INTEGER", "server_recorded INTEGER"];
-const MSG_MIGRATIONS: &[&str] = &["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL", "workspace TEXT"];
+const MSG_MIGRATIONS: &[&str] = &["images TEXT", "gen_ms REAL", "gen_tps REAL", "summary INTEGER", "gen_cost REAL", "workspace TEXT", "context_cleared INTEGER"];
 
 /// Open (creating if needed) a server database at `path`.
 pub async fn open(path: &Path) -> Result<SqlitePool, String> {
@@ -131,6 +131,9 @@ fn message_json(m: &sqlx::sqlite::SqliteRow) -> Value {
     if m.try_get::<Option<i64>, _>("summary").ok().flatten() == Some(1) {
         o["summary"] = json!(true);
     }
+    if m.try_get::<Option<i64>, _>("context_cleared").ok().flatten() == Some(1) {
+        o["contextCleared"] = json!(true);
+    }
     o
 }
 
@@ -140,7 +143,7 @@ pub async fn load_chats(pool: &SqlitePool) -> Result<Value, String> {
     load_chats_with_queries(
         pool,
         &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
-        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages ORDER BY chat_id, idx",
+        "SELECT chat_id, role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared FROM messages ORDER BY chat_id, idx",
     )
     .await
 }
@@ -159,7 +162,7 @@ pub async fn load_chat_list(pool: &SqlitePool) -> Result<Value, String> {
         pool,
         &format!("SELECT {CHAT_COLS} FROM chats ORDER BY COALESCE(updated_at, created_at) DESC"),
         &format!(
-            "SELECT chat_id, role, substr(content, 1, {LIST_PREVIEW_CHARS}) AS content, model, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages ORDER BY chat_id, idx"
+            "SELECT chat_id, role, substr(content, 1, {LIST_PREVIEW_CHARS}) AS content, model, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared FROM messages ORDER BY chat_id, idx"
         ),
     )
     .await?;
@@ -238,7 +241,7 @@ async fn insert_messages<'c>(
     for (i, m) in messages.iter().enumerate() {
         let images = m.images.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default());
         sqlx::query(
-            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "INSERT INTO messages (chat_id, role, content, thinking, model, idx, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(chat_id)
         .bind(&m.role)
@@ -252,6 +255,7 @@ async fn insert_messages<'c>(
         .bind(m.summary.map(|b| if b { 1 } else { 0 }))
         .bind(m.gen_cost)
         .bind(&m.workspace)
+        .bind(m.context_cleared.map(i64::from))
         .execute(&mut **tx)
         .await?;
     }
@@ -357,7 +361,7 @@ pub async fn load_chat(pool: &SqlitePool, id: &str) -> Result<Option<Value>, Str
         return Ok(None);
     };
     let msgs = sqlx::query(
-        "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace FROM messages WHERE chat_id = $1 ORDER BY idx",
+        "SELECT role, content, thinking, model, images, gen_ms, gen_tps, summary, gen_cost, workspace, context_cleared FROM messages WHERE chat_id = $1 ORDER BY idx",
     )
     .bind(id)
     .fetch_all(&mut *tx)
@@ -639,7 +643,7 @@ async fn chat_snippet(pool: &SqlitePool, chat_id: &str, q: &str) -> Result<Strin
     if !q.is_empty() {
         let like = format!("%{}%", escape_like(q));
         let hit: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM messages WHERE chat_id = $1 AND content LIKE $2 ESCAPE '\\' ORDER BY idx LIMIT 1",
+            "SELECT content FROM messages WHERE chat_id = $1 AND context_cleared IS NOT 1 AND content LIKE $2 ESCAPE '\\' ORDER BY idx LIMIT 1",
         )
         .bind(chat_id)
         .bind(&like)
@@ -659,7 +663,7 @@ async fn chat_snippet(pool: &SqlitePool, chat_id: &str, q: &str) -> Result<Strin
     .map_err(err)?;
     let first = match first.filter(|c| !c.trim().is_empty()) {
         Some(c) => Some(c),
-        None => sqlx::query_scalar("SELECT content FROM messages WHERE chat_id = $1 ORDER BY idx LIMIT 1")
+        None => sqlx::query_scalar("SELECT content FROM messages WHERE chat_id = $1 AND context_cleared IS NOT 1 ORDER BY idx LIMIT 1")
             .bind(chat_id)
             .fetch_optional(pool)
             .await
@@ -708,7 +712,7 @@ pub async fn search_chats(pool: &SqlitePool, query: &str, ids: &[String], limit:
         let like = format!("%{}%", escape_like(q));
         let rows = sqlx::query(&format!(
             "SELECT {HIT_COLS} FROM chats c WHERE c.id LIKE $1 ESCAPE '\\' OR c.title LIKE $1 ESCAPE '\\' \
-             OR EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.content LIKE $1 ESCAPE '\\') \
+             OR EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.context_cleared IS NOT 1 AND m.content LIKE $1 ESCAPE '\\') \
              ORDER BY COALESCE(c.updated_at, c.created_at) DESC LIMIT $2"
         ))
         .bind(&like)
@@ -752,6 +756,27 @@ mod tests {
             "id": id, "title": title, "createdAt": 1, "updatedAt": 2, "mode": "work", "workspace": "/srv/p",
             "messages": msgs.iter().map(|(r, c)| json!({ "role": r, "content": c, "thinking": "", "images": null })).collect::<Vec<_>>(),
         })
+    }
+
+    #[tokio::test]
+    async fn context_clear_round_trips_through_all_chat_loaders() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+        let mut chat = row("clear", "Clear", &[("assistant", "old reply")]);
+        merge_json(&pool, &json!([chat]), vec![], &Default::default()).await.unwrap();
+
+        let marker = json!({"role": "assistant", "content": "", "contextCleared": true});
+        chat["messages"].as_array_mut().unwrap().push(marker);
+        write_messages(&pool, "clear", chat["messages"].as_array().unwrap(), None).await.unwrap();
+
+        let full = load_chat(&pool, "clear").await.unwrap().unwrap();
+        for loaded in [full, load_chats(&pool).await.unwrap()[0].clone(), load_chat_list(&pool).await.unwrap()[0].clone()] {
+            let messages = loaded["messages"].as_array().unwrap();
+            assert!(messages[0].get("contextCleared").is_none());
+            assert_eq!(messages[1]["contextCleared"], true);
+            assert_eq!(crate::server::persist::last_reply(messages), "old reply");
+            assert!(crate::server::persist::compacted_history(messages).is_empty());
+        }
     }
 
     #[tokio::test]
