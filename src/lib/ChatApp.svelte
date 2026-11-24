@@ -3,6 +3,7 @@
   import { goto } from "$app/navigation";
   import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, setServerOllama, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { shouldWarnOllamaUnavailable } from "$lib/ollamaWarning";
+  import { newSessionStart, readLastMode, writeLastMode } from "$lib/newSessionMode";
   import { notifyTurnEnd, notifyAgentAsk, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
@@ -172,7 +173,8 @@
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
   /** mode + workspace picker for the session being started (home or empty draft) */
-  let pendingMode = $state<"chat" | "work">("chat");
+  // starts on the mode last picked (remembered across launches, see newSessionMode.ts)
+  let pendingMode = $state<"chat" | "work">(typeof window !== "undefined" ? readLastMode(localStorage) : "chat");
   let pendingWorkspace = $state(resolveDraftWorkspace(initialPrefs.defaultWorkspace));
   const continueWorkspace = $derived(defaultWorkspace || (isNoWorkspacePath(pendingWorkspace) ? "" : pendingWorkspace));
   let workspaceError = $state<string | null>(null);
@@ -2116,12 +2118,16 @@
       chats = chats.filter((c) => c.messages.length > 0);
       save();
     }
+    // New follows the open session's mode (and a Work session's folder);
+    // from home it uses the last-picked mode
+    const start = newSessionStart(activeChat, readLastMode(localStorage));
+    pendingMode = start.mode;
     activeId = null;
     if (sessionFilter === NO_WORKSPACE_FILTER) {
       pendingWorkspace = NO_WORKSPACE_SENTINEL;
     } else {
       const scopeWs = workspaceOfFolderKey(sessionFilter);
-      pendingWorkspace = scopeWs ?? resolveDraftWorkspace(pendingWorkspace || defaultWorkspace);
+      pendingWorkspace = scopeWs ?? resolveDraftWorkspace(start.workspace || pendingWorkspace || defaultWorkspace);
     }
     isPinned = true;
     editingIndex = null;
@@ -6106,6 +6112,7 @@
     const effectiveMode: "chat" | "work" = chat
       ? (chat.mode ?? (chat.messages.length === 0 ? pendingMode : "chat"))
       : pendingMode;
+    writeLastMode(localStorage, effectiveMode);
     if (serverChatTurns && effectiveMode === "chat") {
       const fromHome = !chat;
       if (fromHome && startingChatFromHome) return;
@@ -10418,8 +10425,8 @@
     {#if !activeChat || activeChat.messages.length === 0}
       <div class="empty">
         <div class="seg mode-toggle" role="tablist" aria-label="Session mode" data-testid="mode-toggle">
-          <button class="seg-btn {pendingMode === 'chat' ? 'sel' : ''}" data-testid="mode-chat-btn" role="tab" onclick={() => { pendingMode = "chat"; workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}>Chat</button>
-          <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
+          <button class="seg-btn {pendingMode === 'chat' ? 'sel' : ''}" data-testid="mode-chat-btn" role="tab" onclick={() => { pendingMode = "chat"; writeLastMode(localStorage, "chat"); workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}>Chat</button>
+          <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; writeLastMode(localStorage, "work"); if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
         </div>
         <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
         {#if pendingMode === "work"}
