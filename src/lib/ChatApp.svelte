@@ -12564,6 +12564,13 @@
   @container (max-width: 920px) {
     .work-banner { padding-left: 60px; }
   }
+  /* The collapsed rail (60px, absolute) sits over the column: once the
+   * centered 860px thread can't clear it ((w-860)/2 < 60), reserve its width
+   * so the thread and composer never slide under the rail icons. */
+  @container (max-width: 980px) {
+    .main:has(> .collapsed-rail) .messages { padding-left: 60px; }
+    .main:has(> .collapsed-rail) .composer-wrap { padding-left: 60px; }
+  }
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
     .composer-wrap { padding: 8px 12px 14px 12px; }
