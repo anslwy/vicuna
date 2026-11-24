@@ -18,7 +18,10 @@ test("permissions persist in session extra JSON", () => {
 test("sidebar menu exposes the permissions modal and both toggles", async () => {
   const app = await readFile(new URL("../src/lib/ChatApp.svelte", import.meta.url), "utf8");
   assert.ok(app.includes('data-testid="permissions-item"'));
+  assert.match(app, /\{#if serverPersist\}\s*<button class="ctx-item" data-testid="permissions-item"/);
   assert.ok(app.includes('data-testid="permissions-modal"'));
   assert.ok(app.includes('data-testid="permission-read"'));
   assert.ok(app.includes('data-testid="permission-message"'));
+  assert.ok(app.includes('window.addEventListener("keydown", onEscape, true)'));
+  assert.ok(app.includes("[data-testid=\"permission-read\"]')?.focus()"));
 });

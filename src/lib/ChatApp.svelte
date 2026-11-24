@@ -1716,7 +1716,8 @@
   /** perform a lead's manage_sessions call; the reply is the tool result */
   async function handleSessionControl(leadId: string, leadWs: string, action: string, args: Record<string, any>): Promise<{ ok: boolean; text?: string; error?: string }> {
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
-    const report = args.report !== false;
+    const callerIsLead = chats.find((x) => x.id === leadId)?.role === "lead";
+    const report = callerIsLead && args.report !== false;
     const target = () => {
       const id = str("session_id");
       if (!id) throw new Error("`session_id` is required (see `list`).");
@@ -1728,6 +1729,7 @@
     const engines = workEngineChoices(workEngineInfo).map((e) => e.id);
     switch (action) {
       case "permissions": {
+        if (!serverPersist) throw new Error("Session permissions are available only for sessions persisted by the Vicuna server.");
         const c = target();
         if (typeof args.read !== "boolean" && typeof args.allow_message !== "boolean") {
           return { ok: true, text: JSON.stringify({ session_id: c.id, ...sessionPermissions(c) }) };
@@ -1736,9 +1738,8 @@
         if (typeof args.read === "boolean") change.read = args.read;
         if (typeof args.allow_message === "boolean") change.message = args.allow_message;
         const updated = await serverAction("session_update", { id: c.id, permissions: change });
-        if (updated === false) { c.permissions = { ...c.permissions, ...change }; void save(); }
-        else if (!updated) throw new Error("Could not save session permissions.");
-        const current: Chat = updated === false || updated === null ? c : updated;
+        if (!updated) throw new Error("Could not save session permissions.");
+        const current: Chat = updated;
         return { ok: true, text: JSON.stringify({ session_id: current.id, ...sessionPermissions(current) }) };
       }
       case "list": {
@@ -1788,7 +1789,8 @@
         const ok = await sendToWorkSession(c.id, { role: "user", content: message });
         if (!ok) throw new Error(`"${c.title}" is busy (compacting or streaming) or has no workspace; try again shortly.`);
         if (report) reportIds.add(c.id);
-        return { ok: true, text: running ? `Queued into the running turn of "${c.title}".` : `Started a turn in "${c.title}".` };
+        const acknowledgement = running ? `Queued into the running turn of "${c.title}".` : `Started a turn in "${c.title}".`;
+        return { ok: true, text: callerIsLead ? acknowledgement : `${acknowledgement} No reply will be sent back to this non-lead caller.` };
       }
       case "stop": {
         const c = target();
@@ -4777,17 +4779,33 @@
   let leadPrompt = $state<{ id: string; prevTitle: string | null } | null>(null);
   let permissionsFor = $state<string | null>(null);
   let permissionBusy = $state(false);
+  $effect(() => {
+    const sessionId = permissionsFor;
+    if (!sessionId) return;
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      permissionsFor = null;
+    };
+    window.addEventListener("keydown", onEscape, true);
+    void tick().then(() => {
+      if (permissionsFor === sessionId) document.querySelector<HTMLInputElement>('[data-testid="permission-read"]')?.focus();
+    });
+    return () => window.removeEventListener("keydown", onEscape, true);
+  });
   async function setSessionPermission(key: "read" | "message", value: boolean) {
     const id = permissionsFor;
     if (!id || permissionBusy) return;
+    if (!serverPersist) {
+      error = "Permissions require server-backed session persistence.";
+      return;
+    }
     const c = chats.find((x) => x.id === id);
     if (!c) return;
     permissionBusy = true;
     const r = await serverAction("session_update", { id, permissions: { [key]: value } });
-    if (r === false) {
-      c.permissions = { ...c.permissions, [key]: value };
-      void save();
-    }
+    if (r === false) error = "Permissions could not be enforced because this session is not stored by the Vicuna server.";
     permissionBusy = false;
   }
 
@@ -10304,7 +10322,9 @@
           <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
           <div class="ctx-sep" role="separator"></div>
           {#if (ctxChat?.mode ?? "chat") === "work"}
-            <button class="ctx-item" data-testid="permissions-item" onclick={() => { permissionsFor = ctxMenu!.chatId; ctxMenu = null; }}>Permissions…</button>
+            {#if serverPersist}
+              <button class="ctx-item" data-testid="permissions-item" onclick={() => { permissionsFor = ctxMenu!.chatId; ctxMenu = null; }}>Permissions…</button>
+            {/if}
             {@const tgSnap = ctxChat ? telegramStatuses[ctxChat.id] : null}
             {@const tgState = telegramStateFor(ctxChat?.id)}
             {#if ctxChat?.role === "lead"}
@@ -11679,14 +11699,13 @@
 {#if permissionsFor}
   {@const permChat = chats.find((c) => c.id === permissionsFor)}
   {#if permChat}
-    <div class="permissions-shade" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) permissionsFor = null; }} onkeydown={(e) => { if (e.key === "Escape") permissionsFor = null; }}>
-      <dialog open class="permissions-modal" aria-modal="true" aria-labelledby="permissions-title" data-testid="permissions-modal">
+    <button class="confirm-backdrop" data-testid="permissions-backdrop" aria-label="Close permissions" onclick={() => (permissionsFor = null)} tabindex="-1"></button>
+      <div class="confirm-card permissions-modal" role="dialog" aria-modal="true" aria-labelledby="permissions-title" data-testid="permissions-modal">
         <button class="modal-x" aria-label="Close permissions" onclick={() => (permissionsFor = null)}>×</button>
         <h2 id="permissions-title">Permissions · {permChat.title}</h2>
         <label class="permission-row"><input type="checkbox" data-testid="permission-read" checked={sessionPermissions(permChat).read} disabled={permissionBusy} onchange={(e) => void setSessionPermission("read", e.currentTarget.checked)} /><span><b>Read other sessions</b><small>Read another session’s history or state.</small></span></label>
         <label class="permission-row"><input type="checkbox" data-testid="permission-message" checked={sessionPermissions(permChat).message} disabled={permissionBusy} onchange={(e) => void setSessionPermission("message", e.currentTarget.checked)} /><span><b>Message other sessions</b><small>Send messages to other sessions and start turns.</small></span></label>
-      </dialog>
-    </div>
+      </div>
   {/if}
 {/if}
 {#if telegramFor}
@@ -11982,9 +12001,8 @@
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
-  .permissions-shade { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; background: #0009; padding: 20px; }
-  .permissions-modal { position: relative; width: min(520px, 100%); padding: 24px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel, var(--bg)); box-shadow: 0 18px 70px #0008; }
-  .permissions-modal h2 { margin: 0 36px 22px 0; font-size: 18px; }
+  .confirm-card.permissions-modal { top: 50%; width: min(520px, calc(100vw - 48px)); padding: 24px; border: 1px solid var(--border); border-radius: 18px; background: var(--card); }
+  .confirm-card.permissions-modal h2 { margin: 0 36px 22px 0; font-size: 18px; }
   .permission-row { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); cursor: pointer; }
   .permission-row input { margin-top: 3px; accent-color: var(--accent); }
   .permission-row span { display: grid; gap: 4px; }
