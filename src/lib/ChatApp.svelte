@@ -10679,7 +10679,7 @@
                     ? `The new workspace (${handoff.workspace.from} → ${handoff.workspace.to}) starts its own session: it gets Vicuna's transcript of this conversation, not the previous workspace's own context.`
                     : "The new harness starts its own session: it gets Vicuna's transcript of this conversation, not the previous harness's own context."}
                 <div class="compact-div handoff-div" data-testid="handoff-divider">
-                  <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {modelLabel(handoff.engine.from)} → <span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {modelLabel(handoff.engine.to)}{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} → <span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}{/if}</span></Tooltip>
+                  <Tooltip text={handoffTip}><span class="handoff-inner"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M3 7h18"/><path d="M7 21l-4-4 4-4"/><path d="M21 17H3"/></svg> Context handoff{#if handoff.engine} <span class="handoff-part"><span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.from) ?? "")}</span> {modelLabel(handoff.engine.from)} →</span> <span class="handoff-part"><span class="engine-chip">{@render engineIcon(labelHarness(handoff.engine.to) ?? "")}</span> {modelLabel(handoff.engine.to)}</span>{/if}{#if handoff.engine && wsLabels} <span class="handoff-sep">·</span>{/if}{#if wsLabels} <span class="handoff-part"><span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.from} →</span> <span class="handoff-part"><span class="ws-handoff-chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span> {wsLabels.to}</span>{/if}</span></Tooltip>
                 </div>
               {/if}
               {#if i === activeSummaryIndex}
@@ -12328,7 +12328,17 @@
   .msg-images img { display: block; max-width: min(100%, 320px); max-height: 220px; border-radius: 12px; }
   .lightbox-backdrop { position: fixed; inset: 0; z-index: 60; border: none; padding: 24px; box-sizing: border-box; background: rgba(0, 0, 0, 0.85); cursor: zoom-out; display: flex; align-items: center; justify-content: center; }
   .lightbox-backdrop img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; }
-  .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-end; }
+  /* The leading .spacer right-aligns the row; flex-start (not flex-end) keeps
+   * any overflow on the right instead of spilling the + / tool buttons out of
+   * the composer to the left, under the collapsed rail. The pills shrink first
+   * (names ellipsize) so a side-panel-narrowed column still fits. */
+  .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 10px; justify-content: flex-start; }
+  /* The wrap must be a flex box too: a <button> in a block wrapper sizes to
+   * its content and ignores the wrapper shrinking, so the model name ran under
+   * the send button instead of ellipsizing. */
+  .composer-bar > .ws-split, .composer-bar > .model-pill-wrap { min-width: 0; }
+  .composer-bar > .model-pill-wrap { display: flex; }
+  .composer-bar .ws-pill, .composer-bar > .model-pill-wrap > .model-pill { min-width: 0; }
   .mention-menu { position: absolute; bottom: calc(100% + 6px); left: 24px; width: min(420px, calc(100% - 48px)); z-index: 30; background: var(--card); border: 1px solid var(--border-2); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; max-height: 264px; overflow-y: auto; }
   .mention-item { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; border: none; background: transparent; font: inherit; font-size: 13px; color: var(--text); padding: 7px 10px; border-radius: 10px; cursor: pointer; text-align: left; min-width: 0; }
   .mention-item:hover { background: var(--hover-3); }
@@ -12377,7 +12387,12 @@
   .ws-pill:is(:hover, :focus-visible) + .ws-tooltip,
   .ws-menu-opt:is(:hover, :focus-visible) + .ws-tooltip { visibility: visible; opacity: 1; }
   @container (max-width: 500px) {
-    .composer-bar:has(.ws-split) { position: relative; flex-wrap: wrap; }
+    .composer-bar:has(.ws-split) { position: relative; flex-wrap: wrap; row-gap: 8px; }
+    /* Wrapped: tools + workspace start the first line, model pill starts the
+     * second with send pushed right (a right-aligned first line left the
+     * model pill stranded under it). */
+    .composer-bar:has(.ws-split) > .spacer { display: none; }
+    .composer-bar:has(.ws-split) > .send-split { margin-left: auto; }
     .ws-split { position: static; }
     .ws-menu, .ws-tooltip { left: 0; right: auto; }
   }
@@ -12547,7 +12562,12 @@
   .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
-  .handoff-inner { display: inline-flex; align-items: center; gap: 6px; }
+  /* Wrap whole chips ("Context handoff", "model →") onto new lines in a narrow
+   * column instead of squeezing each text run into a word-per-line stack. */
+  .handoff-inner { display: inline-flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px 6px; }
+  .handoff-div > :global(.tooltip-wrap) { min-width: 0; }
+  /* Keep each engine/folder icon on the same line as its label. */
+  .handoff-part { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
   .ws-handoff-chip { display: inline-flex; align-items: center; opacity: 0.85; }
   .handoff-sep { opacity: 0.5; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
