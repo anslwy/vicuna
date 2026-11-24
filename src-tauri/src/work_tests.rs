@@ -1001,7 +1001,7 @@ mod work_tests {
     fn pty_echo_roundtrip_and_kill() {
         let d = tmp_root("pty");
         let root = d.to_string_lossy().to_string();
-        let out = std::sync::Arc::new(Mutex::new(String::new()));
+        let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let out2 = out.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Option<i32>>();
         let h = spawn_pty(
