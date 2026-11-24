@@ -461,7 +461,9 @@ pub fn strip_harness_markup(content: &str) -> String {
 /// assistant markup stripped (only matters for a fresh engine session's
 /// history preamble — engines resume their own session context otherwise).
 pub fn compacted_history(messages: &[Value]) -> Vec<Value> {
-    let from = messages.iter().rposition(|m| m.get("summary").and_then(Value::as_bool) == Some(true)).unwrap_or(0);
+    let summary_from = messages.iter().rposition(|m| m.get("summary").and_then(Value::as_bool) == Some(true)).unwrap_or(0);
+    let clear_from = messages.iter().rposition(|m| m.get("contextCleared").and_then(Value::as_bool) == Some(true)).map(|i| i + 1).unwrap_or(0);
+    let from = summary_from.max(clear_from);
     messages[from..]
         .iter()
         .map(|m| {
@@ -817,6 +819,17 @@ mod tests {
             json!({"role": "user", "content": "new", "images": ["x"]}),
         ]);
         assert_eq!(h, vec![json!({"role": "assistant", "content": "summary"}), json!({"role": "user", "content": "new", "images": ["x"]})]);
+    }
+
+    #[test]
+    fn context_clear_boundary_hides_all_earlier_messages() {
+        let h = compacted_history(&[
+            json!({"role": "user", "content": "private earlier context"}),
+            json!({"role": "assistant", "content": "earlier reply"}),
+            json!({"role": "assistant", "content": "", "contextCleared": true}),
+            json!({"role": "user", "content": "new request"}),
+        ]);
+        assert_eq!(h, vec![json!({"role": "user", "content": "new request"})]);
     }
 
     #[test]

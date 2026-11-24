@@ -1,6 +1,6 @@
 import type { ChatMsg } from "$lib/ollama";
 import type { Chat } from "$lib/store";
-import { latestSummaryIndex } from "$lib/sessionEngine";
+import { latestContextStartIndex } from "$lib/sessionEngine";
 
 export type AccentDef = {
   label: string;
@@ -123,7 +123,7 @@ export function toHistory(m: ChatMsg): ChatMsg {
 }
 
 export function compactedHistory(messages: ChatMsg[]): ChatMsg[] {
-  const from = Math.max(0, latestSummaryIndex(messages));
+  const from = latestContextStartIndex(messages);
   return messages.slice(from).map(toHistory);
 }
 

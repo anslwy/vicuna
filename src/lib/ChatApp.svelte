@@ -2244,6 +2244,7 @@
 
   let pendingDeleteId = $state<string | null>(null);
   let pendingMsgDelete = $state<number | null>(null);
+  let clearContextChatId = $state<string | null>(null);
   let gotoOpen = $state(false);
   let gotoInput = $state("");
   let gotoError = $state<string | null>(null);
@@ -6041,6 +6042,19 @@
     scrollBottom();
   }
 
+  async function clearContextSession() {
+    const chat = chats.find((c) => c.id === clearContextChatId);
+    clearContextChatId = null;
+    if (!chat || busy || (chat.mode ?? "chat") !== "work") return;
+    if (serverSessionTools) {
+      await runServerSessionTool("session_clear_context", chat);
+      return;
+    }
+    chat.messages = [...chat.messages, { role: "assistant", content: "", contextCleared: true }];
+    chats = [...chats];
+    save();
+  }
+
   async function send() {
     if (blockedWhileLoading()) return;
     if (activeChat?.partial) {
@@ -6590,6 +6604,7 @@
   /** slash commands: like @-mentions but triggered by a leading "/" in an
    *  otherwise empty composer (typing "/usr/…" filters, anything else hides). */
   const SLASH_COMMANDS = [
+    { name: "clear", desc: "Start fresh model context from here" },
     { name: "compact", desc: "Summarize older messages into one note to free context" },
     { name: "undo", desc: "Remove the last turn and revert its file changes" },
     { name: "redo", desc: "Re-apply the turn most recently undone" }
@@ -6614,6 +6629,7 @@
     const items: SlashItem[] = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head)).map((c) => ({
       ...c,
       disabled:
+        c.name === "clear" ? busy :
         c.name === "undo" ? !undoPossible(chat) :
         c.name === "redo" ? !redoPossible(chat) :
         false
@@ -6627,7 +6643,7 @@
     slash = { query: q, items, index: firstEnabled < 0 ? 0 : firstEnabled };
   }
 
-  async function runServerSessionTool(action: "session_compact" | "session_undo" | "session_redo", chat: Chat, args: Record<string, unknown> = {}) {
+  async function runServerSessionTool(action: "session_compact" | "session_clear_context" | "session_undo" | "session_redo", chat: Chat, args: Record<string, unknown> = {}) {
     if (isCompacting(chat.id)) return;
     markCompacting(chat.id);
     error = null;
@@ -6819,6 +6835,7 @@
     clearDraft(null);
     autosizeComposer();
     composerEl?.focus();
+    if (cmd === "clear") clearContextChatId = activeId;
     if (cmd === "compact") void compactSession();
     if (cmd === "undo") void undoSession();
     if (cmd === "redo") void redoSession();
@@ -8622,8 +8639,11 @@
     const own = chats.find((x) => x.id === chat.id) ?? chat;
     const turnEngine = own.engine || engineId(workEngineInfo);
     const turnPick: string | null = own.engine ? (own.workModel ?? null) : workModel;
-    const previousReply = own.messages.slice(0, index).findLast((m) => m.role === "assistant" && !m.summary);
-    const freshSession = opts.freshSession || changesCliAccount(turnEngine, previousReply?.model);
+    const priorMessages = own.messages.slice(0, index);
+    const previousReply = priorMessages.findLast((m) => m.role === "assistant" && !m.summary && !m.contextCleared);
+    const clearAt = priorMessages.findLastIndex((m) => m.contextCleared);
+    const replyAt = previousReply ? priorMessages.lastIndexOf(previousReply) : -1;
+    const freshSession = opts.freshSession || clearAt > replyAt || changesCliAccount(turnEngine, previousReply?.model);
     // first turn of a session without its own harness: pin the last-used pick
     // so the session never silently changes agent later
     if (!own.engine) {
@@ -10620,6 +10640,10 @@
                 <div class="bg-done-label">{m.content}</div>
               </details>
             </div></div>
+          {:else if m.contextCleared}
+            <div class="row asst-row" data-msg-index={i}><div class="col">
+              <div class="compact-div" data-testid="context-cleared-divider"><Tooltip text="Messages above this line stay visible but are no longer sent to the model."><span>Context cleared</span></Tooltip></div>
+            </div></div>
           {:else if m.role === "user"}
             <div class="row user-row {editingIndex === i ? 'is-editing' : ''}" data-msg-index={i}><div class="col">
               {#if editingIndex === i}
@@ -11881,6 +11905,14 @@
     onToggleOpenRouterAdded={toggleOpenRouterAdded}
   />
 {/if}
+{#if clearContextChatId}
+  <button class="confirm-backdrop" data-testid="clear-context-backdrop" aria-label="Cancel clear context" onclick={() => (clearContextChatId = null)} tabindex="-1"></button>
+  <div class="confirm-card" data-testid="clear-context-modal" role="dialog" aria-modal="true" aria-label="Clear context">
+    <p class="confirm-text">Clear context?</p>
+    <p class="confirm-copy">The agent starts fresh from here. Earlier messages stay visible above the line but are no longer sent to the model.</p>
+    <div class="confirm-actions"><button class="confirm-cancel" onclick={() => (clearContextChatId = null)}>Cancel</button><button class="confirm-ok" data-testid="confirm-clear-context" onclick={() => void clearContextSession()}>Clear</button></div>
+  </div>
+{/if}
 {#if pluginsOpen}
   <button
     class="confirm-backdrop"
@@ -12109,6 +12141,7 @@
   .modal-x:hover { background: var(--hover); color: var(--text); }
   .confirm-text { font-size: 17px; font-weight: 700; line-height: 1.4; margin: 0 0 20px 0; color: var(--text); }
   .confirm-actions { display: flex; gap: 10px; }
+  .confirm-copy { color: var(--muted); font-size: 13px; line-height: 1.5; margin: -10px 0 18px; }
   .confirm-cancel { flex: 1; border: none; background: var(--cancel-bg); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--text); }
   .confirm-cancel:hover { background: var(--cancel-hover); }
   .confirm-ok { flex: 1; border: none; background: var(--accent); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--accent-fg); }

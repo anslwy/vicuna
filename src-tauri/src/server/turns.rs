@@ -469,7 +469,12 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant")
             && m.get("summary").and_then(Value::as_bool) != Some(true))
         .and_then(|m| m.get("model").and_then(Value::as_str));
-    let fresh_session = engine.changes_cli_account(previous_model);
+    let clear_at = messages.iter().rposition(|m| m.get("contextCleared").and_then(Value::as_bool) == Some(true));
+    let reply_at = messages.iter().rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant")
+        && m.get("summary").and_then(Value::as_bool) != Some(true)
+        && m.get("contextCleared").and_then(Value::as_bool) != Some(true));
+    let fresh_session = clear_at.is_some_and(|i| reply_at.is_none_or(|r| i > r))
+        || engine.changes_cli_account(previous_model);
     messages.extend(user_msgs);
     let mut ph = persist::assistant_placeholder(&persist::work_reply_model(None, pick.as_deref(), engine.id()));
     if !workspace.is_empty() {

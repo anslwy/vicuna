@@ -84,6 +84,16 @@ export function latestSummaryIndex(messages: readonly { summary?: boolean }[]): 
   return -1;
 }
 
+
+/** First model-visible message after the newest summary or explicit clear boundary. */
+export function latestContextStartIndex(messages: readonly { summary?: boolean; contextCleared?: boolean }[]): number {
+  let from = Math.max(0, latestSummaryIndex(messages));
+  for (let i = messages.length - 1; i >= from; i--) {
+    if (messages[i].contextCleared) { from = i + 1; break; }
+  }
+  return from;
+}
+
 /** A reply that runs on a different harness or workspace than the previous
  *  reply: the new harness or workspace starts its own engine session and only
  *  gets Vicuna's transcript, so the thread shows a "Context handoff" divider. */

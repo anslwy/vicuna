@@ -58,6 +58,18 @@ fn transcript(chat: &Value) -> Vec<Value> {
     chat["messages"].as_array().cloned().unwrap_or_default()
 }
 
+pub(super) async fn clear_context(st: &Arc<BridgeState>, args: &Value) -> Result<Value, String> {
+    let id = super::arg_str(args, "id")?;
+    let _write = st.chat_lock.lock().await;
+    let chat = work_chat(st, &id, args).await?;
+    let mut messages = transcript(&chat);
+    messages.push(json!({"role": "assistant", "content": "", "contextCleared": true}));
+    let db = st.db.as_ref().ok_or("no server db")?;
+    server_store::write_messages(db, &id, &messages, None).await?;
+    st.redo_history.clear(&id);
+    result(st, &id, None).await
+}
+
 pub(super) async fn compact(st: &Arc<BridgeState>, args: &Value) -> Result<Value, String> {
     let id = super::arg_str(args, "id")?;
     let model = super::arg_str(args, "model")?;
