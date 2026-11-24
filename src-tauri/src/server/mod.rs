@@ -26,6 +26,7 @@
 pub mod actions;
 mod chat;
 pub mod embedded;
+pub(crate) mod lb_http;
 pub mod persist;
 pub mod turns;
 mod session_tools;
@@ -45,6 +46,7 @@ use crate::work_agent::{
     agent_queue_msg, agent_remove_msg, agent_stop, WorkAgentState,
 };
 use crate::{AgentShellState, BgExecState, BgJobStatus, BgJobSummary, ChatMessage, UndoState};
+use lb_http::{BoxBody, full_body};
 
 const EVENT_CAP: usize = 2000;
 /// Error prefix of a refused turn start (the window reloads the session).
@@ -993,13 +995,6 @@ async fn dispatch(
     }
 }
 
-type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
-
-fn full_body(data: impl Into<bytes::Bytes>) -> BoxBody {
-    use http_body_util::BodyExt;
-    http_body_util::Full::new(data.into()).boxed()
-}
-
 fn json_resp(status: u16, body: impl Into<bytes::Bytes>) -> hyper::Response<BoxBody> {
     hyper::Response::builder()
         .status(status)
@@ -1009,16 +1004,6 @@ fn json_resp(status: u16, body: impl Into<bytes::Bytes>) -> hyper::Response<BoxB
         .header("Content-Type", "application/json")
         .body(full_body(body))
         .unwrap()
-}
-
-fn lb_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client")
-    })
 }
 
 fn strip_lb_uri(uri: &hyper::Uri) -> String {
@@ -1116,9 +1101,11 @@ async fn proxy_lb_ws(
     builder.body(full_body("")).unwrap()
 }
 
-async fn proxy_lb(req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<BoxBody> {
+async fn proxy_lb(
+    req: hyper::Request<hyper::body::Incoming>,
+    port: u16,
+) -> hyper::Response<BoxBody> {
     use http_body_util::BodyExt;
-    let port = crate::browser::lb_port();
     let target_uri = strip_lb_uri(req.uri());
 
     let is_ws = req
@@ -1135,7 +1122,9 @@ async fn proxy_lb(req: hyper::Request<hyper::body::Incoming>) -> hyper::Response
         Err(_) => return json_resp(405, r#"{"ok":false,"error":"unsupported method"}"#),
     };
     let url = format!("http://127.0.0.1:{port}{target_uri}");
-    let mut fwd = lb_client().request(method, &url);
+    let lb_path = req.uri().path().strip_prefix("/lb").unwrap_or_default();
+    let viewport = lb_http::is_viewport_request(&method, lb_path);
+    let mut fwd = lb_http::client(viewport).request(method, &url);
     for (name, val) in req.headers() {
         let lower = name.as_str().to_ascii_lowercase();
         if matches!(lower.as_str(), "host" | "authorization" | "connection" | "transfer-encoding" | "content-length") {
@@ -1165,22 +1154,7 @@ async fn proxy_lb(req: hyper::Request<hyper::body::Incoming>) -> hyper::Response
         }
     };
 
-    let status = resp.status().as_u16();
-    let mut builder = hyper::Response::builder().status(status);
-    for (name, val) in resp.headers() {
-        let lower = name.as_str().to_ascii_lowercase();
-        if matches!(lower.as_str(), "transfer-encoding" | "connection" | "content-length") {
-            continue;
-        }
-        if let (Ok(hn), Ok(hv)) = (
-            hyper::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            hyper::header::HeaderValue::from_bytes(val.as_bytes()),
-        ) {
-            builder = builder.header(hn, hv);
-        }
-    }
-    let bytes = resp.bytes().await.unwrap_or_default();
-    builder.body(full_body(bytes)).unwrap_or_else(|_| json_resp(502, ""))
+    lb_http::response(resp, viewport).await.unwrap_or_else(|| json_resp(502, ""))
 }
 
 /// Responses smaller than this go out as-is (gzip would barely pay off).
@@ -1225,7 +1199,7 @@ async fn maybe_gzip(resp: hyper::Response<BoxBody>) -> hyper::Response<BoxBody> 
     let (mut parts, body) = resp.into_parts();
     let data = match body.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(e) => match e {},
+        Err(_) => return json_resp(502, r#"{"ok":false,"error":"unreadable response body"}"#),
     };
     if data.len() < GZIP_MIN {
         return hyper::Response::from_parts(parts, full_body(data));
@@ -1292,7 +1266,7 @@ async fn handle_inner(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Inc
         }
     }
     if path == "/lb" || path.starts_with("/lb/") {
-        return proxy_lb(req).await;
+        return proxy_lb(req, crate::browser::lb_port()).await;
     }
     if *req.method() == Method::GET && path.starts_with("/poll/") {
         let id = path.trim_start_matches("/poll/").to_string();
@@ -1735,6 +1709,101 @@ impl Bound {
         }
         drop(listener);
         shutdown_state_async(&state).await;
+    }
+}
+
+#[cfg(test)]
+mod lb_proxy_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::{convert::Infallible, time::Duration};
+    use tokio::{net::TcpListener, time::timeout};
+
+    #[tokio::test]
+    async fn viewport_delivers_first_packet_and_cancels_upstream_on_disconnect() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let packet = Bytes::from_static(b"\x00\x00\x00\x04\xff\xd8\xff\xd9");
+
+        let expected = packet.clone();
+        let upstream_task = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let request = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                assert_eq!(req.uri(), "/api/viewport-stream?tab=7");
+                assert_eq!(req.headers()["x-lb-passcode"], "browser-passcode");
+                assert!(req.headers().get("authorization").is_none());
+                let first = stream::iter([Ok::<_, Infallible>(Frame::data(packet.clone()))]);
+                let response = hyper::Response::builder()
+                    .header("content-type", "application/x-lb-frames")
+                    .header("cache-control", "no-store, no-transform")
+                    .header("x-accel-buffering", "no")
+                    .body(StreamBody::new(first.chain(stream::pending())))
+                    .unwrap();
+                std::future::ready(Ok::<_, Infallible>(response))
+            });
+            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), request).await;
+        });
+        let proxy_task = tokio::spawn(async move {
+            let (socket, _) = proxy.accept().await.unwrap();
+            let request = service_fn(move |req: hyper::Request<hyper::body::Incoming>| async move {
+                assert_eq!(req.headers()["authorization"], "Bearer vicuna-token");
+                Ok::<_, Infallible>(proxy_lb(req, upstream_port).await)
+            });
+            // Dropping a viewer may end the connection mid-response.
+            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), request).await;
+        });
+
+        #[cfg(feature = "desktop")]
+        let (viewer_addr, viewer_path, shim_task) = {
+            let shim = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = shim.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (socket, _) = shim.accept().await.unwrap();
+                let request = service_fn(move |req| async move {
+                    Ok::<_, Infallible>(crate::servers::test_lb_proxy_request(req, proxy_addr).await)
+                });
+                let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), request).await;
+            });
+            (addr, "/api/viewport-stream", task)
+        };
+        #[cfg(not(feature = "desktop"))]
+        let (viewer_addr, viewer_path) = (proxy_addr, "/lb/api/viewport-stream");
+
+        timeout(Duration::from_secs(3), async {
+            let request = reqwest::Client::new()
+                .get(format!("http://{viewer_addr}{viewer_path}?tab=7"))
+                .header("x-lb-passcode", "browser-passcode");
+            #[cfg(not(feature = "desktop"))]
+            let request = request.bearer_auth("vicuna-token");
+            let mut response = request
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "application/x-lb-frames");
+            assert_eq!(response.headers()["cache-control"], "no-store, no-transform");
+            assert_eq!(response.headers()["x-accel-buffering"], "no");
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                received.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+            }
+            assert_eq!(received.as_slice(), expected.as_ref());
+            drop(response);
+            upstream_task.await.unwrap();
+            proxy_task.await.unwrap();
+            #[cfg(feature = "desktop")]
+            shim_task.await.unwrap();
+        })
+        .await
+        .expect("first packet should arrive while upstream is open, then disconnect should cancel upstream");
     }
 }
 

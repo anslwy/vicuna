@@ -386,12 +386,7 @@ mod lb_proxy {
     use std::sync::{Mutex, OnceLock};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
-
-    fn full_body(data: impl Into<bytes::Bytes>) -> BoxBody {
-        use http_body_util::BodyExt;
-        http_body_util::Full::new(data.into()).boxed()
-    }
+    use crate::server::lb_http::{self, BoxBody, full_body};
 
     fn err_resp(status: u16, msg: &str) -> hyper::Response<BoxBody> {
         hyper::Response::builder()
@@ -399,16 +394,6 @@ mod lb_proxy {
             .header("Content-Type", "text/plain; charset=utf-8")
             .body(full_body(msg.to_string()))
             .unwrap()
-    }
-
-    fn http_client() -> &'static reqwest::Client {
-        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-        CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("reqwest client")
-        })
     }
 
     enum UpstreamStream {
@@ -595,7 +580,8 @@ mod lb_proxy {
             Err(_) => return err_resp(405, "unsupported method"),
         };
         let url = format!("{}/lb{path_and_query}", target.base_url);
-        let mut fwd = http_client()
+        let viewport = lb_http::is_viewport_request(&method, req.uri().path());
+        let mut fwd = lb_http::client(viewport)
             .request(method, &url)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", target.token));
         for (name, val) in req.headers() {
@@ -622,22 +608,23 @@ mod lb_proxy {
             Ok(r) => r,
             Err(e) => return err_resp(502, &format!("remote request failed: {e}")),
         };
-        let status = resp.status().as_u16();
-        let mut builder = hyper::Response::builder().status(status);
-        for (name, val) in resp.headers() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if matches!(lower.as_str(), "transfer-encoding" | "connection" | "content-length") {
-                continue;
-            }
-            if let (Ok(hn), Ok(hv)) = (
-                hyper::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-                hyper::header::HeaderValue::from_bytes(val.as_bytes()),
-            ) {
-                builder = builder.header(hn, hv);
-            }
-        }
-        let bytes = resp.bytes().await.unwrap_or_default();
-        builder.body(full_body(bytes)).unwrap_or_else(|_| err_resp(502, "bad response"))
+        lb_http::response(resp, viewport).await.unwrap_or_else(|| err_resp(502, "bad response"))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_request(
+        req: hyper::Request<hyper::body::Incoming>,
+        upstream: std::net::SocketAddr,
+    ) -> hyper::Response<BoxBody> {
+        let target = Target {
+            base_url: format!("http://{upstream}"),
+            token: "vicuna-token".into(),
+            is_tls: false,
+            host: upstream.ip().to_string(),
+            port: upstream.port(),
+            host_header: upstream.to_string(),
+        };
+        handle_req(req, target).await
     }
 
     pub async fn proxy_url(id: &str) -> Result<String, String> {
@@ -705,6 +692,9 @@ mod lb_proxy {
         Ok(format!("http://127.0.0.1:{local_port}"))
     }
 }
+
+#[cfg(all(test, feature = "desktop"))]
+pub(crate) use lb_proxy::test_request as test_lb_proxy_request;
 
 #[cfg(feature = "desktop")]
 pub async fn lb_proxy_url(id: &str) -> Result<String, String> {
