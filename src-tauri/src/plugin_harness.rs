@@ -87,52 +87,236 @@ pub struct Harness {
     /// output (see `UsageSpec`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageSpec>,
-    /// Opt into a Vicuna-supported account adapter. A manifest cannot set
-    /// its own environment variables or choose a sign-in command.
+    /// Named accounts: `"muse"` or a declarative `AccountSpec` (folder
+    /// names only; see `validate_accounts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<AccountProvider>,
 }
 
+/// Named-account support for a harness. Either a fixed Vicuna adapter by
+/// name (`"muse"`, published before the declarative form) or a declarative
+/// `AccountSpec` from the manifest. Both run through the same code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AccountProvider {
+    Named(NamedAccounts),
+    Custom(AccountSpec),
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum AccountProvider {
+pub enum NamedAccounts {
     Muse,
 }
 
-impl AccountProvider {
-    fn environment(self, dir: &Path) -> [(&'static str, PathBuf); 4] {
-        [
-            ("XDG_CONFIG_HOME", dir.join("config")),
-            ("XDG_DATA_HOME", dir.join("data")),
-            ("XDG_STATE_HOME", dir.join("state")),
-            ("XDG_CACHE_HOME", dir.join("cache")),
-        ]
-    }
+/// Declarative account separation. A manifest picks only folder NAMES:
+/// every `env` value becomes a path inside that account's own folder, so a
+/// plugin can never point a variable at arbitrary text or paths. Variable
+/// names are limited to folder-style names (`valid_account_env`), `clear`
+/// can only remove variables, `login` follows the `acp` command rules (and
+/// is part of consent), and `signedIn` only reads a file in the account
+/// folder (JSON, comments allowed; signed in = the pointer has a value).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountSpec {
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear: Vec<String>,
+    pub login: Vec<AcpLaunch>,
+    pub signed_in: SignedInCheck,
+}
 
-    pub fn sign_in_command(self, dir: &Path) -> String {
-        let vars = self.environment(dir);
-        if cfg!(windows) {
-            let assignments = vars.iter().map(|(key, path)| {
-                format!("$env:{key} = '{}'; ", path.to_string_lossy().replace('\'', "''"))
-            }).collect::<String>();
-            format!("$env:META_API_KEY = $null; {assignments}muse login")
-        } else {
-            let assignments = vars.iter().map(|(key, path)| {
-                format!("{key}={}", crate::agy_accounts::shell_quote(&path.to_string_lossy()))
-            }).collect::<Vec<_>>().join(" ");
-            format!("env -u META_API_KEY {assignments} muse login")
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedInCheck {
+    pub file: String,
+    pub pointer: String,
+}
+
+const MAX_ACCOUNT_ENV: usize = 8;
+const MAX_ACCOUNT_CLEAR: usize = 16;
+const MAX_ACCOUNT_LOGIN: usize = 3;
+
+fn muse_spec() -> AccountSpec {
+    let env = [("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache")];
+    AccountSpec {
+        env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        clear: vec!["META_API_KEY".into()],
+        login: vec![AcpLaunch { command: "muse".into(), args: vec!["login".into()] }],
+        // Muse writes the Meta provider entry on login and removes its
+        // credentials on logout.
+        signed_in: SignedInCheck { file: "config/muse/auth.json".into(), pointer: "/providers/meta".into() },
+    }
+}
+
+impl AccountProvider {
+    pub fn spec(&self) -> std::borrow::Cow<'_, AccountSpec> {
+        match self {
+            Self::Named(NamedAccounts::Muse) => std::borrow::Cow::Owned(muse_spec()),
+            Self::Custom(s) => std::borrow::Cow::Borrowed(s),
         }
     }
 
-    pub fn signed_in(self, dir: &Path) -> bool {
-        // Muse writes the Meta provider entry on login and removes its
-        // credentials on logout. Checking it avoids network calls on refresh.
-        std::fs::read(dir.join("config/muse/auth.json")).ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|auth| auth.pointer("/providers/meta")
-                .and_then(Value::as_object).map(|provider| !provider.is_empty()))
-            .unwrap_or(false)
+    pub fn environment(&self, dir: &Path) -> Vec<(String, PathBuf)> {
+        self.spec().env.iter().map(|(k, v)| (k.clone(), dir.join(v))).collect()
     }
+
+    /// Apply this account's environment to a child process: drop the
+    /// credential overrides first, then point the folders at the account.
+    pub fn configure(&self, dir: &Path, cmd: &mut impl EnvTarget) {
+        for key in &self.spec().clear {
+            cmd.remove(key);
+        }
+        for (key, path) in self.environment(dir) {
+            cmd.set(&key, &path);
+        }
+    }
+
+    pub fn sign_in_command(&self, dir: &Path) -> String {
+        let spec = self.spec();
+        let vars = self.environment(dir);
+        let line = |l: &AcpLaunch| std::iter::once(l.command.clone()).chain(l.args.iter().cloned()).collect::<Vec<_>>().join(" ");
+        if cfg!(windows) {
+            let clear = spec.clear.iter().map(|k| format!("$env:{k} = $null; ")).collect::<String>();
+            let assignments = vars.iter().map(|(key, path)| {
+                format!("$env:{key} = '{}'; ", path.to_string_lossy().replace('\'', "''"))
+            }).collect::<String>();
+            format!("{clear}{assignments}{}", spec.login.iter().map(line).collect::<Vec<_>>().join("; "))
+        } else {
+            let mut prefix = vec!["env".to_string()];
+            prefix.extend(spec.clear.iter().map(|k| format!("-u {k}")));
+            prefix.extend(vars.iter().map(|(key, path)| format!("{key}={}", crate::agy_accounts::shell_quote(&path.to_string_lossy()))));
+            let prefix = prefix.join(" ");
+            spec.login.iter().map(|l| format!("{prefix} {}", line(l))).collect::<Vec<_>>().join(" && ")
+        }
+    }
+
+    /// Reads one small file in the account folder; never runs anything.
+    pub fn signed_in(&self, dir: &Path) -> bool {
+        let check = &self.spec().signed_in;
+        let Ok(text) = std::fs::read_to_string(dir.join(&check.file)) else { return false };
+        if text.len() > 1 << 20 {
+            return false;
+        }
+        serde_json::from_str::<Value>(&strip_json_comments(&text)).ok()
+            .and_then(|v| v.pointer(&check.pointer).cloned())
+            .is_some_and(|v| match v {
+                Value::Null | Value::Bool(false) => false,
+                Value::String(s) => !s.trim().is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(o) => !o.is_empty(),
+                _ => true,
+            })
+    }
+}
+
+/// Environment edits shared by std and tokio commands.
+pub trait EnvTarget {
+    fn remove(&mut self, key: &str);
+    fn set(&mut self, key: &str, value: &Path);
+}
+
+impl EnvTarget for std::process::Command {
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+    fn set(&mut self, key: &str, value: &Path) { self.env(key, value); }
+}
+
+impl EnvTarget for tokio::process::Command {
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+    fn set(&mut self, key: &str, value: &Path) { self.env(key, value); }
+}
+
+/// Drop `//` and `/* */` comments outside strings (CLIs like Copilot keep
+/// state in JSON with comments).
+fn strip_json_comments(s: &str) -> String {
+    let (b, mut out, mut i, mut in_str) = (s.as_bytes(), Vec::with_capacity(s.len()), 0, false);
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 1;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+            out.push(c);
+        } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' { i += 1; }
+            continue;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') { i += 1; }
+            i += 2;
+            continue;
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn valid_env_name(k: &str) -> bool {
+    (1..=64).contains(&k.len())
+        && k.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !k.as_bytes()[0].is_ascii_digit()
+}
+
+/// Folder-style variables only. Anything that loads code or changes how
+/// programs are found (PATH, LD_*/DYLD_*, NODE_OPTIONS, PYTHONPATH, …) has
+/// no folder-style name, and HOME itself is refused (an empty HOME breaks
+/// the shell tools the agent runs).
+fn valid_account_env(k: &str) -> bool {
+    const SUFFIXES: [&str; 5] = ["_HOME", "_CONFIG_DIR", "_DATA_DIR", "_STATE_DIR", "_CACHE_DIR"];
+    valid_env_name(k) && k != "HOME" && !k.starts_with("LD_") && !k.starts_with("DYLD_")
+        && SUFFIXES.iter().any(|s| k.len() > s.len() && k.ends_with(s))
+}
+
+fn valid_segment(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s != "." && s != ".."
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn validate_accounts(a: &AccountProvider) -> Result<(), String> {
+    let AccountProvider::Custom(s) = a else { return Ok(()) };
+    if s.env.is_empty() || s.env.len() > MAX_ACCOUNT_ENV {
+        return Err(format!("accounts.env needs 1-{MAX_ACCOUNT_ENV} variables"));
+    }
+    for (k, v) in &s.env {
+        if !valid_account_env(k) {
+            return Err(format!("accounts.env: {k:?} is not allowed (folder variables only: *_HOME, *_CONFIG_DIR, *_DATA_DIR, *_STATE_DIR, *_CACHE_DIR, XDG_*_HOME; never HOME, PATH or loader variables)"));
+        }
+        if !valid_segment(v) {
+            return Err(format!("accounts.env.{k}: {v:?} must be a plain folder name (letters, digits, . _ -)"));
+        }
+    }
+    if s.clear.len() > MAX_ACCOUNT_CLEAR || s.clear.iter().any(|k| !valid_env_name(k)) {
+        return Err(format!("accounts.clear: at most {MAX_ACCOUNT_CLEAR} variable names (A-Z, 0-9, _)"));
+    }
+    if s.login.is_empty() || s.login.len() > MAX_ACCOUNT_LOGIN {
+        return Err(format!("accounts.login needs 1-{MAX_ACCOUNT_LOGIN} commands"));
+    }
+    for l in &s.login {
+        valid_command(&l.command).map_err(|e| format!("accounts.login: {e}"))?;
+        if l.args.len() > MAX_ARGS {
+            return Err(format!("accounts.login: at most {MAX_ARGS} arguments"));
+        }
+        for x in &l.args {
+            valid_arg(x).map_err(|e| format!("accounts.login: {e}"))?;
+        }
+    }
+    let segs: Vec<&str> = s.signed_in.file.split('/').collect();
+    if segs.len() > 4 || !segs.iter().all(|x| valid_segment(x)) {
+        return Err("accounts.signedIn.file must be a relative path inside the account folder (up to 4 plain folder/file names)".into());
+    }
+    let p = &s.signed_in.pointer;
+    if !p.starts_with('/') || p.len() > 200 || p.chars().any(char::is_control) {
+        return Err("accounts.signedIn.pointer must be a JSON pointer like /users/0".into());
+    }
+    Ok(())
 }
 
 /// `usage`: a command printing JSON (same rules as `acp`: bare program on
@@ -330,7 +514,10 @@ pub fn validate(list: &[Harness]) -> Result<(), String> {
         if let Some(u) = &h.usage {
             validate_usage(u).map_err(|e| format!("harness {}: {e}", h.id))?;
         }
-        if h.accounts == Some(AccountProvider::Muse)
+        if let Some(a) = &h.accounts {
+            validate_accounts(a).map_err(|e| format!("harness {}: {e}", h.id))?;
+        }
+        if h.accounts == Some(AccountProvider::Named(NamedAccounts::Muse))
             && (h.acp.command != "muse" || h.acp.args.first().map(String::as_str) != Some("acp")
                 || h.usage.as_ref().is_some_and(|u| u.command != "muse" || u.args != ["usage", "--json"]))
         {
@@ -527,7 +714,7 @@ pub fn account_info(key: &str) -> Option<crate::agy_accounts::AccountInfo> {
 fn account_profile(key: &str, r: &Resolved) -> Result<Option<(AccountProvider, PathBuf)>, String> {
     let (base, id) = split_account(key);
     let Some(id) = id else { return Ok(None) };
-    let provider = r.harness.accounts.ok_or("This plugin harness no longer supports extra accounts.")?;
+    let provider = r.harness.accounts.clone().ok_or("This plugin harness no longer supports extra accounts.")?;
     let dir = AccountRegistry::Plugin(intern(base)).checked_profile(id)?;
     Ok(Some((provider, dir)))
 }
@@ -610,7 +797,7 @@ pub fn launch(key: &str, workspace: &str) -> Result<(PathBuf, tokio::process::Co
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&r.harness.acp.args);
     if let Some((provider, dir)) = profile {
-        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+        provider.configure(&dir, &mut cmd);
     }
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
@@ -653,7 +840,7 @@ pub fn run_usage(key: &str) -> Result<(UsageMap, Value), String> {
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(&u.args);
     if let Some((provider, dir)) = profile {
-        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+        provider.configure(&dir, &mut cmd);
     }
     let out = run_capped(cmd, &bin, USAGE_MAX_BYTES, std::time::Duration::from_secs(USAGE_TIMEOUT_SECS))?;
     let v: Value = serde_json::from_slice(&out).map_err(|_| format!("`{}` did not print JSON", u.command))?;
@@ -922,7 +1109,7 @@ mod tests {
         let old = json!({"id": "demo", "command": "muse", "args": ["acp"]});
         grant(&dir, &[harness.clone()], &[old.clone()], 1).unwrap();
 
-        harness.accounts = Some(AccountProvider::Muse);
+        harness.accounts = Some(AccountProvider::Named(NamedAccounts::Muse));
         validate(&[harness.clone()]).unwrap();
         assert!(!consented(&read_consent(&dir), &harness));
         assert!(grant(&dir, &[harness.clone()], &[old], 2).is_err());
@@ -935,6 +1122,87 @@ mod tests {
         assert!(parse_engine("plugin:muse/muse@work").is_some());
         assert!(parse_engine("plugin:muse/muse@../work").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn copilot_spec() -> AccountProvider {
+        serde_json::from_value(json!({
+            "env": {"COPILOT_HOME": "copilot", "GH_CONFIG_DIR": "gh"},
+            "clear": ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            "login": [{"command": "copilot", "args": ["login"]}, {"command": "gh", "args": ["auth", "login", "--web"]}],
+            "signedIn": {"file": "copilot/config.json", "pointer": "/loggedInUsers/0"}
+        })).unwrap()
+    }
+
+    #[test]
+    fn declarative_accounts_are_validated() {
+        let mut x = h("copilot", &["--acp", "--stdio"]);
+        x.accounts = Some(copilot_spec());
+        validate(&[x.clone()]).unwrap();
+        assert_eq!(serde_json::from_value::<AccountProvider>(json!("muse")).unwrap(), AccountProvider::Named(NamedAccounts::Muse));
+        assert!(serde_json::from_value::<AccountProvider>(json!("copilot")).is_err());
+
+        let bad = |patch: Value| {
+            let mut v = serde_json::to_value(copilot_spec()).unwrap();
+            for (k, val) in patch.as_object().unwrap() { v[k] = val.clone(); }
+            match serde_json::from_value::<AccountProvider>(v) {
+                Err(_) => true,
+                Ok(a) => { let mut y = x.clone(); y.accounts = Some(a); validate(&[y]).is_err() }
+            }
+        };
+        // Variables that load code, change lookup or aren't folder-style.
+        for name in ["PATH", "HOME", "NODE_OPTIONS", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "LD_CONFIG_DIR", "PYTHONHOME", "_HOME", "gh_config_dir", "X-HOME"] {
+            assert!(bad(json!({"env": {name: "x"}})), "{name}");
+        }
+        // Values are folder names only.
+        for v in ["..", ".", "a/b", "/abs", "~", "$(id)", "a b", ""] {
+            assert!(bad(json!({"env": {"COPILOT_HOME": v}})), "{v:?}");
+        }
+        assert!(bad(json!({"env": {}})));
+        assert!(bad(json!({"login": []})));
+        assert!(bad(json!({"login": [{"command": "/bin/sh", "args": []}]})));
+        assert!(bad(json!({"login": [{"command": "gh", "args": ["auth;rm -rf ~"]}]})));
+        assert!(bad(json!({"signedIn": {"file": "../x.json", "pointer": "/a"}})));
+        assert!(bad(json!({"signedIn": {"file": "/etc/passwd", "pointer": "/a"}})));
+        assert!(bad(json!({"signedIn": {"file": "a.json", "pointer": "a"}})));
+        assert!(bad(json!({"clear": ["GH TOKEN"]})));
+        assert!(bad(json!({"shell": "x"})), "unknown fields are refused");
+        assert!(!bad(json!({"env": {"XDG_CONFIG_HOME": "c", "FOO_CACHE_DIR": "k"}})));
+    }
+
+    #[test]
+    fn declarative_accounts_isolate_and_detect_login() {
+        let a = copilot_spec();
+        let dir = Path::new("/tmp/acct one");
+        assert_eq!(a.environment(dir), vec![("COPILOT_HOME".to_string(), dir.join("copilot")), ("GH_CONFIG_DIR".to_string(), dir.join("gh"))]);
+        if !cfg!(windows) {
+            let cmd = a.sign_in_command(dir);
+            assert!(cmd.starts_with("env -u COPILOT_GITHUB_TOKEN -u GH_TOKEN -u GITHUB_TOKEN COPILOT_HOME='/tmp/acct one/copilot'"), "{cmd}");
+            assert!(cmd.contains(" copilot login && env ") && cmd.ends_with(" gh auth login --web"), "{cmd}");
+            let mut c = std::process::Command::new("true");
+            c.env("GH_TOKEN", "leak");
+            a.configure(dir, &mut c);
+            let envs: Vec<_> = c.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
+            assert!(envs.contains(&("GH_TOKEN".into(), None)));
+            assert!(envs.contains(&("GH_CONFIG_DIR".into(), Some("/tmp/acct one/gh".into()))));
+            let muse = AccountProvider::Named(NamedAccounts::Muse).sign_in_command(dir);
+            assert!(muse.starts_with("env -u META_API_KEY XDG_CACHE_HOME='/tmp/acct one/cache'") && muse.ends_with(" muse login"), "{muse}");
+        }
+
+        let tmp = std::env::temp_dir().join(format!("vicuna-decl-acct-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("copilot")).unwrap();
+        assert!(!a.signed_in(&tmp));
+        let cfg = tmp.join("copilot/config.json");
+        std::fs::write(&cfg, "// written by the CLI\n{ \"note\": \"http://x // not a comment\", /* c */ \"loggedInUsers\": [] }").unwrap();
+        assert!(!a.signed_in(&tmp));
+        std::fs::write(&cfg, "// written by the CLI\n{\n  \"loggedInUsers\": [ { \"login\": \"b\" } ] // tail\n}").unwrap();
+        assert!(a.signed_in(&tmp));
+        let muse = AccountProvider::Named(NamedAccounts::Muse);
+        std::fs::create_dir_all(tmp.join("config/muse")).unwrap();
+        std::fs::write(tmp.join("config/muse/auth.json"), "{\"providers\":{\"meta\":{}}}").unwrap();
+        assert!(!muse.signed_in(&tmp));
+        std::fs::write(tmp.join("config/muse/auth.json"), "{\"providers\":{\"meta\":{\"k\":1}}}").unwrap();
+        assert!(muse.signed_in(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
