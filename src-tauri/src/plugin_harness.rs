@@ -97,34 +97,72 @@ pub struct Harness {
 #[serde(rename_all = "lowercase")]
 pub enum AccountProvider {
     Muse,
+    /// GitHub Copilot CLI: `COPILOT_HOME` per account, plus a private
+    /// `GH_CONFIG_DIR` so the `gh api /copilot_internal/user` usage command
+    /// reads this account's quota, not the default gh login.
+    Copilot,
 }
 
 impl AccountProvider {
-    fn environment(self, dir: &Path) -> [(&'static str, PathBuf); 4] {
-        [
-            ("XDG_CONFIG_HOME", dir.join("config")),
-            ("XDG_DATA_HOME", dir.join("data")),
-            ("XDG_STATE_HOME", dir.join("state")),
-            ("XDG_CACHE_HOME", dir.join("cache")),
-        ]
+    pub fn environment(self, dir: &Path) -> Vec<(&'static str, PathBuf)> {
+        match self {
+            Self::Muse => vec![
+                ("XDG_CONFIG_HOME", dir.join("config")),
+                ("XDG_DATA_HOME", dir.join("data")),
+                ("XDG_STATE_HOME", dir.join("state")),
+                ("XDG_CACHE_HOME", dir.join("cache")),
+            ],
+            Self::Copilot => vec![("COPILOT_HOME", dir.join("copilot")), ("GH_CONFIG_DIR", dir.join("gh"))],
+        }
+    }
+
+    /// Credential variables that would override every account's own login.
+    pub fn cleared(self) -> &'static [&'static str] {
+        match self {
+            Self::Muse => &["META_API_KEY"],
+            Self::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
+        }
+    }
+
+    /// Commands run, in order, to sign an account in.
+    fn login_commands(self) -> &'static [&'static str] {
+        match self {
+            Self::Muse => &["muse login"],
+            Self::Copilot => &["copilot login", "gh auth login --hostname github.com --web"],
+        }
+    }
+
+    /// Apply this account's environment to a child process.
+    pub fn configure(self, dir: &Path, cmd: &mut impl EnvTarget) {
+        for key in self.cleared() {
+            cmd.remove(key);
+        }
+        for (key, path) in self.environment(dir) {
+            cmd.set(key, &path);
+        }
     }
 
     pub fn sign_in_command(self, dir: &Path) -> String {
         let vars = self.environment(dir);
         if cfg!(windows) {
+            let clear = self.cleared().iter().map(|k| format!("$env:{k} = $null; ")).collect::<String>();
             let assignments = vars.iter().map(|(key, path)| {
                 format!("$env:{key} = '{}'; ", path.to_string_lossy().replace('\'', "''"))
             }).collect::<String>();
-            format!("$env:META_API_KEY = $null; {assignments}muse login")
+            format!("{clear}{assignments}{}", self.login_commands().join("; "))
         } else {
+            let clear = self.cleared().iter().map(|k| format!("-u {k}")).collect::<Vec<_>>().join(" ");
             let assignments = vars.iter().map(|(key, path)| {
                 format!("{key}={}", crate::agy_accounts::shell_quote(&path.to_string_lossy()))
             }).collect::<Vec<_>>().join(" ");
-            format!("env -u META_API_KEY {assignments} muse login")
+            self.login_commands().iter().map(|c| format!("env {clear} {assignments} {c}")).collect::<Vec<_>>().join(" && ")
         }
     }
 
     pub fn signed_in(self, dir: &Path) -> bool {
+        if self == Self::Copilot {
+            return std::fs::read_to_string(dir.join("copilot/config.json")).is_ok_and(|t| copilot_has_login(&t));
+        }
         // Muse writes the Meta provider entry on login and removes its
         // credentials on logout. Checking it avoids network calls on refresh.
         std::fs::read(dir.join("config/muse/auth.json")).ok()
@@ -133,6 +171,32 @@ impl AccountProvider {
                 .and_then(Value::as_object).map(|provider| !provider.is_empty()))
             .unwrap_or(false)
     }
+}
+
+/// Environment edits shared by std and tokio commands.
+pub trait EnvTarget {
+    fn remove(&mut self, key: &str);
+    fn set(&mut self, key: &str, value: &Path);
+}
+
+impl EnvTarget for std::process::Command {
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+    fn set(&mut self, key: &str, value: &Path) { self.env(key, value); }
+}
+
+impl EnvTarget for tokio::process::Command {
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+    fn set(&mut self, key: &str, value: &Path) { self.env(key, value); }
+}
+
+/// Copilot's `config.json` (JSON with comments) lists signed-in accounts in
+/// `loggedInUsers`; logout leaves it empty. Text scan, no JSON parse.
+fn copilot_has_login(text: &str) -> bool {
+    let Some(at) = text.find("\"loggedInUsers\"") else { return false };
+    let rest = text[at + "\"loggedInUsers\"".len()..].trim_start();
+    let Some(rest) = rest.strip_prefix(':') else { return false };
+    let Some(rest) = rest.trim_start().strip_prefix('[') else { return false };
+    rest.trim_start().starts_with('{')
 }
 
 /// `usage`: a command printing JSON (same rules as `acp`: bare program on
@@ -335,6 +399,12 @@ pub fn validate(list: &[Harness]) -> Result<(), String> {
                 || h.usage.as_ref().is_some_and(|u| u.command != "muse" || u.args != ["usage", "--json"]))
         {
             return Err(format!("harness {}: Muse accounts require muse acp and, if provided, muse usage --json", h.id));
+        }
+        if h.accounts == Some(AccountProvider::Copilot)
+            && (h.acp.command != "copilot" || !h.acp.args.iter().any(|a| a == "--acp")
+                || h.usage.as_ref().is_some_and(|u| u.command != "gh" || u.args != ["api", "/copilot_internal/user"]))
+        {
+            return Err(format!("harness {}: Copilot accounts require copilot --acp and, if provided, gh api /copilot_internal/user", h.id));
         }
     }
     Ok(())
@@ -610,7 +680,7 @@ pub fn launch(key: &str, workspace: &str) -> Result<(PathBuf, tokio::process::Co
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&r.harness.acp.args);
     if let Some((provider, dir)) = profile {
-        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+        provider.configure(&dir, &mut cmd);
     }
     if let Some(p) = crate::exe_resolve::child_path(bin.parent()) {
         cmd.env("PATH", p);
@@ -653,7 +723,7 @@ pub fn run_usage(key: &str) -> Result<(UsageMap, Value), String> {
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(&u.args);
     if let Some((provider, dir)) = profile {
-        cmd.env_remove("META_API_KEY").envs(provider.environment(&dir));
+        provider.configure(&dir, &mut cmd);
     }
     let out = run_capped(cmd, &bin, USAGE_MAX_BYTES, std::time::Duration::from_secs(USAGE_TIMEOUT_SECS))?;
     let v: Value = serde_json::from_slice(&out).map_err(|_| format!("`{}` did not print JSON", u.command))?;
@@ -935,6 +1005,47 @@ mod tests {
         assert!(parse_engine("plugin:muse/muse@work").is_some());
         assert!(parse_engine("plugin:muse/muse@../work").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copilot_accounts_are_validated_and_isolated() {
+        let mut x = h("copilot", &["--acp", "--stdio"]);
+        x.accounts = Some(AccountProvider::Copilot);
+        validate(&[x.clone()]).unwrap();
+        x.usage = Some(usage_spec("gh", &["api", "/copilot_internal/user"]));
+        validate(&[x.clone()]).unwrap();
+        x.usage = Some(usage_spec("gh", &["api", "/user"]));
+        assert!(validate(&[x.clone()]).is_err());
+        x.usage = None;
+        x.acp.args = vec!["--stdio".into()];
+        assert!(validate(&[x.clone()]).is_err());
+        x.acp = h("other", &["--acp"]).acp;
+        assert!(validate(&[x]).is_err());
+
+        let dir = Path::new("/tmp/acct one");
+        let env = AccountProvider::Copilot.environment(dir);
+        assert_eq!(env, vec![("COPILOT_HOME", dir.join("copilot")), ("GH_CONFIG_DIR", dir.join("gh"))]);
+        if !cfg!(windows) {
+            let cmd = AccountProvider::Copilot.sign_in_command(dir);
+            assert!(cmd.contains("-u GH_TOKEN") && cmd.contains("COPILOT_HOME='/tmp/acct one/copilot'"), "{cmd}");
+            assert!(cmd.contains(" copilot login && env ") && cmd.ends_with("gh auth login --hostname github.com --web"), "{cmd}");
+            let mut c = std::process::Command::new("true");
+            c.env("GH_TOKEN", "leak");
+            AccountProvider::Copilot.configure(dir, &mut c);
+            let envs: Vec<_> = c.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
+            assert!(envs.contains(&("GH_TOKEN".into(), None)));
+            assert!(envs.contains(&("GH_CONFIG_DIR".into(), Some("/tmp/acct one/gh".into()))));
+        }
+
+        assert!(copilot_has_login("// state\n{\n  \"loggedInUsers\": [\n    { \"host\": \"https://github.com\", \"login\": \"a\" }\n  ]\n}"));
+        assert!(!copilot_has_login("{ \"loggedInUsers\": [ ] }"));
+        assert!(!copilot_has_login("{ \"firstLaunchAt\": 1 }"));
+        let tmp = std::env::temp_dir().join(format!("vicuna-copilot-acct-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("copilot")).unwrap();
+        assert!(!AccountProvider::Copilot.signed_in(&tmp));
+        std::fs::write(tmp.join("copilot/config.json"), "{\"loggedInUsers\":[{\"login\":\"b\"}]}").unwrap();
+        assert!(AccountProvider::Copilot.signed_in(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

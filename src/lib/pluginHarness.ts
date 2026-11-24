@@ -13,7 +13,7 @@ export type PluginHarness = {
   installUrl?: string | null;
   /** Usage command (runs only after consent, shown in the dialog). */
   usage?: { command: string; args: string[] } | null;
-  accounts?: "muse" | null;
+  accounts?: "muse" | "copilot" | null;
   enabled: boolean;
   installed: boolean;
 };
