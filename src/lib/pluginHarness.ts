@@ -13,10 +13,33 @@ export type PluginHarness = {
   installUrl?: string | null;
   /** Usage command (runs only after consent, shown in the dialog). */
   usage?: { command: string; args: string[] } | null;
-  accounts?: "muse" | "copilot" | null;
+  accounts?: "muse" | AccountSpec | null;
   enabled: boolean;
   installed: boolean;
 };
+
+/** Declarative named accounts (plugin_harness.rs `AccountSpec`): `env`
+ *  values are folder names inside each account's own folder. */
+export type AccountSpec = {
+  env: Record<string, string>;
+  clear?: string[];
+  login: { command: string; args: string[] }[];
+  signedIn: { file: string; pointer: string };
+};
+
+/** What the consent dialog lists for named accounts. `"muse"` is Vicuna's
+ *  fixed adapter, shown with the same fields. */
+export function accountSummary(a: PluginHarness["accounts"]): { folders: string[]; clear: string[]; login: string[] } | null {
+  if (!a) return null;
+  const spec: AccountSpec = a === "muse"
+    ? { env: { XDG_CACHE_HOME: "cache", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_STATE_HOME: "state" }, clear: ["META_API_KEY"], login: [{ command: "muse", args: ["login"] }], signedIn: { file: "config/muse/auth.json", pointer: "/providers/meta" } }
+    : a;
+  return {
+    folders: Object.entries(spec.env).map(([k, v]) => `${k} → <account>/${v}`),
+    clear: [...(spec.clear ?? [])],
+    login: spec.login.map((l) => commandLine(l)),
+  };
+}
 
 export const PLUGIN_ENGINE_PREFIX = "plugin:";
 

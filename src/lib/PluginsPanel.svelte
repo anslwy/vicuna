@@ -5,7 +5,7 @@
   import { onMount } from "svelte";
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
-  import { commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
+  import { accountSummary, commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
   import { cardAction, filterCatalog, githubRepoUrl, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
   let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged }: {
@@ -363,7 +363,11 @@
           <div class="pl-muted">and, to read its subscription usage for the Usage view:</div>
           <code class="pl-cmd big" data-testid="harness-consent-usage-{h.id}">{commandLine(h.usage)}</code>
         {/if}
-        {#if h.accounts}<div class="pl-muted">Named accounts run these commands with separate sign-in and session storage.</div>{/if}
+        {#if accountSummary(h.accounts)}
+          {@const acct = accountSummary(h.accounts)!}
+          <div class="pl-muted" data-testid="harness-consent-accounts-{h.id}">Named accounts: each one runs with its own folders ({acct.folders.join(", ")}){acct.clear.length ? `, without ${acct.clear.join(", ")}` : ""}. Signing an account in means running:</div>
+          {#each acct.login as line (line)}<code class="pl-cmd big">{line}</code>{/each}
+        {/if}
         <div class="pl-muted">{h.installed ? `Found \`${h.command}\` on this server's PATH.` : `\`${h.command}\` is not installed on this server yet. ${h.installHint ?? ""}`}</div>
       </div>
     {/each}

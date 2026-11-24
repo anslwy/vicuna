@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commandLine, consentPayload, isPluginEngine, pendingConsent, pluginHarnessName, type PluginHarness } from "../src/lib/pluginHarness.ts";
+import { accountSummary, commandLine, consentPayload, isPluginEngine, pendingConsent, pluginHarnessName, type PluginHarness } from "../src/lib/pluginHarness.ts";
 
 const h: PluginHarness = { id: "muse", label: "Muse", engine: "plugin:muse-acp/muse", command: "muse", args: ["acp", "--model", "a b"], enabled: false, installed: true };
 
@@ -37,4 +37,20 @@ test("plugin icons accept only SVG data URIs and otherwise use puzzle fallback",
   }
   assert.equal(pluginEngineIcon(id, []), null);
   assert.equal(pluginEngineIcon("claude", [{ id: "claude", icon }]), null);
+});
+
+test("accountSummary lists folders, cleared variables and login commands", () => {
+  assert.equal(accountSummary(null), null);
+  assert.deepEqual(accountSummary({
+    env: { COPILOT_HOME: "copilot", GH_CONFIG_DIR: "gh" },
+    clear: ["GH_TOKEN"],
+    login: [{ command: "copilot", args: ["login"] }, { command: "gh", args: ["auth", "login", "--web"] }],
+    signedIn: { file: "copilot/config.json", pointer: "/loggedInUsers/0" },
+  }), {
+    folders: ["COPILOT_HOME → <account>/copilot", "GH_CONFIG_DIR → <account>/gh"],
+    clear: ["GH_TOKEN"],
+    login: ["copilot login", "gh auth login --web"],
+  });
+  assert.deepEqual(accountSummary("muse")!.login, ["muse login"]);
+  assert.deepEqual(accountSummary("muse")!.clear, ["META_API_KEY"]);
 });
