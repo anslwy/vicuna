@@ -339,7 +339,7 @@ pub fn list_text(v: &Value) -> String {
 async fn pick_message(pool: &sqlx::SqlitePool, id: &str, role: &str, last: bool, window: i64) -> Result<Option<String>, String> {
     let (order, sub) = if last { ("DESC", "substr(content, -$3)") } else { ("ASC", "substr(content, 1, $3)") };
     sqlx::query_scalar(&format!(
-        "SELECT {sub} FROM messages WHERE chat_id = $1 AND role = $2 AND content != '' ORDER BY idx {order} LIMIT 1"
+        "SELECT {sub} FROM messages WHERE chat_id = $1 AND role = $2 AND content != '' AND context_cleared IS NOT 1 AND summary IS NOT 1 ORDER BY idx {order} LIMIT 1"
     ))
     .bind(id)
     .bind(role)

@@ -1088,7 +1088,9 @@ async fn read_session_from_pool(
         return Err(format!("Session not found: {session_id}"));
     };
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE chat_id = $1")
+    let plain = args.get("plain").and_then(Value::as_bool).unwrap_or(false);
+    let filter = if plain { " AND context_cleared IS NOT 1" } else { "" };
+    let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM messages WHERE chat_id = $1{filter}"))
         .bind(session_id)
         .fetch_one(pool)
         .await
@@ -1115,7 +1117,6 @@ async fn read_session_from_pool(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let plain = args.get("plain").and_then(Value::as_bool).unwrap_or(false);
     // Only a window of each message leaves sqlite: plain text shrinks cards,
     // so it reads more than it returns. 0 = no truncation = whole message.
     let window: i64 = if max_chars == 0 { -1 } else if plain { (max_chars as i64 * 8).max(20_000) } else { max_chars as i64 + 1 };
@@ -1125,7 +1126,7 @@ async fn read_session_from_pool(
         (false, false) => "substr(content, 1, $4)",
     };
     let rows = sqlx::query(&format!(
-        "SELECT idx, role, {content_sql} AS content, length(content) AS chars, thinking, model FROM messages WHERE chat_id = $1 ORDER BY idx ASC LIMIT $2 OFFSET $3",
+        "SELECT idx, role, {content_sql} AS content, length(content) AS chars, thinking, model, context_cleared FROM messages WHERE chat_id = $1{filter} ORDER BY idx ASC LIMIT $2 OFFSET $3",
     ))
     .bind(session_id)
     .bind(limit)
@@ -1159,6 +1160,9 @@ async fn read_session_from_pool(
             "content": content,
             "truncated": truncated,
         });
+        if r.try_get::<Option<i64>, _>("context_cleared").ok().flatten() == Some(1) {
+            msg["contextCleared"] = json!(true);
+        }
         if include_thinking {
             let raw_thinking: String = r.try_get("thinking").unwrap_or_default();
             if !raw_thinking.is_empty() {
@@ -2788,7 +2792,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE messages (chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL, model TEXT, idx INTEGER NOT NULL, images TEXT, gen_ms REAL, gen_tps REAL, summary INTEGER, gen_cost REAL)")
+        sqlx::query("CREATE TABLE messages (chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL, model TEXT, idx INTEGER NOT NULL, images TEXT, gen_ms REAL, gen_tps REAL, summary INTEGER, gen_cost REAL, context_cleared INTEGER)")
             .execute(&pool)
             .await
             .unwrap();
@@ -2834,7 +2838,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO messages (chat_id, role, content, thinking, idx, context_cleared) VALUES ('s1', 'assistant', '', '', 6, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let raw = read_session_from_pool(&pool, "s1", &json!({ "tail": true, "limit": 1 })).await.unwrap();
+        assert_eq!(raw["messages"][0]["contextCleared"], true);
         let t = read_session_from_pool(&pool, "s1", &json!({ "tail": true, "limit": 1, "max_chars_per_message": 40, "plain": true })).await.unwrap();
+        assert_eq!(t["total_messages"], 6);
         let c = t["messages"][0]["content"].as_str().unwrap();
         assert!(c.ends_with("▸ Bash: ls\n\nFINAL") && c.starts_with('…') && !c.contains('<'), "{c}");
         assert_eq!(t["messages"][0]["chars"], huge.chars().count() as i64);

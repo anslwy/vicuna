@@ -64,8 +64,10 @@ pub fn apply_edit(msgs: &mut Vec<Value>, index: usize, content: &str, images: Op
 pub fn delete_span(msgs: &[Value], index: usize) -> Result<(usize, usize), String> {
     let role = |i: usize| msgs.get(i).and_then(|m| m.get("role")).and_then(Value::as_str);
     match role(index) {
+        Some(_) if msgs[index]["contextCleared"] == true => Err("Cannot delete a context boundary".into()),
         None => Err(format!("no message {index}")),
-        Some("user") if role(index + 1) == Some("assistant") => Ok((index, 2)),
+        Some("user") if role(index + 1) == Some("assistant")
+            && msgs[index + 1]["contextCleared"] != true => Ok((index, 2)),
         Some("assistant") if index > 0 && role(index - 1) == Some("user") => Ok((index - 1, 2)),
         Some(_) => Ok((index, 1)),
     }

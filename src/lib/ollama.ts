@@ -651,6 +651,7 @@ function isToolsUnsupportedError(e: unknown): boolean {
  */
 export function chatToTranscript(messages: ChatMsg[]): string {
   return messages
+    .filter((m) => !m.contextCleared)
     .map((m) => {
       const who = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : m.role === "tool" ? "Tool" : "System";
       return `${who}: ${m.content}`;

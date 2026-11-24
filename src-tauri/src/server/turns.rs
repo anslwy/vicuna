@@ -465,14 +465,9 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
         return Err(engine.missing_message());
     }
     let mut messages: Vec<Value> = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
-    let previous_model = messages.iter().rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant")
-            && m.get("summary").and_then(Value::as_bool) != Some(true))
-        .and_then(|m| m.get("model").and_then(Value::as_str));
-    let clear_at = messages.iter().rposition(|m| m.get("contextCleared").and_then(Value::as_bool) == Some(true));
-    let reply_at = messages.iter().rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant")
-        && m.get("summary").and_then(Value::as_bool) != Some(true)
-        && m.get("contextCleared").and_then(Value::as_bool) != Some(true));
+    let reply_at = messages.iter().rposition(persist::is_assistant_reply);
+    let previous_model = reply_at.and_then(|i| messages[i]["model"].as_str());
+    let clear_at = messages.iter().rposition(|m| m["contextCleared"] == true);
     let fresh_session = clear_at.is_some_and(|i| reply_at.is_none_or(|r| i > r))
         || engine.changes_cli_account(previous_model);
     messages.extend(user_msgs);
@@ -545,7 +540,7 @@ async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, arg
     let mut chat = crate::server_store::load_chat(db, &id).await?.ok_or_else(|| format!("No session {id}."))?;
     match action {
         "status" => {
-            let reply = chat["messages"].as_array().and_then(|m|m.last()).and_then(|m|m["content"].as_str()).unwrap_or("");
+            let reply = chat["messages"].as_array().map(|messages| persist::last_reply(messages)).unwrap_or("");
             Ok(format!("{id}: {}\nLast reply:\n{}", if live_turn(st,&id).is_some() {"running"} else {"idle"}, persist::tail_text(reply,3000)))
         }
         "send" => {

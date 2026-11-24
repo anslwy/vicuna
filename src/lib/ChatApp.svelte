@@ -49,7 +49,7 @@
   import { createTurnReplyRoute } from "$lib/turnReply";
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
-  import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex } from "$lib/sessionEngine";
+  import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex, canClearContext, isAssistantReply, undoMessageRange } from "$lib/sessionEngine";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workAccountSupport, addWorkAccount, renameWorkAccount, removeWorkAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -389,8 +389,7 @@
   let notifySoundChoice = $state<string>(DEFAULT_CHIME);
   function lastReply(id: string): string {
     const c = chats.find((x) => x.id === id);
-    const m = c?.messages[c.messages.length - 1];
-    return m?.role === "assistant" ? m.content : "";
+    return c?.messages.findLast(isAssistantReply)?.content ?? "";
   }
   let workTurnSeq = 0;
   /** current frontend turn number per session: a stale turn's late events are
@@ -3880,7 +3879,7 @@
       if (c.messages.length === 0) return false;
       if (c.title.toLowerCase().includes(q)) return true;
       if (c.id.toLowerCase().includes(q)) return true;
-      return c.messages.some((m) => m.content.toLowerCase().includes(q));
+      return c.messages.some((m) => !m.contextCleared && m.content.toLowerCase().includes(q));
     }).slice(0, 20);
   });
   /** connected hosts whose chats are NOT loaded in this window */
@@ -4382,7 +4381,7 @@
     // deleting a bot message also removes the user message above it
     let from = i;
     let count = 1;
-    if (target.role === "user" && chat.messages[i + 1]?.role === "assistant") {
+    if (target.role === "user" && chat.messages[i + 1]?.role === "assistant" && !chat.messages[i + 1].contextCleared) {
       count = 2;
     } else if (target.role === "assistant" && i > 0 && chat.messages[i - 1]?.role === "user") {
       from = i - 1;
@@ -5990,6 +5989,10 @@
     // model-visible transcript (drops anything already compacted): the UI
     // keeps every message, only the model's context is trimmed
     const visible = compactedHistory(chat.messages);
+    if (!visible.length) {
+      flashNotice("There are no messages in the current context.");
+      return;
+    }
     if (visible.length <= 1 && chat.messages.some((m) => m.summary)) {
       flashNotice("Already compacted — send more messages first.");
       return;
@@ -6045,14 +6048,16 @@
   async function clearContextSession() {
     const chat = chats.find((c) => c.id === clearContextChatId);
     clearContextChatId = null;
-    if (!chat || busy || (chat.mode ?? "chat") !== "work") return;
+    if (!clearPossible(chat)) return;
     if (serverSessionTools) {
       await runServerSessionTool("session_clear_context", chat);
       return;
     }
     chat.messages = [...chat.messages, { role: "assistant", content: "", contextCleared: true }];
+    dropUndoStash(chat.id);
     chats = [...chats];
     save();
+    scrollBottom();
   }
 
   async function send() {
@@ -6629,7 +6634,7 @@
     const items: SlashItem[] = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head)).map((c) => ({
       ...c,
       disabled:
-        c.name === "clear" ? busy || !chat || compactedHistory(chat.messages).length === 0 :
+        c.name === "clear" ? !clearPossible(chat) :
         c.name === "undo" ? !undoPossible(chat) :
         c.name === "redo" ? !redoPossible(chat) :
         false
@@ -6667,7 +6672,7 @@
     }
   }
 
-  /** /undo: drop the last user + assistant pair and revert the last turn's
+  /** /undo: remove the trailing clear marker or drop the last pair and revert its
    *  file writes (backend pops one undo frame onto its redo stack). Work-only,
    *  idle only — like /compact. Shell (`exec`) side effects are reported,
    *  never auto-reverted. The removed pair is stashed so /redo can restore
@@ -6687,40 +6692,31 @@
       await runServerSessionTool("session_undo", chat);
       return;
     }
-    // last user message with a following assistant reply (the turn's pair).
-    // Later messages (e.g. a /compact summary) stay — only the pair goes.
-    let userIdx = -1;
-    for (let i = chat.messages.length - 1; i >= 0; i--) {
-      if (chat.messages[i].role === "user") {
-        userIdx = i;
-        break;
-      }
-    }
-    if (userIdx < 0) {
-      flashNotice("Nothing to undo — no user message yet.");
+    const range = undoMessageRange(chat.messages);
+    if (!range) {
+      flashNotice("Nothing to undo — no completed turn.");
       return;
     }
-    if (userIdx + 1 >= chat.messages.length || chat.messages[userIdx + 1].role !== "assistant") {
-      flashNotice("Nothing to undo — last user message has no reply yet.");
-      return;
-    }
-    const pair = [chat.messages[userIdx], chat.messages[userIdx + 1]];
-    const afterLen = chat.messages.length - 2;
-    let undoMsg: string | null = null;
-    try {
-      undoMsg = await invokeOrBridge<string>("work_undo", { sessionId: chat.id });
-    } catch (e: any) {
-      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
-      if (msg.includes("Nothing to undo")) {
+    const { index, count } = range;
+    const removed = chat.messages.slice(index, index + count);
+    const afterLen = chat.messages.length - count;
+    const contextOnly = removed[0].contextCleared;
+    let undoMsg = "Restored context.";
+    if (!contextOnly) {
+      try {
+        undoMsg = await invokeOrBridge<string>("work_undo", { sessionId: chat.id });
+      } catch (e: any) {
+        const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+        if (!msg.includes("Nothing to undo")) {
+          error = `Undo failed: ${msg}`;
+          return;
+        }
         undoMsg = "Undone last turn — no file changes to revert.";
-      } else {
-        error = `Undo failed: ${msg}`;
-        return;
       }
     }
     const c = chats.find((x) => x.id === chat.id);
     if (!c) return;
-    c.messages = [...c.messages.slice(0, userIdx), ...c.messages.slice(userIdx + 2)];
+    c.messages = [...c.messages.slice(0, index), ...c.messages.slice(index + count)];
     c.updatedAt = Date.now();
     chats = [...chats];
     // stash for /redo: only valid while the transcript still matches the
@@ -6728,14 +6724,12 @@
     const stack = undoStashes[chat.id] ?? [];
     undoStashes = {
       ...undoStashes,
-      [chat.id]: [...stack.slice(-19), { messages: pair, index: userIdx, afterLen }]
+      [chat.id]: [...stack.slice(-19), { messages: removed, index, afterLen }]
     };
     save();
     scrollBottom();
-    void loadExplorer().catch(() => {});
-    // the backend message is already a full sentence ("Undid last turn: …");
-    // the fallback covers turns with no recorded frame (messages only)
-    flashNotice(undoMsg ?? "Undone last turn — no file changes to revert.");
+    if (!contextOnly) void loadExplorer().catch(() => {});
+    flashNotice(undoMsg);
   }
 
   /** /redo: re-insert the pair /undo removed and re-apply that turn's file
@@ -6758,18 +6752,21 @@
     const stack = undoStashes[chat.id] ?? [];
     const top = stack[stack.length - 1];
     if (!top) return;
-    let redoMsg: string | null = null;
-    try {
-      redoMsg = await invokeOrBridge<string>("work_redo", { sessionId: chat.id });
-    } catch (e: any) {
-      const msg = typeof e === "string" ? e : (e?.message ?? String(e));
-      // messages come from the frontend stash, so a missing backend frame
-      // (e.g. the turn ran before this build) is not a failure
-      if (!msg.includes("Nothing to redo")) {
-        error = `Redo failed: ${msg}`;
-        return;
+    const contextOnly = top.messages[0].contextCleared;
+    let redoMsg = "Cleared context.";
+    if (!contextOnly) {
+      try {
+        redoMsg = await invokeOrBridge<string>("work_redo", { sessionId: chat.id });
+      } catch (e: any) {
+        const msg = typeof e === "string" ? e : (e?.message ?? String(e));
+        // messages come from the frontend stash, so a missing backend frame
+        // (e.g. the turn ran before this build) is not a failure
+        if (!msg.includes("Nothing to redo")) {
+          error = `Redo failed: ${msg}`;
+          return;
+        }
+        redoMsg = "Redone last turn — no file changes to replay.";
       }
-      redoMsg = "Redone last turn — no file changes to replay.";
     }
     const c = chats.find((x) => x.id === chat.id);
     if (!c || c.messages.length !== top.afterLen) {
@@ -6786,19 +6783,16 @@
     undoStashes = { ...undoStashes, [chat.id]: stack.slice(0, -1) };
     save();
     scrollBottom();
-    void loadExplorer().catch(() => {});
-    flashNotice(redoMsg ?? "Redone last turn — no file changes to replay.");
+    if (!contextOnly) void loadExplorer().catch(() => {});
+    flashNotice(redoMsg);
   }
 
-  /** /undo availability: a user+assistant pair exists (Work, idle only). */
+  function clearPossible(chat: Chat | null | undefined): chat is Chat {
+    return !!chat && chat.mode === "work" && !busy && !isCompacting(chat.id) && canClearContext(chat.messages);
+  }
+
   function undoPossible(chat: Chat | null): boolean {
-    if (!chat || (chat.mode ?? "chat") !== "work" || busy) return false;
-    for (let i = chat.messages.length - 1; i >= 0; i--) {
-      if (chat.messages[i].role === "user") {
-        return i + 1 < chat.messages.length && chat.messages[i + 1].role === "assistant";
-      }
-    }
-    return false;
+    return !!chat && chat.mode === "work" && !busy && undoMessageRange(chat.messages) !== null;
   }
 
   /** /redo availability: something was undone and the transcript is
@@ -6835,7 +6829,7 @@
     clearDraft(null);
     autosizeComposer();
     composerEl?.focus();
-    if (cmd === "clear") clearContextChatId = activeId;
+    if (cmd === "clear" && clearPossible(activeChat)) clearContextChatId = activeChat.id;
     if (cmd === "compact") void compactSession();
     if (cmd === "undo") void undoSession();
     if (cmd === "redo") void redoSession();
@@ -8640,10 +8634,9 @@
     const turnEngine = own.engine || engineId(workEngineInfo);
     const turnPick: string | null = own.engine ? (own.workModel ?? null) : workModel;
     const priorMessages = own.messages.slice(0, index);
-    const previousReply = priorMessages.findLast((m) => m.role === "assistant" && !m.summary && !m.contextCleared);
+    const replyAt = priorMessages.findLastIndex(isAssistantReply);
     const clearAt = priorMessages.findLastIndex((m) => m.contextCleared);
-    const replyAt = previousReply ? priorMessages.lastIndexOf(previousReply) : -1;
-    const freshSession = opts.freshSession || clearAt > replyAt || changesCliAccount(turnEngine, previousReply?.model);
+    const freshSession = opts.freshSession || clearAt > replyAt || changesCliAccount(turnEngine, priorMessages[replyAt]?.model);
     // first turn of a session without its own harness: pin the last-used pick
     // so the session never silently changes agent later
     if (!own.engine) {
@@ -8762,8 +8755,8 @@
     // holds narration + markdown results for persistence. seedContext carries
     // hidden context (e.g. a continued chat transcript) never shown here.
     const baseHistory = compactedHistory(live()?.messages.slice(0, index) ?? []);
-    let seed = seedContext;
-    if (!seed.length && chat.forkedFrom && chat.forkFromIndex == null) {
+    let seed = clearAt >= 0 ? [] : seedContext;
+    if (clearAt < 0 && !seed.length && chat.forkedFrom && chat.forkFromIndex == null) {
       // continued thread regenerated (or re-run) without its original seed:
       // rebuild it from the linked source so the agent keeps its context
       const src = chats.find((x) => x.id === (chat.forkedFrom as { id: string }).id);

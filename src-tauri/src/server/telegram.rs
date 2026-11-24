@@ -1414,9 +1414,9 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
             None => None,
         }
         .and_then(|c| {
-            c.get("messages")?.as_array()?.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("assistant")).cloned()
+            let messages = c["messages"].as_array()?;
+            Some(phone_text(super::persist::last_reply(messages)))
         })
-        .map(|m| phone_text(m.get("content").and_then(Value::as_str).unwrap_or("")))
         .unwrap_or_default();
         let reply = if reply.is_empty() { "(no reply text)".to_string() } else { reply };
         let parts = chunks(&reply);

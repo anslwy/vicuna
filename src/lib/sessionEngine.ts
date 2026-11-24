@@ -77,7 +77,14 @@ export interface HandoffInfo {
   workspace?: { from: string; to: string };
 }
 
-export function latestSummaryIndex(messages: readonly { summary?: boolean }[]): number {
+type ContextMessage = { summary?: boolean; contextCleared?: boolean };
+type SessionMessage = ContextMessage & { role: string };
+
+export function isAssistantReply(message: SessionMessage): boolean {
+  return message.role === "assistant" && !message.summary && !message.contextCleared;
+}
+
+export function latestSummaryIndex(messages: readonly ContextMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].summary) return i;
   }
@@ -86,7 +93,7 @@ export function latestSummaryIndex(messages: readonly { summary?: boolean }[]): 
 
 
 /** First model-visible message after the newest summary or explicit clear boundary. */
-export function latestContextStartIndex(messages: readonly { summary?: boolean; contextCleared?: boolean }[]): number {
+export function latestContextStartIndex(messages: readonly ContextMessage[]): number {
   let from = Math.max(0, latestSummaryIndex(messages));
   for (let i = messages.length - 1; i >= from; i--) {
     if (messages[i].contextCleared) { from = i + 1; break; }
@@ -94,22 +101,34 @@ export function latestContextStartIndex(messages: readonly { summary?: boolean; 
   return from;
 }
 
+export function canClearContext(messages: readonly ContextMessage[]): boolean {
+  return latestContextStartIndex(messages) < messages.length;
+}
+
+/** The trailing clear marker, or the latest user and assistant pair. */
+export function undoMessageRange(messages: readonly SessionMessage[]): { index: number; count: number } | null {
+  if (messages.at(-1)?.contextCleared) return { index: messages.length - 1, count: 1 };
+  const index = messages.findLastIndex((m) => m.role === "user");
+  if (index < 0 || !messages[index + 1] || !isAssistantReply(messages[index + 1])) return null;
+  return { index, count: 2 };
+}
+
 /** A reply that runs on a different harness or workspace than the previous
  *  reply: the new harness or workspace starts its own engine session and only
  *  gets Vicuna's transcript, so the thread shows a "Context handoff" divider. */
 export function handoffAt(
-  messages: readonly { role: string; model?: string | null; workspace?: string | null; summary?: boolean }[],
+  messages: readonly (SessionMessage & { model?: string | null; workspace?: string | null })[],
   i: number
 ): HandoffInfo | null {
   const m = messages[i];
-  if (!m || m.role !== "assistant" || m.summary) return null;
+  if (!m || !isAssistantReply(m)) return null;
 
   let engine: { from: string; to: string } | undefined;
   const toEngine = labelHarness(m.model);
   if (toEngine) {
     for (let k = i - 1; k >= 0; k--) {
       const p = messages[k];
-      if (p.role !== "assistant" || p.summary) continue;
+      if (!isAssistantReply(p)) continue;
       const fromEngine = labelHarness(p.model);
       if (!fromEngine) continue;
       if (fromEngine !== toEngine) {
@@ -124,7 +143,7 @@ export function handoffAt(
   if (toWs) {
     for (let k = i - 1; k >= 0; k--) {
       const p = messages[k];
-      if (p.role !== "assistant" || p.summary) continue;
+      if (!isAssistantReply(p)) continue;
       const fromWs = normWorkspace(p.workspace);
       if (!fromWs) continue;
       if (fromWs !== toWs) {

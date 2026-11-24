@@ -142,10 +142,11 @@ export function workspaceBase(p: string): string {
 
 /** Excerpt centered on the first content match (or the opening message). */
 export function searchSnippet(c: Chat, q: string): string {
-  const firstUser = c.messages.find((m) => m.role === "user")?.content ?? c.messages[0]?.content ?? "";
+  const firstUser = c.messages.find((m) => m.role === "user")?.content
+    ?? c.messages.find((m) => !m.contextCleared)?.content ?? "";
   if (!q) return firstUser.slice(0, 140);
   const low = q.toLowerCase();
-  const hit = c.messages.find((m) => m.content.toLowerCase().includes(low));
+  const hit = c.messages.find((m) => !m.contextCleared && m.content.toLowerCase().includes(low));
   const src = hit?.content ?? firstUser;
   const idx = src.toLowerCase().indexOf(low);
   if (idx < 0) return src.slice(0, 140);
