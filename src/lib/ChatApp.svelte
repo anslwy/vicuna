@@ -43,7 +43,7 @@
     type Chat
   } from "$lib/store";
   import { isAgentQuestion, toggleChoice, buildAskAnswer, laterAnswerMessage } from "$lib/askCard";
-  import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, demoteOtherLeads, type SessionRow } from "$lib/leadSessions";
+  import { workerDoneMessage, sessionListText, tailText, parseWorkerDone, demoteOtherLeads, sessionPermissions, type SessionRow } from "$lib/leadSessions";
   import { mcpWakeMessage, parseBgDoneMessage, parseMcpWakeMessage } from "$lib/backgroundRun";
   import { SCHEDULE_KEY, SCHEDULE_OPEN_NOTE, SCHEDULE_SERVER_NOTE, scheduleDiff, resolveWakeTime, wakeMessage, schedulePresets, parseCustomTime, customTimeError, defaultCustomTime, dateInputValue, timeInputValue, formatWhen, formatClock, sortScheduled, dueItems, markMissed, parseScheduled, previewText, trayScheduleLines, scheduledCountLabel, type ScheduledItem } from "$lib/schedule";
   import { createTurnReplyRoute } from "$lib/turnReply";
@@ -1727,6 +1727,20 @@
     };
     const engines = workEngineChoices(workEngineInfo).map((e) => e.id);
     switch (action) {
+      case "permissions": {
+        const c = target();
+        if (typeof args.read !== "boolean" && typeof args.allow_message !== "boolean") {
+          return { ok: true, text: JSON.stringify({ session_id: c.id, ...sessionPermissions(c) }) };
+        }
+        const change: { read?: boolean; message?: boolean } = {};
+        if (typeof args.read === "boolean") change.read = args.read;
+        if (typeof args.allow_message === "boolean") change.message = args.allow_message;
+        const updated = await serverAction("session_update", { id: c.id, permissions: change });
+        if (updated === false) { c.permissions = { ...c.permissions, ...change }; void save(); }
+        else if (!updated) throw new Error("Could not save session permissions.");
+        const current: Chat = updated === false || updated === null ? c : updated;
+        return { ok: true, text: JSON.stringify({ session_id: current.id, ...sessionPermissions(current) }) };
+      }
       case "list": {
         const rows = chats.filter((c) => (c.mode ?? "chat") === "work" && c.messages.length > 0).slice(0, 40).map((c) => sessionRow(c, leadId));
         return { ok: true, text: sessionListText(rows, engines, engineId(workEngineInfo)) };
@@ -4761,6 +4775,21 @@
 
   /** Make/Replace lead prompt (explainer + optional Telegram setup). */
   let leadPrompt = $state<{ id: string; prevTitle: string | null } | null>(null);
+  let permissionsFor = $state<string | null>(null);
+  let permissionBusy = $state(false);
+  async function setSessionPermission(key: "read" | "message", value: boolean) {
+    const id = permissionsFor;
+    if (!id || permissionBusy) return;
+    const c = chats.find((x) => x.id === id);
+    if (!c) return;
+    permissionBusy = true;
+    const r = await serverAction("session_update", { id, permissions: { [key]: value } });
+    if (r === false) {
+      c.permissions = { ...c.permissions, [key]: value };
+      void save();
+    }
+    permissionBusy = false;
+  }
 
   async function toggleLead(id: string) {
     let c = chats.find((x) => x.id === id);
@@ -10275,6 +10304,7 @@
           <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
           <div class="ctx-sep" role="separator"></div>
           {#if (ctxChat?.mode ?? "chat") === "work"}
+            <button class="ctx-item" data-testid="permissions-item" onclick={() => { permissionsFor = ctxMenu!.chatId; ctxMenu = null; }}>Permissions…</button>
             {@const tgSnap = ctxChat ? telegramStatuses[ctxChat.id] : null}
             {@const tgState = telegramStateFor(ctxChat?.id)}
             {#if ctxChat?.role === "lead"}
@@ -11646,6 +11676,19 @@
     onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
   />
 {/if}
+{#if permissionsFor}
+  {@const permChat = chats.find((c) => c.id === permissionsFor)}
+  {#if permChat}
+    <div class="permissions-shade" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) permissionsFor = null; }} onkeydown={(e) => { if (e.key === "Escape") permissionsFor = null; }}>
+      <dialog open class="permissions-modal" aria-modal="true" aria-labelledby="permissions-title" data-testid="permissions-modal">
+        <button class="modal-x" aria-label="Close permissions" onclick={() => (permissionsFor = null)}>×</button>
+        <h2 id="permissions-title">Permissions · {permChat.title}</h2>
+        <label class="permission-row"><input type="checkbox" data-testid="permission-read" checked={sessionPermissions(permChat).read} disabled={permissionBusy} onchange={(e) => void setSessionPermission("read", e.currentTarget.checked)} /><span><b>Read other sessions</b><small>Read another session’s history or state.</small></span></label>
+        <label class="permission-row"><input type="checkbox" data-testid="permission-message" checked={sessionPermissions(permChat).message} disabled={permissionBusy} onchange={(e) => void setSessionPermission("message", e.currentTarget.checked)} /><span><b>Message other sessions</b><small>Send messages to other sessions and start turns.</small></span></label>
+      </dialog>
+    </div>
+  {/if}
+{/if}
 {#if telegramFor}
   <TelegramModal
     sessionId={telegramFor}
@@ -11939,6 +11982,13 @@
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
+  .permissions-shade { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; background: #0009; padding: 20px; }
+  .permissions-modal { position: relative; width: min(520px, 100%); padding: 24px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel, var(--bg)); box-shadow: 0 18px 70px #0008; }
+  .permissions-modal h2 { margin: 0 36px 22px 0; font-size: 18px; }
+  .permission-row { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); cursor: pointer; }
+  .permission-row input { margin-top: 3px; accent-color: var(--accent); }
+  .permission-row span { display: grid; gap: 4px; }
+  .permission-row small { color: var(--muted); }
   :global(html) { color-scheme: light; }
   :global(html[data-theme="dark"]) { color-scheme: dark; }
   :global(:root) {
