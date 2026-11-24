@@ -6604,8 +6604,8 @@
   /** slash commands: like @-mentions but triggered by a leading "/" in an
    *  otherwise empty composer (typing "/usr/…" filters, anything else hides). */
   const SLASH_COMMANDS = [
-    { name: "clear", desc: "Start fresh model context from here" },
     { name: "compact", desc: "Summarize older messages into one note to free context" },
+    { name: "clear", desc: "Clear the agent's context" },
     { name: "undo", desc: "Remove the last turn and revert its file changes" },
     { name: "redo", desc: "Re-apply the turn most recently undone" }
   ];
@@ -6629,7 +6629,7 @@
     const items: SlashItem[] = SLASH_COMMANDS.filter((c) => !head || c.name.startsWith(head)).map((c) => ({
       ...c,
       disabled:
-        c.name === "clear" ? busy :
+        c.name === "clear" ? busy || !chat || compactedHistory(chat.messages).length === 0 :
         c.name === "undo" ? !undoPossible(chat) :
         c.name === "redo" ? !redoPossible(chat) :
         false
