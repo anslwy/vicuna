@@ -1757,7 +1757,8 @@ mod lb_proxy_tests {
                 assert_eq!(req.headers()["authorization"], "Bearer vicuna-token");
                 Ok::<_, Infallible>(proxy_lb(req, upstream_port).await)
             });
-            http1::Builder::new().serve_connection(TokioIo::new(socket), request).await.unwrap();
+            // Dropping a viewer may end the connection mid-response.
+            let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), request).await;
         });
 
         #[cfg(feature = "desktop")]
@@ -1769,7 +1770,7 @@ mod lb_proxy_tests {
                 let request = service_fn(move |req| async move {
                     Ok::<_, Infallible>(crate::servers::test_lb_proxy_request(req, proxy_addr).await)
                 });
-                http1::Builder::new().serve_connection(TokioIo::new(socket), request).await.unwrap();
+                let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), request).await;
             });
             (addr, "/api/viewport-stream", task)
         };
