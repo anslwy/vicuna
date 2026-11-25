@@ -4643,18 +4643,20 @@
     if (!filterWs) return null;
     return workspaceFilterKey(composerWs) === folderOptionKey(filterWs) ? filterWs : null;
   });
-  const folderRows = $derived(folderOptions(orderedChats, activeScopeWorkspace));
+  const SHOW_ARCHIVED_KEY = "vicuna-show-archived";
+  let showArchived = $state(typeof localStorage !== "undefined" && localStorage.getItem(SHOW_ARCHIVED_KEY) === "1");
+  // archived sessions leave Pinned (the pin flag is kept for unarchive) and
+  // are hidden unless "Show archived" is on — the open one always stays
+  const listedChats = $derived(visibleChats(orderedChats, showArchived, activeId));
+  // Scope offers only folders with a listed session: with archived hidden, a
+  // folder whose sessions are all archived drops out (counts match the list)
+  const folderRows = $derived(folderOptions(listedChats, activeScopeWorkspace));
   const sessionFilter = $derived(resolveSessionFilter(sessionFilterRaw, folderRows));
   // full path of the chosen scope: a native <select> can only tooltip the
   // control, not each option, so the closed state carries the path instead
   const scopeTitle = $derived(folderRows.find((f) => f.key === sessionFilter)?.title ?? "");
   // pinned sessions sit above the date groups whatever the scope (the lead
   // stays in view); they are not repeated below
-  const SHOW_ARCHIVED_KEY = "vicuna-show-archived";
-  let showArchived = $state(typeof localStorage !== "undefined" && localStorage.getItem(SHOW_ARCHIVED_KEY) === "1");
-  // archived sessions leave Pinned (the pin flag is kept for unarchive) and
-  // are hidden unless "Show archived" is on — the open one always stays
-  const listedChats = $derived(visibleChats(orderedChats, showArchived, activeId));
   const archivedCount = $derived(chats.filter((c) => c.archived && c.messages.length > 0).length);
   const pinnedChats = $derived(listedChats.filter((c) => isPinnedRow(c)));
   const grouped = $derived(groupByDate(filterChats(listedChats.filter((c) => !isPinnedRow(c)), sessionFilter), Date.now()));
