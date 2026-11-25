@@ -70,11 +70,12 @@ export interface ChatExtra extends McpSelection {
   leadId?: string | null;
   pinned?: boolean;
   archived?: boolean;
-  permissions?: { read?: boolean; message?: boolean };
+  permissions?: { read?: boolean; message?: boolean; remote?: boolean };
 }
 
-export function sessionPermissions(extra: Partial<Pick<ChatExtra, "role" | "permissions">>): { read: boolean; message: boolean } {
-  return { read: extra.permissions?.read ?? true, message: extra.permissions?.message ?? extra.role === "lead" };
+/** `remote` = a lead may manage sessions on the user's saved servers (off unless granted). */
+export function sessionPermissions(extra: Partial<Pick<ChatExtra, "role" | "permissions">>): { read: boolean; message: boolean; remote: boolean } {
+  return { read: extra.permissions?.read ?? true, message: extra.permissions?.message ?? extra.role === "lead", remote: extra.permissions?.remote ?? false };
 }
 
 /** persisted `extra` JSON column: per-session engine/model/lead/pin */
@@ -111,9 +112,10 @@ export function parseChatExtra(raw: unknown): ChatExtra {
   if (o.pinned === true) out.pinned = true;
   if (o.archived === true) out.archived = true;
   if (o.permissions && typeof o.permissions === "object") {
-    const permissions: { read?: boolean; message?: boolean } = {};
+    const permissions: { read?: boolean; message?: boolean; remote?: boolean } = {};
     if (typeof o.permissions.read === "boolean") permissions.read = o.permissions.read;
     if (typeof o.permissions.message === "boolean") permissions.message = o.permissions.message;
+    if (typeof o.permissions.remote === "boolean") permissions.remote = o.permissions.remote;
     if (Object.keys(permissions).length) out.permissions = permissions;
   }
   if (o.mcpEnabled && typeof o.mcpEnabled === "object" && !Array.isArray(o.mcpEnabled)) {

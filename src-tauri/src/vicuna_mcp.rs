@@ -491,11 +491,12 @@ fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
         "title": "Manage worker sessions (lead controls; permissioned send)",
-        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` only. Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session, which works anywhere. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
+        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` only. Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session, which works anywhere. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). Other servers: with the user's \"Use sessions on other servers\" permission, the lead can pass `server` (the name of a server the user saved; `servers` lists them) to run `list`, `create` (needs `workspace`, an absolute folder on that machine), `send`, `status`, `stop`, `archive` and `unarchive` there; replies of reported remote workers reach you the same way. Deleting remote sessions is not allowed. When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions"] },
+                "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions", "servers"] },
+                "server": { "type": "string", "description": "Run the action on another Vicuna server the user saved (its name; see `servers`). Needs the session's \"Use sessions on other servers\" permission." },
                 "read": { "type": "boolean", "description": "permissions: allow reading other sessions' histories/state." },
                 "allow_message": { "type": "boolean", "description": "permissions: allow sending messages to other sessions." },
                 "include_archived": { "type": "boolean", "description": "list: include archived sessions, tagged [archived] (default false)." },
@@ -520,12 +521,21 @@ fn manage_sessions_schema() -> Value {
 /// Hand a session action to the window that runs this (lead) turn.
 async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::future::Future<Output = ()>) -> Value {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions"].contains(&action.as_str()) {
-        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status, set_workspace, permissions.", true);
+    if !["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions", "servers"].contains(&action.as_str()) {
+        return text_result("`action` must be one of list, create, send, stop, delete, archive, unarchive, status, set_workspace, permissions, servers.", true);
     }
     let turn = &target.turn;
     if action == "permissions" && !can_manage_permissions(turn.lead.load(Ordering::Relaxed)) {
         return text_result("Only the lead session can view or change other sessions' permissions.", true);
+    }
+    let remote = action == "servers" || args.get("server").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+    if remote {
+        if !turn.lead.load(Ordering::Relaxed) || !may_remote(&target.session_id).await {
+            return text_result("Managing sessions on other servers needs the lead session with the \"Use sessions on other servers\" permission (Permissions… in the session menu).", true);
+        }
+        if turn.stop.load(Ordering::Relaxed) {
+            return text_result("The user stopped the turn; nothing was done.", true);
+        }
     }
     // moving your own session's folder needs no lead role
     let sid = args.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
@@ -534,18 +544,18 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
         return text_result("This turn has no Vicuna session, so there is nothing to move.", true);
     }
     let messaging = action == "send" && may_message(&target.session_id).await;
-    if !can_manage_sessions_action(turn.lead.load(Ordering::Relaxed), own, &action, messaging) {
+    if !remote && !can_manage_sessions_action(turn.lead.load(Ordering::Relaxed), own, &action, messaging) {
         return text_result("manage_sessions only works in the user's lead session. The user can make a session the lead from its sidebar menu (Make lead).", true);
     }
     let read_target = if action == "list" { "__all__" } else { sid };
     let reads_other = action == "list" || action == "status";
-    if reads_other && !may_read_other(Some(target), read_target).await {
+    if !remote && reads_other && !may_read_other(Some(target), read_target).await {
         return text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true);
     }
     if turn.stop.load(Ordering::Relaxed) {
         return text_result("The user stopped the turn; nothing was done.", true);
     }
-    if action == "list" {
+    if action == "list" && !remote {
         // read-only: straight from the database, no window needed
         let pool = match db_pool().await {
             Ok(p) => p,
@@ -595,6 +605,27 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     } else {
         text_result(v.get("error").and_then(Value::as_str).unwrap_or("the app refused the action"), true)
     }
+}
+
+fn remote_server(args: &Value) -> Option<String> {
+    args.get("server").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Reading another server needs only the `remote` permission (not the lead):
+/// "continue session X from my computer" is usually asked of a worker.
+async fn remote_gate(target: Option<&Target>) -> Result<(), String> {
+    let sid = target.and_then(|t| t.session_id.clone());
+    if sid.is_some() && may_remote(&sid).await { Ok(()) } else {
+        Err("Reading sessions on other servers needs this session's \"Use sessions on other servers\" permission (Permissions… in the session menu).".into())
+    }
+}
+
+async fn may_remote(session_id: &Option<String>) -> bool {
+    let Some(id) = session_id.as_deref() else { return false };
+    let Ok(pool) = db_pool().await else { return false };
+    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(&pool).await.ok().flatten();
+    let extra = row.and_then(|r| r.try_get::<Option<String>, _>("extra").ok().flatten()).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+    effective_permission(&extra, "remote")
 }
 
 async fn may_message(session_id: &Option<String>) -> bool {
@@ -649,6 +680,7 @@ fn read_session_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
+                "server": { "type": "string", "description": "Read from another Vicuna server the user saved (its name; `manage_sessions` action `servers` lists them), e.g. a session on the user's own computer. Needs this session's \"Use sessions on other servers\" permission." },
                 "session_id": { "type": "string", "description": "Vicuna session ID to read. Defaults to the current session if omitted." },
                 "offset": { "type": "integer", "minimum": 0, "description": "0-based message index to start from (default 0)." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of messages to return (default 20, max 100)." },
@@ -709,6 +741,7 @@ fn search_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
+                "server": { "type": "string", "description": "Search another Vicuna server the user saved (its name; `manage_sessions` action `servers` lists them), e.g. a session on the user's own computer. Needs this session's \"Use sessions on other servers\" permission." },
                 "query": { "type": "string", "description": "Text to find (case-insensitive substring)." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max results (default 10)." },
                 "include_archived": { "type": "boolean", "description": "Include archived sessions (default false)." }
@@ -1240,6 +1273,16 @@ async fn read_session_from_pool(
 }
 
 async fn read_session(target: Option<&Target>, args: &Value) -> Value {
+    if let Some(server) = remote_server(args) {
+        if let Err(e) = remote_gate(target).await { return text_result(&e, true); }
+        let Some(id) = args.get("session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            return text_result("`session_id` is required with `server` (find it with search_sessions or manage_sessions list on that server).", true);
+        };
+        return match crate::server::remote_lead::read(&server, id, args).await {
+            Ok(t) => text_result(&t, false),
+            Err(e) => text_result(&e, true),
+        };
+    }
     let requested = args
         .get("session_id")
         .and_then(Value::as_str)
@@ -1300,7 +1343,17 @@ async fn session_overview(args: &Value) -> Value {
     }
 }
 
-async fn search_sessions(args: &Value) -> Value {
+async fn search_sessions(target: Option<&Target>, args: &Value) -> Value {
+    if let Some(server) = remote_server(args) {
+        if let Err(e) = remote_gate(target).await { return text_result(&e, true); }
+        let q = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+        if q.is_empty() { return text_result("`query` is required.", true); }
+        let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(10);
+        return match crate::server::remote_lead::search(&server, q, limit).await {
+            Ok(t) => text_result(&t, false),
+            Err(e) => text_result(&e, true),
+        };
+    }
     let pool = match db_pool().await {
         Ok(p) => p,
         Err(e) => return text_result(&e, true),
@@ -2029,7 +2082,7 @@ async fn handle_rpc(
                 (Some(t), MANAGE_SCHEDULE_TOOL) => manage_schedule(t, &args, client_gone).await,
                 (t, LIST_SESSIONS_TOOL) => if may_read_other(t, "__all__").await { list_sessions(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
                 (t, OVERVIEW_TOOL) => if may_read_other(t, "__all__").await { session_overview(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
-                (t, SEARCH_TOOL) => if may_read_other(t, "__all__").await { search_sessions(&args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
+                (t, SEARCH_TOOL) => if remote_server(&args).is_some() || may_read_other(t, "__all__").await { search_sessions(t, &args).await } else { text_result("This session is not allowed to read other sessions (Permissions… in the session menu).", true) },
                 (_, USAGE_TOOL) => usage_status(&args).await,
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (_, MANAGE_SKILLS_TOOL) => manage_skills(target, &args).await,
@@ -2302,6 +2355,8 @@ mod tests {
         assert!(effective_permission(&json!({"role":"lead"}), "message"));
         assert!(!effective_permission(&json!({"role":"lead", "permissions":{"message":false}}), "message"));
         assert!(!effective_permission(&json!({"permissions":{"read":false}}), "read"));
+        assert!(!effective_permission(&json!({"role":"lead"}), "remote"), "remote is opt-in, even for the lead");
+        assert!(effective_permission(&json!({"role":"lead", "permissions":{"remote":true}}), "remote"));
         assert!(can_read_other(Some("same"), "same", None), "own session reads are unconditional");
         assert!(can_read_other(None, "other", None), "turns without a session id retain access");
         assert!(!can_read_other(Some("worker"), "other", None), "a missing permission row denies");
