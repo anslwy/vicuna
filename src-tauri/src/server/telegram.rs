@@ -1364,6 +1364,9 @@ fn ask_keyboard(session: &str, options: &[String]) -> Option<Value> {
 
 // ---------- mirroring a session turn ----------
 
+/// How often the "typing…" chat action is refreshed while a turn runs.
+const TYPING_EVERY: Duration = Duration::from_secs(4);
+
 fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_id: String) {
     {
         let Ok(mut r) = rt().lock() else { return };
@@ -1376,13 +1379,22 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
         let mut shown = String::new();
         let mut last_edit = std::time::Instant::now();
         let mut asked: Option<String> = None;
+        let mut last_typing: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(Duration::from_millis(1500)).await;
             let live = live_turn(&st, &session).map(|(t, _)| t);
             if live.as_deref() != Some(turn_id.as_str()) {
                 break;
             }
-            if let Some((text, ask)) = live_view(&st, &session) {
+            let view_now = live_view(&st, &session);
+            // "typing…" while the model works; a chat action lasts ~5 s, so
+            // refresh every 4 s. Paused while a question waits on the user.
+            let waiting = matches!(&view_now, Some((_, Some(_))));
+            if !waiting && last_typing.map_or(true, |t| t.elapsed() >= TYPING_EVERY) {
+                let _ = call(&token, "sendChatAction", json!({"chat_id": chat, "action": "typing"})).await;
+                last_typing = Some(std::time::Instant::now());
+            }
+            if let Some((text, ask)) = view_now {
                 if let Some(a) = ask {
                     let id = a.get("ask_id").and_then(Value::as_str).unwrap_or("").to_string();
                     if asked.as_deref() != Some(id.as_str()) {
