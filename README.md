@@ -90,7 +90,7 @@ Browse Explore for themes, sandboxed panels, messaging bridges, and third-party 
 
 ### Desktop app
 
-macOS builds (`.dmg` and CLI) are Apple Developer ID signed and notarized.
+macOS builds (`.dmg` and CLI) are Apple Developer ID signed and notarized. Windows releases use [SignPath](CODE_SIGNING_POLICY.md) Authenticode signing (free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/)).
 
 **macOS / Linux:**
 

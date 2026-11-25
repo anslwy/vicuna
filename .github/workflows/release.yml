@@ -279,11 +279,29 @@ jobs:
         shell: bash
         run: sh scripts/fetch-lb-sidecar.sh
 
+      - name: Check Windows SignPath config
+        id: signpath
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ] && [ -n "${SIGNPATH_API_TOKEN:-}" ] && [ -n "${SIGNPATH_ORGANIZATION_ID:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [ -n "${{ inputs.version }}" ]; then
+              echo "::warning::SIGNPATH_API_TOKEN / SIGNPATH_ORGANIZATION_ID not set — skipping Windows Authenticode signing."
+            fi
+          fi
+
+      # Unsigned path (dev builds, or releases before SignPath secrets are set):
       # nsis = single self-contained setup.exe (the default "all" target
       # would also build an .msi, which needs a WiX toolchain on the runner)
       # (nsis is updater-enabled: with the signing secret it also emits
       # the -setup.exe.sig the Tauri updater verifies)
-      - name: Build setup.exe
+      - name: Build setup.exe (unsigned)
+        if: steps.signpath.outputs.enabled != 'true'
         shell: bash
         run: |
           args=(--bundles nsis)
@@ -292,6 +310,103 @@ jobs:
             args+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
           fi
           npx tauri build "${args[@]}"
+
+      # Signed path (versioned releases with SignPath Foundation):
+      # 1. Build vicuna.exe without bundling.
+      # 2. Sign vicuna.exe + bundled lb.exe via SignPath and verify signatures.
+      # 3. Bundle NSIS with --no-binary-patching so vicuna.exe keeps its signature.
+      # 4. Sign Vicuna_<version>_x64-setup.exe via SignPath and verify signature.
+      # 5. Re-sign the signed setup.exe with Tauri's updater key so .sig matches.
+      - name: Build Windows binary (no bundle)
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: bash
+        run: npx tauri build --no-bundle
+
+      - name: Upload unsigned Windows binaries for SignPath
+        if: steps.signpath.outputs.enabled == 'true'
+        id: upload-win-bins
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows-binaries
+          path: |
+            src-tauri/target/release/vicuna.exe
+            src-tauri/lb-sidecar/lb.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign Windows binaries via SignPath
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'vicuna' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.upload-win-bins.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-windows-bins
+
+      - name: Install and verify signed Windows binaries
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $vicuna = Get-ChildItem -Path signed-windows-bins -Recurse -Filter "vicuna.exe" | Select-Object -First 1
+          $lb = Get-ChildItem -Path signed-windows-bins -Recurse -Filter "lb.exe" | Select-Object -First 1
+          if (-not $vicuna) { throw "Signed vicuna.exe not found in signed-windows-bins" }
+          if (-not $lb) { throw "Signed lb.exe not found in signed-windows-bins" }
+          Copy-Item -Force $vicuna.FullName "src-tauri/target/release/vicuna.exe"
+          Copy-Item -Force $lb.FullName "src-tauri/lb-sidecar/lb.exe"
+          foreach ($f in @("src-tauri/target/release/vicuna.exe", "src-tauri/lb-sidecar/lb.exe")) {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f : $($sig.Status) ($($sig.SignerCertificate.Subject))"
+            if ($sig.Status -ne 'Valid') { throw "Invalid Authenticode signature on $f`: $($sig.Status)" }
+          }
+
+      - name: Bundle NSIS setup.exe (preserving signed binaries)
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: bash
+        run: npx tauri bundle --bundles nsis --no-sign --no-binary-patching
+
+      - name: Upload unsigned NSIS setup.exe for SignPath
+        if: steps.signpath.outputs.enabled == 'true'
+        id: upload-win-nsis
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/Vicuna_${{ inputs.version }}_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign NSIS setup.exe via SignPath
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'vicuna' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.upload-win-nsis.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-windows-nsis
+
+      - name: Install and verify signed NSIS setup.exe
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $dest = "src-tauri/target/release/bundle/nsis/Vicuna_${{ inputs.version }}_x64-setup.exe"
+          $signed = Get-ChildItem -Path signed-windows-nsis -Recurse -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $signed) { throw "Signed setup.exe not found in signed-windows-nsis" }
+          Copy-Item -Force $signed.FullName $dest
+          $sig = Get-AuthenticodeSignature $dest
+          Write-Host "$dest : $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          if ($sig.Status -ne 'Valid') { throw "Invalid Authenticode signature on $dest`: $($sig.Status)" }
+
+      - name: Re-sign NSIS setup.exe for Tauri updater
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          npx tauri signer sign --app-version "${{ inputs.version }}" \
+            "src-tauri/target/release/bundle/nsis/Vicuna_${{ inputs.version }}_x64-setup.exe"
 
       - name: Upload release artifacts
         if: ${{ inputs.version }}
