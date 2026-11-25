@@ -240,7 +240,7 @@ pub async fn dispatch(st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<
                 }
             }
             if let Some(p) = args.get("permissions").filter(|v| v.is_object()) {
-                for k in ["read", "message"] {
+                for k in ["read", "message", "remote"] {
                     if let Some(b) = p.get(k).and_then(Value::as_bool) {
                         extra["permissions"][k] = json!(b);
                     }

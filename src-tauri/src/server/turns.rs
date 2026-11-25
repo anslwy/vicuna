@@ -223,7 +223,9 @@ fn work_channel(
         }
         // Server-owned session management must keep worker chains moving
         // even with every window asleep. Deletion retains the user card.
-        if kind == "sessioncontrol" && st.db.is_some() && v.get("action").and_then(Value::as_str) != Some("delete") {
+        // (a delete aimed at another server is refused there, so it stays here too)
+        let remote_ctl = v["args"].get("server").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+        if kind == "sessioncontrol" && st.db.is_some() && (remote_ctl || v.get("action").and_then(Value::as_str) != Some("delete")) {
             if let Some(sid) = session_id.clone() {
                 let (st, turn) = (st.clone(), turn.clone());
                 tokio::spawn(async move {
@@ -504,6 +506,9 @@ pub async fn start_server_turn(st: &Arc<BridgeState>, chat_id: &str, user_msgs: 
 /// Non-destructive lead actions run against the server database. User
 /// confirmation for delete remains with the connected window.
 async fn session_control(st: &Arc<BridgeState>, lead_id: &str, action: &str, args: &Value) -> Result<String, String> {
+    if action == "servers" || args.get("server").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+        return super::remote_lead::control(st, lead_id, action, args).await;
+    }
     let db = st.db.as_ref().ok_or("no server db")?;
     let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
     let report = args.get("report").and_then(Value::as_bool) != Some(false);

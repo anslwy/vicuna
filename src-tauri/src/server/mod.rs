@@ -29,6 +29,7 @@ pub mod embedded;
 pub(crate) mod lb_http;
 pub mod persist;
 pub mod turns;
+pub mod remote_lead;
 mod session_tools;
 mod self_upgrade;
 pub mod telegram;
@@ -1613,6 +1614,7 @@ pub async fn bind(cfg: &Config) -> Result<Bound, String> {
         turns::spawn_scheduler(state.clone());
         telegram::spawn(state.clone());
         bridge_plugins::spawn(state.clone());
+        remote_lead::spawn(state.clone());
 
     }
     spawn_term_reaper(state.clone());
