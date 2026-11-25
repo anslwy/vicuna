@@ -58,6 +58,11 @@ pub fn candidate_ports(base: u16) -> Vec<u16> {
     (1..=10u16).filter_map(|i| base.checked_add(i)).collect()
 }
 
+/// Full port range Vicuna manages for its `lb` sidecar (`base` plus fallbacks).
+pub fn managed_ports(base: u16) -> Vec<u16> {
+    std::iter::once(base).chain(candidate_ports(base)).collect()
+}
+
 pub fn lb_server_url() -> String {
     format!("http://127.0.0.1:{}", lb_port())
 }
@@ -1215,12 +1220,30 @@ pub async fn browser_start_logic(
     state: &BrowserState,
 ) -> Result<BrowserStatus, String> {
     let client = probe_client();
+    if owned_child_alive(state) && matches!(probe_daemon(&client).await, Probe::Lb(_)) {
+        return browser_status_logic(resource_dir, state).await;
+    }
+    let (bin, source) = resource_dir
+        .as_deref()
+        .and_then(|r| resolve_lb_bin(Some(r)))
+        .or_else(|| resolve_lb_bin(None))
+        .ok_or_else(|| {
+            "no `lb` browser engine found (bundled sidecar missing and `lb` not on PATH) — install live-browser (https://github.com/anslwy/live-browser) or rebuild with scripts/fetch-lb-sidecar.sh".to_string()
+        })?;
+    if source == LbSource::Bundled {
+        ensure_exec_bit(&bin);
+    }
+    // Reap orphaned Vicuna-owned `lb` daemons across our managed port range
+    // (left behind by prior crashes, force-quits, or app updates) before
+    // choosing a port. Live sibling Vicuna instances and unrelated user-run
+    // `lb` daemons are left untouched.
+    reap_orphaned_vicuna_daemons(&bin).await;
+    // Reset to the base port whenever we have no live owned child so we
+    // reclaim 18765 once orphans are cleared instead of sticking on a fallback.
+    set_active_port(base_port());
     match probe_daemon(&client).await {
-        Probe::Lb(_) if owned_child_alive(state) => {
-            return browser_status_logic(resource_dir, state).await;
-        }
         Probe::Lb(_) => {
-            // Another lb (another binary or version, or a personal `lb web`)
+            // Another live lb (a live sibling Vicuna or a personal `lb web`)
             // holds the base port. Never reuse it: run ours on a free port.
             let port = first_free_candidate(&client).await.ok_or_else(|| {
                 format!(
@@ -1235,16 +1258,6 @@ pub async fn browser_start_logic(
             return Err(format!("port {} is busy ({e}) — stop it first", lb_port()));
         }
         Probe::Free => {}
-    }
-    let (bin, source) = resource_dir
-        .as_deref()
-        .and_then(|r| resolve_lb_bin(Some(r)))
-        .or_else(|| resolve_lb_bin(None))
-        .ok_or_else(|| {
-            "no `lb` browser engine found (bundled sidecar missing and `lb` not on PATH) — install live-browser (https://github.com/anslwy/live-browser) or rebuild with scripts/fetch-lb-sidecar.sh".to_string()
-        })?;
-    if source == LbSource::Bundled {
-        ensure_exec_bit(&bin);
     }
     // CloakBrowser first (Vicuna's default engine; downloaded on first run),
     // then any installed system Chromium. The fallback exists because a
@@ -1302,11 +1315,17 @@ pub async fn browser_start_logic(
         let extra = vec!["--chrome".to_string(), target.clone()];
         match spawn_attempt(&bin, source, &extra, &client).await {
             Ok(child) => {
+                let lb_pid = child.id();
                 state
                     .child
                     .lock()
                     .map_err(|_| "browser state poisoned".to_string())?
                     .replace(child);
+                write_vicuna_owner_record_at(
+                    &vicuna_owner_file(lb_port()),
+                    lb_pid,
+                    std::process::id(),
+                );
                 remember_bin(state, &bin);
                 let version = probe_lb_version(&bin).await;
                 if let Ok(mut g) = state.spawned_version.lock() {
@@ -1507,14 +1526,13 @@ fn with_log_tail(msg: String, log_path: &Path) -> String {
 }
 
 /// Graceful `lb web --port P stop` (TERM→KILL the daemon plus reaping
-/// its Chromium). Only ever called for OUR child (checked alive first —
-/// the port is ours then, so `stop` can't hit a foreign daemon).
-async fn graceful_stop(bin: &Path) {
+/// its Chromium). Scoped to `port` + our private `profile-vicuna` dir.
+async fn graceful_stop_port(bin: &Path, port: u16) {
     let mut cmd = tokio::process::Command::new(bin);
     // `--profile` matters: `stop` reaps browsers holding THAT profile. Without
     // it lb reaps its default profile dir, leaving our private
     // `profile-vicuna(-cloak)` Chromium alive to lock the next launch.
-    cmd.args(["web", "--port", &lb_port().to_string()])
+    cmd.args(["web", "--port", &port.to_string()])
         .args(["--profile", &vicuna_profile_dir().display().to_string()])
         .arg("stop")
         .stdin(Stdio::null())
@@ -1524,6 +1542,13 @@ async fn graceful_stop(bin: &Path) {
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
     let run = cmd.output();
     let _ = tokio::time::timeout(Duration::from_secs(15), run).await;
+}
+
+/// Graceful `lb web --port P stop` for the current active port. Only ever
+/// called for OUR child (checked alive first — the port is ours then, so
+/// `stop` can't hit a foreign daemon).
+async fn graceful_stop(bin: &Path) {
+    graceful_stop_port(bin, lb_port()).await;
 }
 
 /// Is `pid` a live process? Mirrors lb's own liveness probe (never signals).
@@ -1566,6 +1591,301 @@ fn daemon_pidfile_path() -> PathBuf {
     lb_cache_base()
         .join("live-browser")
         .join(format!("daemon-{}.pid", lb_port()))
+}
+
+/// Vicuna-owned daemon ownership record (`<lb_pid> <vicuna_pid>`) written next
+/// to lb's own `daemon-<port>.pid`. Lets a restarted Vicuna identify daemons
+/// left behind by a dead Vicuna instance on all platforms (including Windows).
+pub fn vicuna_owner_file_under(base: &Path, port: u16) -> PathBuf {
+    base.join("live-browser")
+        .join(format!("vicuna-owner-{port}.pid"))
+}
+
+fn vicuna_owner_file(port: u16) -> PathBuf {
+    vicuna_owner_file_under(&lb_cache_base(), port)
+}
+
+pub fn parse_vicuna_owner_record(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.split_whitespace();
+    let lb_pid = parts.next()?.parse::<u32>().ok()?;
+    let owner_pid = parts.next()?.parse::<u32>().ok()?;
+    if lb_pid == 0 || owner_pid == 0 {
+        return None;
+    }
+    Some((lb_pid, owner_pid))
+}
+
+fn write_vicuna_owner_record_at(path: &Path, lb_pid: u32, owner_pid: u32) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{lb_pid} {owner_pid}\n"));
+}
+
+fn remove_vicuna_owner_record_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Snapshot row from `ps -eww -o pid=,ppid=,args=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    pub args: String,
+}
+
+/// Parse `ps -eww -o pid=,ppid=,args=` output into `ProcEntry` rows.
+pub fn parse_ps_output(output: &str) -> Vec<ProcEntry> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(sp1) = trimmed.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = trimmed[..sp1].parse::<u32>() else {
+            continue;
+        };
+        let rest = trimmed[sp1..].trim_start();
+        let Some(sp2) = rest.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(ppid) = rest[..sp2].parse::<u32>() else {
+            continue;
+        };
+        let args = rest[sp2..].trim().to_string();
+        if !args.is_empty() {
+            out.push(ProcEntry { pid, ppid, args });
+        }
+    }
+    out
+}
+
+/// Extract `--port <N>` or `--port=<N>` from a command line.
+pub fn extract_port_arg(args: &str) -> Option<u16> {
+    let mut iter = args.split_whitespace();
+    while let Some(tok) = iter.next() {
+        if tok == "--port" {
+            return iter.next().and_then(|v| v.parse::<u16>().ok());
+        }
+        if let Some(v) = tok.strip_prefix("--port=") {
+            return v.parse::<u16>().ok();
+        }
+    }
+    None
+}
+
+/// True when `args` is a long-running `lb web` daemon (not `lb web stop`,
+/// `lb kill`, `lb mcp`, or an unrelated binary).
+pub fn is_lb_web_daemon_args(args: &str) -> bool {
+    let Some((bin_part, rest)) = args.split_once(" web ") else {
+        return false;
+    };
+    let bin_name = bin_part
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_matches(['"', '\'']);
+    if !matches!(bin_name, "lb" | "lb-arm64" | "lb-x64" | "lb.exe") {
+        return false;
+    }
+    !rest
+        .split_whitespace()
+        .any(|t| matches!(t, "stop" | "kill" | "status"))
+}
+
+/// True when `args` is a Vicuna-launched `lb web` daemon (matches Vicuna's
+/// private `profile-vicuna` profile dir or bundled `lb-sidecar` binary path).
+/// Never matches a personal user-run `lb web` on a different profile.
+pub fn is_vicuna_owned_lb_args(args: &str, profile_dir: &Path) -> bool {
+    if !is_lb_web_daemon_args(args) {
+        return false;
+    }
+    let Some((bin_part, rest)) = args.split_once(" web ") else {
+        return false;
+    };
+    let profile_str = profile_dir.to_string_lossy();
+    let has_profile = (!profile_str.is_empty() && rest.contains(profile_str.as_ref()))
+        || rest.contains("live-browser/profile-vicuna")
+        || rest.contains("live-browser\\profile-vicuna");
+    let has_sidecar = bin_part.contains("/lb-sidecar/") || bin_part.contains("\\lb-sidecar\\");
+    has_profile || has_sidecar
+}
+
+/// True when a parent process command line is an OS orphan reaper (`launchd`,
+/// `init`, `systemd --user`, `tini`, etc.), as opposed to a live Vicuna
+/// instance or a user's interactive shell.
+pub fn is_orphan_reaper_args(args: &str) -> bool {
+    let Some(first) = args.split_whitespace().next() else {
+        return false;
+    };
+    let cleaned = first.trim_matches(|c| c == '(' || c == ')' || c == ':' || c == '-');
+    let base = cleaned.rsplit(['/', '\\']).next().unwrap_or(cleaned);
+    matches!(
+        base,
+        "launchd" | "init" | "systemd" | "upstart" | "tini" | "dumb-init"
+    )
+}
+
+/// Identify orphaned Vicuna-owned `lb` daemons in `procs` occupying any port
+/// in `managed`. Returns sorted, deduplicated `(port, pid)` pairs.
+///
+/// A daemon is considered orphaned only when BOTH:
+/// 1. Its command line identifies it as Vicuna-owned (`profile-vicuna` or
+///    bundled `lb-sidecar`) on a port in `managed`.
+/// 2. Its parent is gone (`ppid <= 1`, missing from `procs`, or an OS orphan
+///    reaper like `launchd`/`systemd`/`init`). Daemons whose parent is a live
+///    sibling Vicuna (or a user's shell) are never returned.
+pub fn find_orphaned_vicuna_daemons(
+    procs: &[ProcEntry],
+    managed: &[u16],
+    profile_dir: &Path,
+    self_pid: u32,
+) -> Vec<(u16, u32)> {
+    let by_pid: std::collections::HashMap<u32, &ProcEntry> =
+        procs.iter().map(|p| (p.pid, p)).collect();
+    let mut found: Vec<(u16, u32)> = Vec::new();
+    for p in procs {
+        if p.pid == 0 || p.pid == self_pid || p.ppid == self_pid {
+            continue;
+        }
+        if !is_vicuna_owned_lb_args(&p.args, profile_dir) {
+            continue;
+        }
+        let Some(port) = extract_port_arg(&p.args) else {
+            continue;
+        };
+        if !managed.contains(&port) {
+            continue;
+        }
+        let orphaned = if p.ppid <= 1 {
+            true
+        } else {
+            match by_pid.get(&p.ppid) {
+                None => true,
+                Some(parent) => is_orphan_reaper_args(&parent.args),
+            }
+        };
+        if orphaned {
+            found.push((port, p.pid));
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+#[cfg(unix)]
+fn snapshot_processes() -> Vec<ProcEntry> {
+    Command::new("ps")
+        .args(["-eww", "-o", "pid=,ppid=,args="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_ps_output(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, sig: &str) {
+    let _ = Command::new("kill")
+        .arg(sig)
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Detect and cleanly stop orphaned Vicuna-owned `lb` daemons across
+/// `base_port()..=base_port()+10`. Uses both Unix process inspection (catching
+/// orphans from older Vicuna builds that predated owner pidfiles) and
+/// `vicuna-owner-<port>.pid` records.
+async fn reap_orphaned_vicuna_daemons(bin: &Path) {
+    let managed = managed_ports(base_port());
+    let profile_dir = vicuna_profile_dir();
+    let self_pid = std::process::id();
+    let mut targets: Vec<(u16, u32)> = Vec::new();
+
+    #[cfg(unix)]
+    let procs = {
+        let procs = snapshot_processes();
+        targets.extend(find_orphaned_vicuna_daemons(
+            &procs,
+            &managed,
+            &profile_dir,
+            self_pid,
+        ));
+        procs
+    };
+
+    // Also consult Vicuna's own owner pidfiles (handles Windows and any case
+    // where `ps` output was unavailable).
+    for &port in &managed {
+        let path = vicuna_owner_file(port);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some((lb_pid, owner_pid)) = parse_vicuna_owner_record(&text) else {
+            remove_vicuna_owner_record_at(&path);
+            continue;
+        };
+        if !pid_alive(lb_pid) {
+            remove_vicuna_owner_record_at(&path);
+            continue;
+        }
+        if owner_pid != self_pid && !pid_alive(owner_pid) {
+            #[cfg(unix)]
+            let verified = procs
+                .iter()
+                .find(|p| p.pid == lb_pid)
+                .is_none_or(|p| is_vicuna_owned_lb_args(&p.args, &profile_dir));
+            #[cfg(not(unix))]
+            let verified = true;
+            if verified && !targets.iter().any(|&(p, pid)| p == port && pid == lb_pid) {
+                targets.push((port, lb_pid));
+            }
+        }
+    }
+
+    for (port, pid) in targets {
+        stop_orphaned_daemon(bin, port, pid).await;
+    }
+}
+
+async fn stop_orphaned_daemon(bin: &Path, port: u16, pid: u32) {
+    graceful_stop_port(bin, port).await;
+    #[cfg(unix)]
+    if pid_alive(pid) {
+        signal_pid(pid, "-TERM");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if pid_alive(pid) {
+            signal_pid(pid, "-KILL");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Reap any Chromium that was holding our private profile SingletonLock
+        graceful_stop_port(bin, port).await;
+    }
+    #[cfg(windows)]
+    if pid_alive(pid) {
+        let mut kill_cmd = tokio::process::Command::new(bin);
+        kill_cmd
+            .args(["kill", "--port", &port.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000);
+        let _ = tokio::time::timeout(Duration::from_secs(10), kill_cmd.output()).await;
+    }
+    remove_vicuna_owner_record_at(&vicuna_owner_file(port));
 }
 
 /// Stop the daemon Vicuna itself started. Refuses adopted/foreign ones
@@ -1611,6 +1931,7 @@ pub async fn browser_stop_logic(state: &BrowserState) -> Result<BrowserStatus, S
             graceful_stop(&bin).await;
         }
     }
+    remove_vicuna_owner_record_at(&vicuna_owner_file(lb_port()));
     browser_status_logic(None, state).await
 }
 
@@ -1772,15 +2093,24 @@ pub async fn stop_owned(state: &BrowserState) {
             let _ = tokio::time::timeout(Duration::from_secs(3), graceful_stop(bin)).await;
         }
     }
+    remove_vicuna_owner_record_at(&vicuna_owner_file(lb_port()));
 }
 
 /// Kill the owned daemon at Quit (never an adopted one — it isn't
-/// tracked). Fire-and-forget `lb web --port P stop` first so the daemon's
-/// Chromium is reaped even though the app exits without waiting for it.
+/// tracked). Safe to call more than once (returns immediately once the
+/// tracked child has been taken). Fire-and-forget `lb web --port P stop`
+/// first so the daemon's Chromium is reaped even though the app exits
+/// without waiting for it.
 pub fn kill_owned(state: &BrowserState) {
+    let child = state.child.lock().ok().and_then(|mut g| g.take());
+    let Some(mut child) = child else {
+        return;
+    };
+    let port = lb_port();
+    remove_vicuna_owner_record_at(&vicuna_owner_file(port));
     if let Some(bin) = owned_bin(state) {
         let mut reap = Command::new(&bin);
-        reap.args(["web", "--port", &lb_port().to_string()])
+        reap.args(["web", "--port", &port.to_string()])
             .args(["--profile", &vicuna_profile_dir().display().to_string()])
             .arg("stop")
             .stdin(Stdio::null())
@@ -1790,12 +2120,8 @@ pub fn kill_owned(state: &BrowserState) {
         reap.creation_flags(0x08000000); // CREATE_NO_WINDOW
         let _ = reap.spawn();
     }
-    if let Ok(mut g) = state.child.lock() {
-        if let Some(mut child) = g.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -2277,5 +2603,223 @@ mod tests {
         assert_eq!(p.percent, Some(43));
         parse_download_stderr_line("Extracting archive...", &mut p);
         assert_eq!(p.phase, "extracting");
+    }
+
+    #[test]
+    fn managed_ports_includes_base_and_fallbacks() {
+        let ports = managed_ports(18765);
+        assert_eq!(ports.len(), 11);
+        assert_eq!(ports.first(), Some(&18765));
+        assert_eq!(ports.last(), Some(&18775));
+    }
+
+    #[test]
+    fn vicuna_owner_record_round_trips_and_rejects_invalid() {
+        let dir = std::env::temp_dir().join(format!("vicuna-lb-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = vicuna_owner_file_under(&dir, 18765);
+        write_vicuna_owner_record_at(&path, 4242, 1234);
+        let text = std::fs::read_to_string(&path).expect("owner file written");
+        assert_eq!(parse_vicuna_owner_record(&text), Some((4242, 1234)));
+        remove_vicuna_owner_record_at(&path);
+        assert!(!path.exists());
+
+        assert_eq!(parse_vicuna_owner_record(""), None);
+        assert_eq!(parse_vicuna_owner_record("4242"), None);
+        assert_eq!(parse_vicuna_owner_record("0 1234"), None);
+        assert_eq!(parse_vicuna_owner_record("4242 0"), None);
+        assert_eq!(parse_vicuna_owner_record("abc def"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_ps_output_handles_macos_and_linux_lines() {
+        let sample = "\
+  1   0 /sbin/launchd
+ 42   1 /Applications/My Apps/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18765 --foreground --profile /Users/a b/Library/Caches/live-browser/profile-vicuna
+bad line
+999 42 /usr/bin/sleep 60
+";
+        let rows = parse_ps_output(sample);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ProcEntry { pid: 1, ppid: 0, args: "/sbin/launchd".into() });
+        assert_eq!(rows[1].pid, 42);
+        assert_eq!(rows[1].ppid, 1);
+        assert!(rows[1].args.contains("lb-arm64 web --port 18765"));
+        assert_eq!(rows[2].pid, 999);
+        assert_eq!(rows[2].ppid, 42);
+    }
+
+    #[test]
+    fn extract_port_arg_handles_space_and_equals() {
+        assert_eq!(extract_port_arg("lb web --port 18765 --foreground"), Some(18765));
+        assert_eq!(extract_port_arg("lb web --port=18770 --foreground"), Some(18770));
+        assert_eq!(extract_port_arg("lb web --foreground"), None);
+        assert_eq!(extract_port_arg("lb web --port notanumber"), None);
+    }
+
+    #[test]
+    fn vicuna_owned_lb_args_distinguishes_vicuna_from_personal_daemons() {
+        let profile = Path::new("/Users/alice/Library/Caches/live-browser/profile-vicuna");
+
+        // Bundled sidecar + Vicuna profile
+        assert!(is_vicuna_owned_lb_args(
+            "/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18765 --foreground --profile /Users/alice/Library/Caches/live-browser/profile-vicuna",
+            profile,
+        ));
+        // PATH lb + Vicuna profile
+        assert!(is_vicuna_owned_lb_args(
+            "/opt/homebrew/bin/lb web --port 18766 --foreground --profile /Users/alice/Library/Caches/live-browser/profile-vicuna",
+            profile,
+        ));
+        // Bundled sidecar even without explicit profile arg
+        assert!(is_vicuna_owned_lb_args(
+            "/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18765 --foreground",
+            profile,
+        ));
+
+        // Personal user-run lb daemons MUST NOT match
+        assert!(!is_vicuna_owned_lb_args(
+            "/opt/homebrew/bin/lb web --port 18765 --foreground",
+            profile,
+        ));
+        assert!(!is_vicuna_owned_lb_args(
+            "/opt/homebrew/bin/lb web --port 18765 --profile /Users/alice/my-profile",
+            profile,
+        ));
+        // Control subcommands and unrelated binaries MUST NOT match
+        assert!(!is_vicuna_owned_lb_args(
+            "/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18765 --profile /Users/alice/Library/Caches/live-browser/profile-vicuna stop",
+            profile,
+        ));
+        assert!(!is_vicuna_owned_lb_args(
+            "/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 mcp",
+            profile,
+        ));
+        assert!(!is_vicuna_owned_lb_args(
+            "/usr/bin/node web --port 18765 --profile /Users/alice/Library/Caches/live-browser/profile-vicuna",
+            profile,
+        ));
+    }
+
+    #[test]
+    fn orphan_reaper_detection_matches_os_reapers_only() {
+        assert!(is_orphan_reaper_args("/sbin/launchd"));
+        assert!(is_orphan_reaper_args("/sbin/init splash"));
+        assert!(is_orphan_reaper_args("/lib/systemd/systemd --user"));
+        assert!(is_orphan_reaper_args("(systemd)"));
+        assert!(is_orphan_reaper_args("/usr/bin/tini -- /app"));
+        assert!(!is_orphan_reaper_args("/Applications/Vicuna.app/Contents/MacOS/Vicuna"));
+        assert!(!is_orphan_reaper_args("-zsh"));
+        assert!(!is_orphan_reaper_args("/bin/bash"));
+    }
+
+    #[test]
+    fn find_orphaned_vicuna_daemons_reaps_all_11_orphans_and_spares_live_and_personal() {
+        let profile = Path::new("/Users/alice/Library/Caches/live-browser/profile-vicuna");
+        let managed = managed_ports(18765);
+        let self_pid = 9000;
+
+        // Reproduce the reported 11-orphan accumulation on macOS (PPID=1)
+        let eleven: Vec<ProcEntry> = (0..11u16)
+            .map(|i| ProcEntry {
+                pid: 2000 + u32::from(i),
+                ppid: 1,
+                args: format!(
+                    "/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port {} --foreground --profile {}",
+                    18765 + i,
+                    profile.display()
+                ),
+            })
+            .collect();
+        let found = find_orphaned_vicuna_daemons(&eleven, &managed, profile, self_pid);
+        assert_eq!(found.len(), 11);
+        assert_eq!(found[0], (18765, 2000));
+        assert_eq!(found[10], (18775, 2010));
+
+        // Mixed process table: only genuinely orphaned Vicuna daemons in managed range match
+        let mixed = vec![
+            ProcEntry { pid: 1, ppid: 0, args: "/sbin/launchd".into() },
+            ProcEntry { pid: 1000, ppid: 1, args: "/lib/systemd/systemd --user".into() },
+            ProcEntry { pid: 500, ppid: 1, args: "/Applications/Vicuna.app/Contents/MacOS/Vicuna".into() },
+            ProcEntry { pid: 600, ppid: 1, args: "-zsh".into() },
+            // 18765: orphaned (PPID=1) Vicuna sidecar -> REAP
+            ProcEntry {
+                pid: 3001,
+                ppid: 1,
+                args: format!("/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18765 --foreground --profile {}", profile.display()),
+            },
+            // 18766: orphaned (Linux systemd --user subreaper) Vicuna PATH lb -> REAP
+            ProcEntry {
+                pid: 3002,
+                ppid: 1000,
+                args: format!("/usr/local/bin/lb web --port 18766 --foreground --profile {}", profile.display()),
+            },
+            // 18767: owned by live sibling Vicuna (PID 500) -> SPARE
+            ProcEntry {
+                pid: 3003,
+                ppid: 500,
+                args: format!("/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18767 --foreground --profile {}", profile.display()),
+            },
+            // 18768: our own child -> SPARE
+            ProcEntry {
+                pid: 3004,
+                ppid: self_pid,
+                args: format!("/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 18768 --foreground --profile {}", profile.display()),
+            },
+            // 18769: personal user-run lb (PPID=1, default profile) -> SPARE
+            ProcEntry {
+                pid: 3005,
+                ppid: 1,
+                args: "/opt/homebrew/bin/lb web --port 18769 --foreground".into(),
+            },
+            // 18770: personal user-run lb on different profile -> SPARE
+            ProcEntry {
+                pid: 3006,
+                ppid: 1,
+                args: "/opt/homebrew/bin/lb web --port 18770 --profile /Users/alice/custom".into(),
+            },
+            // 18771: manually run from interactive shell (PPID=600 zsh) -> SPARE
+            ProcEntry {
+                pid: 3007,
+                ppid: 600,
+                args: format!("/opt/homebrew/bin/lb web --port 18771 --profile {}", profile.display()),
+            },
+            // 8765: outside Vicuna's managed port range -> SPARE
+            ProcEntry {
+                pid: 3008,
+                ppid: 1,
+                args: format!("/Applications/Vicuna.app/Contents/Resources/lb-sidecar/lb-arm64 web --port 8765 --foreground --profile {}", profile.display()),
+            },
+        ];
+        let mixed_found = find_orphaned_vicuna_daemons(&mixed, &managed, profile, self_pid);
+        assert_eq!(mixed_found, vec![(18765, 3001), (18766, 3002)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_owned_is_idempotent_and_reaps_child() {
+        let state = BrowserState::default();
+        // No child: safe no-op
+        kill_owned(&state);
+        assert!(!owned_child_alive(&state));
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        state.child.lock().unwrap().replace(child);
+        assert!(pid_alive(pid));
+
+        kill_owned(&state);
+        assert!(!owned_child_alive(&state));
+        assert!(!pid_alive(pid), "kill_owned must kill and reap the tracked child");
+
+        // Second call (e.g. quit_now followed by RunEvent::Exit) is a no-op
+        kill_owned(&state);
     }
 }

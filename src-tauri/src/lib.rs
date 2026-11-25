@@ -356,17 +356,26 @@ pub fn run() {
         .run(on_run_event);
 }
 
-/// App event handler: macOS dock click with the window hidden reopens it.
-/// `RunEvent::Reopen` only exists on macOS, so other platforms do nothing.
+/// App event handler:
+/// - `RunEvent::Exit`: tear down owned children (browser sidecar, embedded
+///   server, terminals, etc.) even when the app exits without going through
+///   `quit_now` (e.g., macOS Dock Quit, OS logout/shutdown, or `app.exit`).
+/// - `RunEvent::Reopen` (macOS only): dock click with the window hidden reopens it.
 #[cfg(feature = "desktop")]
 #[allow(unused_variables)]
 fn on_run_event(app: &AppHandle, event: tauri::RunEvent) {
-    #[cfg(target_os = "macos")]
-    if let tauri::RunEvent::Reopen { .. } = event {
-        if let Some(w) = app.get_webview_window("main") {
-            let _ = w.show();
-            let _ = w.set_focus();
+    match event {
+        tauri::RunEvent::Exit => {
+            app_shell::shutdown_children(app);
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }
+        _ => {}
     }
 }
 
