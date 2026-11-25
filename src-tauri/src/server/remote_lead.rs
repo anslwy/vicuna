@@ -84,7 +84,7 @@ fn unwrap_invoke(v: Value) -> Result<Value, String> {
 
 fn last_reply(session: &Value) -> String {
     session["messages"].as_array().into_iter().flatten().rev()
-        .find(|m| m["role"] == "assistant")
+        .find(|m| persist::is_assistant_reply(m))
         .and_then(|m| m["content"].as_str()).unwrap_or("").to_string()
 }
 
@@ -339,6 +339,8 @@ mod tests {
         assert_eq!(row_text(&r), "- s1 · \"T\" · running · claude/haiku · /w [archived]");
         let s = json!({"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a1"},{"role":"user","content":"q2"}]});
         assert_eq!(last_reply(&s), "a1");
+        let marked = json!({"messages":[{"role":"assistant","content":"real"},{"role":"assistant","content":"sum","summary":true},{"role":"assistant","content":"","contextCleared":true}]});
+        assert_eq!(last_reply(&marked), "real", "summaries and clear markers are not replies");
         assert!(servers_text(&[]).contains("No saved servers"));
     }
 
