@@ -27,77 +27,20 @@ mod client;
 mod server;
 #[cfg(unix)]
 mod upgrade;
-mod web;
+mod serve;
 
 use vicuna_lib::server::{server_dir, server_token, Config};
 
-/// Bind, print the banner (+ tailscale), serve forever.
-fn run(cfg: Config) {
+/// The token-less dev bridge: bind, serve forever.
+fn run_bridge(port: u16) {
+    let cfg = Config { bind: "127.0.0.1".into(), port, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir(), web: None };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("bridge runtime");
     let bound = rt.block_on(vicuna_lib::server::bind(&cfg)).unwrap_or_else(|e| panic!("bridge {e}"));
-    let addr = bound.addr;
-    match (&cfg.token, &cfg.db) {
-        (Some(t), Some(db)) => {
-            println!("vicuna server {} on http://{addr}", env!("CARGO_PKG_VERSION"));
-            println!("  chats: {}", db.display());
-            println!("  token: {t}");
-            if cfg.tailscale {
-                match cli::tailscale_expose(cfg.port, cfg.https_port) {
-                    Ok(url) => {
-                        println!("  tailnet URL: {url}");
-                        println!("In Vicuna: sidebar server menu → Connect to new server… → {url} + the token above.");
-                    }
-                    Err(e) => println!("  tailscale: {e}"),
-                }
-            } else {
-                println!("Expose it to your tailnet (HTTPS) with `vicuna serve --tailscale`, or by hand:");
-                println!("  tailscale serve --bg --https=8443 http://127.0.0.1:{}", cfg.port);
-            }
-            if cfg.bind != "127.0.0.1" && cfg.bind != "localhost" {
-                println!("WARNING: listening on {} over plain HTTP; prefer --bind 127.0.0.1 behind tailscale serve.", cfg.bind);
-            }
-        }
-        _ => println!("vicuna bridge on http://{addr}"),
-    }
+    println!("vicuna bridge on http://{}", bound.addr);
     rt.block_on(bound.serve_until(shutdown_signal()));
 }
 
-/// `vicuna web`: bind, print the banner, open the browser, serve forever.
-fn run_web(o: web::WebOpts) {
-    let root = web::web_root(&o).unwrap_or_else(|e| {
-        eprintln!("vicuna web: {e}");
-        std::process::exit(1)
-    });
-    let token = server_token();
-    let cfg = web::config(&o, root, token.clone(), server_dir().join("vicuna.db"));
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
-    let bound = rt.block_on(vicuna_lib::server::bind(&cfg)).unwrap_or_else(|e| {
-        eprintln!("vicuna web: {e} (pick another port with --port N)");
-        std::process::exit(1)
-    });
-    let url = web::browser_url(bound.addr, &token);
-    println!("vicuna web {} on http://{}", env!("CARGO_PKG_VERSION"), bound.addr);
-    println!("  chats: {}", cfg.db.as_ref().unwrap().display());
-    println!("  open:  {url}");
-    if cfg.tailscale {
-        match cli::tailscale_expose(bound.addr.port(), cfg.https_port) {
-            Ok(t) => println!("  tailnet: {}/#token={token}", t.trim_end_matches('/')),
-            Err(e) => println!("  tailscale: {e}"),
-        }
-    }
-    if !bound.addr.ip().is_loopback() {
-        println!("WARNING: listening on {} over plain HTTP (token-protected); prefer --bind 127.0.0.1 with --tailscale.", cfg.bind);
-    }
-    if o.open {
-        if let Err(e) = cli::open_url(&url) {
-            println!("  (could not open a browser: {e}; open the URL above yourself)");
-        }
-    }
-    println!("Ctrl-C to stop.");
-    rt.block_on(bound.serve_until(shutdown_signal()));
-}
-
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -121,15 +64,19 @@ async fn shutdown_signal() {
 const USAGE: &str = "vicuna — Vicuna's command line
 
 usage:
-  vicuna serve [--port N] [--bind ADDR] [--db PATH] [--tailscale [--https-port N]]
-        Run a Vicuna server for the desktop app (token auth; chats in ~/vicuna/server).
-        --tailscale also exposes it over `tailscale serve` (HTTPS, tailnet only)
-        and prints the URL to paste into the app. Default 127.0.0.1:7421.
-  vicuna web [-p|--port N] [--bind ADDR] [--db PATH] [--no-open] [--tailscale [--https-port N]]
-        Run the full Vicuna web UI + backend in your browser (default
-        127.0.0.1:7422, chats in ~/vicuna/server/vicuna.db). Token-protected:
-        the opened URL carries it as #token=… (`vicuna token` prints it).
+  vicuna serve [-p|--port N] [--bind ADDR] [--db PATH] [--web-dir PATH] [--tailscale [--https-port N]]
+        Run the Vicuna server: the backend for the desktop app AND the web UI
+        for your browser, on one port (default 127.0.0.1:7421, chats in
+        ~/vicuna/server/vicuna.db). Always token-protected; the banner prints
+        the Server URL + Token for the app and a Browser URL carrying the
+        token as #token=… (`vicuna token` prints it). --tailscale also exposes
+        it over `tailscale serve` (HTTPS, tailnet only) and prints those URLs.
         --web-dir PATH serves another `build/` instead of the bundled UI.
+  vicuna web [same options as serve] [--no-open]
+        Open the Vicuna web UI in your browser. With no options it reuses a
+        `vicuna serve` already running on 127.0.0.1:7421; otherwise it starts
+        the server with these options (like `vicuna serve`) and opens it.
+        --no-open just prints the URL (e.g. over SSH).
   vicuna install-service [serve options]   run `vicuna serve` in the background
         on login/boot (systemd user unit on Linux, launchd agent on macOS)
   vicuna uninstall-service
@@ -176,46 +123,26 @@ fn report(r: Result<(), String>) {
     }
 }
 
-/// Parse `serve` options (shared by `serve` and `install-service`).
-fn parse_serve(args: &[String]) -> Config {
-    let mut cfg = Config { bind: "127.0.0.1".into(), port: 7421, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir(), web: None };
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut val = || it.next().cloned().unwrap_or_else(|| die(&format!("{a} needs a value")));
-        match a.as_str() {
-            "--port" => cfg.port = val().parse().unwrap_or_else(|_| die("bad --port")),
-            "--bind" => cfg.bind = val(),
-            "--db" => cfg.db = Some(std::path::PathBuf::from(val())),
-            "--tailscale" => cfg.tailscale = true,
-            "--https-port" => cfg.https_port = Some(val().parse().unwrap_or_else(|_| die("bad --https-port"))),
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0)
-            }
-            other => die(&format!("unknown option {other}")),
-        }
+/// Parse `serve` options (shared by `serve`, `install-service`, `start`, `restart`).
+fn parse_serve(args: &[String]) -> serve::ServeOpts {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        std::process::exit(0)
     }
-    cfg
+    serve::parse(args, false).unwrap_or_else(|e| die(&e))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = args.get(1..).unwrap_or(&[]).to_vec();
     match args.first().map(String::as_str) {
-        Some("serve") => {
-            let mut cfg = parse_serve(&rest);
-            cfg.token = Some(server_token());
-            if cfg.db.is_none() {
-                cfg.db = Some(server_dir().join("vicuna.db"));
-            }
-            run(cfg);
-        }
+        Some("serve") => serve::run(parse_serve(&rest), false),
         Some("web") => {
             if rest.iter().any(|a| a == "-h" || a == "--help") {
                 println!("{USAGE}");
                 return;
             }
-            run_web(web::parse(&rest).unwrap_or_else(|e| die(&e)));
+            serve::web(serve::parse(&rest, true).unwrap_or_else(|e| die(&e)));
         }
         Some("install-service") => {
             let _ = parse_serve(&rest); // validate before writing anything
@@ -293,13 +220,13 @@ fn main() {
         },
         Some("bridge") => {
             let port = rest.first().map(|p| p.parse().unwrap_or_else(|_| die("bad port"))).unwrap_or(1421);
-            run(Config { bind: "127.0.0.1".into(), port, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir(), web: None });
+            run_bridge(port);
         }
         Some("-h") | Some("--help") | Some("help") => println!("{USAGE}"),
         Some("-V") | Some("--version") | Some("version") => println!("vicuna {}", env!("CARGO_PKG_VERSION")),
         // `cargo run -- <port>` (the old bridge invocation) keeps working
         Some(p) if p.parse::<u16>().is_ok() => {
-            run(Config { bind: "127.0.0.1".into(), port: p.parse().unwrap(), token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir(), web: None })
+            run_bridge(p.parse().unwrap())
         }
         // `vicuna [path]` — the old desktop launcher's behavior
         Some(p) if !p.starts_with('-') => match cli::open_in_app(Some(p)) {
@@ -311,7 +238,7 @@ fn main() {
         },
         Some(other) => die(&format!("unknown option {other}")),
         // no args: the dev bridge, as before (docs/scripts run `cargo run` here)
-        None => run(Config { bind: "127.0.0.1".into(), port: 1421, token: None, db: None, tailscale: false, https_port: None, resource_dir: vicuna_lib::browser::headless_resource_dir(), web: None }),
+        None => run_bridge(1421),
     }
 }
 
