@@ -13,9 +13,14 @@
 //     window is always This computer. Constant for the life of a window.
 //   * plain browser (`npm run dev`) → the loopback dev bridge
 //     (`cargo run` in bridge/), so live-browser drives the real backend.
+//   * plain browser on `vicuna web` → the server that served the page
+//     (same origin, any port). It opens `/#token=<t>`: the fragment never
+//     reaches the server or its logs; we keep it in sessionStorage and strip
+//     it from the address bar.
 // When none is present the call fails with the usual desktop error.
 
 import { searchLoadedChats, type LoadedChat } from "./serverSearch";
+import { parseHashToken, stripHashToken } from "./webToken";
 
 export function isTauriRuntime(): boolean {
   return (
@@ -50,12 +55,29 @@ const ACTIVE_SERVER: string | null = (() => {
 const TRANSPORT: string | null =
   ACTIVE_SERVER ?? (typeof window === "undefined" ? null : isTauriRuntime() ? "local" : bridgeToken() ? "bridge" : null);
 
+/** Served by `vicuna web` (token arrived in the fragment): the backend is
+ *  this page's own origin. Remembered per tab across in-app navigation. */
+function webOrigin(): boolean {
+  try {
+    return sessionStorage.getItem("vicuna-web-origin") === "1";
+  } catch {
+    return false;
+  }
+}
+
 /** Plain browser pointed at a real `vicuna serve` (`?bridge=PORT&token=T`):
  *  the same server-backed code path as the desktop main window, for
  *  live-browser testing. Without a token it's the old unauthenticated dev
  *  bridge (window-owned turns). */
 function bridgeToken(): string | null {
   try {
+    const fromHash = parseHashToken(window.location.hash);
+    if (fromHash) {
+      sessionStorage.setItem("vicuna-bridge-token", fromHash);
+      sessionStorage.setItem("vicuna-web-origin", "1");
+      history.replaceState(history.state, "", stripHashToken(window.location.href));
+      return fromHash;
+    }
     const fromUrl = new URLSearchParams(window.location.search).get("token");
     if (fromUrl) sessionStorage.setItem("vicuna-bridge-token", fromUrl);
     return fromUrl ?? sessionStorage.getItem("vicuna-bridge-token");
@@ -186,6 +208,7 @@ function bridgePort(): number {
 }
 
 function bridgeBase(): string {
+  if (webOrigin()) return window.location.origin;
   return `http://127.0.0.1:${bridgePort()}`;
 }
 
@@ -327,6 +350,8 @@ export async function bridgeInvoke(cmd: string, args: Record<string, any>): Prom
     headers: bridgeHeaders(true),
     body: JSON.stringify({ cmd, args })
   });
+  if (res.status === 401)
+    throw new Error("The Vicuna server refused the token. Open the URL `vicuna web` printed, or add #token=<output of `vicuna token`> to this address.");
   if (!res.ok) throw new Error(`bridge ${cmd} failed: HTTP ${res.status}`);
   const j = await res.json();
   if (!j.ok) throw new Error(j.error ?? `${cmd} failed`);

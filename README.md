@@ -125,10 +125,14 @@ vicuna stop                             # stop the running service or process
 vicuna restart [serve options]          # detached restart (safe from inside a hosted session)
 vicuna status                           # running state, pid, version, and log path
 vicuna token                            # print the server auth token
+vicuna web [-p|--port N] [--bind ADDR] [--db PATH] [--no-open] [--tailscale [--https-port N]]
+                                        # full Vicuna UI + backend in your browser (default 127.0.0.1:7422)
 vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
                                         # checksum-verified atomic upgrade + live DB backup
 vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 ```
+
+`vicuna web` serves the web UI bundled into the binary together with the same backend as `vicuna serve` (chats in `~/vicuna/server/vicuna.db` unless `--db`), then opens `http://127.0.0.1:7422/#token=…` in your default browser (`--no-open` just prints it, e.g. over SSH). Its default port 7422 sits beside `vicuna serve`'s 7421, so both can run at once. The API always requires the server token, even on loopback: the browser receives it in the URL fragment, which is never sent to the server, and Vicuna moves it into the tab's sessionStorage and removes it from the address bar. To open another tab, add `#token=$(vicuna token)` to the address. Use `--tailscale` to reach it from your tailnet (HTTPS); a non-loopback `--bind` works but is plain HTTP.
 
 The CLI also drives any running server directly (`vicuna session`, `vicuna schedule`, `vicuna engines`, `vicuna models`, `vicuna mcp`, `vicuna server`, `vicuna api`).
 
