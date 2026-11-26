@@ -1,6 +1,6 @@
 [package]
 name = "vicuna-bridge"
-version = "0.0.87"
+version = "0.0.88"
 description = "vicuna — the Vicuna CLI: `vicuna serve` (headless server for the desktop app), `vicuna open`, and the dev bridge"
 authors = ["you"]
 license = "Apache-2.0"
