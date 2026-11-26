@@ -2,9 +2,9 @@
 //
 // The daemon (Chrome via CDP + JSON API + Svelte UI) is the shared engine:
 // the side-panel tab iframes its web UI while the Work agent drives the
-// same tabs through `lb mcp`. Desktop resolves the bundled sidecar first,
-// PATH fallback; plain browsers go through the loopback bridge (PATH only)
-// or iframe an already-running daemon directly.
+// same tabs through `lb mcp`. Both desktop and headless server resolve
+// the bundled `lb-sidecar/` binary only (no PATH fallback); plain browsers
+// go through the loopback bridge or iframe an already-running daemon directly.
 
 import { invokeOrBridge } from "./bridge";
 
