@@ -433,6 +433,8 @@ async fn dispatch(
                     let path = value.as_str().ok_or("workspace must be a string")?;
                     let workspace = if path.is_empty() {
                         String::new()
+                    } else if path == "__vicuna_no_workspace__" {
+                        path.to_owned()
                     } else {
                         crate::work_validate_root_logic(path.to_owned()).await?
                     };
