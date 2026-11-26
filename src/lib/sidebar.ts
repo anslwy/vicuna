@@ -41,9 +41,17 @@ export function isNoWorkspacePath(p: string | null | undefined): boolean {
   return /\/vicuna\/scratch\/[A-Za-z0-9_-]{1,64}$/.test(norm);
 }
 
-/** Use the saved folder for a Work draft, or start with No workspace. */
-export function resolveDraftWorkspace(workspace: string | null | undefined): string {
-  return workspace && workspace !== "/" ? workspace : NO_WORKSPACE_SENTINEL;
+/** Use the saved folder for a Work draft (including an explicit No workspace
+ *  choice), else the host's home directory when known, else No workspace. */
+export function resolveDraftWorkspace(
+  workspace: string | null | undefined,
+  homeDir?: string | null
+): string {
+  const ws = (workspace ?? "").trim();
+  if (ws && ws !== "/") return ws;
+  const home = (homeDir ?? "").trim();
+  if (home && home !== "/") return home;
+  return NO_WORKSPACE_SENTINEL;
 }
 
 /** Final path segment on any platform, with Rust's Windows verbatim prefix

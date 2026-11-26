@@ -21,14 +21,25 @@ function makeChat(id: string, workspace: string | null): Chat {
   };
 }
 
-test("fresh workspace prefs start Work drafts in No workspace", () => {
+test("fresh workspace prefs default Work drafts to the host home dir when known", () => {
+  assert.equal(resolveDraftWorkspace(undefined, "/home/deck"), "/home/deck");
+  assert.equal(resolveDraftWorkspace("", "/root"), "/root");
+  assert.equal(resolveDraftWorkspace("/", "/Users/alice"), "/Users/alice");
+  assert.equal(resolveDraftWorkspace("", "C:\\Users\\alice"), "C:\\Users\\alice");
+});
+
+test("fresh workspace prefs fall back to No workspace when home dir is unavailable", () => {
   assert.equal(resolveDraftWorkspace(undefined), NO_WORKSPACE_SENTINEL);
   assert.equal(resolveDraftWorkspace(""), NO_WORKSPACE_SENTINEL);
   assert.equal(resolveDraftWorkspace("/"), NO_WORKSPACE_SENTINEL);
+  assert.equal(resolveDraftWorkspace("", ""), NO_WORKSPACE_SENTINEL);
+  assert.equal(resolveDraftWorkspace("", "/"), NO_WORKSPACE_SENTINEL);
 });
 
-test("Work drafts retain a saved default workspace", () => {
+test("Work drafts retain a saved default workspace or explicit No workspace choice", () => {
   assert.equal(resolveDraftWorkspace("/projects/vicuna"), "/projects/vicuna");
+  assert.equal(resolveDraftWorkspace("/projects/vicuna", "/home/deck"), "/projects/vicuna");
+  assert.equal(resolveDraftWorkspace(NO_WORKSPACE_SENTINEL, "/home/deck"), NO_WORKSPACE_SENTINEL);
 });
 
 test("showWorkspaceBadge hides pill when session is already in the selected workspace scope", () => {

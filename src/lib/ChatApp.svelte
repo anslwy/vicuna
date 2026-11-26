@@ -172,11 +172,15 @@
   setOpenRouterApiKey(initialPrefs.openrouterApiKey ?? "");
   let sidebarOpen = $state(initialPrefs.sidebarOpen);
   let defaultWorkspace = $state(initialPrefs.defaultWorkspace ?? "");
+  let hostHomeDir = $state("");
   /** mode + workspace picker for the session being started (home or empty draft) */
   // starts on the mode last picked (remembered across launches, see newSessionMode.ts)
   let pendingMode = $state<"chat" | "work">(typeof window !== "undefined" ? readLastMode(localStorage) : "chat");
   let pendingWorkspace = $state(resolveDraftWorkspace(initialPrefs.defaultWorkspace));
-  const continueWorkspace = $derived(defaultWorkspace || (isNoWorkspacePath(pendingWorkspace) ? "" : pendingWorkspace));
+  const continueWorkspace = $derived(
+    (isNoWorkspacePath(defaultWorkspace) ? "" : defaultWorkspace) ||
+    (isNoWorkspacePath(pendingWorkspace) ? "" : pendingWorkspace)
+  );
   let workspaceError = $state<string | null>(null);
   /** true while the in-thread workspace input is focused: keeps the picker
    *  mounted while typing (it hides once a workspace is set) */
@@ -2144,7 +2148,7 @@
       pendingWorkspace = NO_WORKSPACE_SENTINEL;
     } else {
       const scopeWs = workspaceOfFolderKey(sessionFilter);
-      pendingWorkspace = scopeWs ?? resolveDraftWorkspace(start.workspace || pendingWorkspace || defaultWorkspace);
+      pendingWorkspace = scopeWs ?? resolveDraftWorkspace(start.workspace || pendingWorkspace || defaultWorkspace, hostHomeDir);
     }
     isPinned = true;
     editingIndex = null;
@@ -2175,7 +2179,7 @@
     workspaceEditing = false;
     if (c && c.messages.length === 0) {
       pendingMode = c.mode ?? "chat";
-      pendingWorkspace = resolveDraftWorkspace(c.workspace || defaultWorkspace);
+      pendingWorkspace = resolveDraftWorkspace(c.workspace || defaultWorkspace, hostHomeDir);
       workspaceError = null;
     }
   });
@@ -4869,6 +4873,7 @@
   function setSessionFilter(key: string) {
     sessionFilterRaw = key;
     if (key === NO_WORKSPACE_FILTER) {
+      defaultWorkspace = NO_WORKSPACE_SENTINEL;
       pendingWorkspace = NO_WORKSPACE_SENTINEL;
       pendingMode = "work";
       workspaceError = null;
@@ -6231,6 +6236,7 @@
       }
       workspaceError = null;
       if (isNoWorkspacePath(rawWs)) {
+        defaultWorkspace = NO_WORKSPACE_SENTINEL;
         pendingWorkspace = NO_WORKSPACE_SENTINEL;
       } else {
         defaultWorkspace = workRoot;
@@ -8336,6 +8342,7 @@
       workspaceChat.workspace = NO_WORKSPACE_SENTINEL;
     }
     pendingMode = "work";
+    defaultWorkspace = NO_WORKSPACE_SENTINEL;
     pendingWorkspace = NO_WORKSPACE_SENTINEL;
     syncScopeToWorkspace(NO_WORKSPACE_SENTINEL);
     persistPrefs();
@@ -9747,7 +9754,7 @@
       ollamaBase = prefs.ollamaBase;
       setOllamaBase(ollamaBase);
       defaultWorkspace = normalizeStoredWorkspace(prefs.defaultWorkspace);
-      pendingWorkspace = resolveDraftWorkspace(defaultWorkspace);
+      pendingWorkspace = resolveDraftWorkspace(defaultWorkspace, hostHomeDir);
       zoomLevel = prefs.zoom;
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
@@ -9775,21 +9782,31 @@
         chatsLoaded = true;
       }
       if (isServerBacked() && !srvLoadError) {
-        const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean; sessionTools?: boolean }>("server_info", {}).catch(() => null);
+        const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean; sessionTools?: boolean; home?: string }>("server_info", {}).catch(() => null);
         serverPersist = info?.persist === true;
         serverChatTurns = info?.chatTurns === true;
         serverSessionTools = info?.sessionTools === true;
+        if (typeof info?.home === "string") {
+          hostHomeDir = normalizeStoredWorkspace(info.home);
+        }
         if (serverSessionTools) {
           const workspace = await invokeOrBridge<string | null>("work_default_workspace", {}).catch(() => null);
           if (workspace) {
             defaultWorkspace = normalizeStoredWorkspace(workspace);
-            pendingWorkspace = resolveDraftWorkspace(defaultWorkspace);
           }
           lastDefaultWorkspace = workspace ?? "";
         }
         setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
+      if (!hostHomeDir && ((isServerBacked() && !srvLoadError) || await bridgeAvailable())) {
+        const listing = await invokeOrBridge<{ path?: string; home?: string }>("fs_list_dirs", { path: null, hidden: false }).catch(() => null);
+        const listedHome = typeof listing?.path === "string" && listing.path.trim()
+          ? listing.path
+          : (typeof listing?.home === "string" ? listing.home : "");
+        if (listedHome) hostHomeDir = normalizeStoredWorkspace(listedHome);
+      }
+      pendingWorkspace = resolveDraftWorkspace(defaultWorkspace, hostHomeDir);
       // Keep the composer workspace synced with a non-"all" workspace scope on
       // startup (even if server work_default_workspace or prefs drifted).
       const resolvedStartupScope = resolveSessionFilter(sessionFilterRaw, folderOptions(chats));
@@ -10388,7 +10405,7 @@
             <button
               class="ctx-ws-pill"
               data-testid="continue-work-workspace"
-              title={defaultWorkspace ? `Work folder: ${displayWorkspace(defaultWorkspace)} — click to change` : "Pick a work folder"}
+              title={continueWorkspace ? `Work folder: ${displayWorkspace(continueWorkspace)} — click to change` : "Pick a work folder"}
               aria-label="Change work folder"
               onclick={(e) => void pickContinueWorkspace(e)}
             >
