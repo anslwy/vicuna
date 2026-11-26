@@ -496,13 +496,13 @@ async fn manage_schedule(target: &Target, args: &Value, client_gone: impl std::f
 fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
-        "title": "Manage worker sessions (lead controls; permissioned send)",
-        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` only. Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session, which works anywhere. Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). Other servers: with the user's \"Use sessions on other servers\" permission, the lead can pass `server` (the name of a server the user saved; `servers` lists them) to run `list`, `create` (needs `workspace`, an absolute folder on that machine), `send`, `status`, `stop`, `archive` and `unarchive` there; replies of reported remote workers reach you the same way. Deleting remote sessions is not allowed. When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
+        "title": "Manage worker sessions (lead controls; permissioned send & remote read/send)",
+        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` (locally, or on another server with Use sessions on other servers). Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session (works anywhere) and remote `servers`/`list`/`status` (see Other servers below). Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). Other servers: with this session's \"Use sessions on other servers\" permission, any session can list saved servers (`servers`), list or inspect remote sessions (`list`/`status` with Read other sessions), and message remote sessions (`send` with Message other sessions; non-lead `send` forces `report: false`). The lead can also pass `server` to `create` (needs `workspace`, an absolute folder on that machine), `stop`, `archive` and `unarchive` there; replies of reported remote workers reach the lead the same way. Deleting remote sessions is not allowed. When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["list", "create", "send", "stop", "delete", "archive", "unarchive", "status", "set_workspace", "permissions", "servers"] },
-                "server": { "type": "string", "description": "Run the action on another Vicuna server the user saved (its name; see `servers`). Needs the session's \"Use sessions on other servers\" permission." },
+                "server": { "type": "string", "description": "Run the action on another Vicuna server the user saved (its name; see `servers`). Needs this session's \"Use sessions on other servers\" permission (plus Read/Message permissions for non-lead `list`/`status`/`send`, or the lead role for `create`/`stop`/`archive`/`unarchive`)." },
                 "read": { "type": "boolean", "description": "permissions: allow reading other sessions' histories/state." },
                 "allow_message": { "type": "boolean", "description": "permissions: allow sending messages to other sessions." },
                 "include_archived": { "type": "boolean", "description": "list: include archived sessions, tagged [archived] (default false)." },
@@ -534,11 +534,22 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     if action == "permissions" && !can_manage_permissions(turn.lead.load(Ordering::Relaxed)) {
         return text_result("Only the lead session can view or change other sessions' permissions.", true);
     }
-    let remote = action == "servers" || args.get("server").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+    let remote = action == "servers" || remote_server(args).is_some();
     if remote {
         let lead = turn.lead.load(Ordering::Relaxed);
-        let permitted = lead && may_remote(&target.session_id).await;
-        if let Err(e) = remote_gate_decision(target.session_id.is_some(), permitted, lead, true) {
+        let has_session = target.session_id.is_some();
+        let remote_perm = has_session && may_remote(&target.session_id).await;
+        let read_perm = if remote_perm && matches!(action.as_str(), "list" | "status") {
+            may_read_other(Some(target), "__all__").await
+        } else {
+            false
+        };
+        let message_perm = if remote_perm && action == "send" {
+            may_message(&target.session_id).await
+        } else {
+            false
+        };
+        if let Err(e) = remote_session_decision(has_session, remote_perm, lead, read_perm, message_perm, &action) {
             return text_result(e, true);
         }
         if turn.stop.load(Ordering::Relaxed) {
@@ -626,7 +637,9 @@ fn is_remote_call(tool: &str, args: &Value) -> bool {
 }
 
 const REMOTE_READ_DENIED: &str = "Reading sessions on other servers needs this session's \"Use sessions on other servers\" permission (Permissions… in the session menu).";
+const REMOTE_SEND_DENIED: &str = "Messaging sessions on other servers needs this session's \"Use sessions on other servers\" and \"Message other sessions\" permissions (Permissions… in the session menu).";
 const REMOTE_MANAGE_DENIED: &str = "Managing sessions on other servers needs the lead session with the \"Use sessions on other servers\" permission (Permissions… in the session menu).";
+const READ_OTHER_DENIED: &str = "This session is not allowed to read other sessions (Permissions… in the session menu).";
 
 /// The remote gate's decision, kept pure. Reading (read/search) needs only the
 /// `remote` permission; managing also needs the lead role. Error texts are
@@ -635,6 +648,47 @@ fn remote_gate_decision(has_session: bool, permitted: bool, lead: bool, manage: 
     if manage {
         if has_session && permitted && lead { Ok(()) } else { Err(REMOTE_MANAGE_DENIED) }
     } else if has_session && permitted { Ok(()) } else { Err(REMOTE_READ_DENIED) }
+}
+
+/// Pure permission decision for remote `manage_sessions` actions (`servers` or
+/// `server: ...`). Every refusal returns a fixed string that never names saved
+/// servers, and runs before any server list or target is resolved.
+fn remote_session_decision(
+    has_session: bool,
+    remote_perm: bool,
+    lead: bool,
+    read_perm: bool,
+    message_perm: bool,
+    action: &str,
+) -> Result<(), &'static str> {
+    match action {
+        "servers" => {
+            if has_session && remote_perm { Ok(()) } else { Err(REMOTE_READ_DENIED) }
+        }
+        "list" | "status" => {
+            if !has_session || !remote_perm {
+                Err(REMOTE_READ_DENIED)
+            } else if !read_perm {
+                Err(READ_OTHER_DENIED)
+            } else {
+                Ok(())
+            }
+        }
+        "send" => {
+            if has_session && remote_perm && (lead || message_perm) {
+                Ok(())
+            } else {
+                Err(REMOTE_SEND_DENIED)
+            }
+        }
+        _ => {
+            if has_session && remote_perm && lead {
+                Ok(())
+            } else {
+                Err(REMOTE_MANAGE_DENIED)
+            }
+        }
+    }
 }
 
 fn remote_server(args: &Value) -> Option<String> {
@@ -649,6 +703,19 @@ async fn remote_gate(target: Option<&Target>) -> Result<(), String> {
     remote_gate_decision(sid.is_some(), permitted, false, false).map_err(str::to_string)
 }
 
+async fn session_permission_in(pool: &sqlx::SqlitePool, id: &str, name: &str) -> bool {
+    let Ok(Some(row)) = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(pool).await else {
+        return false;
+    };
+    let extra = row
+        .try_get::<Option<String>, _>("extra")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null);
+    effective_permission(&extra, name)
+}
+
 async fn may_remote(session_id: &Option<String>) -> bool {
     let Some(id) = session_id.as_deref() else { return false };
     let Ok(pool) = db_pool().await else { return false };
@@ -656,17 +723,13 @@ async fn may_remote(session_id: &Option<String>) -> bool {
 }
 
 async fn may_remote_in(pool: &sqlx::SqlitePool, id: &str) -> bool {
-    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(pool).await.ok().flatten();
-    let extra = row.and_then(|r| r.try_get::<Option<String>, _>("extra").ok().flatten()).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
-    effective_permission(&extra, "remote")
+    session_permission_in(pool, id, "remote").await
 }
 
 async fn may_message(session_id: &Option<String>) -> bool {
     let Some(id) = session_id.as_deref() else { return false };
     let Ok(pool) = db_pool().await else { return false };
-    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(&pool).await.ok().flatten();
-    let extra = row.and_then(|r| r.try_get::<Option<String>, _>("extra").ok().flatten()).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
-    effective_permission(&extra, "message")
+    session_permission_in(&pool, id, "message").await
 }
 
 fn can_manage_permissions(is_lead: bool) -> bool { is_lead }
@@ -2460,10 +2523,85 @@ mod tests {
         assert_eq!(remote_gate_decision(true, true, false, true), Err(REMOTE_MANAGE_DENIED));
         assert_eq!(remote_gate_decision(true, false, true, true), Err(REMOTE_MANAGE_DENIED));
         assert_eq!(remote_gate_decision(false, true, true, true), Err(REMOTE_MANAGE_DENIED));
-        for e in [REMOTE_READ_DENIED, REMOTE_MANAGE_DENIED] {
+        for e in [REMOTE_READ_DENIED, REMOTE_SEND_DENIED, REMOTE_MANAGE_DENIED] {
             assert!(e.contains("\"Use sessions on other servers\""));
             no_saved_names(e);
         }
+        no_saved_names(READ_OTHER_DENIED);
+    }
+
+    #[test]
+    fn remote_session_decision_matrix() {
+        let lead_only = ["create", "stop", "archive", "unarchive", "delete", "set_workspace", "permissions"];
+
+        // Non-lead with remote + message + read: servers/list/status/send allowed; lead-only blocked
+        assert!(remote_session_decision(true, true, false, true, true, "servers").is_ok());
+        assert!(remote_session_decision(true, true, false, true, true, "list").is_ok());
+        assert!(remote_session_decision(true, true, false, true, true, "status").is_ok());
+        assert!(remote_session_decision(true, true, false, true, true, "send").is_ok());
+        for action in lead_only {
+            assert_eq!(remote_session_decision(true, true, false, true, true, action), Err(REMOTE_MANAGE_DENIED), "{action}");
+        }
+
+        // Non-lead with remote + read only (no message): servers/list/status allowed; send & lead-only blocked
+        assert!(remote_session_decision(true, true, false, true, false, "servers").is_ok());
+        assert!(remote_session_decision(true, true, false, true, false, "list").is_ok());
+        assert!(remote_session_decision(true, true, false, true, false, "status").is_ok());
+        assert_eq!(remote_session_decision(true, true, false, true, false, "send"), Err(REMOTE_SEND_DENIED));
+        for action in lead_only {
+            assert_eq!(remote_session_decision(true, true, false, true, false, action), Err(REMOTE_MANAGE_DENIED), "{action}");
+        }
+
+        // Non-lead with remote + message but read=false: servers & send allowed; list/status blocked
+        assert!(remote_session_decision(true, true, false, false, true, "servers").is_ok());
+        assert!(remote_session_decision(true, true, false, false, true, "send").is_ok());
+        assert_eq!(remote_session_decision(true, true, false, false, true, "list"), Err(READ_OTHER_DENIED));
+        assert_eq!(remote_session_decision(true, true, false, false, true, "status"), Err(READ_OTHER_DENIED));
+
+        // Non-lead with message + read only (no remote): all remote actions blocked
+        for action in ["servers", "list", "status"] {
+            assert_eq!(remote_session_decision(true, false, false, true, true, action), Err(REMOTE_READ_DENIED), "{action}");
+        }
+        assert_eq!(remote_session_decision(true, false, false, true, true, "send"), Err(REMOTE_SEND_DENIED));
+        for action in lead_only {
+            assert_eq!(remote_session_decision(true, false, false, true, true, action), Err(REMOTE_MANAGE_DENIED), "{action}");
+        }
+
+        // Lead without remote: all remote actions still blocked
+        for action in ["servers", "list", "status"] {
+            assert_eq!(remote_session_decision(true, false, true, true, true, action), Err(REMOTE_READ_DENIED), "{action}");
+        }
+        assert_eq!(remote_session_decision(true, false, true, true, true, "send"), Err(REMOTE_SEND_DENIED));
+        for action in lead_only {
+            assert_eq!(remote_session_decision(true, false, true, true, true, action), Err(REMOTE_MANAGE_DENIED), "{action}");
+        }
+
+        // Lead with remote: all actions pass the remote gate (read=false still gates list/status)
+        for action in ["servers", "list", "status", "send", "create", "stop", "archive", "unarchive", "delete"] {
+            assert!(remote_session_decision(true, true, true, true, false, action).is_ok(), "lead + remote: {action}");
+        }
+        assert_eq!(remote_session_decision(true, true, true, false, true, "list"), Err(READ_OTHER_DENIED));
+
+        // Missing session id: always refused
+        for action in ["servers", "list", "status", "send", "create"] {
+            let err = remote_session_decision(false, true, true, true, true, action).unwrap_err();
+            no_saved_names(err);
+        }
+
+        // Non-lead remote send forces report: false while preserving server
+        let fwd = forwarded_session_args(
+            &json!({"action": "send", "server": "Oracle VPS", "session_id": "s1", "message": "hi", "report": true}),
+            "send",
+            false,
+        );
+        assert_eq!(fwd["report"], false);
+        assert_eq!(fwd["server"], "Oracle VPS");
+        let fwd_lead = forwarded_session_args(
+            &json!({"action": "send", "server": "Oracle VPS", "session_id": "s1", "message": "hi", "report": true}),
+            "send",
+            true,
+        );
+        assert_eq!(fwd_lead["report"], true);
     }
 
     #[test]
@@ -2472,6 +2610,7 @@ mod tests {
         assert!(is_remote_call(READ_SESSION_TOOL, &json!({"server": "nope"})));
         assert!(is_remote_call(MANAGE_SESSIONS_TOOL, &json!({"action": "servers"})));
         assert!(is_remote_call(MANAGE_SESSIONS_TOOL, &json!({"action": "list", "server": "vps"})));
+        assert!(is_remote_call(MANAGE_SESSIONS_TOOL, &json!({"action": "send", "server": "vps", "session_id": "s1", "message": "hi"})));
         assert!(!is_remote_call(SEARCH_TOOL, &json!({"server": "  "})));
         assert!(!is_remote_call(READ_SESSION_TOOL, &json!({})));
         assert!(!is_remote_call(LIST_SESSIONS_TOOL, &json!({"server": "vps"})));
@@ -2504,10 +2643,19 @@ mod tests {
             let turn = Arc::new(TurnState::new());
             turn.lead.store(lead, Ordering::Relaxed);
             let t = Target { seq: 0, workspace: ws(), session_id: Some("lead-no-perm".into()), turn, on_event: ch };
-            for args in [json!({"action": "servers"}), json!({"action": "list", "server": "Oracle VPS"}), json!({"action": "status", "server": "unknown", "session_id": "x"})] {
+            for (args, expected) in [
+                (json!({"action": "servers"}), REMOTE_READ_DENIED),
+                (json!({"action": "list", "server": "Oracle VPS"}), REMOTE_READ_DENIED),
+                (json!({"action": "status", "server": "unknown", "session_id": "x"}), REMOTE_READ_DENIED),
+                (json!({"action": "send", "server": "Oracle VPS", "session_id": "x", "message": "hi"}), REMOTE_SEND_DENIED),
+                (json!({"action": "create", "server": "Oracle VPS", "workspace": "/tmp"}), REMOTE_MANAGE_DENIED),
+                (json!({"action": "stop", "server": "Oracle VPS", "session_id": "x"}), REMOTE_MANAGE_DENIED),
+                (json!({"action": "archive", "server": "Oracle VPS", "session_id": "x"}), REMOTE_MANAGE_DENIED),
+                (json!({"action": "unarchive", "server": "Oracle VPS", "session_id": "x"}), REMOTE_MANAGE_DENIED),
+            ] {
                 let (text, err) = gate_text(&manage_sessions(&t, &args, std::future::pending::<()>()).await);
                 assert!(err, "{text}");
-                assert_eq!(text, REMOTE_MANAGE_DENIED);
+                assert_eq!(text, expected, "lead={lead} args={args}");
                 no_saved_names(&text);
             }
             assert!(seen.lock().unwrap().is_empty(), "nothing may reach the window");
@@ -2520,6 +2668,9 @@ mod tests {
         sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, extra TEXT)").execute(&pool).await.unwrap();
         for (id, extra) in [
             ("ok", r#"{"permissions":{"remote":true}}"#),
+            ("worker-remote-msg", r#"{"permissions":{"remote":true,"message":true}}"#),
+            ("worker-remote-noread", r#"{"permissions":{"remote":true,"read":false}}"#),
+            ("worker-msg-only", r#"{"permissions":{"message":true}}"#),
             ("lead-ok", r#"{"role":"lead","permissions":{"remote":true}}"#),
             ("lead-plain", r#"{"role":"lead"}"#),
             ("off", r#"{"permissions":{"remote":false,"read":true}}"#),
@@ -2527,13 +2678,42 @@ mod tests {
             sqlx::query("INSERT INTO chats (id, extra) VALUES (?, ?)").bind(id).bind(extra).execute(&pool).await.unwrap();
         }
         assert!(may_remote_in(&pool, "ok").await);
+        assert!(may_remote_in(&pool, "worker-remote-msg").await);
+        assert!(session_permission_in(&pool, "worker-remote-msg", "message").await);
+        assert!(session_permission_in(&pool, "worker-remote-msg", "read").await);
+        assert!(!session_permission_in(&pool, "worker-remote-noread", "read").await);
+        assert!(!may_remote_in(&pool, "worker-msg-only").await);
+        assert!(session_permission_in(&pool, "worker-msg-only", "message").await);
         assert!(may_remote_in(&pool, "lead-ok").await);
         assert!(!may_remote_in(&pool, "lead-plain").await, "opt-in even for the lead");
         assert!(!may_remote_in(&pool, "off").await);
         assert!(!may_remote_in(&pool, "missing").await);
+        assert!(!session_permission_in(&pool, "missing", "read").await, "missing row must not default read to true");
         // and the decision lets the permitted ones through
         assert!(remote_gate_decision(true, may_remote_in(&pool, "ok").await, false, false).is_ok());
         assert!(remote_gate_decision(true, may_remote_in(&pool, "lead-ok").await, true, true).is_ok());
+
+        let decide = |id: &'static str, lead: bool, action: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let r = may_remote_in(&pool, id).await;
+                let rd = session_permission_in(&pool, id, "read").await;
+                let msg = session_permission_in(&pool, id, "message").await;
+                remote_session_decision(true, r, lead, rd, msg, action)
+            }
+        };
+        assert!(decide("worker-remote-msg", false, "servers").await.is_ok());
+        assert!(decide("worker-remote-msg", false, "list").await.is_ok());
+        assert!(decide("worker-remote-msg", false, "status").await.is_ok());
+        assert!(decide("worker-remote-msg", false, "send").await.is_ok());
+        assert_eq!(decide("worker-remote-msg", false, "create").await, Err(REMOTE_MANAGE_DENIED));
+        assert!(decide("ok", false, "servers").await.is_ok());
+        assert!(decide("ok", false, "list").await.is_ok());
+        assert_eq!(decide("ok", false, "send").await, Err(REMOTE_SEND_DENIED));
+        assert_eq!(decide("worker-remote-noread", false, "list").await, Err(READ_OTHER_DENIED));
+        assert_eq!(decide("worker-msg-only", false, "send").await, Err(REMOTE_SEND_DENIED));
+        assert_eq!(decide("lead-plain", true, "servers").await, Err(REMOTE_READ_DENIED));
+        assert!(decide("lead-ok", true, "create").await.is_ok());
     }
 
     #[test]
@@ -2551,6 +2731,8 @@ mod tests {
             call(SEARCH_TOOL, json!({"server": "Oracle VPS", "query": "q"})),
             call(READ_SESSION_TOOL, json!({"server": "Oracle VPS", "session_id": "s"})),
             call(MANAGE_SESSIONS_TOOL, json!({"action": "servers"})),
+            call(MANAGE_SESSIONS_TOOL, json!({"action": "list", "server": "Oracle VPS"})),
+            call(MANAGE_SESSIONS_TOOL, json!({"action": "send", "server": "Oracle VPS", "session_id": "s", "message": "hi"})),
         ] {
             assert_eq!(pick(&msg).as_deref(), Some("worker"), "{msg}");
         }
