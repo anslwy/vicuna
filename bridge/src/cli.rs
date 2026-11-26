@@ -251,21 +251,26 @@ pub fn open_in_app(path: Option<&str>) -> Result<String, String> {
         return Err(format!("{} is not a folder", abs.display()));
     }
     let url = format!("vicuna://open?path={}", percent_encode(&abs.to_string_lossy()));
+    open_url(&url).map_err(|e| format!("could not open the Vicuna app ({e}). Is it installed?"))?;
+    Ok(abs.display().to_string())
+}
+
+/// Hand a URL to the OS (default browser / registered app).
+pub fn open_url(url: &str) -> Result<(), String> {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
-        c.arg(&url);
+        c.arg(url);
         c
     } else if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", &url]);
+        c.args(["/C", "start", "", url]);
         c
     } else {
         let mut c = Command::new("xdg-open");
-        c.arg(&url);
+        c.arg(url);
         c
     };
-    run_ok(&mut cmd).map_err(|e| format!("could not open the Vicuna app ({e}). Is it installed?"))?;
-    Ok(abs.display().to_string())
+    run_ok(&mut cmd).map(|_| ())
 }
 
 #[cfg(test)]

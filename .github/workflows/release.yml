@@ -517,6 +517,19 @@ jobs:
           workspaces: bridge -> target
           key: cli-${{ matrix.target }}
 
+      # `vicuna web` embeds the built SvelteKit app (bridge/build.rs reads
+      # ../build), so build the frontend before the binary
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Build web UI
+        run: |
+          npm ci
+          npm run build
+          test -f build/index.html
+
       - name: Install musl toolchain (Linux)
         if: ${{ runner.os == 'Linux' }}
         run: |

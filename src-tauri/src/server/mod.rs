@@ -33,6 +33,7 @@ pub mod remote_lead;
 mod session_tools;
 mod self_upgrade;
 pub mod telegram;
+pub mod web;
 pub mod bridge_plugins;
 
 
@@ -89,6 +90,8 @@ pub struct BridgeState {
     pub events: EventQueues,
     /// server mode (`serve`): bearer token every request must carry
     pub token: Option<String>,
+    /// `vicuna web`: the bundled web UI served on non-API GETs
+    pub web: Option<web::WebRoot>,
     /// server mode: this machine's own vicuna.db (chats live on the server)
     pub db: Option<crate::server_store::Pool>,
     /// terminal tabs (remote-server terminals): ptys + term id -> channel id
@@ -132,6 +135,7 @@ impl Default for BridgeState {
             undo: Arc::new(UndoState::default()),
             acp: Arc::new(AcpState::default()),
             token: None,
+            web: None,
             db: None,
             terms: Arc::new(crate::TermState::default()),
             term_channels: Arc::new(Mutex::new(HashMap::new())),
@@ -1255,6 +1259,27 @@ async fn handle_inner(st: Arc<BridgeState>, req: hyper::Request<hyper::body::Inc
     if *req.method() == Method::GET && path.starts_with("/plugin-panel/") {
         return panel_resp(&path);
     }
+    // `vicuna web`: the app's own files are public; API routes below keep
+    // the token check (web::is_api_path never falls back to index.html)
+    if let Some(root) = &st.web {
+        if (*req.method() == Method::GET || *req.method() == Method::HEAD) && !web::is_api_path(&path) {
+            return match root.resolve(&path) {
+                Some(f) => hyper::Response::builder()
+                    .status(200)
+                    .header("Content-Type", f.content_type)
+                    .header("Cache-Control", f.cache_control)
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Referrer-Policy", "no-referrer")
+                    .body(full_body(bytes::Bytes::from(f.body.into_owned())))
+                    .unwrap(),
+                None => hyper::Response::builder()
+                    .status(404)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(full_body("not found"))
+                    .unwrap(),
+            };
+        }
+    }
     if let Some(want) = &st.token {
         let given = req
             .headers()
@@ -1410,6 +1435,8 @@ pub struct Config {
     pub https_port: Option<u16>,
     /// app resource root (the desktop's bundled `lb`); None = headless
     pub resource_dir: Option<std::path::PathBuf>,
+    /// `vicuna web`: serve the bundled web UI too
+    pub web: Option<web::WebRoot>,
 }
 
 
@@ -1602,6 +1629,7 @@ pub async fn bind(cfg: &Config) -> Result<Bound, String> {
     }
     state.token = cfg.token.clone();
     state.resource_dir = cfg.resource_dir.clone();
+    state.web = cfg.web.clone();
     if let Some(d) = &cfg.resource_dir {
         let _ = EMBEDDED_RESOURCE_DIR.set(d.clone());
     }
@@ -1994,5 +2022,44 @@ mod shutdown_tests {
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "listener should be closed after shutdown"
         );
+    }
+}
+
+#[cfg(test)]
+mod web_route_tests {
+    use super::*;
+
+    static FILES: &[(&str, &[u8])] = &[("index.html", b"<html>vicuna</html>"), ("_app/immutable/a.js", b"x")];
+
+    #[tokio::test]
+    async fn web_ui_is_public_but_the_api_keeps_its_token() {
+        let bound = bind(&Config {
+            bind: "127.0.0.1".into(),
+            port: 0,
+            token: Some("t0k".into()),
+            web: Some(web::WebRoot::Embedded(FILES)),
+            ..Default::default()
+        })
+        .await
+        .expect("bind");
+        let base = format!("http://{}", bound.addr);
+        let task = tokio::spawn(bound.serve());
+        let c = reqwest::Client::new();
+        let r = c.get(format!("{base}/s/abc")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+        assert_eq!(r.text().await.unwrap(), "<html>vicuna</html>");
+        let r = c.get(format!("{base}/_app/immutable/a.js")).send().await.unwrap();
+        assert!(r.headers()["cache-control"].to_str().unwrap().contains("immutable"));
+        assert_eq!(c.get(format!("{base}/nope.js")).send().await.unwrap().status(), 404);
+        assert_eq!(c.get(format!("{base}/health")).send().await.unwrap().status(), 200);
+        // API: no fallback to index.html, and the token still gates it
+        let r = c.post(format!("{base}/invoke")).body(r#"{"cmd":"api_actions"}"#).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(c.get(format!("{base}/poll/x")).send().await.unwrap().status(), 401);
+        let r = c.post(format!("{base}/invoke")).bearer_auth("t0k").body(r#"{"cmd":"api_actions"}"#).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("\"ok\":true"));
+        task.abort();
     }
 }
