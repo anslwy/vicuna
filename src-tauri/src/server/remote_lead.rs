@@ -1,10 +1,11 @@
-// Lead sessions managing sessions on another Vicuna server.
+// Sessions reaching another Vicuna server.
 //
-// `manage_sessions` with `server: "<saved name>"` lands here (server side,
-// after vicuna_mcp checked lead + the `remote` permission). The target is
-// resolved only from this machine's saved servers (`~/vicuna/config/
+// `manage_sessions` with `action: "servers"` or `server: "<saved name>"` lands
+// here (server side, after vicuna_mcp checked the session's `remote` permission
+// plus Read/Message permissions or lead role as required by the action). The
+// target is resolved only from this machine's saved servers (`~/vicuna/config/
 // servers.json`): a URL in the tool call is never dialled, so a prompt
-// injection can't point the lead at a stranger's box. Calls go to the
+// injection can't point a session at a stranger's box. Calls go to the
 // remote's `cli_session` action, the same one `vicuna session …` uses.
 //
 // Reports: the remote server can't reach us, so we watch. After a reported

@@ -73,7 +73,7 @@ export interface ChatExtra extends McpSelection {
   permissions?: { read?: boolean; message?: boolean; remote?: boolean };
 }
 
-/** `remote` = a lead may manage sessions on the user's saved servers (off unless granted). */
+/** `remote` = session may access sessions on the user's saved servers (off unless granted). */
 export function sessionPermissions(extra: Partial<Pick<ChatExtra, "role" | "permissions">>): { read: boolean; message: boolean; remote: boolean } {
   return { read: extra.permissions?.read ?? true, message: extra.permissions?.message ?? extra.role === "lead", remote: extra.permissions?.remote ?? false };
 }
