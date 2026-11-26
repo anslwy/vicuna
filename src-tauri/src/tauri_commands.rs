@@ -411,7 +411,7 @@ fn browser_resource_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
 #[tauri::command]
 pub(crate) async fn browser_status(
     app: AppHandle,
-    state: State<'_, browser::BrowserState>,
+    state: State<'_, std::sync::Arc<browser::BrowserState>>,
 ) -> Result<browser::BrowserStatus, String> {
     browser::browser_status_logic(browser_resource_dir(&app), &state).await
 }
@@ -420,14 +420,14 @@ pub(crate) async fn browser_status(
 #[tauri::command]
 pub(crate) async fn browser_start(
     app: AppHandle,
-    state: State<'_, browser::BrowserState>,
+    state: State<'_, std::sync::Arc<browser::BrowserState>>,
 ) -> Result<browser::BrowserStatus, String> {
     browser::browser_start_logic(browser_resource_dir(&app), &state).await
 }
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
-pub(crate) async fn browser_stop(state: State<'_, browser::BrowserState>) -> Result<browser::BrowserStatus, String> {
+pub(crate) async fn browser_stop(state: State<'_, std::sync::Arc<browser::BrowserState>>) -> Result<browser::BrowserStatus, String> {
     browser::browser_stop_logic(&state).await
 }
 
@@ -435,7 +435,7 @@ pub(crate) async fn browser_stop(state: State<'_, browser::BrowserState>) -> Res
 #[tauri::command]
 pub(crate) async fn browser_restart(
     app: AppHandle,
-    state: State<'_, browser::BrowserState>,
+    state: State<'_, std::sync::Arc<browser::BrowserState>>,
 ) -> Result<browser::BrowserStatus, String> {
     browser::browser_restart_logic(browser_resource_dir(&app), &state).await
 }
@@ -454,7 +454,7 @@ pub(crate) async fn browser_ensure_engine(
 #[tauri::command]
 pub(crate) async fn browser_takeover(
     app: AppHandle,
-    state: State<'_, browser::BrowserState>,
+    state: State<'_, std::sync::Arc<browser::BrowserState>>,
 ) -> Result<browser::BrowserStatus, String> {
     browser::browser_takeover_logic(browser_resource_dir(&app), &state).await
 }

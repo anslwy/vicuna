@@ -157,7 +157,7 @@ pub fn run() {
         .manage(acp::AcpState::default())
         .manage(AppQuitState::default())
         .manage(ScheduleState::default())
-        .manage(browser::BrowserState::default())
+        .manage(browser::shared())
         .manage(mcp::McpManager::default())
         .manage(ZoomState {
             factor: Mutex::new(1.0),

@@ -261,7 +261,7 @@ pub(crate) struct AppQuitState {
 #[cfg(feature = "desktop")]
 pub(crate) fn shutdown_children(app: &AppHandle) {
     server::embedded::shutdown();
-    if let Some(s) = app.try_state::<browser::BrowserState>() {
+    if let Some(s) = app.try_state::<std::sync::Arc<browser::BrowserState>>() {
         browser::kill_owned(&s);
     }
     if let Some(s) = app.try_state::<OllamaServerState>() {

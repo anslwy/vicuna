@@ -109,6 +109,18 @@ pub struct BrowserState {
     fallback: Mutex<Option<String>>,
 }
 
+/// The one `BrowserState` of this process. The desktop shell (Tauri
+/// commands, quit, local Work turns) and the embedded server (UI via the
+/// API, server turns, vicuna-mcp) used to hold one each: each believed it
+/// owned no daemon, so the second start found 18765 busy and spawned a
+/// second `lb` on 18766 with the SAME `profile-vicuna` — two daemons
+/// fighting over one SingletonLock (each `recover` reaped the other's
+/// Chromium). Every production caller must use this shared instance.
+pub fn shared() -> std::sync::Arc<BrowserState> {
+    static SHARED: std::sync::OnceLock<std::sync::Arc<BrowserState>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| std::sync::Arc::new(BrowserState::default())).clone()
+}
+
 fn remember_bin(state: &BrowserState, bin: &Path) {
     if let Ok(mut g) = state.bin.lock() {
         g.replace(bin.to_path_buf());
@@ -447,6 +459,24 @@ pub fn vicuna_profile_under(base: &Path) -> PathBuf {
 
 pub fn vicuna_profile_dir() -> PathBuf {
     vicuna_profile_under(&lb_cache_base())
+}
+
+/// Profile for a daemon on `port`: the base port keeps `profile-vicuna`
+/// (logins persist), a fallback port gets its own `profile-vicuna-<port>`.
+/// A fallback daemon only exists because another live lb holds the base
+/// port — sharing its profile would make the two Chromiums fight over the
+/// SingletonLock (and each lb's recover reaps the other's browser).
+pub fn profile_for_port_under(base: &Path, port: u16, base_port: u16) -> PathBuf {
+    let dir = vicuna_profile_under(base);
+    if port == base_port {
+        dir
+    } else {
+        dir.with_file_name(format!("profile-vicuna-{port}"))
+    }
+}
+
+fn vicuna_profile_for_port(port: u16) -> PathBuf {
+    profile_for_port_under(&lb_cache_base(), port, base_port())
 }
 
 /// Resource roots to search for the bundled binary. Release builds use
@@ -1391,7 +1421,7 @@ async fn spawn_attempt(
         .unwrap_or_else(|_| Stdio::null());
     let mut cmd = Command::new(bin);
     cmd.args(["web", "--port", &lb_port().to_string(), "--foreground"])
-        .args(["--profile", &vicuna_profile_dir().display().to_string()])
+        .args(["--profile", &vicuna_profile_for_port(lb_port()).display().to_string()])
         .args(extra)
         .stdin(Stdio::null())
         .stdout(log_out)
@@ -1449,7 +1479,7 @@ async fn graceful_stop_port(bin: &Path, port: u16) {
     // it lb reaps its default profile dir, leaving our private
     // `profile-vicuna(-cloak)` Chromium alive to lock the next launch.
     cmd.args(["web", "--port", &port.to_string()])
-        .args(["--profile", &vicuna_profile_dir().display().to_string()])
+        .args(["--profile", &vicuna_profile_for_port(port).display().to_string()])
         .arg("stop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2027,7 +2057,7 @@ pub fn kill_owned(state: &BrowserState) {
     if let Some(bin) = owned_bin(state) {
         let mut reap = Command::new(&bin);
         reap.args(["web", "--port", &port.to_string()])
-            .args(["--profile", &vicuna_profile_dir().display().to_string()])
+            .args(["--profile", &vicuna_profile_for_port(port).display().to_string()])
             .arg("stop")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2227,6 +2257,27 @@ mod tests {
         assert_eq!(p, PathBuf::from("/cache/live-browser/profile-vicuna"));
         // must differ from a personal daemon's default profile dir
         assert!(!p.ends_with("live-browser/profile"));
+    }
+
+    #[test]
+    fn fallback_ports_never_share_the_base_profile() {
+        let base = Path::new("/cache");
+        assert_eq!(
+            profile_for_port_under(base, 18765, 18765),
+            PathBuf::from("/cache/live-browser/profile-vicuna")
+        );
+        let fb = profile_for_port_under(base, 18766, 18765);
+        assert_eq!(fb, PathBuf::from("/cache/live-browser/profile-vicuna-18766"));
+        // still recognized as Vicuna-owned by the orphan reaper
+        let args = format!("/x/lb-sidecar/lb web --port 18766 --foreground --profile {}", fb.display());
+        assert!(is_vicuna_owned_lb_args(&args, &vicuna_profile_under(base)));
+    }
+
+    #[test]
+    fn shell_and_server_share_one_browser_state() {
+        assert!(std::sync::Arc::ptr_eq(&shared(), &shared()));
+        let st = crate::server::BridgeState::default();
+        assert!(std::sync::Arc::ptr_eq(&st.browser, &shared()));
     }
 
     #[test]

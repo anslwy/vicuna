@@ -1562,7 +1562,7 @@ impl TurnMcp {
             return;
         }
         #[cfg(feature = "desktop")]
-        if let Some(browser) = APP_HANDLE.get().and_then(|app| app.try_state::<crate::browser::BrowserState>()) {
+        if let Some(browser) = APP_HANDLE.get().and_then(|app| app.try_state::<std::sync::Arc<crate::browser::BrowserState>>()) {
             let _ = crate::browser::browser_start_logic(self.resources.clone(), &browser).await;
         }
     }
