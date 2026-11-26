@@ -3,12 +3,14 @@
 // the side-panel tab iframes its web UI while the Work agent drives the
 // same tabs through `lb mcp` (seeded as the default `browser` MCP server).
 //
-// Binary resolution: the bundled `lb-sidecar/` resource dir first (staged
-// by `scripts/fetch-lb-sidecar.sh`, shipped via `bundle.resources`), then
-// `lb` on PATH (dev + user installs). Like `ollama serve`, an already
-// reachable daemon is adopted, never double-spawned — and only a daemon
-// Vicuna itself started can be stopped from here (foreign ones are left
-// alone). Quit kills the owned child via `shutdown_children`.
+// Binary resolution: bundled `lb-sidecar/` resource dir only (staged
+// by `scripts/fetch-lb-sidecar.sh`, shipped via `bundle.resources`).
+// External `lb` binaries on PATH are never used, so Vicuna always runs
+// the exact sidecar version it was built and tested with. Like
+// `ollama serve`, an already reachable daemon is adopted, never
+// double-spawned — and only a daemon Vicuna itself started can be
+// stopped from here (foreign ones are left alone). Quit kills the owned
+// child via `shutdown_children`.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -71,14 +73,12 @@ pub fn lb_server_url() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LbSource {
     Bundled,
-    Path,
 }
 
 impl LbSource {
     fn as_str(self) -> &'static str {
         match self {
             LbSource::Bundled => "bundled",
-            LbSource::Path => "path",
         }
     }
 }
@@ -190,36 +190,6 @@ pub fn bundled_candidates_for_arch(resource_dir: &Path, arch: &str) -> Vec<PathB
 pub fn bundled_candidates(resource_dir: &Path) -> Vec<PathBuf> {
     bundled_candidates_for_arch(resource_dir, std::env::consts::ARCH)
 }
-
-/// `lb` on PATH plus the usual GUI-launch locations (Finder-launched apps
-/// get a sparse PATH — same problem as the `ollama` lookup).
-fn find_on_path_dirs(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
-}
-
-fn path_search_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/bin"));
-    }
-    #[cfg(windows)]
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        dirs.push(PathBuf::from(local).join("live-browser"));
-    }
-    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        dirs.push(PathBuf::from(extra));
-    }
-    dirs
-}
-
-#[cfg(windows)]
-const LB_PATH_NAME: &str = "lb.exe";
-#[cfg(not(windows))]
-const LB_PATH_NAME: &str = "lb";
 
 /// Binary location inside a `chromium-{version}/` cache entry (mirrors the
 /// cloakbrowser wrapper's `getBinaryPath`, same as lb's own inventory).
@@ -524,70 +494,22 @@ fn headless_root_for_exe(exe: &Path) -> Option<PathBuf> {
     roots.into_iter().find(|r| bundled_candidates(r).iter().any(|p| p.is_file()))
 }
 
-/// Resolve the `lb` binary: bundled resource first, PATH fallback.
-/// Returns the binary path plus where it came from.
+/// Resolve the bundled `lb` binary. External `lb` binaries on PATH are
+/// never used so the built-in browser always runs the pinned sidecar.
 pub fn resolve_lb_bin(resource_dir: Option<&Path>) -> Option<(PathBuf, LbSource)> {
     resolve_in_roots(&bundled_search_roots(resource_dir))
 }
 
 fn resolve_in_roots(roots: &[PathBuf]) -> Option<(PathBuf, LbSource)> {
-    let bundled = roots
+    roots
         .iter()
-        .find_map(|root| bundled_candidates(root).into_iter().find(|p| p.is_file()));
-    let path = find_on_path_dirs(LB_PATH_NAME, &path_search_dirs());
-    choose_lb(bundled, path, cached_lb_version)
-}
-
-/// Pick the `lb` to run. The bundled sidecar always wins, so a release
-/// build runs the engine it was tested with, never an older `lb` that
-/// happens to be on PATH. A PATH binary is used only when nothing is
-/// bundled (dev builds without a fetch) or when it is at least as new
-/// as the bundled one. `version` is consulted only when both exist.
-pub fn choose_lb(
-    bundled: Option<PathBuf>,
-    path: Option<PathBuf>,
-    version: impl Fn(&Path) -> Option<String>,
-) -> Option<(PathBuf, LbSource)> {
-    match (bundled, path) {
-        (Some(b), None) => Some((b, LbSource::Bundled)),
-        (None, Some(p)) => Some((p, LbSource::Path)),
-        (None, None) => None,
-        (Some(b), Some(p)) => {
-            let newer_or_equal = match (version(&p), version(&b)) {
-                (Some(pv), Some(bv)) => at_least_as_new(&pv, &bv),
-                _ => false,
-            };
-            if newer_or_equal {
-                Some((p, LbSource::Path))
-            } else {
-                Some((b, LbSource::Bundled))
-            }
-        }
-    }
-}
-
-/// `candidate >= reference` for dotted numeric versions (`0.4.20` vs
-/// `0.4.9`). Unparseable input is "not at least as new".
-pub fn at_least_as_new(candidate: &str, reference: &str) -> bool {
-    fn key(v: &str) -> Option<Vec<u64>> {
-        v.trim_start_matches('v')
-            .split('.')
-            .map(|part| part.parse::<u64>().ok())
-            .collect()
-    }
-    match (key(candidate), key(reference)) {
-        (Some(a), Some(b)) => {
-            let n = a.len().max(b.len());
-            let at = |v: &Vec<u64>, i: usize| v.get(i).copied().unwrap_or(0);
-            (0..n).map(|i| at(&a, i)).cmp((0..n).map(|i| at(&b, i))) != std::cmp::Ordering::Less
-        }
-        _ => false,
-    }
+        .find_map(|root| bundled_candidates(root).into_iter().find(|p| p.is_file()))
+        .map(|b| (b, LbSource::Bundled))
 }
 
 /// `lb --version` for a binary, cached per (path, size, mtime) so the
 /// 3s status poll doesn't spawn it every time. Blocking, but only on a
-/// cache miss, and only for the bundled-vs-PATH comparison.
+/// cache miss.
 fn cached_lb_version(bin: &Path) -> Option<String> {
     static CACHE: Mutex<Vec<(PathBuf, Option<(u64, u64)>, Option<String>)>> = Mutex::new(Vec::new());
     let id = bin_id(bin);
@@ -1136,8 +1058,7 @@ pub struct BrowserStatus {
     pub download: Option<EngineDownloadProgress>,
 }
 
-/// Daemon status for the Browser tab + MCP seeding. `resource_dir` is
-/// `None` under the headless bridge (no app bundle there — PATH only).
+/// Daemon status for the Browser tab + MCP seeding.
 pub async fn browser_status_logic(
     resource_dir: Option<PathBuf>,
     state: &BrowserState,
@@ -1223,16 +1144,14 @@ pub async fn browser_start_logic(
     if owned_child_alive(state) && matches!(probe_daemon(&client).await, Probe::Lb(_)) {
         return browser_status_logic(resource_dir, state).await;
     }
-    let (bin, source) = resource_dir
+    let (bin, _source) = resource_dir
         .as_deref()
         .and_then(|r| resolve_lb_bin(Some(r)))
         .or_else(|| resolve_lb_bin(None))
         .ok_or_else(|| {
-            "no `lb` browser engine found (bundled sidecar missing and `lb` not on PATH) — install live-browser (https://github.com/anslwy/live-browser) or rebuild with scripts/fetch-lb-sidecar.sh".to_string()
+            "no bundled `lb` browser engine found (lb-sidecar missing) — run scripts/fetch-lb-sidecar.sh or reinstall Vicuna".to_string()
         })?;
-    if source == LbSource::Bundled {
-        ensure_exec_bit(&bin);
-    }
+    ensure_exec_bit(&bin);
     // Reap orphaned Vicuna-owned `lb` daemons across our managed port range
     // (left behind by prior crashes, force-quits, or app updates) before
     // choosing a port. Live sibling Vicuna instances and unrelated user-run
@@ -1313,7 +1232,7 @@ pub async fn browser_start_logic(
     let mut last_err = String::from("no attempt ran");
     for target in &attempts {
         let extra = vec!["--chrome".to_string(), target.clone()];
-        match spawn_attempt(&bin, source, &extra, &client).await {
+        match spawn_attempt(&bin, &extra, &client).await {
             Ok(child) => {
                 let lb_pid = child.id();
                 state
@@ -1448,7 +1367,6 @@ pub fn log_tail(path: &Path, lines: usize) -> String {
 /// engine as broken.
 async fn spawn_attempt(
     bin: &Path,
-    source: LbSource,
     extra: &[String],
     client: &reqwest::Client,
 ) -> Result<Child, String> {
@@ -1480,10 +1398,8 @@ async fn spawn_attempt(
         .stderr(log_err);
     // the bundled binary finds its web UI via its cwd fast-path
     // (`lb-sidecar/web/dist` ships next to it)
-    if source == LbSource::Bundled {
-        if let Some(dir) = bin.parent() {
-            cmd.current_dir(dir);
-        }
+    if let Some(dir) = bin.parent() {
+        cmd.current_dir(dir);
     }
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash
@@ -2135,7 +2051,7 @@ mod tests {
         let bin = t.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let exe = bin.join("vicuna");
-        assert_eq!(headless_root_for_exe(&exe), None, "nothing bundled → PATH fallback");
+        assert_eq!(headless_root_for_exe(&exe), None, "nothing bundled");
         let share = t.join("share").join("vicuna");
         for p in bundled_candidates(&share) {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -2199,18 +2115,6 @@ mod tests {
     }
 
     #[test]
-    fn path_search_finds_explicit_dirs() {
-        let dir = std::env::temp_dir().join("vicuna-lb-probe");
-        let _ = std::fs::create_dir_all(&dir);
-        let fake = dir.join(LB_PATH_NAME);
-        std::fs::write(&fake, "x").expect("write fake lb");
-        let hit = find_on_path_dirs(LB_PATH_NAME, &[dir.clone()]);
-        assert_eq!(hit, Some(fake));
-        assert!(find_on_path_dirs(LB_PATH_NAME, &[dir.join("nope")]).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn cloak_cache_picks_newest_binary() {
         let cache = std::env::temp_dir().join("vicuna-cloak-probe");
         let _ = std::fs::remove_dir_all(&cache);
@@ -2265,16 +2169,20 @@ mod tests {
     }
 
     #[test]
-    fn bundled_beats_path() {
+    fn resolve_in_roots_uses_bundled_only() {
         // explicit roots (not resolve_lb_bin: debug builds prepend the
         // ambient crate dir, which would win over the fake root whenever
         // the checkout has a staged sidecar)
         let root = std::env::temp_dir().join("vicuna-lb-bundled");
+        let _ = std::fs::remove_dir_all(&root);
+        // Empty root must return None (never fall back to any external `lb` on PATH).
+        assert_eq!(resolve_in_roots(&[root.clone()]), None);
+        assert_eq!(resolve_in_roots(&[]), None);
         let sidecar = root.join("lb-sidecar");
         let _ = std::fs::create_dir_all(&sidecar);
         let expected = bundled_candidates(&root)[0].clone();
         std::fs::write(&expected, "x").expect("write bundled lb");
-        let (hit, src) = resolve_in_roots(&[root.clone()]).expect("bundled must win");
+        let (hit, src) = resolve_in_roots(&[root.clone()]).expect("bundled must resolve");
         assert_eq!(hit, expected);
         assert_eq!(src, LbSource::Bundled);
         let _ = std::fs::remove_dir_all(&root);
@@ -2319,65 +2227,6 @@ mod tests {
         assert_eq!(p, PathBuf::from("/cache/live-browser/profile-vicuna"));
         // must differ from a personal daemon's default profile dir
         assert!(!p.ends_with("live-browser/profile"));
-    }
-
-    #[test]
-    fn bundled_sidecar_wins_over_older_path_lb() {
-        let b = PathBuf::from("/app/lb-sidecar/lb");
-        let p = PathBuf::from("/usr/local/bin/lb");
-        let older = |x: &Path| {
-            Some((if x == p.as_path() { "0.4.18" } else { "0.4.20" }).to_string())
-        };
-        // the owner's case: a release build with an older lb on PATH
-        assert_eq!(
-            choose_lb(Some(b.clone()), Some(p.clone()), older),
-            Some((b.clone(), LbSource::Bundled))
-        );
-        // PATH newer than the bundle: PATH wins
-        let newer = |x: &Path| {
-            Some((if x == p.as_path() { "0.4.21" } else { "0.4.20" }).to_string())
-        };
-        assert_eq!(
-            choose_lb(Some(b.clone()), Some(p.clone()), newer),
-            Some((p.clone(), LbSource::Path))
-        );
-        // equal counts as "at least as new"
-        let same = |_: &Path| Some("0.4.20".to_string());
-        assert_eq!(
-            choose_lb(Some(b.clone()), Some(p.clone()), same),
-            Some((p.clone(), LbSource::Path))
-        );
-        // unknown PATH version: keep the bundle
-        let unknown = |x: &Path| if x == p.as_path() { None } else { Some("0.4.20".to_string()) };
-        assert_eq!(
-            choose_lb(Some(b.clone()), Some(p.clone()), unknown),
-            Some((b.clone(), LbSource::Bundled))
-        );
-    }
-
-    #[test]
-    fn dev_build_without_sidecar_uses_path() {
-        let p = PathBuf::from("/usr/local/bin/lb");
-        assert_eq!(
-            choose_lb(None, Some(p.clone()), |_| None),
-            Some((p, LbSource::Path))
-        );
-        assert_eq!(choose_lb(None, None, |_| None), None);
-        let b = PathBuf::from("/app/lb-sidecar/lb");
-        assert_eq!(
-            choose_lb(Some(b.clone()), None, |_| None),
-            Some((b, LbSource::Bundled))
-        );
-    }
-
-    #[test]
-    fn version_compare_is_numeric() {
-        assert!(at_least_as_new("0.4.20", "0.4.18"));
-        assert!(at_least_as_new("0.4.10", "0.4.9"));
-        assert!(!at_least_as_new("0.4.9", "0.4.10"));
-        assert!(at_least_as_new("0.4.20", "0.4.20"));
-        assert!(at_least_as_new("v1.0", "0.9.9"));
-        assert!(!at_least_as_new("garbage", "0.4.20"));
     }
 
     #[test]
