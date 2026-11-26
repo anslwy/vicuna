@@ -356,6 +356,12 @@ fn target_for_call(registry: &SharedRegistry, token: &str, default: Option<Targe
     if let Some(t) = r.targets.get(token).and_then(|v| v.iter().rev().find(mine)) {
         return Some(t.clone());
     }
+    // A remote-server call is permission-gated by the target session, so a
+    // caller id may never pull in a session from another route: that would
+    // let any session borrow a permitted session's identity.
+    if msg.pointer("/params/name").and_then(Value::as_str).is_some_and(|n| is_remote_call(n, msg.pointer("/params/arguments").unwrap_or(&Value::Null))) {
+        return default;
+    }
     let mut any: Vec<&Target> = r.targets.values().flatten().filter(mine).collect();
     any.sort_by_key(|t| t.seq);
     any.last().map(|t| (*t).clone()).or(default)
@@ -530,8 +536,10 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     }
     let remote = action == "servers" || args.get("server").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
     if remote {
-        if !turn.lead.load(Ordering::Relaxed) || !may_remote(&target.session_id).await {
-            return text_result("Managing sessions on other servers needs the lead session with the \"Use sessions on other servers\" permission (Permissions… in the session menu).", true);
+        let lead = turn.lead.load(Ordering::Relaxed);
+        let permitted = lead && may_remote(&target.session_id).await;
+        if let Err(e) = remote_gate_decision(target.session_id.is_some(), permitted, lead, true) {
+            return text_result(e, true);
         }
         if turn.stop.load(Ordering::Relaxed) {
             return text_result("The user stopped the turn; nothing was done.", true);
@@ -607,6 +615,28 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     }
 }
 
+/// Calls that reach (or list) other saved servers. Every one of them must pass
+/// the "Use sessions on other servers" gate before any server is resolved.
+fn is_remote_call(tool: &str, args: &Value) -> bool {
+    match tool {
+        MANAGE_SESSIONS_TOOL => args.get("action").and_then(Value::as_str).map(str::trim) == Some("servers") || remote_server(args).is_some(),
+        READ_SESSION_TOOL | SEARCH_TOOL => remote_server(args).is_some(),
+        _ => false,
+    }
+}
+
+const REMOTE_READ_DENIED: &str = "Reading sessions on other servers needs this session's \"Use sessions on other servers\" permission (Permissions… in the session menu).";
+const REMOTE_MANAGE_DENIED: &str = "Managing sessions on other servers needs the lead session with the \"Use sessions on other servers\" permission (Permissions… in the session menu).";
+
+/// The remote gate's decision, kept pure. Reading (read/search) needs only the
+/// `remote` permission; managing also needs the lead role. Error texts are
+/// fixed strings: they never name saved servers.
+fn remote_gate_decision(has_session: bool, permitted: bool, lead: bool, manage: bool) -> Result<(), &'static str> {
+    if manage {
+        if has_session && permitted && lead { Ok(()) } else { Err(REMOTE_MANAGE_DENIED) }
+    } else if has_session && permitted { Ok(()) } else { Err(REMOTE_READ_DENIED) }
+}
+
 fn remote_server(args: &Value) -> Option<String> {
     args.get("server").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
@@ -615,15 +645,18 @@ fn remote_server(args: &Value) -> Option<String> {
 /// "continue session X from my computer" is usually asked of a worker.
 async fn remote_gate(target: Option<&Target>) -> Result<(), String> {
     let sid = target.and_then(|t| t.session_id.clone());
-    if sid.is_some() && may_remote(&sid).await { Ok(()) } else {
-        Err("Reading sessions on other servers needs this session's \"Use sessions on other servers\" permission (Permissions… in the session menu).".into())
-    }
+    let permitted = sid.is_some() && may_remote(&sid).await;
+    remote_gate_decision(sid.is_some(), permitted, false, false).map_err(str::to_string)
 }
 
 async fn may_remote(session_id: &Option<String>) -> bool {
     let Some(id) = session_id.as_deref() else { return false };
     let Ok(pool) = db_pool().await else { return false };
-    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(&pool).await.ok().flatten();
+    may_remote_in(&pool, id).await
+}
+
+async fn may_remote_in(pool: &sqlx::SqlitePool, id: &str) -> bool {
+    let row = sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(pool).await.ok().flatten();
     let extra = row.and_then(|r| r.try_get::<Option<String>, _>("extra").ok().flatten()).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
     effective_permission(&extra, "remote")
 }
@@ -2402,6 +2435,130 @@ mod tests {
         assert_eq!(pick(&other_token, Some("lead")).as_deref(), Some("lead"), "found on another route");
         assert_eq!(pick(&other_token, None), None);
         assert_eq!(pick(&lead.token, Some("gone")).as_deref(), Some("worker"));
+    }
+
+    const SAVED_NAMES: [&str; 3] = ["Deck Remote Server", "Oracle VPS", "Deck Family"];
+
+    fn no_saved_names(text: &str) {
+        for n in SAVED_NAMES { assert!(!text.contains(n), "leaked {n}: {text}"); }
+        assert!(!text.contains("Saved servers"), "{text}");
+    }
+
+    fn gate_text(v: &Value) -> (String, bool) {
+        (v.pointer("/content/0/text").and_then(Value::as_str).unwrap_or("").to_string(), v["isError"] == true)
+    }
+
+    #[test]
+    fn remote_gate_decision_matrix() {
+        // read/search: the permission alone is enough (lead not needed)
+        assert!(remote_gate_decision(true, true, false, false).is_ok());
+        assert!(remote_gate_decision(true, true, true, false).is_ok());
+        assert_eq!(remote_gate_decision(true, false, true, false), Err(REMOTE_READ_DENIED));
+        assert_eq!(remote_gate_decision(false, true, false, false), Err(REMOTE_READ_DENIED));
+        // manage: lead AND permission
+        assert!(remote_gate_decision(true, true, true, true).is_ok());
+        assert_eq!(remote_gate_decision(true, true, false, true), Err(REMOTE_MANAGE_DENIED));
+        assert_eq!(remote_gate_decision(true, false, true, true), Err(REMOTE_MANAGE_DENIED));
+        assert_eq!(remote_gate_decision(false, true, true, true), Err(REMOTE_MANAGE_DENIED));
+        for e in [REMOTE_READ_DENIED, REMOTE_MANAGE_DENIED] {
+            assert!(e.contains("\"Use sessions on other servers\""));
+            no_saved_names(e);
+        }
+    }
+
+    #[test]
+    fn remote_calls_are_recognized() {
+        assert!(is_remote_call(SEARCH_TOOL, &json!({"server": "Oracle VPS"})));
+        assert!(is_remote_call(READ_SESSION_TOOL, &json!({"server": "nope"})));
+        assert!(is_remote_call(MANAGE_SESSIONS_TOOL, &json!({"action": "servers"})));
+        assert!(is_remote_call(MANAGE_SESSIONS_TOOL, &json!({"action": "list", "server": "vps"})));
+        assert!(!is_remote_call(SEARCH_TOOL, &json!({"server": "  "})));
+        assert!(!is_remote_call(READ_SESSION_TOOL, &json!({})));
+        assert!(!is_remote_call(LIST_SESSIONS_TOOL, &json!({"server": "vps"})));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_remote_read_and_search_are_refused_without_names() {
+        let (ch, _) = capture();
+        let worker = Target { seq: 0, workspace: ws(), session_id: Some("worker-no-perm".into()), turn: Arc::new(TurnState::new()), on_event: ch };
+        let none: Option<&Target> = None;
+        // valid saved names and unknown ones alike: the gate answers first
+        for server in ["Oracle VPS", "Deck Family", "vps", "no-such-server", "https://evil.example"] {
+            for t in [Some(&worker), none] {
+                let (text, err) = gate_text(&search_sessions(t, &json!({"server": server, "query": "test"})).await);
+                assert!(err, "{text}");
+                assert_eq!(text, REMOTE_READ_DENIED);
+                no_saved_names(&text);
+                let (text, err) = gate_text(&read_session(t, &json!({"server": server, "session_id": "abc"})).await);
+                assert!(err, "{text}");
+                assert_eq!(text, REMOTE_READ_DENIED);
+                no_saved_names(&text);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_remote_manage_is_refused_without_names() {
+        for lead in [false, true] {
+            let (ch, seen) = capture();
+            let turn = Arc::new(TurnState::new());
+            turn.lead.store(lead, Ordering::Relaxed);
+            let t = Target { seq: 0, workspace: ws(), session_id: Some("lead-no-perm".into()), turn, on_event: ch };
+            for args in [json!({"action": "servers"}), json!({"action": "list", "server": "Oracle VPS"}), json!({"action": "status", "server": "unknown", "session_id": "x"})] {
+                let (text, err) = gate_text(&manage_sessions(&t, &args, std::future::pending::<()>()).await);
+                assert!(err, "{text}");
+                assert_eq!(text, REMOTE_MANAGE_DENIED);
+                no_saved_names(&text);
+            }
+            assert!(seen.lock().unwrap().is_empty(), "nothing may reach the window");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_permission_reads_the_session_row() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, extra TEXT)").execute(&pool).await.unwrap();
+        for (id, extra) in [
+            ("ok", r#"{"permissions":{"remote":true}}"#),
+            ("lead-ok", r#"{"role":"lead","permissions":{"remote":true}}"#),
+            ("lead-plain", r#"{"role":"lead"}"#),
+            ("off", r#"{"permissions":{"remote":false,"read":true}}"#),
+        ] {
+            sqlx::query("INSERT INTO chats (id, extra) VALUES (?, ?)").bind(id).bind(extra).execute(&pool).await.unwrap();
+        }
+        assert!(may_remote_in(&pool, "ok").await);
+        assert!(may_remote_in(&pool, "lead-ok").await);
+        assert!(!may_remote_in(&pool, "lead-plain").await, "opt-in even for the lead");
+        assert!(!may_remote_in(&pool, "off").await);
+        assert!(!may_remote_in(&pool, "missing").await);
+        // and the decision lets the permitted ones through
+        assert!(remote_gate_decision(true, may_remote_in(&pool, "ok").await, false, false).is_ok());
+        assert!(remote_gate_decision(true, may_remote_in(&pool, "lead-ok").await, true, true).is_ok());
+    }
+
+    #[test]
+    fn caller_id_cannot_borrow_another_routes_session_for_remote_calls() {
+        let reg: SharedRegistry = Arc::default();
+        let (ch, _) = capture();
+        let lead = register_on(&reg, 1, Some("claude|a"), "/a", Some("lead"), Arc::new(TurnState::new()), ch.clone());
+        let worker = register_on(&reg, 1, Some("claude|b"), "/b", Some("worker"), Arc::new(TurnState::new()), ch.clone());
+        let call = |tool: &str, mut args: Value| {
+            args[CALLER_ARG] = json!("lead");
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": args } })
+        };
+        let pick = |msg: &Value| target_for_call(&reg, &worker.token, target_for(&reg, &worker.token).flatten(), msg).and_then(|t| t.session_id);
+        for msg in [
+            call(SEARCH_TOOL, json!({"server": "Oracle VPS", "query": "q"})),
+            call(READ_SESSION_TOOL, json!({"server": "Oracle VPS", "session_id": "s"})),
+            call(MANAGE_SESSIONS_TOOL, json!({"action": "servers"})),
+        ] {
+            assert_eq!(pick(&msg).as_deref(), Some("worker"), "{msg}");
+        }
+        // ordinary calls keep the cross-route lookup (#76)
+        assert_eq!(pick(&call(SCHEDULE_TOOL, json!({}))).as_deref(), Some("lead"));
+        // on the lead's own route the lead still resolves for remote calls
+        let own = target_for_call(&reg, &lead.token, None, &call(SEARCH_TOOL, json!({"server": "x", "query": "q"}))).and_then(|t| t.session_id);
+        assert_eq!(own.as_deref(), Some("lead"));
     }
 
     fn capture() -> (Channel<WorkAgentEvent>, Arc<Mutex<Vec<Value>>>) {
