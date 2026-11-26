@@ -338,7 +338,7 @@ pub async fn work_agent_start(
     let _ = turn.mcp.set(crate::vicuna_mcp::TurnMcp::new(mgr, resources.clone(), selection, None));
     tokio::spawn(async move {
         if mcp_snapshot.uses_builtin_browser() {
-            let browser = app.state::<crate::browser::BrowserState>();
+            let browser = app.state::<std::sync::Arc<crate::browser::BrowserState>>();
             let _ = crate::browser::browser_start_logic(resources, &browser).await;
             mcp_snapshot.update_browser_url();
         }

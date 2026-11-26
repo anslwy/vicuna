@@ -128,7 +128,7 @@ impl Default for BridgeState {
             shell: Arc::new(AgentShellState::default()),
             mcp: McpManager::default(),
             agent: WorkAgentState::default(),
-            browser: Arc::new(BrowserState::default()),
+            browser: crate::browser::shared(),
             undo: Arc::new(UndoState::default()),
             acp: Arc::new(AcpState::default()),
             token: None,
