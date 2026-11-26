@@ -113,11 +113,11 @@ curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli
 vicuna serve --tailscale
 ```
 
-Paste the printed URL and token into the desktop app via **Sidebar server menu → Connect to new server…**.
+Paste the printed URL and token into the desktop app via **Sidebar server menu → Connect to new server…**, or open the printed browser URL (it carries the token as `#token=…`) to use the same server from any browser.
 
 ```sh
-vicuna serve [--port N] [--bind ADDR] [--db PATH] [--tailscale [--https-port N]]
-                                        # run the server in the foreground
+vicuna serve [-p|--port N] [--bind ADDR] [--db PATH] [--web-dir PATH] [--tailscale [--https-port N]]
+                                        # run the server (desktop app + browser UI) in the foreground
 vicuna install-service [serve options]  # keep it running on login/boot (systemd / launchd)
 vicuna uninstall-service
 vicuna start [serve options]            # start in the background
@@ -125,14 +125,13 @@ vicuna stop                             # stop the running service or process
 vicuna restart [serve options]          # detached restart (safe from inside a hosted session)
 vicuna status                           # running state, pid, version, and log path
 vicuna token                            # print the server auth token
-vicuna web [-p|--port N] [--bind ADDR] [--db PATH] [--no-open] [--tailscale [--https-port N]]
-                                        # full Vicuna UI + backend in your browser (default 127.0.0.1:7422)
+vicuna web [serve options] [--no-open]  # open the web UI in your browser, starting the server if needed
 vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
                                         # checksum-verified atomic upgrade + live DB backup
 vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 ```
 
-`vicuna web` serves the web UI bundled into the binary together with the same backend as `vicuna serve` (chats in `~/vicuna/server/vicuna.db` unless `--db`), then opens `http://127.0.0.1:7422/#token=…` in your default browser (`--no-open` just prints it, e.g. over SSH). Its default port 7422 sits beside `vicuna serve`'s 7421, so both can run at once. The API always requires the server token, even on loopback: the browser receives it in the URL fragment, which is never sent to the server, and Vicuna moves it into the tab's sessionStorage and removes it from the address bar. To open another tab, add `#token=$(vicuna token)` to the address. Use `--tailscale` to reach it from your tailnet (HTTPS); a non-loopback `--bind` works but is plain HTTP.
+`vicuna serve` serves the web UI bundled into the binary on the same port as the backend (default `127.0.0.1:7421`, chats in `~/vicuna/server/vicuna.db` unless `--db`; `--web-dir` serves another `build/`). Its banner prints the `Server:` URL and `Token:` for the desktop app plus a `Browser:` URL (`http://127.0.0.1:7421/#token=…`); with `--tailscale` it also prints the tailnet app URL and its browser URL. `vicuna web` is the shortcut: with no options it opens the browser on a `vicuna serve` that is already running on the default port, otherwise it starts the server with the given options and opens it (`--no-open` just prints the URL, e.g. over SSH). The API always requires the server token, even on loopback: the browser receives it in the URL fragment, which is never sent to the server, and Vicuna moves it into the tab's sessionStorage and removes it from the address bar. To open another tab, add `#token=$(vicuna token)` to the address. A non-loopback `--bind` works but is plain HTTP; prefer `--tailscale`.
 
 The CLI also drives any running server directly (`vicuna session`, `vicuna schedule`, `vicuna engines`, `vicuna models`, `vicuna mcp`, `vicuna server`, `vicuna api`).
 
