@@ -62,7 +62,9 @@
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
   import BridgeModal from "$lib/BridgeModal.svelte";
-  import PluginsPanel from "$lib/PluginsPanel.svelte";
+  import PluginsModal from "$lib/PluginsModal.svelte";
+  import PermissionsModal from "$lib/PermissionsModal.svelte";
+  import ClearContextModal from "$lib/ClearContextModal.svelte";
   import SkillsModal from "$lib/SkillsModal.svelte";
   import EngineIcon from "$lib/EngineIcon.svelte";
   import UsageModal from "$lib/UsageModal.svelte";
@@ -73,6 +75,7 @@
   import McpPopup from "$lib/McpPopup.svelte";
   import ServerMenu from "$lib/ServerMenu.svelte";
   import SidebarSessionItem from "$lib/SidebarSessionItem.svelte";
+  import SessionContextMenu from "$lib/SessionContextMenu.svelte";
   import SettingsModal from "$lib/SettingsModal.svelte";
   import SidePanel, { type SideTab } from "$lib/SidePanel.svelte";
   import ConfirmModals from "$lib/ConfirmModals.svelte";
@@ -9815,120 +9818,36 @@
         </button>
       </div>
       {#if ctxMenu}
-        <button
-          class="ctx-backdrop"
-          data-testid="session-menu-backdrop"
-          aria-label="Close menu"
-          onclick={() => {
-            ctxMenu = null;
-            workspacePickerOpen = false;
-          }}
-          oncontextmenu={(e) => {
-            e.preventDefault();
-            ctxMenu = null;
-            workspacePickerOpen = false;
-          }}
-          tabindex="-1"
-        ></button>
-        <div
-          class="ctx-menu"
-          data-testid="session-menu"
-          style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;"
-        >
-          <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
-          <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
-          <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
-          <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
-          <div class="ctx-sep" role="separator"></div>
-          {#if (ctxChat?.mode ?? "chat") === "work"}
-            {#if serverPersist}
-              <button class="ctx-item" data-testid="permissions-item" onclick={() => { permissionsFor = ctxMenu!.chatId; ctxMenu = null; }}>Permissions…</button>
-            {/if}
-            {@const tgSnap = ctxChat ? telegramStatuses[ctxChat.id] : null}
-            {@const tgState = telegramStateFor(ctxChat?.id)}
-            {#if ctxChat?.role === "lead"}
-              <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>Remove lead</button>
-            {:else}
-              {@const hasLead = chats.some((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)}
-              <button
-                class="ctx-item"
-                data-testid="lead-item"
-                onclick={() => { leadPrompt = { id: ctxMenu!.chatId, prevTitle: chats.find((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)?.title ?? null }; ctxMenu = null; }}
-              >{hasLead ? "Replace lead" : "Make lead"}</button>
-            {/if}
-            <button
-              class="ctx-item ctx-telegram"
-              data-testid="telegram-item"
-              title={telegramConnTitle(tgSnap)}
-              onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}
-            >
-              <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
-              <span class="ctx-tg-label">Telegram</span>
-              {#if tgSnap?.botUsername}<span class="ctx-tg-bot">@{tgSnap.botUsername}</span>{/if}
-              <span class="ctx-tg-dot {tgState}" data-testid="telegram-status-dot" data-status={tgState} aria-label={telegramConnLabel(tgState)}></span>
-            </button>
-            {#each bridgePlugins as bp (bp.id)}
-              {@const bSnap = ctxChat ? bridgeStatuses[bp.id]?.[ctxChat.id] : null}
-              {@const bState = bridgeConnState(bSnap)}
-              {@const bName = bridgeDisplayName(bp)}
-              {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
-              <button
-                class="ctx-item ctx-telegram"
-                data-testid="bridge-item-{bp.id}"
-                title={bridgeConnTitle(bName, bSnap)}
-                onclick={() => { bridgeModal = { pluginId: bp.id, sessionId: ctxMenu!.chatId }; ctxMenu = null; }}
-              >
-                <span class="ctx-tg-icon" style:background={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
-                <span class="ctx-tg-label">{bName}</span>
-                {#if bSnap?.botUsername}<span class="ctx-tg-bot">@{bSnap.botUsername}</span>{/if}
-                <span class="ctx-tg-dot {bState}" data-testid="bridge-status-dot-{bp.id}" data-status={bState} aria-label={bridgeConnLabel(bName, bState)}></span>
-              </button>
-            {/each}
-          {/if}
-          <div class="ctx-continue-row">
-            <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
-            <button
-              class="ctx-ws-pill"
-              data-testid="continue-work-workspace"
-              title={continueWorkspace ? `Work folder: ${displayWorkspace(continueWorkspace)} — click to change` : "Pick a work folder"}
-              aria-label="Change work folder"
-              onclick={(e) => void pickContinueWorkspace(e)}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              <span class="ctx-ws-name">{workspaceBase(continueWorkspace) || "Folder"}</span>
-            </button>
-          </div>
-          {#if workspacePickerOpen && (!isTauriRuntime() || onServer)}
-            <form
-              class="ctx-ws-form"
-              data-testid="continue-work-workspace-form"
-              onsubmit={(e) => {
-                e.preventDefault();
-                void commitContinueWorkspace();
-              }}
-            >
-              <input
-                class="pull-input"
-                data-testid="continue-work-workspace-input"
-                placeholder={isWindows ? "C:\\path\\to\\workspace" : "/absolute/path/to/workspace"}
-                bind:value={workspaceDraft}
-                spellcheck={false}
-                onkeydown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    workspacePickerOpen = false;
-                  }
-                }}
-              />
-              {#if workspaceError}
-                <div class="goto-error" data-testid="continue-work-workspace-error">{workspaceError}</div>
-              {/if}
-            </form>
-          {/if}
-          <div class="ctx-sep" role="separator"></div>
-          <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
-        </div>
+        <SessionContextMenu
+          menu={ctxMenu}
+          {ctxChat}
+          {chats}
+          {serverPersist}
+          {onServer}
+          {telegramStatuses}
+          {telegramStateFor}
+          {bridgePlugins}
+          {bridgeStatuses}
+          {continueWorkspace}
+          {workspacePickerOpen}
+          bind:workspaceDraft
+          {workspaceError}
+          onClose={() => { ctxMenu = null; workspacePickerOpen = false; }}
+          {startRename}
+          {copySessionLink}
+          {togglePin}
+          {setArchived}
+          {toggleLead}
+          openPermissions={(id) => { permissionsFor = id; ctxMenu = null; }}
+          openLeadPrompt={(id, prevTitle) => { leadPrompt = { id, prevTitle }; ctxMenu = null; }}
+          openTelegram={(id) => { telegramFor = id; ctxMenu = null; }}
+          openBridge={(pluginId, sessionId) => { bridgeModal = { pluginId, sessionId }; ctxMenu = null; }}
+          {continueInWork}
+          {pickContinueWorkspace}
+          {commitContinueWorkspace}
+          closeWorkspacePicker={() => (workspacePickerOpen = false)}
+          {requestDelete}
+        />
       {/if}
     </aside>
   {/if}
@@ -11253,14 +11172,7 @@
 {#if permissionsFor}
   {@const permChat = chats.find((c) => c.id === permissionsFor)}
   {#if permChat}
-    <button class="confirm-backdrop" data-testid="permissions-backdrop" aria-label="Close permissions" onclick={() => (permissionsFor = null)} tabindex="-1"></button>
-      <div class="confirm-card permissions-modal" role="dialog" aria-modal="true" aria-labelledby="permissions-title" data-testid="permissions-modal">
-        <button class="modal-x" aria-label="Close permissions" onclick={() => (permissionsFor = null)}>×</button>
-        <h2 id="permissions-title">Permissions · {permChat.title}</h2>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-read" checked={sessionPermissions(permChat).read} disabled={permissionBusy} onchange={(e) => void setSessionPermission("read", e.currentTarget.checked)} /><span><b>Read other sessions</b><small>Read another session’s history or state.</small></span></label>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-message" checked={sessionPermissions(permChat).message} disabled={permissionBusy} onchange={(e) => void setSessionPermission("message", e.currentTarget.checked)} /><span><b>Message other sessions</b><small>Send messages to other sessions and start turns.</small></span></label>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-remote" checked={sessionPermissions(permChat).remote} disabled={permissionBusy} onchange={(e) => void setSessionPermission("remote", e.currentTarget.checked)} /><span><b>Use sessions on other servers</b><small>List, read, search, and (with Message other sessions) message sessions on servers saved on this machine. As the lead, also start, stop and archive sessions there{permChat.role === "lead" ? "" : " (creating/stopping/archiving needs the lead)"}.</small></span></label>
-      </div>
+    <PermissionsModal chat={permChat} busy={permissionBusy} onSet={setSessionPermission} onClose={() => (permissionsFor = null)} />
   {/if}
 {/if}
 {#if telegramFor}
@@ -11499,32 +11411,18 @@
   />
 {/if}
 {#if clearContextChatId}
-  <button class="confirm-backdrop" data-testid="clear-context-backdrop" aria-label="Cancel clear context" onclick={() => (clearContextChatId = null)} tabindex="-1"></button>
-  <div class="confirm-card" data-testid="clear-context-modal" role="dialog" aria-modal="true" aria-label="Clear context">
-    <p class="confirm-text">Clear context?</p>
-    <p class="confirm-copy">The agent starts fresh from here. Earlier messages stay visible above the line but are no longer sent to the model.</p>
-    <div class="confirm-actions"><button class="confirm-cancel" onclick={() => (clearContextChatId = null)}>Cancel</button><button class="confirm-ok" data-testid="confirm-clear-context" onclick={() => void clearContextSession()}>Clear</button></div>
-  </div>
+  <ClearContextModal onCancel={() => (clearContextChatId = null)} onConfirm={() => void clearContextSession()} />
 {/if}
 {#if pluginsOpen}
-  <button
-    class="confirm-backdrop"
-    data-testid="plugins-backdrop"
-    aria-label="Close plugins"
-    onclick={() => (pluginsOpen = false)}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card settings-card"
-    data-testid="plugins-modal"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Plugins"
-  >
-    <button class="modal-x" data-testid="close-plugins-btn" aria-label="Close plugins" onclick={() => (pluginsOpen = false)}>×</button>
-    <p class="confirm-text">Plugins</p>
-    <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onHarnessesChanged={() => void refreshWorkEngine()} onUseTheme={usePluginTheme} onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }} />
-  </div>
+  <PluginsModal
+    {plugins}
+    activeThemeKey={pluginTheme?.key ?? null}
+    onChanged={onPluginsChanged}
+    onHarnessesChanged={() => void refreshWorkEngine()}
+    onUseTheme={usePluginTheme}
+    onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }}
+    onClose={() => (pluginsOpen = false)}
+  />
 {/if}
 {/if}
 
@@ -11564,12 +11462,6 @@
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
-  .confirm-card.permissions-modal { top: 50%; width: min(520px, calc(100vw - 48px)); padding: 24px; border: 1px solid var(--border); border-radius: 18px; background: var(--card); }
-  .confirm-card.permissions-modal h2 { margin: 0 36px 22px 0; font-size: 18px; }
-  .permission-row { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); cursor: pointer; }
-  .permission-row input { margin-top: 3px; accent-color: var(--accent); }
-  .permission-row span { display: grid; gap: 4px; }
-  .permission-row small { color: var(--muted); }
   :global(html) { color-scheme: light; }
   :global(html[data-theme="dark"]) { color-scheme: dark; }
   :global(:root) {
@@ -11680,33 +11572,6 @@
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
-  .ctx-item.ctx-telegram { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
-  .ctx-sep { height: 1px; background: var(--border); margin: 4px 8px; }
-  .ctx-tg-label { flex: 1; min-width: 0; }
-  .ctx-tg-bot { font-size: 12px; color: var(--muted); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }
-  .ctx-tg-dot { flex: none; margin-left: auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
-  .ctx-tg-dot.connected { background: #22c55e; }
-  .ctx-tg-dot.disconnected { background: #ef4444; }
-  .ctx-tg-dot.unconfigured { background: transparent; border: 1.5px solid var(--muted-2); }
-  .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
-  .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
-  .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
-  .ctx-ws-pill:hover { background: var(--hover-3); color: var(--text); border-color: var(--border-3); }
-  .ctx-ws-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ctx-ws-form { display: flex; flex-direction: column; gap: 6px; padding: 4px 8px 6px 8px; }
-  .ctx-ws-form .pull-input { width: 100%; box-sizing: border-box; }
-  .confirm-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 50; }
-  .confirm-card { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); z-index: 51; background: var(--card); border-radius: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.18); padding: 26px 26px 22px 26px; width: 340px; max-width: calc(100vw - 48px); box-sizing: border-box; }
-  .modal-x { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border: none; background: transparent; border-radius: 50%; cursor: pointer; color: var(--icon-dim); font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center; }
-  .modal-x:hover { background: var(--hover); color: var(--text); }
-  .confirm-text { font-size: 17px; font-weight: 700; line-height: 1.4; margin: 0 0 20px 0; color: var(--text); }
-  .confirm-actions { display: flex; gap: 10px; }
-  .confirm-copy { color: var(--muted); font-size: 13px; line-height: 1.5; margin: -10px 0 18px; }
-  .confirm-cancel { flex: 1; border: none; background: var(--cancel-bg); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--text); }
-  .confirm-cancel:hover { background: var(--cancel-hover); }
-  .confirm-ok { flex: 1; border: none; background: var(--accent); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--accent-fg); }
-  .confirm-ok:hover { background: var(--accent-hover); }
   .empty-hint { color: var(--faint); font-size: 13px; padding: 0 8px; }
   .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; container-type: inline-size; }
   .stream-bar { position: relative; height: 3px; border-radius: 999px; overflow: hidden; margin: 0 4px 8px 4px; background: var(--border); pointer-events: none; }
@@ -12058,7 +11923,6 @@
   .edit-save { background: var(--accent); color: var(--accent-fg); border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; padding: 6px 18px; border-radius: 16px; }
   .edit-save:disabled { opacity: .5; cursor: default; }
   .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
-  .settings-card { width: 80vw; max-width: 900px; height: 80vh; max-height: 820px; top: 50%; display: flex; flex-direction: column; overflow-y: auto; }
   .mini-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; flex-shrink: 0; }
   .mini-btn:hover:not(:disabled) { background: var(--hover); }
   .mini-btn:disabled { opacity: .5; cursor: default; }
@@ -12211,7 +12075,6 @@
     .work-banner { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
     .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
-    .confirm-card { width: calc(100vw - 32px); }
     .settings-layout { flex-direction: column; }
     .settings-nav { width: auto; flex-direction: row; align-items: center; gap: 6px; padding: 12px 44px 10px 14px; border-right: none; border-bottom: 1px solid var(--border); overflow-x: auto; }
     .settings-nav-title, .settings-nav-label { display: none; }

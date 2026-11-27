@@ -22,13 +22,18 @@ test("the remote-servers permission round-trips through extra JSON", () => {
 });
 
 test("sidebar menu exposes the permissions modal and both toggles", async () => {
-  const app = await readFile(new URL("../src/lib/ChatApp.svelte", import.meta.url), "utf8");
-  assert.ok(app.includes('data-testid="permissions-item"'));
-  assert.match(app, /\{#if serverPersist\}\s*<button class="ctx-item" data-testid="permissions-item"/);
-  assert.ok(app.includes('data-testid="permissions-modal"'));
-  assert.ok(app.includes('data-testid="permission-read"'));
-  assert.ok(app.includes('data-testid="permission-message"'));
-  assert.ok(app.includes('data-testid="permission-remote"'));
+  const read = (f: string) => readFile(new URL(`../src/lib/${f}`, import.meta.url), "utf8");
+  const app = await read("ChatApp.svelte");
+  const menu = await read("SessionContextMenu.svelte");
+  const modal = await read("PermissionsModal.svelte");
+  assert.ok(app.includes("<SessionContextMenu"));
+  assert.ok(menu.includes('data-testid="permissions-item"'));
+  assert.match(menu, /\{#if serverPersist\}\s*<button class="ctx-item" data-testid="permissions-item"/);
+  assert.ok(app.includes("<PermissionsModal"));
+  assert.ok(modal.includes('data-testid="permissions-modal"'));
+  assert.ok(modal.includes('data-testid="permission-read"'));
+  assert.ok(modal.includes('data-testid="permission-message"'));
+  assert.ok(modal.includes('data-testid="permission-remote"'));
   assert.ok(app.includes('window.addEventListener("keydown", onEscape, true)'));
   assert.ok(app.includes("[data-testid=\"permission-read\"]')?.focus()"));
 });

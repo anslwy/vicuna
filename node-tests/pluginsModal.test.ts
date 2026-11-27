@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 const root = new URL("..", import.meta.url).pathname;
 const chatApp = readFileSync(root + "src/lib/ChatApp.svelte", "utf8");
+const pluginsModal = readFileSync(root + "src/lib/PluginsModal.svelte", "utf8");
 const settingsModal = readFileSync(root + "src/lib/SettingsModal.svelte", "utf8");
 
 test("sidebar footer orders Server switcher, Plugins, then Settings", () => {
@@ -40,11 +41,12 @@ test("Settings modal no longer contains a Plugins tab", () => {
 });
 
 test("standalone Plugins modal hosts PluginsPanel with close controls", () => {
-  const modalStart = chatApp.indexOf('data-testid="plugins-modal"');
+  assert.ok(chatApp.includes("<PluginsModal"), "ChatApp renders PluginsModal");
+  const modalStart = pluginsModal.indexOf('data-testid="plugins-modal"');
   assert.ok(modalStart >= 0, "plugins-modal exists");
-  assert.ok(chatApp.includes('data-testid="plugins-backdrop"'), "plugins-backdrop exists");
-  assert.ok(chatApp.includes('data-testid="close-plugins-btn"'), "close-plugins-btn exists");
-  const panelIdx = chatApp.indexOf("<PluginsPanel", modalStart);
+  assert.ok(pluginsModal.includes('data-testid="plugins-backdrop"'), "plugins-backdrop exists");
+  assert.ok(pluginsModal.includes('data-testid="close-plugins-btn"'), "close-plugins-btn exists");
+  const panelIdx = pluginsModal.indexOf("<PluginsPanel", modalStart);
   assert.ok(panelIdx > modalStart, "PluginsPanel renders inside plugins-modal");
 });
 
