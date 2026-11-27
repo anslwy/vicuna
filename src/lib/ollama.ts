@@ -128,6 +128,24 @@ export async function stopServer(): Promise<void> {
   await invoke("ollama_stop_server");
 }
 
+/** Whether the desktop system tray icon is enabled (default false). */
+export async function getTrayEnabled(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  try {
+    const { invoke } = await tauri();
+    return Boolean(await invoke<boolean>("tray_get_enabled"));
+  } catch {
+    return false;
+  }
+}
+
+/** Toggle the desktop system tray icon on or off (persisted + applied live). */
+export async function setTrayEnabled(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  const { invoke } = await tauri();
+  return Boolean(await invoke<boolean>("tray_set_enabled", { enabled }));
+}
+
 /**
  * Update the tray menu ("No running sessions" / "N running work session(s)",
  * plus an elapsed line under Quit while sessions run). Best-effort: never

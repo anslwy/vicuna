@@ -53,3 +53,19 @@ test("Settings has a send-follow-ups-now toggle that defaults on", () => {
   assert.ok(tag.includes("workEngineInfo?.sendNow ?? true"), "missing value = on");
   assert.ok(tag.includes("onToggleWorkSendNow"), "wired to the server setting");
 });
+
+test("Settings General tab has a desktop-only Show system tray icon toggle", () => {
+  const modalStart = chatApp.indexOf('data-testid="settings-modal"');
+  const bodyStart = chatApp.indexOf('class="settings-pane-body', modalStart);
+  const generalStart = chatApp.indexOf('{#if settingsTab === "general"}', bodyStart);
+  const workStart = chatApp.indexOf('{:else if settingsTab === "work"}', generalStart);
+  const generalBlock = chatApp.slice(generalStart, workStart);
+  const desktopIdx = generalBlock.indexOf("{#if isTauriRuntime()}");
+  const toggleIdx = generalBlock.indexOf('data-testid="tray-icon-toggle"');
+  assert.ok(desktopIdx >= 0, "Desktop & CLI section is gated by isTauriRuntime()");
+  assert.ok(toggleIdx > desktopIdx, "tray toggle lives inside the desktop-only block in General");
+  const tag = generalBlock.slice(generalBlock.lastIndexOf("<input", toggleIdx), generalBlock.indexOf("/>", toggleIdx));
+  assert.ok(tag.includes("checked={trayEnabled}"), "bound to trayEnabled");
+  assert.ok(tag.includes("onToggleTray"), "wired to onToggleTray");
+  assert.ok(generalBlock.includes("Show system tray icon"), "label present");
+});

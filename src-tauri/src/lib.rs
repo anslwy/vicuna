@@ -9,8 +9,6 @@
 #[cfg(feature = "desktop")]
 use std::sync::Mutex;
 #[cfg(feature = "desktop")]
-use tauri::tray::TrayIconBuilder;
-#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Manager, WindowEvent};
 
 pub mod ipc;
@@ -116,7 +114,7 @@ pub use app_shell::app_title;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 pub(crate) use app_shell::install_app_menu;
 #[cfg(feature = "desktop")]
-pub(crate) use app_shell::{request_quit, tray_menu, AppQuitState, ScheduleState, ZoomState};
+pub(crate) use app_shell::{request_quit, AppQuitState, ScheduleState, TrayState, ZoomState};
 
 #[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -157,6 +155,7 @@ pub fn run() {
         .manage(acp::AcpState::default())
         .manage(AppQuitState::default())
         .manage(ScheduleState::default())
+        .manage(TrayState::default())
         .manage(browser::shared())
         .manage(mcp::McpManager::default())
         .manage(ZoomState {
@@ -236,6 +235,8 @@ pub fn run() {
             app_shell::zoom_apply,
             app_shell::zoom_step,
             app_shell::quit_app,
+            app_shell::tray_get_enabled,
+            app_shell::tray_set_enabled,
             app_shell::tray_set_status,
             tauri_commands::mcp_list_servers,
             tauri_commands::mcp_set_defaults,
@@ -306,49 +307,40 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_title(app_title());
             }
-            // System tray: closing the window hides here (streams keep
-            // running); only Quit exits. The menu opens on either click;
-            // Show reopens the window.
+            // System tray is opt-in (default OFF). On macOS we still install
+            // the custom app menu so Cmd+Q routes through `request_quit`.
             #[cfg(target_os = "macos")]
             let _ = install_app_menu(app.handle());
-            let menu = tray_menu(app, "No running sessions", None, &[])?;
-            if let Some(icon) = app.default_window_icon().cloned() {
-                TrayIconBuilder::with_id("main")
-                    .icon(icon)
-                    .tooltip(app_title())
-                    .menu(&menu)
-                    .show_menu_on_left_click(true)
-                    .on_menu_event(|app, event| match event.id.as_ref() {
-                        "show" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                        }
-                        "quit" => request_quit(app),
-                        _ => {}
-                    })
-                    .build(app)?;
+            if app_shell::tray_enabled(app.handle()) {
+                let _ = app_shell::create_tray(app.handle());
             }
             Ok(())
         })
+        .on_menu_event(app_shell::handle_menu_event)
         .on_window_event(|window, event| {
-            // Hide to the tray instead of quitting so the backend (streams,
-            // terminals, self-started ollama) survives a window close.
-            // Only the main window hides; server windows (open_server_window)
-            // are just views of a remote server and close for real.
+            // When the tray is enabled, closing the main window hides to the
+            // tray so the backend (streams, terminals, self-started ollama)
+            // survives. When the tray is disabled:
+            //   - macOS keeps hide-on-close (Dock icon reopens via Reopen).
+            //   - Windows & Linux cleanly quit via `request_quit` so closing
+            //     the window never strands the app in an unreachable background.
+            // Server windows (open_server_window) always close for real.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() != "main" {
                     return;
                 }
-                let allow = window
-                    .app_handle()
+                let app = window.app_handle();
+                let allow = app
                     .try_state::<AppQuitState>()
                     .and_then(|s| s.allow.lock().ok().map(|g| *g))
                     .unwrap_or(false);
                 if !allow {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if app_shell::tray_enabled(app) || cfg!(target_os = "macos") {
+                        let _ = window.hide();
+                    } else {
+                        request_quit(app);
+                    }
                 }
             }
         })

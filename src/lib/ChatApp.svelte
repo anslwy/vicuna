@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick, untrack } from "svelte";
   import { goto } from "$app/navigation";
-  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, setServerOllama, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
+  import { listModels, listRunning, loadModelIntoMemory, unloadModelFromMemory, pullModel, deleteModel, chatStream, generateStream, setOllamaBase, setServerOllama, ollamaBase as activeOllamaBase, isCloudModel, serverVersion, startServer as startOllamaServer, stopServer as stopOllamaServer, quitApp, getTrayEnabled, setTrayEnabled, setTrayStatus, isTauriRuntime, modelContextLength, modelThinking, modelFamily, type ChatMsg, type RunningModel } from "$lib/ollama";
   import { shouldWarnOllamaUnavailable } from "$lib/ollamaWarning";
   import { newSessionStart, readLastMode, writeLastMode } from "$lib/newSessionMode";
   import { notifyTurnEnd, notifyAgentAsk, getNotifyEnabled, setNotifyEnabled, getNotifySound, setNotifySound, getNotifySoundChoice, setNotifySoundChoice } from "$lib/notify";
@@ -1670,6 +1670,8 @@
   }
   /** Vicuna CLI launcher status (desktop only, loaded when Settings opens) */
   let cliState = $state<CliStatus | null>(null);
+  /** Desktop system tray icon preference (default off, loaded when Settings opens) */
+  let trayEnabled = $state(false);
   let cliOp = $state<null | "load" | "install" | "uninstall">(null);
   let cliError = $state<string | null>(null);
   /** last install/uninstall outcome line (e.g. where it landed, PATH note) */
@@ -2060,9 +2062,26 @@
     settingsTab = "general";
     settingsOpen = true;
     void refreshCliStatus();
+    void refreshTrayEnabled();
     void refreshBuildInfo();
     void refreshWorkEngine();
     void refreshBrowserEngine();
+  }
+
+  async function refreshTrayEnabled() {
+    if (!isTauriRuntime()) return;
+    trayEnabled = await getTrayEnabled();
+  }
+
+  async function toggleTrayEnabled(enabled: boolean) {
+    const prev = trayEnabled;
+    trayEnabled = enabled;
+    try {
+      trayEnabled = await setTrayEnabled(enabled);
+    } catch (e: any) {
+      trayEnabled = prev;
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
+    }
   }
 
   function openPlugins() {
@@ -9093,7 +9112,9 @@
     cliInstallCmd={CLI_INSTALL_CMD}
     {cliCopied}
     {cliState}
+    {trayEnabled}
     onCopyCliInstall={copyCliInstall}
+    onToggleTray={toggleTrayEnabled}
     onQuitVicuna={quitVicuna}
     {workEngineInfo}
     {workEngineLabel}
