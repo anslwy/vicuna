@@ -10568,9 +10568,6 @@
                 onclick={() => copyWorkPath(wsFull)}
               >
                 <span class="work-path-label">{wsLabel}</span>
-                {#if workPathCopied}
-                  <svg class="work-path-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
-                {/if}
               </button>
               <span class="ctx-popup work-path-popup" data-testid="work-path-popup">
                 <span class="work-path-popup-head">
@@ -12748,7 +12745,6 @@
   .work-path-btn:hover, .work-path-btn:focus-visible { background: var(--hover); color: var(--text); border-color: var(--border); outline: none; }
   .work-path-btn.copied { color: var(--accent); }
   .work-path-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .work-path-ico { flex-shrink: 0; }
   .work-path-popup { left: 0; right: auto; width: max-content; min-width: 200px; max-width: min(440px, calc(100vw - 48px), calc(100cqi - 110px)); padding: 10px 12px; }
   .work-path-popup::before { content: ""; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
   .work-path-popup-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
