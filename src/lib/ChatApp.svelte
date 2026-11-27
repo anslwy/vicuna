@@ -10252,8 +10252,10 @@
                     {@const bState = bridgeConnState(bSnap)}
                     {#if bState !== "unconfigured"}
                       {@const bName = bridgeDisplayName(bp)}
+                      {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
                       <span
                         class="tg-row-badge {bState}"
+                        style:background={bState === "connected" ? bColor : undefined}
                         data-testid="bridge-row-badge-{bp.id}"
                         data-status={bState}
                         title={bridgeConnTitle(bName, bSnap)}
@@ -10407,7 +10409,7 @@
                 title={bridgeConnTitle(bName, bSnap)}
                 onclick={() => { bridgeModal = { pluginId: bp.id, sessionId: ctxMenu!.chatId }; ctxMenu = null; }}
               >
-                <span class="ctx-tg-icon" style:color={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
+                <span class="ctx-tg-icon" style:background={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
                 <span class="ctx-tg-label">{bName}</span>
                 {#if bSnap?.botUsername}<span class="ctx-tg-bot">@{bSnap.botUsername}</span>{/if}
                 <span class="ctx-tg-dot {bState}" data-testid="bridge-status-dot-{bp.id}" data-status={bState} aria-label={bridgeConnLabel(bName, bState)}></span>
