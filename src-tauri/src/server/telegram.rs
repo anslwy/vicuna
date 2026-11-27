@@ -1419,17 +1419,8 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
                 }
             }
         }
-        // the final write lands after `done`; give it a moment
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        let reply = match st.db.as_ref() {
-            Some(db) => crate::server_store::load_chat(db, &session).await.ok().flatten(),
-            None => None,
-        }
-        .and_then(|c| {
-            let messages = c["messages"].as_array()?;
-            Some(phone_text(super::persist::last_reply(messages)))
-        })
-        .unwrap_or_default();
+        // wait for the recorder's final events + write, not a blind sleep
+        let reply = phone_text(&super::turns::final_reply(&st, &session, &turn_id).await);
         let reply = if reply.is_empty() { "(no reply text)".to_string() } else { reply };
         let parts = chunks(&reply);
         let mut it = parts.iter();

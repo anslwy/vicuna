@@ -111,6 +111,50 @@ pub fn live_turn(st: &BridgeState, session_id: &str) -> Option<(String, Arc<Turn
     (!turn.done.load(Ordering::Relaxed)).then_some((tid, turn))
 }
 
+/// The final reply text of a turn that just ended, for bridges mirroring it.
+///
+/// `turn.done` flips when the engine loop returns, which is independent of the
+/// recorder applying the last channel events and of `finalize`'s forced write
+/// (queued behind `chat_lock`). Reading the DB after a fixed sleep therefore
+/// returned the last periodic write and dropped the closing text. Instead,
+/// wait until the turn's recorder is gone (finalize removes it after its final
+/// write) and use its in-memory transcript; the DB is only a fallback.
+pub async fn final_reply(st: &BridgeState, session: &str, turn_id: &str) -> String {
+    let find = || -> Option<Arc<Mutex<RecState>>> {
+        let recs: Vec<_> = st.recorders.lock().ok()?.values().cloned().collect();
+        recs.into_iter().find(|r| r.lock().map(|g| g.turn_id == turn_id).unwrap_or(false))
+    };
+    let mut held = find();
+    let until = Instant::now() + Duration::from_secs(60);
+    // a turn with no recorder at all (no db) has nothing to wait for
+    let mut grace = Instant::now() + Duration::from_secs(3);
+    loop {
+        match find() {
+            Some(r) => {
+                held = Some(r);
+                grace = until;
+            }
+            None if held.is_some() || Instant::now() >= grace => break,
+            None => {}
+        }
+        if Instant::now() >= until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if let Some(reply) = held.and_then(|r| r.lock().ok().map(|g| g.rec.last_reply())) {
+        if !reply.is_empty() {
+            return reply;
+        }
+    }
+    match &st.db {
+        Some(db) => crate::server_store::load_chat(db, session).await.ok().flatten()
+            .and_then(|c| Some(persist::last_reply(c["messages"].as_array()?).to_string()))
+            .unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
 /// Start a Work turn (window-started or server-started) and return its id.
 pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, String> {
     if !p.engine.is_present() {
@@ -1395,6 +1439,27 @@ mod tests {
         st.recorders.lock().unwrap().insert("channel".into(), rs.clone());
         st.session_turns.lock().unwrap().insert("chat".into(), (tid, "channel".into(), 1));
         (st, rs, turn, dir)
+    }
+
+    #[tokio::test]
+    async fn final_reply_waits_for_the_recorder_not_the_done_flag() {
+        let (st, rs, turn, _dir) = recording().await;
+        let tid = rs.lock().unwrap().turn_id.clone();
+        // a periodic write saved only the opening line
+        let ev = json!({"type":"token", "text":"Searching."});
+        rs.lock().unwrap().rec.apply(&ev, &ev.to_string());
+        write_rec(&st, &rs, false).await;
+        // the engine loop returned before the recorder saw the closing text
+        turn.done.store(true, Ordering::Relaxed);
+        let (st2, rs2) = (st.clone(), rs.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            let ev = json!({"type":"token", "text":" Here are the headlines."});
+            rs2.lock().unwrap().rec.apply(&ev, &ev.to_string());
+            st2.recorders.lock().unwrap().remove("channel");
+        });
+        let reply = final_reply(&st, "chat", &tid).await;
+        assert_eq!(reply, "Searching. Here are the headlines.");
     }
 
     #[tokio::test]
