@@ -140,6 +140,7 @@ The CLI also drives any running server directly (`vicuna session`, `vicuna sched
 ## Highlights
 
 - **Headless server.** Run `vicuna serve --tailscale` on a workstation or VPS. Install it as a systemd or launchd service and switch between connected servers from the sidebar.
+- **Lightweight Rust server.** `vicuna serve` (backend + bundled web UI) idles at roughly 10–25 MB of RAM, leaving almost all of your VPS memory for the coding agent CLIs themselves.
 - **Scheduled work.** Schedule prompts to run later, and let agents set wake-ups to follow up on long builds or CI runs.
 - **No-workspace scratch mode.** Start a Work session without choosing a project folder. Vicuna provides a temporary scratch folder when the harness needs one.
 - **Cross-host session search.** Press Cmd+P (Ctrl+P on Windows and Linux) to find sessions on your computer and connected servers.
