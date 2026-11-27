@@ -77,7 +77,9 @@
     cliInstallCmd,
     cliCopied,
     cliState,
+    trayEnabled,
     onCopyCliInstall,
+    onToggleTray,
     onQuitVicuna,
     // Work
     workEngineInfo,
@@ -196,7 +198,9 @@
     cliInstallCmd: string;
     cliCopied: boolean;
     cliState: CliStatus | null;
+    trayEnabled: boolean;
     onCopyCliInstall: () => Promise<void>;
+    onToggleTray: (enabled: boolean) => Promise<void>;
     onQuitVicuna: (force?: boolean) => Promise<void>;
     workEngineInfo: WorkEngineInfo | null;
     workEngineLabel: string;
@@ -539,10 +543,23 @@
                 {/if}
                 <span class="setting-note">Run in a terminal (macOS/Linux, no sudo). Then <code>vicuna [path]</code> opens a folder here, and <code>vicuna serve --tailscale</code> exposes this machine as a server.</span>
               </div>
+              <div class="setting-stacked" data-testid="tray-icon-section">
+                <span class="setting-label">System tray</span>
+                <label class="setting-note approval-row" data-testid="tray-icon-setting">
+                  <input
+                    type="checkbox"
+                    data-testid="tray-icon-toggle"
+                    checked={trayEnabled}
+                    onchange={(e) => onToggleTray((e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  Show system tray icon
+                </label>
+                <span class="setting-note">Keep Vicuna in the menu bar / system tray with live session status and quick Show/Quit controls.</span>
+              </div>
               <div class="setting-row quit-row">
                 <div class="settings-group-head-text">
                   <span class="setting-label">Quit Vicuna</span>
-                  <span class="setting-note">Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.</span>
+                  <span class="setting-note">{#if trayEnabled}Closing the window keeps Vicuna in the tray so streams continue. Quit stops everything.{:else}Quit stops running streams, terminals, and any self-started Ollama server.{/if}</span>
                 </div>
                 <button class="mini-btn danger" data-testid="quit-app-btn" onclick={() => void onQuitVicuna()}>Quit Vicuna</button>
               </div>

@@ -1,6 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(feature = "desktop")]
-use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+#[cfg(feature = "desktop")]
+use tauri::tray::TrayIconBuilder;
 #[cfg(feature = "desktop")]
 use tauri::State;
 #[cfg(feature = "desktop")]
@@ -429,6 +432,180 @@ pub(crate) fn tray_menu<R: Runtime>(
     Menu::with_items(manager, &items)
 }
 
+/// Desktop shell preferences persisted in `~/vicuna/config/app-shell.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AppShellConfig {
+    /// Whether to show the system tray / menu bar icon. Defaults to `false`.
+    #[serde(default)]
+    pub(crate) show_tray_icon: bool,
+}
+
+fn app_shell_config_path_in(home: &Path) -> PathBuf {
+    home.join("vicuna").join("config").join("app-shell.json")
+}
+
+pub(crate) fn read_app_shell_config_in(home: &Path) -> AppShellConfig {
+    let path = app_shell_config_path_in(home);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<AppShellConfig>(&s).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn write_app_shell_config_in(home: &Path, cfg: &AppShellConfig) -> Result<(), String> {
+    let path = app_shell_config_path_in(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(cfg)
+        .map_err(|e| format!("cannot serialize app-shell config: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("cannot write app-shell config: {e}"))
+}
+
+pub(crate) fn read_tray_enabled_in(home: &Path) -> bool {
+    read_app_shell_config_in(home).show_tray_icon
+}
+
+pub(crate) fn write_tray_enabled_in(home: &Path, enabled: bool) -> Result<(), String> {
+    let mut cfg = read_app_shell_config_in(home);
+    cfg.show_tray_icon = enabled;
+    write_app_shell_config_in(home, &cfg)
+}
+
+pub(crate) fn read_tray_enabled() -> bool {
+    crate::opencode::home_dir()
+        .map(|h| read_tray_enabled_in(&h))
+        .unwrap_or(false)
+}
+
+pub(crate) fn write_tray_enabled(enabled: bool) -> Result<(), String> {
+    let home =
+        crate::opencode::home_dir().ok_or_else(|| "cannot locate home folder".to_string())?;
+    write_tray_enabled_in(&home, enabled)
+}
+
+/// Cached tray preference and latest status/elapsed/scheduled lines so turning
+/// the tray icon ON mid-session immediately displays accurate live status.
+pub(crate) struct TrayState {
+    pub(crate) enabled: Mutex<bool>,
+    pub(crate) status: Mutex<String>,
+    pub(crate) elapsed: Mutex<Option<String>>,
+    pub(crate) scheduled: Mutex<Vec<String>>,
+}
+
+impl Default for TrayState {
+    fn default() -> Self {
+        Self {
+            enabled: Mutex::new(read_tray_enabled()),
+            status: Mutex::new("No running sessions".to_string()),
+            elapsed: Mutex::new(None),
+            scheduled: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) fn tray_enabled(app: &AppHandle) -> bool {
+    app.try_state::<TrayState>()
+        .and_then(|s| s.enabled.lock().ok().map(|g| *g))
+        .unwrap_or(false)
+}
+
+/// Global menu event handler for both the macOS app menu and the system tray
+/// menu (`"show"` and `"quit"`). Registered once on `tauri::Builder` so Cmd+Q
+/// works even when the tray is disabled and toggling the tray never duplicates
+/// menu handlers.
+#[cfg(feature = "desktop")]
+pub(crate) fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
+    match event.id.as_ref() {
+        "show" => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }
+        "quit" => request_quit(app),
+        _ => {}
+    }
+}
+
+/// Build (or refresh) the `"main"` system tray icon with the latest cached
+/// status, elapsed, and scheduled lines.
+#[cfg(feature = "desktop")]
+pub(crate) fn create_tray(app: &AppHandle) -> Result<(), String> {
+    let (status, elapsed, scheduled) = if let Some(s) = app.try_state::<TrayState>() {
+        let status = s
+            .status
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "No running sessions".to_string());
+        let elapsed = s.elapsed.lock().ok().and_then(|g| g.clone());
+        let scheduled = s.scheduled.lock().map(|g| g.clone()).unwrap_or_default();
+        (status, elapsed, scheduled)
+    } else {
+        ("No running sessions".to_string(), None, Vec::new())
+    };
+    if app.tray_by_id("main").is_some() {
+        return refresh_tray_menu(app, &status, elapsed.as_deref(), &scheduled);
+    }
+    let menu = tray_menu(app, &status, elapsed.as_deref(), &scheduled)
+        .map_err(|e| format!("tray menu failed: {e}"))?;
+    if let Some(icon) = app.default_window_icon().cloned() {
+        TrayIconBuilder::with_id("main")
+            .icon(icon)
+            .tooltip(app_title())
+            .menu(&menu)
+            .show_menu_on_left_click(true)
+            .build(app)
+            .map_err(|e| format!("tray icon failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Hide and remove the `"main"` system tray icon if it exists.
+#[cfg(feature = "desktop")]
+pub(crate) fn remove_tray(app: &AppHandle) {
+    if let Some(tray) = app.remove_tray_by_id("main") {
+        let _ = tray.set_visible(false);
+        drop(tray);
+    }
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub(crate) async fn tray_get_enabled(state: State<'_, TrayState>) -> Result<bool, String> {
+    state
+        .enabled
+        .lock()
+        .map(|g| *g)
+        .map_err(|_| "tray state poisoned".to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub(crate) async fn tray_set_enabled(
+    app: AppHandle,
+    state: State<'_, TrayState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    write_tray_enabled(enabled)?;
+    {
+        let mut g = state
+            .enabled
+            .lock()
+            .map_err(|_| "tray state poisoned".to_string())?;
+        *g = enabled;
+    }
+    if enabled {
+        create_tray(&app)?;
+    } else {
+        remove_tray(&app);
+    }
+    Ok(enabled)
+}
+
 /// Refresh the tray menu (no-op when the tray is unavailable).
 #[cfg(feature = "desktop")]
 pub(crate) fn refresh_tray_menu(
@@ -473,19 +650,28 @@ pub(crate) async fn tray_set_status(
         }
     }
     let short: String = status.trim().chars().take(80).collect();
+    let display_status = if short.is_empty() {
+        "No running sessions".to_string()
+    } else {
+        short
+    };
     let elapsed: Option<String> = elapsed
         .map(|e| e.trim().chars().take(20).collect::<String>())
         .filter(|e| !e.is_empty());
-    refresh_tray_menu(
-        &app,
-        if short.is_empty() {
-            "No running sessions"
-        } else {
-            &short
-        },
-        elapsed.as_deref(),
-        &scheduled,
-    )
+    // Cache latest status/elapsed/scheduled even when the tray is off so
+    // enabling it later immediately populates accurate menu items.
+    if let Some(s) = app.try_state::<TrayState>() {
+        if let Ok(mut g) = s.status.lock() {
+            *g = display_status.clone();
+        }
+        if let Ok(mut g) = s.elapsed.lock() {
+            *g = elapsed.clone();
+        }
+        if let Ok(mut g) = s.scheduled.lock() {
+            *g = scheduled.clone();
+        }
+    }
+    refresh_tray_menu(&app, &display_status, elapsed.as_deref(), &scheduled)
 }
 
 /// Window/tray title of the running shell. `tauri dev` builds with
@@ -499,5 +685,58 @@ pub fn app_title() -> &'static str {
         "Vicuna (Dev)"
     } else {
         "Vicuna"
+    }
+}
+
+#[cfg(test)]
+mod tray_pref_tests {
+    use super::{
+        app_shell_config_path_in, read_app_shell_config_in, read_tray_enabled_in,
+        write_tray_enabled_in, AppShellConfig,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_home(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vicuna-tray-pref-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn tray_preference_defaults_to_false() {
+        let home = scratch_home("default");
+        assert_eq!(read_app_shell_config_in(&home), AppShellConfig { show_tray_icon: false });
+        assert!(!read_tray_enabled_in(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tray_preference_round_trips() {
+        let home = scratch_home("roundtrip");
+        write_tray_enabled_in(&home, true).expect("write true");
+        assert!(read_tray_enabled_in(&home));
+        let raw = std::fs::read_to_string(app_shell_config_path_in(&home)).expect("read json");
+        assert!(raw.contains("\"showTrayIcon\": true"), "expected camelCase key in {raw}");
+
+        write_tray_enabled_in(&home, false).expect("write false");
+        assert!(!read_tray_enabled_in(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tray_preference_falls_back_to_false_on_invalid_json() {
+        let home = scratch_home("invalid");
+        let path = app_shell_config_path_in(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&path, "{not valid json").expect("write bad json");
+        assert!(!read_tray_enabled_in(&home));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

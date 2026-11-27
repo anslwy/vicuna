@@ -146,6 +146,8 @@ export const DESKTOP_CMDS = new Set([
   "github_download_asset",
   "show_main_window",
   "quit_app",
+  "tray_get_enabled",
+  "tray_set_enabled",
   "tray_set_status",
   "zoom_apply",
   "zoom_step",
