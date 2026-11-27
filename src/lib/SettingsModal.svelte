@@ -586,7 +586,7 @@
             </label>
             <label class="setting-note approval-row" data-testid="work-send-now">
               <input type="checkbox" data-testid="work-send-now-toggle" checked={workEngineInfo?.sendNow ?? true} disabled={!workEngineInfo} onchange={(e) => void onToggleWorkSendNow?.((e.currentTarget as HTMLInputElement).checked)} />
-              Send follow-ups immediately while the agent works: a message sent mid-turn (also from Telegram and bridge plugins) interrupts the current step and goes now. Off = it queues until the agent finishes (↑ or <code>/send_now</code> sends it now).
+              <span>Send follow-ups immediately while the agent works: a message sent mid-turn (also from Telegram and bridge plugins) interrupts the current step and goes now. Off = it queues until the agent finishes (↑ or <code>/send_now</code> sends it now).</span>
             </label>
             <details class="setting-details">
               <summary>How engines &amp; binary overrides work</summary>

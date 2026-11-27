@@ -8,6 +8,7 @@ import {
 
 const root = new URL("..", import.meta.url).pathname;
 const app = readFileSync(root + "src/lib/ChatApp.svelte", "utf8");
+const clearModal = readFileSync(root + "src/lib/ClearContextModal.svelte", "utf8");
 const beforeClear = [
   { role: "user", content: "old request" },
   { role: "assistant", content: "old reply" }
@@ -20,9 +21,10 @@ const afterClear = [
 
 test("/clear is a Work slash command with a custom confirmation modal", () => {
   assert.match(app, /name: "clear", desc:/);
-  assert.match(app, /data-testid="clear-context-modal"/);
-  assert.match(app, /data-testid="confirm-clear-context"/);
-  assert.match(app, /Earlier messages stay visible above the line but are no longer sent to the model/);
+  assert.match(app, /<ClearContextModal\b/);
+  assert.match(clearModal, /data-testid="clear-context-modal"/);
+  assert.match(clearModal, /data-testid="confirm-clear-context"/);
+  assert.match(clearModal, /Earlier messages stay visible above the line but are no longer sent to the model/);
   assert.match(app, /data-testid="context-cleared-divider"/);
 });
 

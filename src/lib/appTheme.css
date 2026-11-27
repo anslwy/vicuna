@@ -1,0 +1,46 @@
+/* App-wide palette (CSS variables) and document defaults. Plugin themes and
+   the accent picker override these at runtime via inline properties. */
+html { color-scheme: light; }
+html[data-theme="dark"] { color-scheme: dark; }
+:root {
+  --bg: #ffffff; --text: #111111; --text-dim: #333333;
+  --muted: #9a9a9a; --muted-2: #8a8a8a; --faint: #aaaaaa;
+  --hover: #f0f0f0; --hover-2: #ececec; --hover-3: #f2f2f3;
+  --active-item: #efefef; --item-bg: #f4f4f5; --composer: #f4f4f5;
+  --card: #ffffff; --border: #ececec; --border-2: #e2e2e2; --border-3: #e5e5e5;
+  --border-strong: #c9c9c9; --input-border: #dddddd;
+  --bubble-user: #efefef; --chip: #eeeeee;
+  --icon: #555555; --icon-dim: #909090;
+  --thinking: #7a7a7a; --link: #0b57d0; --link-hover: #084298;
+  --danger: #b3261e; --err-text: #b3261e; --err-bg: #fdecea;
+  --code-bg: #f4f4f5; --code-inline: #f0f0f0;
+  --code-keyword: #d73a49; --code-string: #032f62; --code-comment: #6a737d;
+  --code-number: #005cc5; --code-title: #6f42c1; --code-builtin: #005cc5;
+  --code-literal: #005cc5; --code-attr: #6f42c1;
+  --send-disabled: #d9d9de;
+  --cancel-bg: #ececf1; --cancel-hover: #e0e0e6;
+  --ok: #1a7f37;
+  --pink: #d63384;
+  --accent: #ef6c00; --accent-hover: #d96000; --accent-fg: #ffffff;
+}
+html[data-theme="dark"] {
+  --bg: #3d3332; --text: #ece4e0; --text-dim: #b3a6a3;
+  --muted: #b3a6a3; --muted-2: #a39592; --faint: #8e7f7c;
+  --hover: #5d4f4d; --hover-2: #5d4f4d; --hover-3: #5d4f4d;
+  --active-item: #5d4f4d; --item-bg: #4e4442; --composer: #4e4442;
+  --card: #4e4442; --border: #665b58; --border-2: #756866; --border-3: #756866;
+  --border-strong: #756866; --input-border: #756866;
+  --bubble-user: #5d4f4d; --chip: #5d4f4d;
+  --icon: #b3a6a3; --icon-dim: #a39592;
+  --thinking: #b3a6a3; --link: #7ed491; --link-hover: #a2e1af;
+  --danger: #ff8a80; --err-text: #ffb4a9; --err-bg: #4a1f1a;
+  --code-bg: #4e4442; --code-inline: #5d4f4d;
+  --code-keyword: #ff7b72; --code-string: #a5d6ff; --code-comment: #8b949e;
+  --code-number: #79c0ff; --code-title: #d2a8ff; --code-builtin: #79c0ff;
+  --code-literal: #79c0ff; --code-attr: #7ee787;
+  --send-disabled: #665b58;
+  --cancel-bg: #5d4f4d; --cancel-hover: #665b58;
+  --ok: #7ed491;
+  --pink: #f472b6;
+}
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }

@@ -8,6 +8,7 @@
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
   import "katex/dist/katex.min.css";
+  import "$lib/appTheme.css";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
   import {
@@ -63,7 +64,9 @@
   import FolderPickerModal from "$lib/FolderPickerModal.svelte";
   import TelegramModal from "$lib/TelegramModal.svelte";
   import BridgeModal from "$lib/BridgeModal.svelte";
-  import PluginsPanel from "$lib/PluginsPanel.svelte";
+  import PluginsModal from "$lib/PluginsModal.svelte";
+  import PermissionsModal from "$lib/PermissionsModal.svelte";
+  import ClearContextModal from "$lib/ClearContextModal.svelte";
   import SkillsModal from "$lib/SkillsModal.svelte";
   import EngineIcon from "$lib/EngineIcon.svelte";
   import UsageModal from "$lib/UsageModal.svelte";
@@ -72,6 +75,11 @@
   import GotoPaletteModal from "$lib/GotoPaletteModal.svelte";
   import ScheduleModals from "$lib/ScheduleModals.svelte";
   import McpPopup from "$lib/McpPopup.svelte";
+  import ServerMenu from "$lib/ServerMenu.svelte";
+  import SidebarSessionItem from "$lib/SidebarSessionItem.svelte";
+  import SessionContextMenu from "$lib/SessionContextMenu.svelte";
+  import WorkHeader from "$lib/WorkHeader.svelte";
+  import EmptyStarter from "$lib/EmptyStarter.svelte";
   import SettingsModal from "$lib/SettingsModal.svelte";
   import SidePanel, { type SideTab } from "$lib/SidePanel.svelte";
   import ConfirmModals from "$lib/ConfirmModals.svelte";
@@ -135,6 +143,19 @@
   import pkg from "../../package.json";
   import type { Terminal as XTerm, ITheme as XTermTheme } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
+  import { findMentions, renderMentions, renderUserMessage } from "$lib/mentions";
+  import { type StreamSel, textOffsetIn, nodeForOffset, copyText, copyTermSelection, CODE_CHECK_SVG, hasDroppedFiles, prefillAsk, revealCard, imageFileToDataUrl, pastedImageFiles, openExternal, openTokenPage, withBrowserTimeout, BROWSER_START_TIMEOUT_MS, BROWSER_START_TIMEOUT_MESSAGE, isMac, isWindows, validateWorkspace, canonicalWorkspace, ensureScratchWorkspace, clampExplorerWidth, EXPLORER_MIN_W, EXPLORER_DEFAULT_W } from "$lib/chatDom";
+  import { type PendingAsk, type LaterAsk, type ModelChoice, type RemoteHit, type SearchItem, type ChatTurnEvent, type ChatTurnOperation, BROWSE_CATS, SUGGESTIONS, WORK_SUGGESTIONS, SHOW_ARCHIVED_KEY, USAGE_CACHE_KEY, CLI_INSTALL_CMD, SERVER_SETUP_CMD, WARM_RECENT_COUNT, resolveAppUpdateReleaseNotes, openRouterUsageText, newMcpEnabled, scheduleTz } from "$lib/chatAppData";
+  import { createMcpState } from "$lib/mcpState.svelte";
+  import { createBrowserState } from "$lib/browserState.svelte";
+  import { createAppUpdateState } from "$lib/appUpdateState.svelte";
+  import { createServerSwitcherState } from "$lib/serverSwitcherState.svelte";
+  import { createUsageState } from "$lib/usageState.svelte";
+  import { createOpenRouterState } from "$lib/openRouterState.svelte";
+  import { createOllamaModelsState } from "$lib/ollamaModelsState.svelte";
+  import { createGotoPaletteState } from "$lib/gotoPaletteState.svelte";
+  import { createMessagingBridgesState } from "$lib/messagingBridgesState.svelte";
+  import { createTerminalsState } from "$lib/terminalsState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -209,46 +230,9 @@
       toolStatuses = { ...toolStatuses, [chatId]: label };
     }
   }
-  /** live multiple-choice question from a work agent turn, per session. The
-   *  turn blocks until the user answers; each session keeps its own card so
-   *  concurrent turns don't overwrite each other's question. */
-  interface PendingAsk {
-    chatId: string;
-    index: number;
-    question: string;
-    options: string[];
-    /** multi-select question (vicuna-mcp ask_user `multiple`) */
-    multi: boolean;
-    /** the labels picked so far in a multi-select question */
-    picked: string[];
-    /** agent question (vicuna-mcp ask_user): choices prefill the answer box
-     *  instead of answering, and the box takes pasted images. Permission
-     *  asks (Allow/Deny) still answer on click. */
-    agentQuestion: boolean;
-    /** the answer box's draft text */
-    text: string;
-    /** images pasted into the answer box (data URLs) */
-    images: string[];
-    /** Other… opened the box on a permission ask */
-    otherOpen: boolean;
-    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel" | "later", display?: string) => void;
-  }
   let pendingAsks = $state<Record<string, PendingAsk>>({});
   /** the open session's ask card (null when it has none pending) */
   const pendingAsk = $derived(activeId != null ? (pendingAsks[activeId] ?? null) : null);
-  /** agent questions the user put off with "Answer later": the ask_user call
-   *  already returned, so the answer goes to the session as a message */
-  interface LaterAsk {
-    id: string;
-    chatId: string;
-    index: number;
-    question: string;
-    options: string[];
-    multi: boolean;
-    picked: string[];
-    text: string;
-    images: string[];
-  }
   let laterAsks = $state<LaterAsk[]>([]);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
@@ -289,16 +273,22 @@
   let sideTabSeq = 1;
   let newTabMenu = $state(false);
   /** live xterm instances by tab key (non-reactive on purpose) */
-  const termViews = new Map<string, { term: XTerm; fit: XFitAddon; ro: ResizeObserver; resizeTimer: ReturnType<typeof setTimeout> | null }>();
+  const terminals = createTerminalsState({
+    get flashExpNotice() { return flashExpNotice; },
+    get themeBase() { return themeBase; },
+    get pluginTheme() { return pluginTheme; },
+    get sideTabs() { return sideTabs; },
+    set sideTabs(v) { sideTabs = v; },
+    get newTabMenu() { return newTabMenu; },
+    set newTabMenu(v) { newTabMenu = v; },
+    get sideTabSeq() { return sideTabSeq; },
+    set sideTabSeq(v) { sideTabSeq = v; },
+    get explorerRootBase() { return explorerRootBase; },
+    get activeSideTab() { return activeSideTab; },
+    set activeSideTab(v) { activeSideTab = v; },
+    get explorerRoot() { return explorerRoot; }
+  });
   let lastExplorerRoot = "";
-
-  const EXPLORER_MIN_W = 220;
-  const EXPLORER_DEFAULT_W = 300;
-
-  function clampExplorerWidth(w: number): number {
-    const maxW = Math.max(240, window.innerWidth - 360);
-    return Math.min(Math.max(EXPLORER_MIN_W, Math.round(w)), maxW);
-  }
 
   /** drag the panel's left edge to resize (dragging left widens) */
   function onExpResizeStart(e: PointerEvent) {
@@ -426,475 +416,28 @@
   // Configs live in ~/vicuna/config/vicuna.json (opencode.json shape); the
   // file stores shared definitions and defaults. Work sessions store their
   // switches with chat metadata; connections are shared by the backend.
-  let mcpServers = $state<McpServerConfig[]>([]);
-  let mcpLive = $state<Record<string, { connected: boolean; tools: McpTool[]; error: string | null }>>({});
-  let homeMcpEnabled = $state<McpEnabledMap>();
-  let mcpDefaultFeedback = $state("");
-  let mcpSavingDefaults = $state(false);
-  let mcpDefaultTimer: ReturnType<typeof setTimeout> | undefined;
-  function findMcpServer(id: string): McpServerConfig | undefined {
-    return mcpServers.find((s) => s.id === id);
-  }
-
-  function currentMcpSelection() {
-    return activeChat ?? { mcpEnabled: homeMcpEnabled };
-  }
-
-  async function newMcpEnabled(draft?: McpEnabledMap): Promise<McpEnabledMap> {
-    const defaults = await listMcpServers();
-    return resolveMcpEnabled(defaults, { mcpEnabled: draft });
-  }
-
-  async function setMcpForSession(sid: string | null, id: string, enabled: boolean) {
-    if (sid === null) {
-      homeMcpEnabled = toggleMcpEnabled([], { mcpEnabled: homeMcpEnabled }, id, enabled);
-      return true;
-    }
-    const updated = await serverAction("session_update", { id: sid, mcpToggle: { id, enabled } });
-    if (updated !== false) return updated !== null;
-    const chat = chats.find((c) => c.id === sid);
-    if (!chat) return false;
-    chat.mcpEnabled = toggleMcpEnabled(mcpServers, chat, id, enabled);
-    save();
-    return true;
-  }
-
-  async function setMcpDefaults() {
-    mcpSavingDefaults = true;
-    mcpDefaultFeedback = "";
-    clearTimeout(mcpDefaultTimer);
-    try {
-      mcpServers = await saveMcpDefaults(mcpServers, currentMcpSelection());
-      mcpDefaultFeedback = "Saved as default";
-      mcpDefaultTimer = setTimeout(() => { mcpDefaultFeedback = ""; }, 2500);
-    } catch (e) {
-      mcpDefaultFeedback = String(e);
-    } finally {
-      mcpSavingDefaults = false;
-    }
-  }
-
-  /** ids with a connection op in flight (connect/disconnect/refresh/sign-in,
-   *  or `builtin:<key>` while a Built-in Add saves). A single shared slot
-   *  used to drop every launch reconnect after the first, so only one
-   *  server ever came back after a restart — per-server tracking fixes it. */
-  let mcpBusy = $state<string[]>([]);
-  function mcpIsBusy(id: string): boolean {
-    return mcpBusy.includes(id);
-  }
-  function mcpMarkBusy(id: string) {
-    if (!mcpBusy.includes(id)) mcpBusy = [...mcpBusy, id];
-  }
-  function mcpUnmarkBusy(id: string) {
-    mcpBusy = mcpBusy.filter((x) => x !== id);
-  }
-  /** which popup tab is showing: the Built-in gallery or Custom servers */
-  let mcpView = $state<"builtin" | "custom">("builtin");
-  /** keyboard selection within the Built-in gallery */
-  let mcpBuiltinSel = $state(0);
-  /** one-click Add failure (desktop-only writes in a plain browser) */
-  let mcpBuiltinError = $state<string | null>(null);
-  /** search input: focused on open so arrows work immediately (the
-   *  `autofocus` attribute only applies on first page load, not for
-   *  dynamically mounted popups) */
-  let mcpSearchEl = $state<HTMLInputElement | null>(null);
-  $effect(() => {
-    if (mcpOpen) mcpSearchEl?.focus();
+  const mcp = createMcpState({
+    get activeChat() { return activeChat; },
+    serverAction,
+    get chats() { return chats; },
+    save,
+    get activeId() { return activeId; },
+    get ensureBrowserDaemon() { return browser.ensureBrowserDaemon; },
+    get onServer() { return onServer; },
+    get explorerOpen() { return explorerOpen; },
+    set explorerOpen(v) { explorerOpen = v; },
+    openSideBrowser,
+    flashExpNotice,
+    get error() { return error; },
+    set error(v) { error = v; }
   });
-  /** server id waiting on the browser login redirect (label override) */
-  let mcpAuthWait = $state<string | null>(null);
-  /** github-only token prompt: sign-in failed with no open registration, so
-   *  ask for a PAT instead (with a link to generate one) */
-  let mcpPatFor = $state<string | null>(null);
-  let mcpPatToken = $state("");
-  let mcpPatError = $state<string | null>(null);
-  let mcpOpen = $state(false);
-  let mcpQuery = $state("");
-  let mcpSel = $state(0);
-  let mcpShowForm = $state(false);
-  let mcpEditingId = $state<string | null>(null);
-  let mcpForm = $state({
-    name: "",
-    transport: "stdio" as "stdio" | "http",
-    command: "",
-    args: "",
-    envText: "",
-    url: "",
-    headersText: "",
-    oauthId: "",
-    oauthSecret: "",
-    enabled: true
-  });
-  let mcpFormError = $state<string | null>(null);
-  let mcpConfirmDelete = $state<string | null>(null);
-  /** whether the server being edited has a stored OAuth login */
-  let mcpHasLogin = $state(false);
-  const mcpFiltered = $derived(
-    mcpServers.filter((s) => s.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()))
-  );
-  const mcpEnabledCount = $derived(mcpServers.filter((s) => isMcpEnabled(s, currentMcpSelection())).length);
-  const builtinShown = $derived(
-    BUILT_IN_MCPS.filter(
-      (b) =>
-        b.name.toLowerCase().includes(mcpQuery.trim().toLowerCase()) ||
-        b.blurb.toLowerCase().includes(mcpQuery.trim().toLowerCase())
-    )
-  );
-
-  /** installed config matching a Built-in entry (by name), if the user added it */
-  function builtinInstalled(b: BuiltinMcp): McpServerConfig | undefined {
-    return mcpServers.find((s) => s.name.toLowerCase() === b.name.toLowerCase());
-  }
-
-  /** status line for a Built-in row: mirrors mcpStatusOf for installed ones */
-  function builtinStatus(b: BuiltinMcp): { kind: "connected" | "disabled" | "error" | "idle" | "add"; label: string } {
-    const s = builtinInstalled(b);
-    if (!s) return { kind: "add", label: "+ Add" };
-    return mcpStatusOf(s);
-  }
-
-  /** one-click Add: writes the entry to vicuna.json and connects (an auth
-   *  failure flips the row to Sign in, same as Custom servers) */
-  async function addBuiltin(b: BuiltinMcp) {
-    if (builtinInstalled(b) || mcpIsBusy(`builtin:${b.key}`) || mcpIsBusy(b.name)) return;
-    mcpBuiltinError = null;
-    mcpMarkBusy(`builtin:${b.key}`);
-    const sid = activeId;
-    try {
-      mcpServers = await saveMcpServer(builtinToConfig(b));
-      if (!await setMcpForSession(sid, b.name, true)) return;
-    } catch (e: any) {
-      mcpBuiltinError = e?.message ?? String(e);
-      return;
-    } finally {
-      mcpUnmarkBusy(`builtin:${b.key}`);
-    }
-    if (sid === activeId) await connectMcpServer(b.name);
-  }
-
-  /** Add or toggle a server from the Built-in gallery. */
-  async function builtinPrimary(b: BuiltinMcp) {
-    const s = builtinInstalled(b);
-    if (!s) {
-      await addBuiltin(b);
-      return;
-    }
-    await toggleMcpServer(s.id);
-  }
-
-  /** arrow navigation shared by the popup container + search input */
-  function mcpMoveSel(delta: 1 | -1) {
-    if (mcpView === "builtin") {
-      mcpBuiltinSel = builtinShown.length ? (mcpBuiltinSel + delta + builtinShown.length) % builtinShown.length : 0;
-    } else {
-      mcpSel = mcpFiltered.length ? (mcpSel + delta + mcpFiltered.length) % mcpFiltered.length : 0;
-    }
-    // keep the selected row in view: the gallery is taller than the popup,
-    // so arrowing past the fold would otherwise move an invisible cursor
-    void tick().then(() => {
-      document.querySelector(".mcp-popup .mcp-row.sel")?.scrollIntoView({ block: "nearest" });
-    });
-  }
-
-  /** Enter/Space on the selected row (both views; not while editing) */
-  function mcpActivateSelected() {
-    if (mcpShowForm) return;
-    if (mcpView === "builtin") {
-      const b = builtinShown[mcpBuiltinSel];
-      if (b) void builtinPrimary(b);
-    } else {
-      const s = mcpFiltered[mcpSel];
-      if (s) void toggleMcpServer(s.id);
-    }
-  }
-
-  function mcpStatusOf(s: McpServerConfig): { kind: "connected" | "disabled" | "error" | "idle"; label: string } {
-    const live = mcpLive[s.id];
-    if (!isMcpEnabled(s, currentMcpSelection())) return { kind: "disabled", label: "Off" };
-    if (live?.connected) return { kind: "connected", label: "On · Connected" };
-    if (live?.error) {
-      if (isAuthError(live.error)) return { kind: "error", label: "Sign in required →" };
-      return { kind: "error", label: "Error ✕" };
-    }
-    if (mcpIsBusy(s.id)) return { kind: "idle", label: mcpAuthWait === s.id ? "Waiting for browser…" : "Connecting…" };
-    return { kind: "idle", label: "On" };
-  }
-
-  async function loadMcpServers() {
-    // listMcpServers resolves via Tauri, the loopback bridge, or [] when
-    // neither is present (plain browser with no backend has no servers).
-    try {
-      mcpServers = await listMcpServers();
-    } catch (e) {
-      console.error("mcp load failed:", e);
-      mcpServers = [];
-      return;
-    }
-    for (const s of mcpServers) {
-      if (!isBrowserMcpId(s.id) && isMcpEnabled(s, currentMcpSelection())) void connectMcpServer(s.id);
-    }
-  }
-
-  async function connectMcpServer(id: string) {
-    const cfg = findMcpServer(id);
-    if (!cfg || mcpIsBusy(id)) return;
-    mcpMarkBusy(id);
-    mcpLive[id] = { connected: false, tools: [], error: null };
-    try {
-      // the Browser row drives the shared daemon: make sure it is up first
-      // (adopt a running one or spawn ours) before `lb mcp` dials it
-      let config = cfg;
-      if (isBrowserMcpId(id)) {
-        await ensureBrowserDaemon();
-        config = (await listMcpServers()).find((s) => s.id === id) ?? cfg;
-      }
-      const info = await connectMcpBackend(config);
-      mcpLive[id] = { connected: true, tools: info.tools, error: null };
-    } catch (e: any) {
-      mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
-    } finally {
-      mcpUnmarkBusy(id);
-    }
-  }
-
-  async function disconnectMcpServer(id: string, silent = false) {
-    const cfg = findMcpServer(id);
-    try {
-      await disconnectMcpBackend(id, cfg?.transport ?? "stdio");
-    } catch (e: any) {
-      if (!silent) {
-        mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
-        return;
-      }
-    }
-    delete mcpLive[id];
-  }
-
-  async function toggleMcpServer(id: string) {
-    const cfg = findMcpServer(id);
-    if (!cfg || isFixedMcp(id) || mcpIsBusy(id)) return;
-    const sid = activeId;
-    const enable = !isMcpEnabled(cfg, currentMcpSelection());
-    mcpMarkBusy(id);
-    try {
-      if (!await setMcpForSession(sid, id, enable)) return;
-    } finally {
-      mcpUnmarkBusy(id);
-    }
-    if (enable && sid === activeId && isMcpEnabled(cfg, currentMcpSelection()) && !mcpLive[id]?.connected) {
-      await connectMcpServer(id);
-    }
-  }
-
-  /** OAuth sign-in uses the side-panel browser in a remote window.
-   *  A server that turns out to need no auth falls back to plain connect. */
-  async function signInMcpServer(id: string) {
-    const cfg = findMcpServer(id);
-    if (!cfg || mcpIsBusy(id)) return;
-    mcpMarkBusy(id);
-    mcpAuthWait = id;
-    mcpLive[id] = { connected: false, tools: [], error: null };
-    try {
-      if (onServer) {
-        mcpOpen = false;
-        explorerOpen = true;
-        openSideBrowser();
-        await ensureBrowserDaemon();
-      }
-      const info = await signInMcpBackend(cfg, onServer);
-      mcpLive[id] = { connected: true, tools: info.tools, error: null };
-    } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (msg.includes("does not require sign-in")) {
-        mcpAuthWait = null;
-        mcpUnmarkBusy(id);
-        await connectMcpServer(id);
-        return;
-      }
-      mcpLive[id] = { connected: false, tools: [], error: msg };
-      if (onServer) flashExpNotice(msg);
-      // github only: no open registration means the browser flow can never
-      // start — prompt for a personal access token instead of dead-ending
-      if (msg.includes("no open client registration") && /github/i.test(cfg?.name ?? "")) {
-        mcpOpen = true;
-        mcpPatFor = id;
-        mcpPatToken = "";
-        mcpPatError = null;
-      }
-    } finally {
-      mcpAuthWait = null;
-      mcpUnmarkBusy(id);
-    }
-  }
-
-  async function refreshMcpTools(id: string) {
-    const cfg = findMcpServer(id);
-    if (!cfg || mcpIsBusy(id)) return;
-    mcpMarkBusy(id);
-    try {
-      const tools = await listMcpServerTools(cfg);
-      mcpLive[id] = { connected: true, tools, error: null };
-    } catch (e: any) {
-      mcpLive[id] = { connected: false, tools: [], error: e?.message ?? String(e) };
-    } finally {
-      mcpUnmarkBusy(id);
-    }
-  }
-
-  /** Refresh shared definitions after agent changes and when the popup opens. */
-  async function syncMcpServersAfterTurn() {
-    let fresh: McpServerConfig[];
-    try {
-      fresh = await listMcpServers();
-    } catch {
-      return;
-    }
-    const prev = new Map(mcpServers.map((s) => [s.id, s]));
-    const next = new Set(fresh.map((s) => s.id));
-    mcpServers = fresh;
-    for (const s of fresh) {
-      const old = prev.get(s.id);
-      if (old && JSON.stringify(old) === JSON.stringify(s)) continue;
-      if (isMcpEnabled(s, currentMcpSelection()) && !mcpLive[s.id]?.connected) void connectMcpServer(s.id);
-    }
-    for (const id of prev.keys()) {
-      if (!next.has(id)) delete mcpLive[id];
-    }
-  }
-
-  function openMcpPopup() {
-    mcpQuery = "";
-    mcpSel = 0;
-    mcpBuiltinSel = 0;
-    // Open Added when there are servers to manage.
-    mcpView = mcpServers.length ? "custom" : "builtin";
-    mcpDefaultFeedback = "";
-    mcpBuiltinError = null;
-    mcpShowForm = false;
-    mcpFormError = null;
-    mcpConfirmDelete = null;
-    mcpOpen = true;
-    void syncMcpServersAfterTurn();
-  }
-
-  function openMcpForm(existing?: McpServerConfig) {
-    mcpFormError = null;
-    mcpConfirmDelete = null;
-    mcpHasLogin = false;
-    if (existing) {
-      mcpEditingId = existing.id;
-      mcpForm = {
-        name: existing.name,
-        transport: existing.transport,
-        command: existing.command?.[0] ?? "",
-        args: (existing.command ?? []).slice(1).join(" "),
-        envText: existing.env ? JSON.stringify(existing.env, null, 2) : "",
-        url: existing.url ?? "",
-        headersText: existing.headers ? JSON.stringify(existing.headers, null, 2) : "",
-        oauthId: existing.oauth?.client_id ?? "",
-        oauthSecret: existing.oauth?.client_secret ?? "",
-        enabled: isMcpEnabled(existing, currentMcpSelection())
-      };
-      // does this server hold a browser login? (drives the Sign out row)
-      const checkId = existing.id;
-      void loginPresentBackend(existing.id)
-        .then((v) => {
-          if (mcpEditingId === checkId) mcpHasLogin = v;
-        })
-        .catch(() => {});
-    } else {
-      mcpEditingId = null;
-      mcpForm = { name: "", transport: "stdio", command: "", args: "", envText: "", url: "", headersText: "", oauthId: "", oauthSecret: "", enabled: true };
-    }
-    mcpShowForm = true;
-  }
-
-  function closeMcpForm() {
-    mcpShowForm = false;
-    mcpEditingId = null;
-    mcpFormError = null;
-  }
-
-  async function saveMcpForm() {
-    const sid = activeId;
-    const err = validateMcpServer(mcpForm);
-    if (err) {
-      mcpFormError = err;
-      return;
-    }
-    const argParts = mcpForm.args.split(/\s+/).filter(Boolean);
-    const oauthId = mcpForm.oauthId.trim();
-    const cfg: McpServerConfig = {
-      id: (mcpEditingId ?? mcpForm.name.trim()),
-      name: mcpForm.name.trim(),
-      transport: mcpForm.transport,
-      command: mcpForm.transport === "stdio" ? [mcpForm.command.trim(), ...argParts] : undefined,
-      env: mcpForm.transport === "stdio" ? parseMcpStringMap(mcpForm.envText) : undefined,
-      url: mcpForm.transport === "http" ? mcpForm.url.trim() : undefined,
-      headers: mcpForm.transport === "http" ? parseMcpStringMap(mcpForm.headersText) : undefined,
-      oauth: mcpForm.transport === "http" && oauthId
-        ? { client_id: oauthId, ...(mcpForm.oauthSecret.trim() ? { client_secret: mcpForm.oauthSecret.trim() } : {}) }
-        : undefined,
-      enabled: mcpForm.enabled
-    };
-    if (mcpServers.some((s) => s.id !== cfg.id && s.name.toLowerCase() === cfg.name.toLowerCase())) {
-      mcpFormError = "A server with that name already exists.";
-      return;
-    }
-    try {
-      await disconnectMcpServer(cfg.id, true);
-    } catch {
-      /* replacing the config drops the old connection */
-    }
-    try {
-      mcpServers = await saveMcpServer(cfg, mcpEditingId);
-      if (!await setMcpForSession(sid, cfg.name, cfg.enabled)) {
-        mcpEditingId = cfg.name;
-        mcpFormError = "Server saved. The session switch could not be updated.";
-        return;
-      }
-    } catch (e: any) {
-      mcpFormError = e?.message ?? String(e);
-      return;
-    }
-    closeMcpForm();
-    if (cfg.enabled) void connectMcpServer(cfg.name);
-  }
-
-  async function deleteMcpServerEntry(id: string) {
-    if (mcpConfirmDelete !== id) {
-      mcpConfirmDelete = id;
-      return;
-    }
-    mcpConfirmDelete = null;
-    await disconnectMcpServer(id, true);
-    try {
-      mcpServers = await deleteMcpServer(id);
-    } catch (e: any) {
-      error = e?.message ?? String(e);
-    }
-  }
-
-  /** Forget the stored browser login for the server being edited. */
-  async function signOutMcp() {
-    const id = mcpEditingId;
-    if (!id) return;
-    try {
-      await signOutMcpBackend(id);
-    } catch (e: any) {
-      mcpFormError = e?.message ?? String(e);
-      return;
-    }
-    mcpHasLogin = false;
-    delete mcpLive[id];
-  }
 
   /** `live-browser:open-external` from the Browser-tab iframe: lb's own
    *  target=_blank links die silently in desktop webviews (no new-window
    *  implementation), so when framed lb posts out instead and the app opens
    *  the URL natively. Strict loopback-origin + shape check. */
   function onBrowserFrameMessage(e: MessageEvent) {
-    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
+    const base = onServer ? browser.browserProxyUrl : (browser.browserDaemon?.url ?? LB_URL);
     if (!base) return;
     try {
       if (e.origin !== new URL(base).origin) return;
@@ -905,56 +448,6 @@
     if (!d || d.type !== "live-browser:open-external" || typeof d.url !== "string") return;
     if (!/^https?:\/\//.test(d.url)) return;
     void openExternal(d.url);
-  }
-
-  /** Open a URL outside the app: system browser on desktop (Tauri opener),
-   *  new tab in plain browsers. Never navigates the app webview itself. */
-  async function openExternal(url: string): Promise<void> {
-    if (isTauriRuntime()) {
-      try {
-        const { openUrl } = await import("@tauri-apps/plugin-opener");
-        await openUrl(url);
-        return;
-      } catch {
-        /* fall through to window.open */
-      }
-    }
-    window.open(url, "_blank", "noopener");
-  }
-
-  /** Open the token generation page (github-only PAT prompt). */
-  async function openTokenPage(e: MouseEvent) {
-    e.preventDefault();
-    await openExternal("https://github.com/settings/tokens/new");
-  }
-
-  /** Save the pasted PAT into the server's Headers and connect. */
-  async function savePatAndConnect() {
-    const id = mcpPatFor;
-    const token = mcpPatToken.trim();
-    if (!id) return;
-    if (!token) {
-      mcpPatError = "Paste a token first.";
-      return;
-    }
-    const cfg = findMcpServer(id);
-    if (!cfg) {
-      mcpPatFor = null;
-      return;
-    }
-    try {
-      mcpServers = await saveMcpServer({
-        ...cfg,
-        headers: { ...(cfg.headers ?? {}), Authorization: `Bearer ${token}` }
-      });
-    } catch (e: any) {
-      mcpPatError = e?.message ?? String(e);
-      return;
-    }
-    mcpPatFor = null;
-    mcpPatToken = "";
-    mcpPatError = null;
-    await connectMcpServer(id);
   }
 
   /** prompts typed while a work turn is live: they join the context at the
@@ -1337,7 +830,7 @@
   // advance the live clock while a turn runs (or a browser start is in
   // flight) so elapsed tooltips/labels stay current
   $effect(() => {
-    if (!streaming && !workRunning && !browserStarting) return;
+    if (!streaming && !workRunning && !browser.browserStarting) return;
     const t = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -1425,13 +918,6 @@
   let scheduleCustom = $state<{ date: string; time: string; rescheduleId: string | null; error: string | null } | null>(null);
   /** clock for the schedule UI (preset times, Today/Tomorrow labels) */
   let scheduleNow = $state(Date.now());
-  const scheduleTz = (() => {
-    try {
-      return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-    } catch {
-      return "";
-    }
-  })();
   /** ids being sent right now (a slow workspace check must not double-send) */
   const scheduleSending = new Set<string>();
 
@@ -1911,144 +1397,11 @@
     if (scheduled.length && Math.floor(at / 60000) !== Math.floor(scheduleNow / 60000)) scheduleNow = at;
     for (const it of dueItems(scheduled, at)) void deliverScheduled(it.id);
   }
-  type UsageCacheEntry = { report: WorkUsageReport | null; error: string | null; at: number };
-  const USAGE_CACHE_KEY = "vicuna-usage-cache";
-  let usageOpen = $state(false);
-  let usageEngine = $state("agy");
-  let usageNoEngineError = $state<string | null>(null);
-  /** Unified per-engine usage snapshot shared by the header badge, hover popover, and modal. */
-  let usageStore = $state<Record<string, UsageCacheEntry>>({});
-  /** Per-engine in-flight flags so hover, background poll, and modal refreshes deduplicate. */
-  let usageFetching = $state<Record<string, boolean>>({});
-  /** Ticks every 30s so "Updated Xm ago" labels stay fresh without extra fetches. */
-  let usageNow = $state(Date.now());
-  const usageInFlight = new Map<string, Promise<void>>();
-  let usagePollRunning = false;
-
-  const usageEntry = $derived(usageStore[usageEngine] ?? null);
-  const usageReport = $derived(usageEntry?.report ?? null);
-  const usageError = $derived(usageNoEngineError ?? usageEntry?.error ?? null);
-  const usageUpdatedAt = $derived(usageEntry?.at ?? null);
-  const usageLoading = $derived(!!usageFetching[usageEngine]);
-
-  function persistUsageStore() {
-    try {
-      const toSave: Record<string, { report: WorkUsageReport; at: number }> = {};
-      for (const [k, v] of Object.entries(usageStore)) {
-        if (v.report) toSave[k] = { report: v.report, at: v.at };
-      }
-      localStorage.setItem(USAGE_CACHE_KEY, JSON.stringify(toSave));
-    } catch {}
-  }
-
-  function hydrateUsageStore() {
-    try {
-      const loaded = parseUsageCache<WorkUsageReport>(localStorage.getItem(USAGE_CACHE_KEY));
-      if (Object.keys(loaded).length) usageStore = loaded;
-    } catch {}
-  }
-
-  function fetchUsageEngine(engine: string, opts?: { force?: boolean; background?: boolean }): Promise<void> {
-    if (!engine) return Promise.resolve();
-    const force = opts?.force ?? false;
-    const background = opts?.background ?? false;
-    const existing = usageStore[engine];
-    if (!force && existing?.report && !isUsageStale(existing.at, Date.now(), USAGE_POLL_INTERVAL_MS)) {
-      return Promise.resolve();
-    }
-    const inflight = usageInFlight.get(engine);
-    if (inflight) return inflight;
-
-    usageFetching = { ...usageFetching, [engine]: true };
-    const p = (async () => {
-      try {
-        const res = await fetchWorkUsage(engine);
-        const now = Date.now();
-        const prev = usageStore[engine];
-        if (!res.error) {
-          usageStore = { ...usageStore, [engine]: { report: res, error: null, at: now } };
-          persistUsageStore();
-        } else if (background && prev?.report) {
-          // keep last good snapshot on transient background poll failures
-        } else {
-          usageStore = {
-            ...usageStore,
-            [engine]: { report: prev?.report ?? null, error: res.error, at: prev?.report ? prev.at : now },
-          };
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        const prev = usageStore[engine];
-        if (!(background && prev?.report)) {
-          usageStore = {
-            ...usageStore,
-            [engine]: { report: prev?.report ?? null, error: msg, at: prev?.report ? prev.at : Date.now() },
-          };
-        }
-      } finally {
-        usageInFlight.delete(engine);
-        const { [engine]: _, ...rest } = usageFetching;
-        usageFetching = rest;
-        usageNow = Date.now();
-      }
-    })();
-    usageInFlight.set(engine, p);
-    return p;
-  }
-
-  async function pollUsageBackground() {
-    if (usagePollRunning) return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-    const order = usagePollOrder(workEngines, engineId(workEngineInfo));
-    if (!order.length) return;
-    usagePollRunning = true;
-    try {
-      for (const eng of order) {
-        if (typeof document !== "undefined" && document.visibilityState === "hidden") break;
-        await fetchUsageEngine(eng, { background: true });
-      }
-    } finally {
-      usagePollRunning = false;
-    }
-  }
-
-  function primeUsageHover() {
-    usageNow = Date.now();
-    const engine = usageHoverEngine;
-    if (!engine) return;
-    void fetchUsageEngine(engine, { background: true });
-  }
-
-  function closeUsageModal() {
-    usageOpen = false;
-  }
-
-  function selectUsageTab(engine: string) {
-    usageNoEngineError = null;
-    usageEngine = engine;
-    usageNow = Date.now();
-    void fetchUsageEngine(engine, { background: true });
-  }
-
-  async function openUsageModal(engine?: string) {
-    usageOpen = true;
-    usageNoEngineError = null;
-    usageNow = Date.now();
-    if (!engine && !workEngineInfo) await refreshWorkEngine();
-    if (!usageOpen) return;
-    const target = engine ?? usageTabs(workEngines, engineId(workEngineInfo)).initial;
-    if (!target) {
-      usageNoEngineError = "Usage is available for Claude Code, Codex and Antigravity; none of them is installed.";
-      return;
-    }
-    usageEngine = target;
-    void fetchUsageEngine(target, { background: true });
-  }
-
-  $effect(() => {
-    const key = usagePollOrder(workEngines, engineId(workEngineInfo)).join(",");
-    if (!key) return;
-    void pollUsageBackground();
+  const usage = createUsageState({
+    get workEngines() { return workEngines; },
+    get workEngineInfo() { return workEngineInfo; },
+    get usageHoverEngine() { return usageHoverEngine; },
+    get refreshWorkEngine() { return refreshWorkEngine; }
   });
 
   /** Esc closes the top schedule/usage overlay before any other handler sees it */
@@ -2056,7 +1409,7 @@
     if (e.key !== "Escape") return;
     if (scheduleCustom) scheduleCustom = null;
     else if (quitPromptOpen) quitPromptOpen = false;
-    else if (usageOpen) closeUsageModal();
+    else if (usage.usageOpen) usage.closeUsageModal();
     else if (scheduleListOpen) scheduleListOpen = false;
     else if (scheduleMenuOpen) scheduleMenuOpen = false;
     else return;
@@ -2153,7 +1506,7 @@
   }
 
   function newChat() {
-    homeMcpEnabled = undefined;
+    mcp.homeMcpEnabled = undefined;
     homeSkillsEnabled = undefined;
     // navigating never touches live turns: other sessions keep streaming or
     // working in the background (sidebar shimmer shows them)
@@ -2292,14 +1645,19 @@
   let pendingDeleteId = $state<string | null>(null);
   let pendingMsgDelete = $state<number | null>(null);
   let clearContextChatId = $state<string | null>(null);
-  let gotoOpen = $state(false);
-  let gotoInput = $state("");
-  let gotoError = $state<string | null>(null);
-  let gotoSel = $state(0);
+  const palette = createGotoPaletteState({
+    get srv() { return srv; },
+    get chats() { return chats; },
+    get activeServer() { return activeServer; },
+    get onServer() { return onServer; },
+    get newChat() { return newChat; },
+    get selectChat() { return selectChat; },
+    get error() { return error; },
+    set error(v) { error = v; }
+  });
   let settingsOpen = $state(false);
   let settingsTab = $state<"general" | "work" | "models" | "openrouter" | "chat">("general");
   let pluginsOpen = $state(false);
-  const CLI_INSTALL_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh";
   let cliCopied = $state(false);
   async function copyCliInstall() {
     try {
@@ -2452,10 +1810,6 @@
     } catch (e: any) {
       accountError = typeof e === "string" ? e : (e?.message ?? String(e));
     }
-  }
-  /** Keep the sign-in card visible when it opens under an account row in the scrolling engine list. */
-  function revealCard(node: HTMLElement) {
-    requestAnimationFrame(() => node.scrollIntoView({ block: "nearest", behavior: "smooth" }));
   }
 
   let accountSignInCopiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2626,227 +1980,10 @@
   // download/install + relaunch). The manifest is latest.json on the newest
   // stable GitHub release (tauri.conf.json → plugins.updater.endpoints).
   // Plain-browser/bridge mode has no updater and keeps the download flow above.
-  let showUpdatePrompt = $state(false);
-  let availableAppUpdate = $state<AppUpdateInfo | null>(null);
-  let appUpdateStatus = $state<AppUpdateStatus>("idle");
-  let appUpdateError = $state<string | null>(null);
-  let appUpdateProgress = $state<{ downloadedBytes: number; totalBytes: number | null } | null>(null);
-  let skippedAppUpdateVersion = $state<string | null>(null);
-  let autoCheckAppUpdatesEnabled = $state(true);
-  let suppressAutoUpdatePromptUntilNextCheck = false;
-  /** the plugin's Update handle (not reactive: it owns a native resource) */
-  let updateObject: {
-    version: string;
-    currentVersion?: string;
-    downloadAndInstall: (cb?: (event: unknown) => void) => Promise<void>;
-  } | null = null;
-  const appUpdateLabel = $derived(
-    appUpdateStatus === "checking"
-      ? "Checking for updates…"
-      : appUpdateStatus === "installing"
-        ? "Installing update…"
-        : appUpdateStatus === "installed"
-          ? "Restart to apply update"
-          : appUpdateStatus === "available" && availableAppUpdate
-            ? `Update to v${availableAppUpdate.version}`
-            : "Check for updates"
-  );
-
-  function initializeAppUpdatePreference() {
-    const stored = loadAppUpdatePreferenceFromStorage();
-    skippedAppUpdateVersion = stored.skippedVersion;
-    autoCheckAppUpdatesEnabled = stored.autoCheckEnabled;
-  }
-
-  function setAutoCheckAppUpdates(enabled: boolean) {
-    autoCheckAppUpdatesEnabled = enabled;
-    try {
-      persistAppUpdatePreference({ skippedVersion: skippedAppUpdateVersion, autoCheckEnabled: enabled });
-    } catch {
-      /* storage unavailable: keep the in-memory choice */
-    }
-  }
-
-  function closeUpdatePrompt() {
-    showUpdatePrompt = false;
-  }
-
-  function skipAvailableAppUpdateVersion() {
-    const version = availableAppUpdate?.version?.trim();
-    if (version) {
-      skippedAppUpdateVersion = version;
-      try {
-        persistAppUpdatePreference({ skippedVersion: version, autoCheckEnabled: autoCheckAppUpdatesEnabled });
-      } catch {
-        /* storage unavailable */
-      }
-    }
-    suppressAutoUpdatePromptUntilNextCheck = false;
-    closeUpdatePrompt();
-  }
-
-  function remindAboutAppUpdateLater() {
-    suppressAutoUpdatePromptUntilNextCheck = true;
-    closeUpdatePrompt();
-  }
-
-  async function triggerAutomaticAppUpdateCheck() {
-    if (typeof navigator !== "undefined" && !navigator.onLine) return;
-    if (!autoCheckAppUpdatesEnabled) return;
-    if (appUpdateStatus === "checking" || appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
-    const suppressPrompt = suppressAutoUpdatePromptUntilNextCheck;
-    suppressAutoUpdatePromptUntilNextCheck = false;
-    await checkForAppUpdates({ source: "automatic", suppressAutoPrompt: suppressPrompt });
-  }
-
-  async function resolveAppUpdateReleaseNotes(update: {
-    body?: string | null;
-  }): Promise<{ notesPreview: string | null; releaseNotesUrl: string }> {
-    const fallback = createReleaseNotesPreview(update.body ?? null);
-    try {
-      return await fetchGithubReleaseNotesMetadata();
-    } catch (err) {
-      console.warn("Failed to fetch GitHub release notes preview:", err);
-      return { notesPreview: fallback, releaseNotesUrl: APP_UPDATE_RELEASES_URL };
-    }
-  }
-
-  async function checkForAppUpdates(
-    options: { source?: "manual" | "automatic"; suppressAutoPrompt?: boolean } = {}
-  ) {
-    const source = options.source ?? "manual";
-    const suppressAutoPrompt = options.suppressAutoPrompt ?? false;
-    if (!isTauriRuntime()) {
-      void openExternal(APP_UPDATE_RELEASES_URL);
-      return;
-    }
-    if (appUpdateStatus === "checking" || appUpdateStatus === "installing") return;
-
-    const previousAvailable = availableAppUpdate;
-    const previousStatus = appUpdateStatus;
-    const previousError = appUpdateError;
-    const previousUpdateObject = updateObject;
-
-    appUpdateStatus = "checking";
-    appUpdateError = null;
-    appUpdateProgress = null;
-    availableAppUpdate = null;
-    updateObject = null;
-
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (update) {
-        const rawTarget = (update as unknown as { rawJson?: { target?: unknown } }).rawJson?.target;
-        const releaseNotes = await resolveAppUpdateReleaseNotes({
-          body: (update as unknown as { body?: string | null }).body ?? null
-        });
-        availableAppUpdate = {
-          version: update.version,
-          currentVersion: update.currentVersion || "",
-          notes: releaseNotes.notesPreview,
-          publishedAt: (update as unknown as { date?: string | null }).date ?? null,
-          target: typeof rawTarget === "string" ? rawTarget : "",
-          releaseNotesUrl: releaseNotes.releaseNotesUrl
-        };
-        updateObject = update as unknown as typeof updateObject;
-        appUpdateStatus = "available";
-        if (source === "manual") {
-          showUpdatePrompt = true;
-        } else if (!suppressAutoPrompt && update.version !== skippedAppUpdateVersion) {
-          showUpdatePrompt = true;
-        } else {
-          closeUpdatePrompt();
-        }
-      } else {
-        appUpdateStatus = "up_to_date";
-        closeUpdatePrompt();
-        if (source === "manual") flashNotice("Vicuna is already up to date.");
-      }
-    } catch (err) {
-      console.error("Failed to check for app updates:", err);
-      if (source === "automatic") {
-        // background checks never surface errors (offline, no release yet…)
-        availableAppUpdate = previousAvailable;
-        appUpdateStatus = previousStatus;
-        appUpdateError = previousError;
-        updateObject = previousUpdateObject;
-        return;
-      }
-      availableAppUpdate = null;
-      updateObject = null;
-      appUpdateStatus = "error";
-      appUpdateError = normalizeUpdateErrorMessage(err);
-      showUpdatePrompt = false;
-    }
-  }
-
-  async function installAppUpdate() {
-    if (appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
-    // The modal can outlive the in-memory updater handle: re-check instead
-    // of silently doing nothing.
-    if (!updateObject) {
-      appUpdateError = null;
-      await checkForAppUpdates({ source: "manual" });
-      if (!updateObject || appUpdateStatus !== "available") return;
-    }
-    if (appUpdateStatus !== "available" && appUpdateStatus !== "error") return;
-    const handle = updateObject;
-    if (!handle) return;
-    appUpdateStatus = "installing";
-    appUpdateError = null;
-    appUpdateProgress = { downloadedBytes: 0, totalBytes: null };
-    // Keep the dialog visible so progress is seen; it stays dismissible and
-    // the install continues in the background if hidden.
-    showUpdatePrompt = true;
-    try {
-      await handle.downloadAndInstall((event) => {
-        const name = (event as { event?: string })?.event;
-        const data = (event as { data?: { chunkLength?: unknown; contentLength?: unknown } })?.data ?? {};
-        if (name === "Started") {
-          const total = typeof data.contentLength === "number" ? data.contentLength : null;
-          appUpdateProgress = { downloadedBytes: 0, totalBytes: total };
-        } else if (name === "Progress") {
-          const chunk = typeof data.chunkLength === "number" ? data.chunkLength : 0;
-          const prev = appUpdateProgress ?? { downloadedBytes: 0, totalBytes: null };
-          appUpdateProgress = { downloadedBytes: prev.downloadedBytes + chunk, totalBytes: prev.totalBytes };
-        }
-      });
-      appUpdateProgress = null;
-      appUpdateStatus = "installed";
-    } catch (err) {
-      console.error("Failed to install app update:", err);
-      appUpdateProgress = null;
-      appUpdateStatus = "error";
-      appUpdateError = formatAppUpdateInstallError(err);
-    }
-  }
-
-  async function restartToApplyUpdate() {
-    try {
-      const { relaunch } = await import("@tauri-apps/plugin-process");
-      await relaunch();
-    } catch (err) {
-      console.error("Failed to restart after installing update:", err);
-      appUpdateError = normalizeUpdateErrorMessage(err);
-    }
-  }
-
-  /** Settings → App updates button: reopen a known update (incl. one that
-   *  is installing/installed/failed) instead of starting a conflicting check. */
-  async function openAppUpdate() {
-    if (
-      availableAppUpdate &&
-      (appUpdateStatus === "available" ||
-        appUpdateStatus === "installing" ||
-        appUpdateStatus === "installed" ||
-        appUpdateStatus === "error")
-    ) {
-      showUpdatePrompt = true;
-      return;
-    }
-    await checkForAppUpdates({ source: "manual" });
-  }
+  const appUpdate = createAppUpdateState({
+    get flashNotice() { return flashNotice; },
+    get updateError() { return updateError; }
+  });
   /** update errors fade like the main error box (a manual × also exists);
    *  same plain-timer shape as `errorTimer` above */
   let updateErrorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2862,177 +1999,38 @@
       if (updateError === msg) updateError = null;
     }, 12000);
   });
-  let runners = $state<RunningModel[]>([]);
-  let runnersError = $state<string | null>(null);
-  let modelOp = $state<string | null>(null);
-  let pullName = $state("");
-  let pulling = $state<string | null>(null);
-  let pullStatus = $state("");
-  let pullDone = $state(0);
-  let pullTotal = $state(0);
-  let pullRate = $state(0); // bytes/sec, EMA of completed deltas
-  let pullLastAt = 0;
-  let pullLastDone = 0;
-  let pullLastDigest: string | null = null;
-  let pullAborter: AbortController | null = null;
-  let confirmDeleteModel = $state<string | null>(null);
-  let browseView = $state<"installed" | "discover">("installed");
-  let browseQuery = $state("");
-  let browseCat = $state<"all" | CatalogCat | "small" | "mlx">("all");
-  let variantPick = $state<Record<string, string>>({});
-  // discover catalog: bundled list, replaced by a fetched override when the
-  // user hits Fetch (persisted via store so it survives restarts)
-  let catalog = $state<CatalogEntry[]>([...MODEL_CATALOG]);
-  let catalogUpdated = $state(CATALOG_UPDATED);
-  let fetching = $state<{ done: number; total: number } | null>(null);
-  let catalogError = $state<string | null>(null);
+  const ollamaMgr = createOllamaModelsState({
+    get refreshModels() { return refreshModels; },
+    get models() { return models; },
+    get selectedModel() { return selectedModel; },
+    set selectedModel(v) { selectedModel = v; },
+    get save() { return save; }
+  });
 
   // ── OpenRouter (Settings → OpenRouter) ─────────────────────────────
   // The key lives in prefs; the catalog is fetched at runtime (the public
   // endpoint is CORS-enabled) and cached in localStorage. Chat + Work both
   // run through OpenRouter selections (`openrouter:` ids).
-  let openrouterKey = $state(initialPrefs.openrouterApiKey ?? "");
-  let openrouterKeyDraft = $state(initialPrefs.openrouterApiKey ?? "");
-  let openrouterKeyVisible = $state(false);
-  /** Once a key is saved the full form collapses (frees room for the model
-   *  list); "Change" reveals it again. Always open when no key is set. */
-  let openrouterKeyEditing = $state(false);
-  let openrouterKeyBusy = $state(false);
-  let openrouterKeyInfo = $state<OpenRouterKeyInfo | null>(null);
-  let openrouterKeyError = $state<string | null>(null);
-  let openrouterModels = $state<OpenRouterModel[]>([]);
-  let openrouterUpdated = $state("");
-  let openrouterLoading = $state(false);
-  let openrouterError = $state<string | null>(null);
-  let openrouterQuery = $state("");
-  let openrouterCat = $state<OpenRouterFilter>("added");
-  const openrouterKeyDirty = $derived(openrouterKeyDraft.trim() !== openrouterKey);
-  /** Curated ids: only these appear in the model picker and under the
-   *  Added chip — the live catalog is 400+ entries. Any other chip or a
-   *  search query browses the full catalog for discovery. */
-  let openrouterAdded = $state<string[]>([...(initialPrefs.openrouterAdded ?? [])]);
+  const openrouter = createOpenRouterState({
+    get initialPrefs() { return initialPrefs; },
+    get persistPrefs() { return persistPrefs; },
+    get settingsTab() { return settingsTab; },
+    set settingsTab(v) { settingsTab = v; }
+  });
   /** Sidebar scope ("all", "chat", or a workspace root). Resolved against the
    *  live folders below, so a stale value can never blank the list. */
   let sessionFilterRaw = $state<string>(initialPrefs.sessionFilter ?? ALL_FILTER);
-  const openrouterAddedSet = $derived(new Set(openrouterAdded));
-  const openrouterBrowsing = $derived(openrouterCat !== "added" || openrouterQuery.trim() !== "");
-  const filteredOpenRouterModels = $derived.by(() => {
-    const base =
-      openrouterCat === "added" && openrouterQuery.trim() === ""
-        ? openrouterModels.filter((m) => openrouterAddedSet.has(m.id))
-        : openrouterModels;
-    return filterOpenRouterModels(base, openrouterQuery, openrouterCat);
-  });
-
-  function toggleOpenRouterAdded(id: string) {
-    openrouterAdded = openrouterAddedSet.has(id)
-      ? openrouterAdded.filter((x) => x !== id)
-      : [...openrouterAdded, id];
-    persistPrefs();
-  }
-
-  function openOpenRouterTab() {
-    settingsTab = "openrouter";
-    // Verify a saved key when the tab opens. Success sticks (no network per
-    // click); a failed check retries next time, which helps after the account
-    // or network is fixed.
-    if (openrouterKey && !openrouterKeyInfo && !openrouterKeyBusy) void verifyOpenRouterKey();
-  }
-
-  /** Persist the trimmed key and verify it immediately. */
-  async function saveOpenRouterKey() {
-    const next = openrouterKeyDraft.trim();
-    const changed = next !== openrouterKey;
-    openrouterKey = next;
-    openrouterKeyDraft = next;
-    openrouterKeyInfo = null;
-    openrouterKeyError = null;
-    setOpenRouterApiKey(next);
-    if (changed) persistPrefs();
-    if (!next) {
-      openrouterKeyVisible = false;
-      return;
-    }
-    await verifyOpenRouterKey();
-    if (!openrouterKeyError) openrouterKeyEditing = false;
-  }
-
-  async function verifyOpenRouterKey() {
-    if (openrouterKeyBusy) return;
-    openrouterKeyError = null;
-    if (!openrouterKey) {
-      openrouterKeyError = "Enter an API key first.";
-      return;
-    }
-    openrouterKeyBusy = true;
-    try {
-      openrouterKeyInfo = await testOpenRouterKey(openrouterKey);
-    } catch (e: any) {
-      openrouterKeyInfo = null;
-      openrouterKeyError = e?.message ?? String(e);
-    } finally {
-      openrouterKeyBusy = false;
-    }
-  }
-
-  function clearOpenRouterKey() {
-    openrouterKey = "";
-    openrouterKeyDraft = "";
-    openrouterKeyVisible = false;
-    openrouterKeyEditing = false;
-    openrouterKeyInfo = null;
-    openrouterKeyError = null;
-    setOpenRouterApiKey("");
-    persistPrefs();
-  }
-
-  async function fetchOpenRouterCatalog() {
-    if (openrouterLoading) return;
-    openrouterLoading = true;
-    openrouterError = null;
-    try {
-      const list = await fetchOpenRouterModels(openrouterKey);
-      openrouterModels = list;
-      openrouterUpdated = writeOpenRouterCache(list);
-    } catch (e: any) {
-      openrouterError = e?.message ?? String(e);
-    } finally {
-      openrouterLoading = false;
-    }
-  }
-
-  function openRouterUsageText(info: OpenRouterKeyInfo): string {
-    const bits: string[] = [];
-    if (info.usage !== null) bits.push(`usage ${formatUsd(info.usage)}`);
-    if (info.limit !== null && info.limit > 0) {
-      bits.push(info.limitRemaining !== null ? `${formatUsd(info.limitRemaining)} of ${formatUsd(info.limit)} left` : `limit ${formatUsd(info.limit)}`);
-    }
-    return bits.join(" · ");
-  }
-
-  async function fetchCatalog() {
-    if (fetching) return;
-    catalogError = null;
-    fetching = { done: 0, total: catalog.length };
-    try {
-      const over: CatalogOverride = await refreshCatalog(catalog, (done, total) => {
-        fetching = { done, total };
-      });
-      catalog = over.entries;
-      catalogUpdated = over.updated;
-      saveCatalog(over);
-    } catch (e: any) {
-      catalogError = e?.message ?? String(e);
-    } finally {
-      fetching = null;
-    }
-  }
 
   // ---- remote server (sidebar server menu; src/lib/bridge.ts + src-tauri/src/servers.rs) ----
   // Picking a server reloads the window onto it: every backend call, the
   // chat list and Work turns then live on that machine. Constant per load.
   const onServer = isRemoteServer();
   const activeServer = activeServerId();
+  /** scheduled sends target chat ids, which belong to one backend: keep a
+   *  separate list per server so nothing fires against the wrong machine */
+  function scheduleStoreKey(): string {
+    return activeServer ? `${SCHEDULE_KEY}:server:${activeServer}` : SCHEDULE_KEY;
+  }
   /** `?chat=<id>`: this window was opened on a session from the Cmd+P palette
    *  (a server window gets the session in its URL; read before navigation
    *  rewrites it). */
@@ -3044,262 +2042,18 @@
       return null;
     }
   })();
-  let srvList = $state<ServerInfo[]>([]);
-  let srvMenuOpen = $state(false);
-  let srvDialogOpen = $state(false);
-  let srvUrlDraft = $state("");
-  let srvTokenDraft = $state("");
-  let srvNameDraft = $state("");
-  let srvNameTouched = $state(false);
-  let srvBusy = $state(false);
-  let srvErr = $state<string | null>(null);
-  /** chats could not be loaded from the active server */
-  let srvLoadError = $state<string | null>(null);
-  let srvCopied = $state<string | null>(null);
-  const srvCurrent = $derived(srvList.find((x) => x.id === activeServer) ?? null);
-  const srvLabel = $derived(onServer ? (srvCurrent?.name ?? "Remote server") : "This computer");
+  const srv = createServerSwitcherState({
+    get activeServer() { return activeServer; },
+    get onServer() { return onServer; },
+    get clientVersion() { return clientVersion; },
+    get uiReady() { return uiReady; },
+    get flashNotice() { return flashNotice; },
+    get error() { return error; },
+    set error(v) { error = v; }
+  });
 
   /** this app's version vs. the remote `vicuna serve` it talks to */
   const clientVersion: string = pkg.version;
-  let srvVersion = $state<string | null>(null);
-  let srvLatest = $state<string | null>(null);
-  let srvCanUpgrade = $state(false);
-  let srvUpgrading = $state(false);
-  let srvVersionChecked = false;
-  const srvVersionSkew = $derived(!!srvVersion && srvVersion !== clientVersion);
-  const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && cmpVersion(srvLatest, srvVersion) > 0);
-
-  async function loadServerVersion() {
-    const info = await invokeOrBridge<{ version?: string; canUpgrade?: boolean }>("server_info", {}).catch(() => null);
-    srvVersion = info?.version ?? null;
-    srvCanUpgrade = !!info?.canUpgrade;
-    if (!srvCanUpgrade) return;
-    const chk = await invokeOrBridge<{ latest?: string }>("server_upgrade_check", {}).catch(() => null);
-    srvLatest = chk?.latest ?? null;
-  }
-
-  $effect(() => {
-    if (onServer && uiReady && !srvVersionChecked) {
-      srvVersionChecked = true;
-      void loadServerVersion();
-    }
-  });
-
-  /** live progress of a server upgrade (`server_upgrade_status`) */
-  let srvUpgradeStage = $state<string | null>(null);
-  let srvUpgradePct = $state<number | null>(null);
-  let srvUpgradeDetail = $state<string | null>(null);
-
-  async function upgradeServer() {
-    if (srvUpgrading || !srvLatest) return;
-    const from = srvVersion;
-    srvUpgrading = true;
-    srvUpgradeStage = "Starting upgrade…";
-    srvUpgradePct = null;
-    srvUpgradeDetail = null;
-    type St = { running?: boolean; failed?: boolean; error?: string; stage?: string | null; step?: number; steps?: number; percent?: number | null; detail?: string | null };
-    try {
-      await invokeOrBridge("server_upgrade", {});
-      // ~3 minutes: progress from the upgrade log, then the restart
-      for (let i = 0; i < 180; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const st = await invokeOrBridge<St>("server_upgrade_status", {}).catch(() => null);
-        if (st?.failed) throw new Error(st.error || "upgrade failed");
-        if (st?.stage && st.running !== false) {
-          srvUpgradeStage = st.steps && st.step ? `${st.stage} (${st.step}/${st.steps})` : st.stage;
-          srvUpgradePct = st.percent ?? null;
-          srvUpgradeDetail = st.detail ?? null;
-          continue;
-        }
-        // upgrader finished (or the server is down / restarted): wait for the new version
-        srvUpgradeStage = "Restarting the server…";
-        srvUpgradePct = null;
-        srvUpgradeDetail = null;
-        const info = await invokeOrBridge<{ version?: string }>("server_info", {}).catch(() => null);
-        if (info?.version && info.version !== from) {
-          srvVersion = info.version;
-          flashNotice(`${srvLabel} is now on v${info.version}.`);
-          return;
-        }
-      }
-      error = `${srvLabel} did not come back on a new version. Check ~/vicuna/server/upgrade.log there.`;
-    } catch (e) {
-      error = `Server upgrade failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      srvUpgrading = false;
-      srvUpgradeStage = null;
-      srvUpgradePct = null;
-      srvUpgradeDetail = null;
-    }
-  }
-
-  /** scheduled sends target chat ids, which belong to one backend: keep a
-   *  separate list per server so nothing fires against the wrong machine */
-  function scheduleStoreKey(): string {
-    return activeServer ? `${SCHEDULE_KEY}:server:${activeServer}` : SCHEDULE_KEY;
-  }
-
-  async function refreshServers() {
-    try {
-      srvList = await listServers();
-    } catch {
-      srvList = [];
-    }
-  }
-
-  function toggleServerMenu() {
-    srvMenuOpen = !srvMenuOpen;
-    srvMenuRenaming = false;
-    if (srvMenuOpen) void refreshServers();
-  }
-
-  function openServerDialog() {
-    srvMenuOpen = false;
-    srvMenuRenaming = false;
-    srvEditingId = null;
-    srvEditDraft = "";
-    srvErr = null;
-    srvUrlDraft = "";
-    srvTokenDraft = "";
-    srvNameDraft = "";
-    srvNameTouched = false;
-    srvDialogOpen = true;
-    void refreshServers();
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-url-input]")?.focus());
-  }
-
-  function fillRecentServer(sv: ServerInfo) {
-    srvUrlDraft = sv.url;
-    srvTokenDraft = "";
-    srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-    srvNameTouched = true;
-  }
-
-  /** Open the server's own window (or focus it), or focus the main window
-   *  for This computer. This window keeps running whatever it shows. */
-  async function requestServerSwitch(id: string | null) {
-    srvMenuOpen = false;
-    if (id === activeServer) return;
-    try {
-      if (id) await touchServer(id).catch(() => {});
-      await switchServer(id, srvList.find((x) => x.id === id)?.name);
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  async function submitServer() {
-    if (srvBusy || !srvUrlDraft.trim()) return;
-    srvBusy = true;
-    srvErr = null;
-    try {
-      const sv = await connectServer(
-        srvUrlDraft.trim(),
-        srvTokenDraft.trim(),
-        srvNameTouched ? srvNameDraft.trim() : null
-      );
-      srvDialogOpen = false;
-      await refreshServers();
-      await switchServer(sv.id, sv.name);
-    } catch (e) {
-      srvErr = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvBusy = false;
-    }
-  }
-
-  let srvEditingId = $state<string | null>(null);
-  let srvEditDraft = $state("");
-  let srvRenaming = $state(false);
-  let srvMenuRenaming = $state(false);
-
-  function startRenameServer(sv: ServerInfo) {
-    srvEditingId = sv.id;
-    srvEditDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-rename-input]")?.focus());
-  }
-
-  function cancelRenameServer() {
-    srvEditingId = null;
-    srvEditDraft = "";
-  }
-
-  async function saveRenameServer() {
-    if (srvRenaming || !srvEditingId) return;
-    srvRenaming = true;
-    srvErr = null;
-    try {
-      const sv = await renameServer(srvEditingId, srvEditDraft.trim());
-      srvEditingId = null;
-      srvEditDraft = "";
-      if (srvUrlDraft.trim() === sv.url) {
-        srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-      }
-      await refreshServers();
-    } catch (e) {
-      srvErr = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvRenaming = false;
-    }
-  }
-
-  function startMenuRenameServer() {
-    if (!srvCurrent) return;
-    srvEditDraft = srvCurrent.name === defaultServerName(srvCurrent.url) ? "" : srvCurrent.name;
-    srvMenuRenaming = true;
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-menu-rename-input]")?.focus());
-  }
-
-  async function saveMenuRenameServer() {
-    if (srvRenaming || !srvCurrent) return;
-    srvRenaming = true;
-    try {
-      await renameServer(srvCurrent.id, srvEditDraft.trim());
-      srvMenuRenaming = false;
-      srvMenuOpen = false;
-      await refreshServers();
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvRenaming = false;
-    }
-  }
-
-  async function forgetServer(id: string) {
-    if (srvEditingId === id) cancelRenameServer();
-    await removeServer(id).catch(() => {});
-    await refreshServers();
-    // removed the server this window shows: back to the main window, close this one
-    if (id === activeServer) {
-      await switchServer(null).catch(() => {});
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      void getCurrentWindow().close();
-    }
-  }
-
-  const SERVER_SETUP_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh\nvicuna serve --tailscale";
-  let srvCmdCopied = $state(false);
-  async function copyServerSetup() {
-    try {
-      await navigator.clipboard.writeText(SERVER_SETUP_CMD);
-      srvCmdCopied = true;
-      setTimeout(() => (srvCmdCopied = false), 1500);
-    } catch {
-      /* clipboard unavailable */
-    }
-  }
-
-  async function copyServerUrl(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-      srvCopied = url;
-      setTimeout(() => {
-        if (srvCopied === url) srvCopied = null;
-      }, 1500);
-    } catch {
-      /* clipboard unavailable */
-    }
-  }
 
   async function openSettings() {
     pluginsOpen = false;
@@ -3319,7 +2073,7 @@
   /** Browser engine row (Settings → Browser engine): which `lb` runs and
    *  its version, from the backend status. Silent on failure. */
   async function refreshBrowserEngine() {
-    browserDaemon = await browserStatus().catch(() => null);
+    browser.browserDaemon = await browserStatus().catch(() => null);
   }
 
   /** Read this build's version + baked timestamp (silent unless it fails:
@@ -3433,199 +2187,10 @@
 
   async function openModelsTab() {
     settingsTab = "models";
-    confirmDeleteModel = null;
+    ollamaMgr.confirmDeleteModel = null;
     await refreshModels();
-    await refreshRunners();
-    await refreshServerStatus();
-  }
-
-  let ollamaVersion: string | null = $state(null);
-  let serverChecking = $state(false);
-  let serverOp: null | "start" | "stop" = $state(null);
-  let serverError: string | null = $state(null);
-
-  async function refreshServerStatus() {
-    if (serverChecking) return;
-    serverChecking = true;
-    serverError = null;
-    try {
-      ollamaVersion = await serverVersion();
-    } catch (e: any) {
-      ollamaVersion = null;
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverChecking = false;
-    }
-  }
-
-  async function startServerFlow() {
-    if (serverOp) return;
-    serverOp = "start";
-    serverError = null;
-    try {
-      ollamaVersion = await startOllamaServer();
-      await refreshModels();
-      await refreshRunners();
-    } catch (e: any) {
-      ollamaVersion = null;
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverOp = null;
-    }
-  }
-
-  async function stopServerFlow() {
-    if (serverOp) return;
-    serverOp = "stop";
-    serverError = null;
-    try {
-      await stopOllamaServer();
-      ollamaVersion = null;
-      await refreshModels();
-      await refreshRunners();
-    } catch (e: any) {
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverOp = null;
-    }
-  }
-
-  async function refreshRunners() {
-    runnersError = null;
-    try {
-      runners = await listRunning();
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-      runners = [];
-    }
-  }
-
-  async function toggleModelLoaded(name: string, loaded: boolean) {
-    if (modelOp || pulling) return;
-    modelOp = name;
-    runnersError = null;
-    try {
-      if (loaded) await unloadModelFromMemory(name);
-      else await loadModelIntoMemory(name);
-      await refreshRunners();
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-    } finally {
-      modelOp = null;
-    }
-  }
-
-  async function submitPull() {
-    const name = pullName.trim();
-    if (!name || pulling || modelOp) return;
-    await submitPullName(name);
-    pullName = "";
-  }
-
-  async function submitPullName(name: string) {
-    if (!name || pulling || modelOp) return;
-    pulling = name;
-    pullStatus = "starting…";
-    pullDone = 0;
-    pullTotal = 0;
-    pullRate = 0;
-    pullLastAt = 0;
-    pullLastDone = 0;
-    pullLastDigest = null;
-    runnersError = null;
-    pullAborter = new AbortController();
-    try {
-      await pullModel(
-        name,
-        (p) => {
-          pullStatus = p.status;
-          if (typeof p.completed === "number") pullDone = p.completed;
-          if (typeof p.total === "number") pullTotal = p.total;
-          // Ollama reports per-layer completed/total with no rate, so derive
-          // download speed from completed deltas (EMA over ~second windows).
-          if (typeof p.completed === "number" && p.status.startsWith("pulling")) {
-            const digest = p.digest ?? p.status;
-            const now = performance.now();
-            if (pullLastAt === 0 || digest !== pullLastDigest) {
-              pullLastAt = now;
-              pullLastDone = p.completed;
-              pullLastDigest = digest;
-            } else {
-              const dt = (now - pullLastAt) / 1000;
-              if (dt >= 0.2) {
-                const delta = p.completed - pullLastDone;
-                if (delta < 0) {
-                  // new layer / restart: re-baseline without spiking
-                  pullLastAt = now;
-                  pullLastDone = p.completed;
-                } else {
-                  const inst = delta / dt;
-                  pullRate = pullRate > 0 ? pullRate * 0.7 + inst * 0.3 : inst;
-                  pullLastAt = now;
-                  pullLastDone = p.completed;
-                }
-                pullLastDigest = digest;
-              }
-            }
-          } else if (!p.status.startsWith("pulling")) {
-            pullRate = 0;
-          }
-        },
-        pullAborter.signal
-      );
-      pullName = "";
-      await refreshModels();
-      if (models.includes(name)) {
-        selectedModel = name;
-        save();
-      } else if (models.length > 0 && !models.includes(selectedModel) && !isOpenRouterSelection(selectedModel)) {
-        selectedModel = models[0];
-        save();
-      }
-      await refreshRunners();
-    } catch (e: any) {
-      if (e?.name !== "AbortError") runnersError = e?.message ?? String(e);
-    } finally {
-      pulling = null;
-      pullRate = 0;
-      pullAborter = null;
-    }
-  }
-
-  function cancelPull() {
-    pullAborter?.abort();
-  }
-
-  async function requestDeleteModel(name: string) {
-    if (modelOp || pulling) return;
-    if (confirmDeleteModel !== name) {
-      confirmDeleteModel = name;
-      return;
-    }
-    confirmDeleteModel = null;
-    modelOp = name;
-    runnersError = null;
-    try {
-      // a loaded model may refuse deletion: unload first, then delete
-      if (runners.some((r) => r.name === name)) {
-        try {
-          await unloadModelFromMemory(name);
-        } catch {
-          // fall through: the delete below surfaces the real error
-        }
-      }
-      await deleteModel(name);
-      await refreshModels();
-      await refreshRunners();
-      if (!models.includes(selectedModel) && models.length > 0 && !isOpenRouterSelection(selectedModel)) {
-        selectedModel = models[0];
-        save();
-      }
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-    } finally {
-      modelOp = null;
-    }
+    await ollamaMgr.refreshRunners();
+    await ollamaMgr.refreshServerStatus();
   }
 
   let theme = $state<"light" | "dark">(initialPrefs.theme);
@@ -3866,7 +2431,7 @@
   let defaultWorkspaceWrite = Promise.resolve();
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded, sessionFilter: sessionFilterRaw });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouter.openrouterKey, openrouterAdded: openrouter.openrouterAdded, sessionFilter: sessionFilterRaw });
     if (!serverSessionTools || lastDefaultWorkspace === defaultWorkspace) return;
     const prev = lastDefaultWorkspace;
     const workspace = defaultWorkspace;
@@ -3887,255 +2452,6 @@
     persistPrefs();
     refreshModels();
   }
-
-  function openGoto() {
-    gotoInput = "";
-    gotoError = null;
-    gotoSel = 0;
-    gotoOpen = true;
-    // fresh host list: a pasted link is looked up on every connected server
-    void refreshServers();
-  }
-
-  function closeGoto() {
-    gotoOpen = false;
-    gotoInput = "";
-    gotoError = null;
-    gotoSel = 0;
-    if (remoteTimer) {
-      clearTimeout(remoteTimer);
-      remoteTimer = null;
-    }
-    remoteKey = "";
-    remotePending = null;
-    remoteResolve?.();
-    remoteResolve = null;
-    remoteHits = [];
-    remoteSearching = false;
-    remoteFailures = [];
-    remoteNotices = [];
-    localServerHits = [];
-    localServerSearching = false;
-  }
-
-  // search modal: filter sessions by title, message text, or id substring.
-  // A pasted session id/link resolves directly via gotoIdHit AND is looked up
-  // on every connected server (searchServerChats), so a link that belongs to
-  // another machine still lands in the palette, labelled with its host.
-  const searchQuery = $derived(gotoInput.trim());
-  const searchQueryLow = $derived(searchQuery.toLowerCase());
-  const gotoSessionId = $derived(sessionIdIn(gotoInput));
-  const gotoIdHit = $derived.by((): { id: string; chat: Chat | null } | null => {
-    if (!gotoSessionId) return null;
-    const id = gotoSessionId;
-    return { id, chat: chats.find((c) => c.id.toLowerCase() === id) ?? null };
-  });
-  const searchResults = $derived.by((): Chat[] => {
-    const q = searchQueryLow;
-    if (!q) return chats.filter((c) => c.messages.length > 0).slice(0, 8);
-    return chats.filter((c) => {
-      if (c.messages.length === 0) return false;
-      if (c.title.toLowerCase().includes(q)) return true;
-      if (c.id.toLowerCase().includes(q)) return true;
-      return c.messages.some((m) => !m.contextCleared && m.content.toLowerCase().includes(q));
-    }).slice(0, 20);
-  });
-  /** connected hosts whose chats are NOT loaded in this window */
-  const remoteTargets = $derived(srvList.filter((s) => s.id !== activeServer));
-  const hasPartialChats = $derived(isServerBacked() && chats.some((c) => c.partial));
-  type RemoteHit = ServerChatHit & { serverId: string; serverName: string };
-  let localServerHits = $state<ServerChatHit[]>([]);
-  let localServerSearching = $state(false);
-  let remoteHits = $state<RemoteHit[]>([]);
-  let remoteSearching = $state(false);
-  let remoteFailures = $state<{ serverName: string; message: string }[]>([]);
-  let remoteNotices = $state<string[]>([]);
-  let remoteKey = "";
-  let remoteTimer: ReturnType<typeof setTimeout> | null = null;
-  let remotePending: Promise<void> | null = null;
-  let remoteResolve: (() => void) | null = null;
-  type SearchItem =
-    | { kind: "new" }
-    | { kind: "chat"; chat: Chat; snippet?: string }
-    | { kind: "remote"; hit: RemoteHit };
-  const searchItems = $derived.by((): SearchItem[] => {
-    const rows: SearchItem[] = [];
-    const seen = new Set<string>();
-    // a pasted session link surfaces its local session first, even though the
-    // raw link text matches nothing
-    if (gotoIdHit?.chat) {
-      rows.push({ kind: "chat", chat: gotoIdHit.chat });
-      seen.add(gotoIdHit.chat.id);
-    }
-    const merged: Array<{ chat: Chat; snippet?: string }> = searchQuery
-      ? mergeLocalServerHits(searchResults, localServerHits, chats, 20)
-      : searchResults.map((chat) => ({ chat }));
-    for (const m of merged) {
-      if (seen.has(m.chat.id)) continue;
-      seen.add(m.chat.id);
-      rows.push(m.snippet ? { kind: "chat", chat: m.chat, snippet: m.snippet } : { kind: "chat", chat: m.chat });
-    }
-    for (const h of remoteHits) rows.push({ kind: "remote", hit: h });
-    // matches first: the keyboard cursor starts at 0, so a query needs no
-    // arrow-key walk (paste a link → Enter)
-    return orderPaletteRows(rows, searchQuery);
-  });
-  const searchShowHosts = $derived(showHostLabels(onServer, remoteHits.length));
-
-  // ask the current server (when some sessions are still `partial` previews)
-  // AND any other connected hosts on every query change (debounced), and by
-  // session id alone when a link was pasted into the box
-  $effect(() => {
-    if (!gotoOpen) return;
-    const { ids, text } = remoteQueryFor(searchQuery, gotoSessionId);
-    const targets = remoteTargets;
-    const searchHere = hasPartialChats;
-    const key = `${ids.join(",")}|${text}|${targets.map((t) => t.id).join(",")}|${searchHere ? 1 : 0}`;
-    if (key === remoteKey) return;
-    remoteKey = key;
-    if (remoteTimer) {
-      clearTimeout(remoteTimer);
-      remoteTimer = null;
-    }
-    // a superseded lookup answers at once so an Enter waiting on it moves on
-    remoteResolve?.();
-    remoteResolve = null;
-    localServerHits = [];
-    localServerSearching = false;
-    remoteHits = [];
-    remoteSearching = false;
-    remoteFailures = [];
-    remoteNotices = [];
-    remotePending = null;
-    if ((!targets.length && !searchHere) || (!ids.length && !text)) return;
-    remoteSearching = targets.length > 0;
-    localServerSearching = searchHere;
-    const wait = ids.length ? 0 : 200;
-    remotePending = new Promise<void>((resolve) => {
-      remoteResolve = resolve;
-      remoteTimer = setTimeout(async () => {
-        const failures: { serverName: string; message: string }[] = [];
-        const notices: string[] = [];
-        const localPromise = searchHere
-          ? invokeOrBridge<ServerChatHit[]>("server_search_chats", { query: text, ids, limit: 20 })
-              .then((res) => (Array.isArray(res) ? res : []))
-              .catch(() => [] as ServerChatHit[])
-          : Promise.resolve([] as ServerChatHit[]);
-        const remotePromise = Promise.all(
-          targets.map(async (sv) => {
-            try {
-              const { hits, degraded } = await searchServerChats(sv.id, text, ids, 6);
-              // an older `vicuna serve` has no server_search_chats; the list
-              // search above still answers, so say how the rows were found
-              if (degraded) notices.push(sv.name);
-              return hits.map((h) => ({ ...h, serverId: sv.id, serverName: sv.name }));
-            } catch (e: any) {
-              // shown under the rows: a silent empty result is indistinguishable
-              // from "this session is nowhere"
-              failures.push({
-                serverName: sv.name,
-                message: describeServerSearchError(typeof e === "string" ? e : (e?.message ?? String(e)))
-              });
-              return [] as RemoteHit[];
-            }
-          })
-        );
-        const [localFound, found] = await Promise.all([localPromise, remotePromise]);
-        remoteTimer = null;
-        remoteResolve = null;
-        if (remoteKey !== key) {
-          resolve();
-          return;
-        }
-        localServerHits = localFound;
-        localServerSearching = false;
-        remoteHits = found.flat();
-        remoteFailures = failures;
-        remoteNotices = notices;
-        remoteSearching = false;
-        resolve();
-      }, wait);
-    });
-  });
-
-  function openSearchItem(it: SearchItem) {
-    if (it.kind === "remote") {
-      void openRemoteHit(it.hit);
-      return;
-    }
-    closeGoto();
-    if (it.kind === "new") newChat();
-    else selectChat(it.chat.id);
-  }
-
-  /** A hit on another host: raise that host's window on the session. The
-   *  palette's own window keeps whatever it was doing. */
-  async function openRemoteHit(hit: RemoteHit) {
-    closeGoto();
-    try {
-      await openChatInWindow(hit.serverId, hit.id);
-    } catch (e: any) {
-      error = typeof e === "string" ? e : (e?.message ?? String(e));
-    }
-  }
-
-  async function submitSearch() {
-    // a pasted link may still be resolving on the connected servers
-    if (remotePending) {
-      try {
-        await remotePending;
-      } catch {
-        /* an offline host just contributes no rows */
-      }
-    }
-    if (gotoIdHit && !gotoIdHit.chat && !remoteHits.some((h) => h.id === gotoIdHit.id)) {
-      if (remoteFailures.length) {
-        gotoError = `No session with that link here — ${remoteFailures.map((f) => f.serverName).join(", ")} couldn't be searched.`;
-      } else {
-        gotoError = remoteTargets.length
-          ? "No session with that link here or on your connected servers."
-          : "No chat found for that session.";
-      }
-      return;
-    }
-    const it = searchItems[Math.min(gotoSel, searchItems.length - 1)];
-    if (!it) {
-      gotoError = "No matching chats.";
-      return;
-    }
-    openSearchItem(it);
-  }
-
-  function onSearchKey(e: KeyboardEvent) {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      gotoSel = (gotoSel + 1) % searchItems.length;
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      gotoSel = (gotoSel - 1 + searchItems.length) % searchItems.length;
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      void submitSearch();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      closeGoto();
-    }
-  }
-
-  // typing restarts keyboard selection at the top; the selection-follow
-  // effect below keeps the highlighted row visible while arrowing
-  $effect(() => {
-    if (!gotoOpen) return;
-    gotoInput;
-    gotoSel = 0;
-  });
-  $effect(() => {
-    if (!gotoOpen) return;
-    gotoSel;
-    requestAnimationFrame(() => {
-      document.querySelector("[data-testid=goto-dialog] .search-row.sel")?.scrollIntoView({ block: "nearest" });
-    });
-  });
 
   function requestDelete(id: string) {
     ctxMenu = null;
@@ -4162,7 +2478,7 @@
       y: Math.max(8, Math.min(e.clientY, window.innerHeight - 360))
     };
     if ((chats.find((x) => x.id === id)?.mode ?? "chat") === "work") {
-      void refreshTelegramStatus();
+      void bridges.refreshTelegramStatus();
     }
   }
 
@@ -4263,11 +2579,11 @@
    *  every connected server (the session may live on a remote host, whose
    *  window is raised on it). */
   async function openSessionLink(id: string) {
-    if (srvList.length === 0) await refreshServers();
+    if (srv.srvList.length === 0) await srv.refreshServers();
     const action = sessionLinkAction(id, {
       ready,
       localIds: chats.map((c) => c.id),
-      serverCount: remoteTargets.length
+      serverCount: palette.remoteTargets.length
     });
     if (action.kind === "stash") {
       pendingDeepLinkId = id;
@@ -4280,7 +2596,7 @@
       return;
     }
     if (action.kind === "search-remote") {
-      for (const sv of remoteTargets) {
+      for (const sv of palette.remoteTargets) {
         try {
           const { hits } = await searchServerChats(sv.id, "", [id], 1);
           if (hits.some((h) => h.id === id)) {
@@ -4318,7 +2634,7 @@
     if (!p || !isTauriRuntime()) return;
     if (onServer) {
       // `vicuna <path>` names a folder on THIS computer
-      flashNotice(`Switch to This computer to open ${p}: Vicuna is connected to ${srvLabel}.`);
+      flashNotice(`Switch to This computer to open ${p}: Vicuna is connected to ${srv.srvLabel}.`);
       return;
     }
     // links can arrive while hidden in the tray — come forward
@@ -4463,7 +2779,7 @@
       void refreshWorkEngine().then(() => refreshOpencodeModels());
       return;
     }
-    if (modelOpen) void refreshRunners();
+    if (modelOpen) void ollamaMgr.refreshRunners();
   }
   /** Work picker rows (opencode's list, saved pick kept visible). */
   const workModelChoices = $derived(opencodeModelChoices(ocModels, workModel, modelQuery));
@@ -4498,7 +2814,7 @@
       // OpenRouter exposes reasoning as a model capability, not a level list.
       // Effort strings are only offered when the model advertises support;
       // OpenRouter normalizes/falls back otherwise.
-      const om = findOpenRouterModel(openrouterModels, m);
+      const om = findOpenRouterModel(openrouter.openrouterModels, m);
       if (selectedModel !== m) return;
       thinkLevels = om?.reasoning && om.supportedParameters.includes("reasoning_effort") ? ["low", "medium", "high"] : [];
       thinkDefault = null;
@@ -4549,9 +2865,6 @@
     persistPrefs();
   }
 
-  // ⌘N on macOS, Ctrl+N elsewhere (shown as the New Chat hover hint)
-  const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent ?? "");
-
   /** human-readable model name, Ollama-style everywhere: OpenRouter picks
    *  show the bare provider id (`org/model…`, `openrouter:` prefix and the
    *  registry's `~` rolling-pointer mark stripped) instead of the catalog
@@ -4563,13 +2876,6 @@
     const engine = sel.split("/", 1)[0];
     const account = workEngineList.find((e) => e.id === engine && e.account);
     return account ? account.label + sel.slice(engine.length) : sel;
-  }
-
-  interface ModelChoice {
-    id: string;
-    name: string;
-    sub: string;
-    provider: "ollama" | "openrouter";
   }
 
   // model menu: installed Ollama tags first (as before), then the added
@@ -4584,9 +2890,9 @@
     for (const m of models) {
       if (!q || m.toLowerCase().includes(q)) out.push({ id: m, name: m, sub: "", provider: "ollama" });
     }
-    for (const om of openrouterModels) {
+    for (const om of openrouter.openrouterModels) {
       const sel = openRouterSelection(om.id);
-      if (!openrouterAddedSet.has(om.id) && sel !== selectedModel) continue;
+      if (!openrouter.openrouterAddedSet.has(om.id) && sel !== selectedModel) continue;
       if (q && !om.id.toLowerCase().includes(q) && !om.name.toLowerCase().includes(q)) continue;
       out.push({ id: sel, name: displayOpenRouterId(om.id), sub: "", provider: "openrouter" });
     }
@@ -4594,67 +2900,12 @@
     // the menu, and the model should be right there — not lost in the long
     // list — when it reopens. Stable otherwise, so search order is steady.
     const rank = (c: ModelChoice) =>
-      c.id === selectedModel ? 0 : c.provider === "ollama" && runningNames.has(c.id) ? 1 : 2;
+      c.id === selectedModel ? 0 : c.provider === "ollama" && ollamaMgr.runningNames.has(c.id) ? 1 : 2;
     return out
       .map((c, i) => ({ c, i }))
       .sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i)
       .map((x) => x.c);
   });
-
-  const runningNames = $derived(new Set(runners.map((r) => r.name)));
-
-  // manage tab: current chat's model first, then loaded models, then the rest
-  const sortedManageModels = $derived.by(() => {
-    const running = new Set(runners.map((r) => r.name));
-    const rank = (m: string) => (m === selectedModel ? 0 : running.has(m) ? 1 : 2);
-    return models.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m) || a.i - b.i).map((x) => x.m);
-  });
-
-  // discover tab: curated registry catalog with client-side search + filters
-  const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small", "mlx"] as const;
-  /** variant tags ending in -mlx are Apple-silicon builds (see refresh-catalog.py) */
-  const filteredCatalog = $derived.by(() => {
-    const q = browseQuery.trim().toLowerCase();
-    return catalog.filter((e) => {
-      if (browseCat === "small") {
-        if (Math.max(...e.variants.map((v) => v.sizeMB)) > 2560) return false;
-      } else if (browseCat === "mlx") {
-        if (!e.variants.some((v) => isMlxVariant(v.tag))) return false;
-      } else if (browseCat !== "all" && !e.cats.includes(browseCat)) return false;
-      if (!q) return true;
-      return (
-        e.name.toLowerCase().includes(q) ||
-        e.blurb.toLowerCase().includes(q) ||
-        e.cats.some((c) => c.includes(q)) ||
-        e.variants.some((v) => v.tag.toLowerCase().includes(q))
-      );
-    });
-  });
-
-  function pickedVariant(entryName: string, fallback: string): string {
-    return variantPick[entryName] ?? fallback;
-  }
-
-  // generic starter prompts (no tools required on the model's side)
-  const SUGGESTIONS = [
-    { title: "Explain a concept", prompt: "Explain black holes in simple terms", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
-    { title: "Write code", prompt: "Write a Python function to sort a list", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' },
-    { title: "Draft a message", prompt: "Write a friendly follow-up email", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>' },
-    { title: "Brainstorm ideas", prompt: "Give me ideas for a weekend project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>' },
-    { title: "Summarize text", prompt: "Summarize this paragraph in two sentences:", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
-    { title: "What can you do?", prompt: "What can you do?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
-  ];
-
-  // work starters: each one maps to a real Work-mode capability (list/read,
-  // grep, exec, write, sessions) so the cards demo what the agent can do
-  const WORK_SUGGESTIONS = [
-    { title: "Explore this folder", prompt: "List the files here and explain what this project is", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' },
-    { title: "Find in files", prompt: "Search the workspace for TODO comments and group them by file", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' },
-    { title: "Run a command", prompt: "Run `git status` and summarize what changed", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>' },
-    { title: "Write a file", prompt: "Create a README.md that explains this project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>' },
-    { title: "Search past chats", prompt: "Search my past chats for this project and summarize what we did", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>' },
-    { title: "What can you do?", prompt: "What can you do in Work mode?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
-  ];
 
   function useSuggestion(prompt: string) {
     input = prompt;
@@ -4685,7 +2936,6 @@
     if (!filterWs) return null;
     return workspaceFilterKey(composerWs) === folderOptionKey(filterWs) ? filterWs : null;
   });
-  const SHOW_ARCHIVED_KEY = "vicuna-show-archived";
   let showArchived = $state(typeof localStorage !== "undefined" && localStorage.getItem(SHOW_ARCHIVED_KEY) === "1");
   // archived sessions leave Pinned (the pin flag is kept for unarchive) and
   // are hidden unless "Show archived" is on — the open one always stays
@@ -4763,60 +3013,10 @@
 
   /** the lead may manage other sessions; making one the lead also pins it */
   // Per-session Telegram bridge dialog; the session it was opened for
-  let telegramFor = $state<string | null>(null);
-  // Per-session Telegram statuses keyed by session ID (for sidebar badges & context menu dots)
-  let telegramStatuses = $state<Record<string, TelegramStatusSnapshot>>({});
-  function telegramStateFor(id: string | undefined): TelegramConnState {
-    return telegramConnState(id ? telegramStatuses[id] : null);
-  }
-  async function refreshTelegramStatus() {
-    try {
-      const res = await invokeOrBridge<{ bridges?: Record<string, TelegramStatusSnapshot> }>("telegram_list", {});
-      telegramStatuses = res?.bridges ?? {};
-    } catch {
-      // Fallback for older servers that only expose single-lead telegram_status
-      try {
-        const lead = chats.find((c) => c.role === "lead");
-        if (!lead) {
-          telegramStatuses = {};
-          return;
-        }
-        const s = await invokeOrBridge<TelegramStatusSnapshot>("telegram_status", {});
-        telegramStatuses = s?.configured ? { [lead.id]: s } : {};
-      } catch {
-        telegramStatuses = {};
-      }
-    }
-  }
-  // Per-session bridge plugin dialog & statuses
-  const bridgePlugins = $derived(plugins.filter((p) => !!p.bridge));
-  let bridgeModal = $state<{ pluginId: string; sessionId: string } | null>(null);
-  let bridgeStatuses = $state<Record<string, Record<string, BridgeStatusSnapshot>>>({});
-  async function refreshBridgeStatuses() {
-    if (bridgePlugins.length === 0) {
-      bridgeStatuses = {};
-      return;
-    }
-    try {
-      const res = await invokeOrBridge<{ plugins?: Record<string, Record<string, BridgeStatusSnapshot>> }>("bridge_list", {});
-      bridgeStatuses = res?.plugins ?? {};
-    } catch {
-      bridgeStatuses = {};
-    }
-  }
-  $effect(() => {
-    if (!ready) return;
-    void refreshTelegramStatus();
-    const t = setInterval(refreshTelegramStatus, 15000);
-    return () => clearInterval(t);
-  });
-  $effect(() => {
-    if (!ready) return;
-    void bridgePlugins.length;
-    void refreshBridgeStatuses();
-    if (bridgePlugins.length === 0) return;
-    const t = setInterval(refreshBridgeStatuses, 15000);
-    return () => clearInterval(t);
+  const bridges = createMessagingBridgesState({
+    get chats() { return chats; },
+    get plugins() { return plugins; },
+    get ready() { return ready; }
   });
 
   /** Make/Replace lead prompt (explainer + optional Telegram setup). */
@@ -4985,40 +3185,6 @@
     activeChat?.messages.length;
     scrollBottom();
   });
-
-  // The streaming reply re-renders `{@html renderMarkdown(...)}` on every
-  // token, which replaces the answer DOM and collapses any selection inside
-  // it. Capture the selection as character offsets before the update and
-  // restore it after Svelte applies the new HTML, so selecting mid-stream
-  // no longer "goes off on its own".
-  type StreamSel = { cls: string; a: number; f: number };
-  function textOffsetIn(root: Element, node: Node | null, nodeOffset: number): number | null {
-    if (!node) return null;
-    try {
-      // length of the scope's text from its start up to the caret: correct
-      // for text anchors, element anchors, and markup-nested carets alike
-      const range = document.createRange();
-      range.selectNodeContents(root);
-      range.setEnd(node, nodeOffset);
-      return range.toString().length;
-    } catch {
-      return null;
-    }
-  }
-  function nodeForOffset(root: Element, offset: number): { node: Node; off: number } {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    let cur: Node | null = walker.nextNode();
-    let acc = 0;
-    let last: Node = root;
-    while (cur) {
-      const len = cur.textContent?.length ?? 0;
-      if (acc + len >= offset) return { node: cur, off: offset - acc };
-      acc += len;
-      last = cur;
-      cur = walker.nextNode();
-    }
-    return { node: last, off: last.textContent?.length ?? 0 };
-  }
   function captureStreamSel(index: number): StreamSel | null {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !messagesEl) return null;
@@ -5074,12 +3240,12 @@
   });
 
   $effect(() => {
-    if (!pendingDeleteId && pendingMsgDelete == null && !gotoOpen && !settingsOpen && !pluginsOpen && !lightboxSrc && !pendingSaveConfirm) return;
+    if (!pendingDeleteId && pendingMsgDelete == null && !palette.gotoOpen && !settingsOpen && !pluginsOpen && !lightboxSrc && !pendingSaveConfirm) return;
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         pendingDeleteId = null;
         pendingMsgDelete = null;
-        closeGoto();
+        palette.closeGoto();
         settingsOpen = false;
         pluginsOpen = false;
         closeLightbox();
@@ -5096,7 +3262,7 @@
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (gotoOpen || settingsOpen || pluginsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
+      if (palette.gotoOpen || settingsOpen || pluginsOpen || pendingDeleteId || pendingMsgDelete != null || modelOpen || lightboxSrc || pendingSaveConfirm) return;
       e.preventDefault();
       composerEl?.focus();
     };
@@ -5125,7 +3291,7 @@
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "p") {
         if (settingsOpen || pluginsOpen || pendingDeleteId || pendingMsgDelete != null || pendingSaveConfirm || lightboxSrc || modelOpen) return;
         e.preventDefault();
-        openGoto();
+        palette.openGoto();
       }
     };
     window.addEventListener("keydown", h);
@@ -5144,9 +3310,6 @@
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   });
-
-  // delegated handler for code-block copy buttons rendered via {@html}
-  const CODE_CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
   $effect(() => {
     const el = messagesEl;
     if (!el) return;
@@ -5214,72 +3377,6 @@
       el.removeEventListener("auxclick", onAux);
     };
   });
-
-  async function copyText(t: string): Promise<boolean> {
-    try {
-      await navigator.clipboard.writeText(t);
-      return true;
-    } catch {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = t;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        const ok = document.execCommand("copy");
-        ta.remove();
-        return ok;
-      } catch {
-        return false;
-      }
-    }
-  }
-
-  /** Copy xterm's model selection. Prefer the synchronous copy command:
-   *  xterm's own `copy` listener fills clipboardData, and WebView2 may deny
-   *  the async Clipboard API on the custom scheme. */
-  function copyTermSelection(term: XTerm) {
-    const text = term.getSelection();
-    if (!text) return;
-    let ok = false;
-    try {
-      ok = document.execCommand("copy");
-    } catch {
-      ok = false;
-    }
-    if (!ok) void copyText(text);
-  }
-
-  /** terminal right-click menu (see the xterm `contextmenu` listener) */
-  let termCtx = $state.raw<{ x: number; y: number; term: XTerm; sel: string } | null>(null);
-
-  function termMenu(action: "copy" | "paste" | "selectAll" | "clear") {
-    const c = termCtx;
-    termCtx = null;
-    if (!c) return;
-    const { term } = c;
-    if (action === "copy") {
-      void copyText(c.sel).then((ok) => flashExpNotice(ok ? "Copied" : "Copy failed (clipboard unavailable)", 1800));
-    } else if (action === "paste") {
-      const clip = navigator.clipboard;
-      if (!clip?.readText) {
-        flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V.");
-      } else {
-        clip
-          .readText()
-          .then((text) => {
-            if (text) term.paste(text);
-          })
-          .catch(() => flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V."));
-      }
-    } else if (action === "selectAll") {
-      term.selectAll();
-    } else {
-      term.clear();
-    }
-    term.focus();
-  }
 
   function copyMessage(i: number) {
     const m = activeChat?.messages[i];
@@ -5561,15 +3658,6 @@
     continuing: boolean;
     imagesStripped: boolean;
   };
-  type ChatTurnEvent =
-    | { type: "token" | "think" | "replace"; text: string }
-    | { type: "done" | "images_stripped" }
-    | { type: "error"; message: string };
-  type ChatTurnOperation =
-    | { operation: "send"; content: string; images?: string[]; titleSource: string }
-    | { operation: "continue" | "regenerate"; index: number }
-    | { operation: "edit"; index: number; content: string; images?: string[] }
-    | { operation: "fork_edit"; index: number; content: string; images: string[]; forkId: string };
 
   const serverChatFeeds = new Map<string, { stop(): void; close(): void; reconcile(turnId: string | undefined): void }>();
   let startingChatFromHome: string | null = null;
@@ -5601,7 +3689,7 @@
         baseRev: operation.operation === "send" && chat ? serverSaveRow(chat)?.baseRev : baseRev,
         ...operation,
         ...options,
-        ...(isOpenRouterSelection(options.model) ? { openRouterApiKey: openrouterKey } : {}),
+        ...(isOpenRouterSelection(options.model) ? { openRouterApiKey: openrouter.openrouterKey } : {}),
         onEvent
       });
     }, onStarted ?? (() => {}), !isOpenRouterSelection(options.model));
@@ -6071,7 +4159,7 @@
       try {
         await runServerSessionTool("session_compact", chat, {
           model: selectedModel,
-          ...(isOpenRouterSelection(selectedModel) ? { openRouterApiKey: openrouterKey } : {})
+          ...(isOpenRouterSelection(selectedModel) ? { openRouterApiKey: openrouter.openrouterKey } : {})
         });
       } finally {
         setToolStatus(chat.id, null);
@@ -6314,13 +4402,13 @@
           { role: "assistant", content: "", thinking: "", model: selectedModel }
         ],
         mode: effectiveMode,
-        mcpEnabled: effectiveMode === "work" ? await newMcpEnabled(homeMcpEnabled) : undefined,
+        mcpEnabled: effectiveMode === "work" ? await newMcpEnabled(mcp.homeMcpEnabled) : undefined,
         skillsEnabled: effectiveMode === "work" ? await newSessionSkills(homeSkillsEnabled) : undefined,
         workspace: effectiveMode === "work" ? workRoot : null
       };
       chats = [chat, ...chats];
       if (effectiveMode === "work") {
-        homeMcpEnabled = undefined;
+        mcp.homeMcpEnabled = undefined;
         homeSkillsEnabled = undefined;
       }
       activeId = chat.id;
@@ -6499,7 +4587,7 @@
       lastExplorerRoot = explorerRoot.trim();
       void loadExplorer();
       // the aside was display:none: xterm needs a re-fit now it has size
-      void tick().then(() => fitSideTerm(activeSideTab));
+      void tick().then(() => terminals.fitSideTerm(activeSideTab));
     }
   }
 
@@ -6513,97 +4601,6 @@
   function insertExplorerPath(path: string) {
     input = input ? `${input.trimEnd()} @${path} ` : `@${path} `;
     requestAnimationFrame(() => composerEl?.focus());
-  }
-
-  function escapeHtmlText(s: string): string {
-    return s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
-
-  function escapeHtmlAttr(s: string): string {
-    return escapeHtmlText(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  }
-
-  /** join an upload dir and a relative file name with the dir's separator */
-  function joinUploadPath(dir: string, name: string): string {
-    const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
-    return dir.replace(/[\\/]+$/, "") + sep + name;
-  }
-
-  interface MentionToken {
-    start: number;
-    end: number;
-    core: string;
-  }
-
-  /** @path tokens in text: @ + non-space run at start/after whitespace (so
-   *  a@b.com stays plain), trailing [.,;:!?)] excluded. Shared by rendering,
-   *  caret snapping, and unit deletion so all three always agree. */
-  function findMentions(text: string): MentionToken[] {
-    const out: MentionToken[] = [];
-    const re = /(^|[\s(])(@[^\s]+)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const tok: string = m[2];
-      const tail = tok.match(/[.,;:!?)]+$/);
-      const core = tail ? tok.slice(0, -tail[0].length) : tok;
-      if (core.length <= 1) continue;
-      const start = m.index + m[1].length;
-      out.push({ start, end: start + core.length, core });
-    }
-    return out;
-  }
-
-  const mentionFolderIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
-  const mentionFileIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>';
-
-  function mentionIconFor(core: string): string {
-    const base = core.slice(1).split(/[/\\]/).pop() ?? "";
-    return base.includes(".") ? mentionFileIcon : mentionFolderIcon;
-  }
-
-  /** render @path mentions as green pills (ws-badge style) with a folder/file
-   *  icon. Scans the escaped text (entities contain no @/space/paren, so
-   *  boundaries match the raw text). Padding/margin cancel so the composer
-   *  backdrop aligns exactly with the transparent textarea text. */
-  function renderMentions(text: string): string {
-    const esc = escapeHtmlText(text);
-    const toks = findMentions(esc);
-    if (!toks.length) return esc;
-    let out = "";
-    let last = 0;
-    for (const t of toks) {
-      out += esc.slice(last, t.start);
-      out += `<span class="mention-pill">${mentionIconFor(t.core)}<span>${esc.slice(t.start, t.end)}</span></span>`;
-      last = t.end;
-    }
-    return out + esc.slice(last);
-  }
-
-  /** user bubbles: @-mentions become pills, and attached-files notes collapse
-   *  to a clickable file list at the top of the bubble (raw text keeps the
-   *  full note so the agent still sees paths + tool instructions in history) */
-  function renderUserMessage(text: string): string {
-    const re = /\[Attached files saved to ([^\]]*?) \(use the read_upload tool[^)]*\):\r?\n((?:[ \t]*-[ \t]+[^\r\n]*\r?\n?)+)\]/g;
-    const files: { name: string; path: string }[] = [];
-    const body = text.replace(re, (_full, dir: string, list: string) => {
-      for (const x of list.matchAll(/^[ \t]*-[ \t]*(.+?)[ \t]*$/gm)) {
-        const name = x[1];
-        if (name) files.push({ name, path: joinUploadPath(dir, name) });
-      }
-      return "";
-    });
-    if (!files.length) return renderMentions(text);
-    const pills = files
-      .map(
-        (f) =>
-          `<button type="button" class="mention-pill file-pill" data-reveal-path="${escapeHtmlAttr(f.path)}" title="Reveal in Finder">${mentionFileIcon}<span>${escapeHtmlText(f.name)}</span></button>`
-      )
-      .join("");
-    const rest = renderMentions(body.replace(/^\s+/, "").replace(/\s+$/, ""));
-    return `<div class="bubble-files">${pills}</div>${rest}`;
   }
 
   /** click a file pill in a user bubble → reveal it in Finder/Explorer */
@@ -6965,7 +4962,7 @@
   async function refreshCtxWindow() {
     const m = selectedModel;
     if (isOpenRouterSelection(m)) {
-      const om = findOpenRouterModel(openrouterModels, m);
+      const om = findOpenRouterModel(openrouter.openrouterModels, m);
       if (selectedModel !== m) return;
       if (om?.contextLength) ctxWindow = om.contextLength;
       return;
@@ -6977,7 +4974,7 @@
   $effect(() => {
     if (!ready) return;
     selectedModel;
-    openrouterModels;
+    openrouter.openrouterModels;
     void refreshCtxWindow();
   });
 
@@ -7270,339 +5267,17 @@
   // the daemon (and the agent's MCP connection) running. The only tab chrome
   // is a stale-engine strip (owned daemon predates the on-disk bundle):
   // in-place recover can't fix that, so it offers a full restart instead.
-  let browserDaemon = $state<BrowserStatus | null>(null);
-  let browserStarting = $state(false);
-  let browserError = $state<string | null>(null);
-  /** starting-view label: plain starts vs button restarts/takeovers. */
-  let browserStartLabel = $state("Starting browser…");
-  /** live CloakBrowser download progress while an engine fetch is in flight. */
-  let browserDownload = $state<EngineDownloadProgress | null>(null);
-  /** wall-clock start of the in-flight start drive: the starting view shows
-   *  elapsed seconds so a slow Windows first launch never reads as frozen. */
-  let browserStartedAt = $state<number | null>(null);
-  /** iframe key: bumped whenever the daemon behind a live frame is (re)started,
-   *  so the frame re-navigates instead of sitting on a failed navigation. */
-  let browserFrameRev = $state(0);
-  let browserProxyUrl = $state<string | null>(null);
-  /** lb UI url + Vicuna theme/palette/accent: lb reads `?theme=`/`?accent=`/
-   *  `?accentfg=` + palette vars (`bg`, `fg`, `card`, `border`, …) pre-paint
-   *  (older lb builds ignore unknown params and fall back to their saved theme
-   *  + built-in greens). Derived from `themeBase`/`pluginTheme`/`accent`, so
-   *  appearance flips re-navigate the frame into the matching lb look. */
-  const browserFrameSrc = $derived.by(() => {
-    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
-    if (!base) return "about:blank";
-    const a = ACCENTS[accent] ?? ACCENTS.orange;
-    const v = pluginAccent && !pluginAccentMuted ? pluginAccent : themeBase === "dark" ? a.dark : a.light;
-    return `${base}/?${browserThemeParams(themeBase, pluginTheme, v).toString()}`;
-  });
-
-  /** status → start when down. Throws on failure (callers surface it).
-   *  Concurrent callers share one in-flight drive (tab-open + visible-tab
-   *  ensure + poll can all fire together) instead of stacking spawns. */
-  let browserDrive: Promise<BrowserStatus> | null = null;
-  function ensureBrowserDaemon(): Promise<BrowserStatus> {
-    browserDrive ??= driveBrowserDaemon().finally(() => {
-      browserDrive = null;
-    });
-    return browserDrive;
-  }
-  /** one-time CloakBrowser fetch with live progress polling (non-blocking on
-   *  new backends so remote servers never hit HTTP timeouts during a slow
-   *  ~200 MB download; falls back gracefully on older backends that ignore
-   *  `background: true`). Best-effort: a failed/blocked download must not
-   *  abort the start, since the backend falls back to a system Chromium. */
-  async function prewarmBrowserEngine(existing?: EngineDownloadProgress | null) {
-    const active = (d?: EngineDownloadProgress | null) =>
-      d != null && (d.phase === "downloading" || d.phase === "extracting");
-    browserDownload = active(existing) ? existing! : null;
-    browserStartLabel = browserDownload
-      ? formatDownloadProgress(browserDownload)
-      : "Downloading browser engine (one-time setup)…";
-    try {
-      let poll = active(existing);
-      if (!poll) {
-        const info = await browserEnsureEngine(true);
-        poll = !!info.downloading;
-      }
-      if (poll) {
-        const deadline = Date.now() + 15 * 60 * 1000;
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const st = await browserStatus();
-          if (st.running) {
-            browserDownload = null;
-            return;
-          }
-          const d = st.download ?? null;
-          if (!active(d)) {
-            browserDownload = null;
-            return;
-          }
-          browserDownload = d;
-          browserStartLabel = formatDownloadProgress(d!);
-        }
-      }
-    } catch {
-      /* fall through: the start path falls back to a system Chromium */
-    } finally {
-      browserDownload = null;
-    }
-  }
-
-  /** Seconds the start drive has been running (0 while idle). */
-  const browserStartSeconds = $derived.by(() => {
-    if (!browserStarting || browserStartedAt == null) return 0;
-    return Math.max(0, Math.floor((now - browserStartedAt) / 1000));
-  });
-  /** Starting label + elapsed tick ("Starting browser… (12s)"). */
-  const browserStartDisplay = $derived.by(() => {
-    return browserStartSeconds >= 3
-      ? `${browserStartLabel} (${browserStartSeconds}s)`
-      : browserStartLabel;
-  });
-
-  /** Reject `p` after `ms` so a blocked backend call can never leave the tab
-   *  spinning forever (Windows antivirus/SmartScreen can stall a first launch
-   *  far past every backend timeout). The backend attempt keeps running and a
-   *  later poll adopts the daemon if it did come up. */
-  function withBrowserTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(message)), ms);
-      p.then(
-        (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        (e) => {
-          clearTimeout(timer);
-          reject(e);
-        }
-      );
-    });
-  }
-
-  const BROWSER_START_TIMEOUT_MS = 4 * 60 * 1000;
-  const BROWSER_START_TIMEOUT_MESSAGE =
-    "The browser engine did not respond within 4 minutes. On Windows this is usually antivirus blocking the engine binary — click Retry, or set VICUNA_BROWSER_CHROME to a Chrome/Edge path and relaunch Vicuna.";
-
-  async function driveBrowserDaemon(): Promise<BrowserStatus> {
-    browserStartLabel = "Starting browser…";
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    browserError = null;
-    try {
-      let st = await browserStatus();
-      if (!st.running) {
-        await prewarmBrowserEngine(st.download);
-        browserStartedAt = Date.now();
-        browserStartLabel = "Starting browser…";
-        st = await withBrowserTimeout(
-          browserStart(),
-          BROWSER_START_TIMEOUT_MS,
-          BROWSER_START_TIMEOUT_MESSAGE
-        );
-      }
-      if (onServer && !browserProxyUrl) {
-        const sid = activeServerId();
-        if (sid) browserProxyUrl = await serverLbProxyUrl(sid);
-      }
-      browserDaemon = st;
-      return st;
-    } catch (e: any) {
-      // plain browser with no bridge: still allow viewing a manually-run
-      // daemon (`lb web --port 18765` in a terminal) via a direct probe
-      if (!isTauriRuntime()) {
-        try {
-          const r = await fetch(`${LB_URL}/api/health`);
-          const h = await r.json();
-          if (h?.ok === true && typeof h?.probe === "string") {
-            browserDaemon = {
-              running: true,
-              owned: false,
-              engine_stale: false,
-              url: LB_URL,
-              health: { browser_alive: !!h.browser_alive, probe: h.probe, tabs: h.tabs ?? 0 }
-            };
-            return browserDaemon;
-          }
-        } catch {
-          /* fall through to the backend error below */
-        }
-      }
-      browserError = e?.message ?? String(e);
-      browserDaemon = null;
-      throw e;
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** full stop + start of an owned daemon (stale engine / wedged
-   *  browser). Refuses adopted daemons — the backend owns that refusal. */
-  async function restartBrowserDaemon() {
-    // swap the view instantly: the stop + start takes seconds, and the
-    // stale frame meanwhile reads as "nothing happens"
-    browserStartLabel = "Restarting browser…";
-    browserDaemon = null;
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    browserError = null;
-    try {
-      await prewarmBrowserEngine();
-      browserStartLabel = "Restarting browser…";
-      browserDaemon = await withBrowserTimeout(
-        browserRestart(),
-        BROWSER_START_TIMEOUT_MS,
-        BROWSER_START_TIMEOUT_MESSAGE
-      );
-      browserFrameRev += 1;
-    } catch (e: any) {
-      browserError = e?.message ?? String(e);
-      browserDaemon = null;
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** two-step arm for adopted takeovers (first click explains + arms,
-   *  second within 5s executes) — killing a foreign session must stay a
-   *  deliberate act, never a stray click. */
-  let browserKillArmed = $state(false);
-  let browserKillTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** tab-bar button: `lb start` when down, stop + start when owned,
-   *  confirmed kill + start when adopted. Failures flash a transient
-   *  notice instead of replacing a (possibly healthy) frame. */
-  async function restartBrowserFromButton() {
-    if (browserStarting) return;
-    let st: BrowserStatus | null = null;
-    try {
-      st = await browserStatus();
-    } catch {
-      /* fall through to ensure on last-known state */
-    }
-    const action = browserButtonAction(st ?? browserDaemon);
-    if (action === "start") {
-      // instant view swap (a stale running frame would sit blank meanwhile)
-      browserStartLabel = "Starting browser…";
-      browserDaemon = null;
-      const ok = await ensureBrowserDaemon().then(
-        () => true,
-        () => false
-      );
-      if (ok) browserFrameRev += 1;
-      return;
-    }
-    if (action === "restart") {
-      browserStartLabel = "Restarting browser…";
-      browserDaemon = null;
-      browserStarting = true;
-      browserStartedAt = Date.now();
-      try {
-        await prewarmBrowserEngine();
-        browserStartLabel = "Restarting browser…";
-        browserDaemon = await withBrowserTimeout(
-          browserRestart(),
-          BROWSER_START_TIMEOUT_MS,
-          BROWSER_START_TIMEOUT_MESSAGE
-        );
-        browserError = null;
-        browserFrameRev += 1;
-      } catch (e: any) {
-        flashExpNotice(e?.message ?? String(e));
-        // restore truth instead of guessing: stop may have died mid-flight
-        browserDaemon = await browserStatus().catch(() => null);
-      } finally {
-        browserStarting = false;
-        browserStartedAt = null;
-      }
-      return;
-    }
-    if (!browserKillArmed) {
-      browserKillArmed = true;
-      flashExpNotice(
-        "Browser was started outside Vicuna — click again to force-stop it and start Vicuna's own (its tabs will be lost)."
-      );
-      if (browserKillTimer) clearTimeout(browserKillTimer);
-      browserKillTimer = setTimeout(() => {
-        browserKillArmed = false;
-        browserKillTimer = null;
-      }, 5000);
-      return;
-    }
-    if (browserKillTimer) {
-      clearTimeout(browserKillTimer);
-      browserKillTimer = null;
-    }
-    browserKillArmed = false;
-    browserStartLabel = "Taking over browser…";
-    browserDaemon = null;
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    try {
-      // pre-warm BEFORE the kill: a failed download must not cost their tabs
-      // (backend takeover ensures pre-kill too — this is the honest label)
-      await prewarmBrowserEngine();
-      browserStartLabel = "Taking over browser…";
-      browserDaemon = await withBrowserTimeout(
-        browserTakeover(),
-        BROWSER_START_TIMEOUT_MS,
-        BROWSER_START_TIMEOUT_MESSAGE
-      );
-      browserError = null;
-      browserFrameRev += 1;
-    } catch (e: any) {
-      flashExpNotice(e?.message ?? String(e));
-      browserDaemon = await browserStatus().catch(() => null);
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** one poll tick for a visible running tab (see browserPollAction). */
-  async function pollBrowserDaemon() {
-    if (browserStarting) return;
-    let st: BrowserStatus | null = null;
-    try {
-      st = await browserStatus();
-    } catch {
-      /* backend unreachable: keep the frame, retry next tick */
-    }
-    const action = browserPollAction(browserDaemon, st);
-    if (action === "update" && st) browserDaemon = st;
-    else if (action === "ensure") {
-      const ok = await ensureBrowserDaemon().then(
-        () => true,
-        () => false
-      );
-      if (browserPollRevived(action, ok)) browserFrameRev += 1;
-    }
-  }
-
-  // A visible Browser tab must converge to running: the daemon can die
-  // under a live tab (crash, kill, sleep) leaving a dead iframe with no
-  // recourse, so re-validate on every view and poll while up. Never
-  // revives while hidden; errors stay user-driven (Retry owns them).
-  let browserPoll: ReturnType<typeof setInterval> | null = null;
-  const browserTabVisible = $derived(
-    sideTabs.find((t) => t.key === activeSideTab)?.kind === "browser"
-  );
-  $effect(() => {
-    const visible = browserTabVisible;
-    const running = browserDaemon?.running === true;
-    if (visible && !running && !browserStarting && !browserError) {
-      void ensureBrowserDaemon().catch(() => {});
-    }
-    if (visible && running && !browserPoll) {
-      browserPoll = setInterval(() => void pollBrowserDaemon(), 5000);
-    } else if ((!visible || !running) && browserPoll) {
-      clearInterval(browserPoll);
-      browserPoll = null;
-    }
+  const browser = createBrowserState({
+    get onServer() { return onServer; },
+    get accent() { return accent; },
+    get pluginAccent() { return pluginAccent; },
+    get pluginAccentMuted() { return pluginAccentMuted; },
+    get themeBase() { return themeBase; },
+    get pluginTheme() { return pluginTheme; },
+    get now() { return now; },
+    flashExpNotice,
+    get sideTabs() { return sideTabs; },
+    get activeSideTab() { return activeSideTab; }
   });
 
   /** side-panel tabs: focus the Browser view, creating it if closed */
@@ -7615,199 +5290,14 @@
       sideTabs = [...sideTabs, { key: "browser", kind: "browser", title: "Browser" }];
       activeSideTab = "browser";
     }
-    void ensureBrowserDaemon().catch(() => {});
-  }
-
-  function termTheme(): XTermTheme {
-    // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
-    // console (yellow prompt segments, white text), so the defaults that
-    // ship with xterm go unreadable on a light background. Both palettes
-    // follow the active app/plugin theme's bg/fg while remapping every ANSI
-    // slot to stay legible.
-    const chrome = resolveTerminalColors(themeBase, pluginTheme);
-    if (themeBase === "dark") {
-      return {
-        ...chrome,
-        selectionBackground: "rgba(255,255,255,.25)",
-        selectionInactiveBackground: "rgba(255,255,255,.16)",
-        black: "#000000",
-        red: "#cd3131",
-        green: "#0dbc79",
-        yellow: "#e5e510",
-        blue: "#2472c8",
-        magenta: "#bc3fbc",
-        cyan: "#11a8cd",
-        white: "#e5e5e5",
-        brightBlack: "#666666",
-        brightRed: "#f14c4c",
-        brightGreen: "#23d18b",
-        brightYellow: "#f5f543",
-        brightBlue: "#3b8eea",
-        brightMagenta: "#d670d6",
-        brightCyan: "#29b8db",
-        brightWhite: "#ffffff"
-      };
-    }
-    return {
-      ...chrome,
-      selectionBackground: "rgba(0,0,0,.20)",
-      selectionInactiveBackground: "rgba(0,0,0,.12)",
-      black: "#000000",
-      red: "#b3261e",
-      green: "#0a7a42",
-      yellow: "#795e00",
-      blue: "#0a4fb3",
-      magenta: "#9a3a9a",
-      cyan: "#0a7a8a",
-      white: "#767676",
-      brightBlack: "#5a5a5a",
-      brightRed: "#d32f2f",
-      brightGreen: "#1a7f37",
-      brightYellow: "#8a6d00",
-      brightBlue: "#2563eb",
-      brightMagenta: "#d63384",
-      brightCyan: "#0a8a9a",
-      brightWhite: "#333333"
-    };
-  }
-  // re-theme live terminals when the app theme flips (terminals are created
-  // once with the theme at open time, so existing tabs would go stale)
-  $effect(() => {
-    const t = termTheme();
-    for (const [, v] of termViews) {
-      try {
-        v.term.options.theme = t;
-      } catch {
-        /* terminal mid-dispose */
-      }
-    }
-  });
-
-  /** fit the active terminal to its container and tell the pty the size */
-  function fitSideTerm(key: string) {
-    const el = document.querySelector(`[data-term="${key}"]`);
-    if (!(el instanceof HTMLElement) || el.clientWidth === 0 || el.clientHeight === 0) return;
-    const v = termViews.get(key);
-    const t = sideTabs.find((x) => x.key === key);
-    if (!v || !t?.termId || t.dead) return;
-    try {
-      v.fit.fit();
-      const id = t.termId;
-      if (v.resizeTimer) clearTimeout(v.resizeTimer);
-      v.resizeTimer = setTimeout(() => {
-        void resizeTerm(id, v.term.cols, v.term.rows).catch(() => {});
-      }, 150);
-    } catch {
-      /* container hidden mid-switch */
-    }
-  }
-
-  /** open a Terminal tab rooted at the workspace (desktop or dev bridge) */
-  async function openSideTerminal() {
-    newTabMenu = false;
-    const key = `term-${sideTabSeq++}`;
-    sideTabs = [...sideTabs, { key, kind: "terminal", title: explorerRootBase || "Terminal" }];
-    activeSideTab = key;
-    await tick();
-    if (!isTauriRuntime() && !(await bridgeAvailable())) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: "Terminal needs the Vicuna desktop app." } : t
-      );
-      return;
-    }
-    const root = explorerRoot.trim();
-    if (!root) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: "Pick a workspace folder first." } : t
-      );
-      return;
-    }
-    try {
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
-        import("xterm"),
-        import("@xterm/addon-fit")
-      ]);
-      await import("xterm/css/xterm.css");
-      const el = document.querySelector(`[data-term="${key}"]`);
-      if (!(el instanceof HTMLElement)) throw new Error("terminal view missing");
-      const term = new Terminal({
-        theme: termTheme(),
-        fontSize: 13,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-        cursorBlink: true,
-        scrollback: 5000,
-        windowsPty: /win/i.test(navigator.userAgent ?? "") ? { backend: "conpty" } : undefined
-      });
-      const fit = new FitAddon();
-      term.loadAddon(fit);
-      term.open(el);
-      fit.fit();
-      // xterm leaves clipboard chords to the embedder. macOS WKWebView fires
-      // the browser copy event for ⌘C, but WebView2 does not, so a selection
-      // there could not be copied and Ctrl+C interrupted the shell instead.
-      term.attachCustomKeyEventHandler((ev) => {
-        if (ev.type !== "keydown") return true;
-        const key = ev.key.toLowerCase();
-        // Windows Terminal's select-all chord: a no-drag escape hatch.
-        if (!isMac && ev.ctrlKey && ev.shiftKey && key === "a") {
-          term.selectAll();
-          return false;
-        }
-        if (key !== "c" || !term.hasSelection()) return true;
-        const copyChord = isMac ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.altKey;
-        if (!copyChord) return true;
-        // Returning false also keeps xterm from sending ETX, which sent SIGINT
-        // to the shell and cleared the selection on Windows.
-        copyTermSelection(term);
-        return false;
-      });
-      // Tauri disables the native WebView context menu, so right-click opens
-      // our own (Copy / Paste / Select All / Clear). It used to copy silently
-      // on right-click, with no sign anything happened.
-      el.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        termCtx = {
-          x: Math.max(8, Math.min(ev.clientX, window.innerWidth - 200)),
-          y: Math.max(8, Math.min(ev.clientY, window.innerHeight - 180)),
-          term,
-          // read now: focus leaves the terminal once the menu is clicked
-          sel: term.getSelection()
-        };
-      });
-      const setTab = (patch: Partial<SideTab>) => {
-        sideTabs = sideTabs.map((t) => (t.key === key ? { ...t, ...patch } : t));
-      };
-      const termId = await spawnTerm(
-        root,
-        term.cols,
-        term.rows,
-        (text) => term.write(text),
-        (code) => {
-          setTab({ dead: true });
-          term.write(`\r\n[process exited${code == null ? "" : ` with code ${code}`} — close the tab or open a new one]`);
-        }
-      );
-      term.onData((d) => {
-        void writeTerm(termId, d).catch(() => {});
-      });
-      const ro = new ResizeObserver(() => fitSideTerm(key));
-      ro.observe(el);
-      termViews.set(key, { term, fit, ro, resizeTimer: null });
-      setTab({ termId });
-      term.focus();
-    } catch (e: any) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: typeof e === "string" ? e : (e?.message ?? String(e)) } : t
-      );
-    }
+    void browser.ensureBrowserDaemon().catch(() => {});
   }
 
   /** close a side tab, killing its pty; never strand the active key */
   function closeSideTab(key: string) {
     const t = sideTabs.find((x) => x.key === key);
     if (t?.termId) void killTerm(t.termId);
-    const v = termViews.get(key);
+    const v = terminals.termViews.get(key);
     if (v) {
       v.ro.disconnect();
       if (v.resizeTimer) clearTimeout(v.resizeTimer);
@@ -7816,12 +5306,12 @@
       } catch {
         /* already gone */
       }
-      termViews.delete(key);
+      terminals.termViews.delete(key);
     }
     sideTabs = sideTabs.filter((x) => x.key !== key);
     if (activeSideTab === key) {
       activeSideTab = sideTabs.length ? sideTabs[sideTabs.length - 1].key : "";
-      if (activeSideTab) void tick().then(() => fitSideTerm(activeSideTab));
+      if (activeSideTab) void tick().then(() => terminals.fitSideTerm(activeSideTab));
     }
   }
 
@@ -7830,16 +5320,10 @@
     const t = sideTabs.find((x) => x.key === key);
     if (t?.kind === "terminal") {
       void tick().then(() => {
-        fitSideTerm(key);
-        termViews.get(key)?.term.focus();
+        terminals.fitSideTerm(key);
+        terminals.termViews.get(key)?.term.focus();
       });
     }
-  }
-
-  /** whether a drag carries OS files (vs. text selection etc.) */
-  function hasDroppedFiles(e: DragEvent): boolean {
-    const types = e.dataTransfer?.types;
-    return !!types && Array.from(types).includes("Files");
   }
 
   /** composer drop target highlight */
@@ -7847,10 +5331,6 @@
     if (!hasDroppedFiles(e)) return;
     compDragDepth += 1;
     composerDropActive = true;
-  }
-
-  function onComposerDragOver(e: DragEvent) {
-    e.preventDefault();
   }
 
   function onComposerDragLeave() {
@@ -7966,7 +5446,7 @@
     if (wasWorkRunning && !workRunning) {
       if (explorerOpen && !explorerLoading) void loadExplorer();
       gitRefreshTick++;
-      void syncMcpServersAfterTurn();
+      void mcp.syncMcpServersAfterTurn();
     }
     wasWorkRunning = workRunning;
   });
@@ -8002,20 +5482,6 @@
     pendingAsks = rest;
     a.resolve(value, "answer", display);
     scrollBottom();
-  }
-
-  /** a choice on an agent question: copy it into the answer box to edit,
-   *  caret at the end — sending stays a separate, deliberate step */
-  function prefillAsk(card: { text: string }, opt: string, from: HTMLElement) {
-    card.text = opt;
-    // the box of the card that was clicked (live and put-off cards coexist)
-    const box = from.closest(".ask-card");
-    requestAnimationFrame(() => {
-      const el = box?.querySelector<HTMLTextAreaElement>("textarea.ask-input");
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
-    });
   }
 
   /** send the agent-question answer box (text, multi-select picks, images) */
@@ -8364,27 +5830,6 @@
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
 
-  const isWindows = typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "");
-
-  async function validateWorkspace(path: string): Promise<string | null> {
-    const p = path.trim();
-    if (!p) return null;
-    try {
-      await invokeOrBridge<string>("work_validate_root", { path: p });
-      return null;
-    } catch (e: any) {
-      return typeof e === "string" ? e : (e?.message ?? String(e));
-    }
-  }
-
-  async function canonicalWorkspace(path: string): Promise<string> {
-    return await invokeOrBridge<string>("work_validate_root", { path: path.trim() });
-  }
-
-  async function ensureScratchWorkspace(sessionId: string): Promise<string> {
-    return await invokeOrBridge<string>("work_ensure_scratch_workspace", { sessionId });
-  }
-
   let wsMenuOpen = $state(false);
 
   /** Switch to No Workspace mode: uses an empty per-session scratch folder
@@ -8656,7 +6101,6 @@
   let hoverPrefetchTimer: ReturnType<typeof setTimeout> | null = null;
   let warmCancelled = false;
   let warmStarted = false;
-  const WARM_RECENT_COUNT = 12;
 
   function ensureChatFull(chat: Chat | null | undefined, opts: { silent?: boolean } = {}): Promise<void> {
     if (!chat?.partial) return Promise.resolve();
@@ -9121,7 +6565,7 @@
             if (!list.some((item) => item.name === name)) list.push({ name, tools });
             pendingMcpWakes.set(chat.id, list);
           }
-          void syncMcpServersAfterTurn();
+          void mcp.syncMcpServersAfterTurn();
           break;
         }
         case "toolstart":
@@ -9452,27 +6896,6 @@
     await runWorkTurn(fork, fork.messages.length - 1, ws, seedContext);
   }
 
-  // downscale pasted images: full screenshots blow up localStorage quotas
-  // and model context windows, and vision models don't need more than this
-  async function imageFileToDataUrl(f: File | Blob): Promise<string> {
-    const bitmap = await createImageBitmap(f);
-    const MAX = 1568;
-    const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
-    const w = Math.max(1, Math.round(bitmap.width * scale));
-    const h = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      bitmap.close();
-      throw new Error("canvas unavailable");
-    }
-    ctx.drawImage(bitmap, 0, 0, w, h);
-    bitmap.close();
-    return canvas.toDataURL("image/jpeg", 0.85);
-  }
-
   async function onPaste(e: ClipboardEvent) {
     const files = pastedImageFiles(e);
     if (!files.length) return;
@@ -9487,19 +6910,6 @@
     }
     autosizeComposer();
     requestAnimationFrame(() => composerEl?.focus());
-  }
-
-  function pastedImageFiles(e: ClipboardEvent): File[] {
-    const items = e.clipboardData?.items;
-    if (!items) return [];
-    const files: File[] = [];
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        const f = it.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-    return files;
   }
 
   async function onEditPaste(e: ClipboardEvent) {
@@ -9615,9 +7025,9 @@
         e.preventDefault();
         return;
       }
-      if (termCtx) {
-        termCtx.term.focus();
-        termCtx = null;
+      if (terminals.termCtx) {
+        terminals.termCtx.term.focus();
+        terminals.termCtx = null;
         e.preventDefault();
         return;
       }
@@ -9626,12 +7036,12 @@
         e.preventDefault();
         return;
       }
-      if (mcpOpen) {
-        mcpOpen = false;
+      if (mcp.mcpOpen) {
+        mcp.mcpOpen = false;
         e.preventDefault();
         return;
       }
-      if (settingsOpen || pluginsOpen || skillsOpen || gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
+      if (settingsOpen || pluginsOpen || skillsOpen || palette.gotoOpen || lightboxSrc || editingIndex != null || renamingId || pendingDeleteId || modelOpen || codeEditorPath) return;
       if (!activeWorkRunning) return;
       if (onEscape()) e.preventDefault();
     };
@@ -9641,7 +7051,7 @@
 
   function setSidebar(open: boolean) {
     sidebarOpen = open;
-    srvMenuOpen = false;
+    srv.srvMenuOpen = false;
     persistPrefs();
   }
 
@@ -9675,13 +7085,13 @@
       }
     }
     const scheduleTimer = setInterval(scheduleTick, 5000);
-    hydrateUsageStore();
-    const usagePollTimer = setInterval(() => void pollUsageBackground(), USAGE_POLL_INTERVAL_MS);
-    const usageTickTimer = setInterval(() => { usageNow = Date.now(); }, 30_000);
+    usage.hydrateUsageStore();
+    const usagePollTimer = setInterval(() => void usage.pollUsageBackground(), USAGE_POLL_INTERVAL_MS);
+    const usageTickTimer = setInterval(() => { usage.usageNow = Date.now(); }, 30_000);
     const onUsageVisibility = () => {
       if (document.visibilityState === "visible") {
-        usageNow = Date.now();
-        void pollUsageBackground();
+        usage.usageNow = Date.now();
+        void usage.pollUsageBackground();
       }
     };
     document.addEventListener("visibilitychange", onUsageVisibility);
@@ -9703,11 +7113,11 @@
     }
     void initApp();
     void loadPlugins();
-    void refreshServers();
+    void srv.refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
-    initializeAppUpdatePreference();
+    appUpdate.initializeAppUpdatePreference();
     const updateCheckTimer = isTauriRuntime() && !isRemoteServer()
-      ? setTimeout(() => void triggerAutomaticAppUpdateCheck(), 2500)
+      ? setTimeout(() => void appUpdate.triggerAutomaticAppUpdateCheck(), 2500)
       : null;
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
@@ -9747,7 +7157,7 @@
             unlistenOpenChat = u;
           });
           void listen("vicuna-servers-changed", () => {
-            void refreshServers();
+            void srv.refreshServers();
           }).then((u) => {
             unlistenServersChanged = u;
           });
@@ -9765,7 +7175,7 @@
       unlistenOpenChat?.();
       unlistenServersChanged?.();
       unlistenQuit?.();
-      clearTimeout(mcpDefaultTimer);
+      clearTimeout(mcp.mcpDefaultTimer);
       clearInterval(scheduleTimer);
       clearInterval(usagePollTimer);
       clearInterval(usageTickTimer);
@@ -9826,10 +7236,10 @@
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
       continueMode = normalizeContinueMode(prefs.continueMode);
-      openrouterKey = prefs.openrouterApiKey ?? "";
-      openrouterKeyDraft = openrouterKey;
-      setOpenRouterApiKey(openrouterKey);
-      openrouterAdded = [...(prefs.openrouterAdded ?? [])];
+      openrouter.openrouterKey = prefs.openrouterApiKey ?? "";
+      openrouter.openrouterKeyDraft = openrouter.openrouterKey;
+      setOpenRouterApiKey(openrouter.openrouterKey);
+      openrouter.openrouterAdded = [...(prefs.openrouterAdded ?? [])];
       sessionFilterRaw = prefs.sessionFilter ?? ALL_FILTER;
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
@@ -9844,11 +7254,11 @@
       } catch (e) {
         if (!isServerBacked()) throw e;
         chats = [];
-        srvLoadError = e instanceof Error ? e.message : String(e);
+        srv.srvLoadError = e instanceof Error ? e.message : String(e);
       } finally {
         chatsLoaded = true;
       }
-      if (isServerBacked() && !srvLoadError) {
+      if (isServerBacked() && !srv.srvLoadError) {
         const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean; sessionTools?: boolean; home?: string }>("server_info", {}).catch(() => null);
         serverPersist = info?.persist === true;
         serverChatTurns = info?.chatTurns === true;
@@ -9866,7 +7276,7 @@
         setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
-      if (!hostHomeDir && ((isServerBacked() && !srvLoadError) || await bridgeAvailable())) {
+      if (!hostHomeDir && ((isServerBacked() && !srv.srvLoadError) || await bridgeAvailable())) {
         const listing = await invokeOrBridge<{ path?: string; home?: string }>("fs_list_dirs", { path: null, hidden: false }).catch(() => null);
         const listedHome = typeof listing?.path === "string" && listing.path.trim()
           ? listing.path
@@ -9924,17 +7334,17 @@
       }
       const savedCatalog = await loadCatalog();
       if (savedCatalog) {
-        catalog = savedCatalog.entries;
-        catalogUpdated = savedCatalog.updated;
+        ollamaMgr.catalog = savedCatalog.entries;
+        ollamaMgr.catalogUpdated = savedCatalog.updated;
       }
       const cachedOpenRouter = readOpenRouterCache();
       if (cachedOpenRouter) {
-        openrouterModels = cachedOpenRouter.models;
-        openrouterUpdated = cachedOpenRouter.updated;
+        openrouter.openrouterModels = cachedOpenRouter.models;
+        openrouter.openrouterUpdated = cachedOpenRouter.updated;
       }
       const m = await loadModel();
       if (m) selectedModel = m;
-      await loadMcpServers();
+      await mcp.loadMcpServers();
     } catch (e) {
       console.error("storage load failed:", e);
     } finally {
@@ -10129,57 +7539,13 @@
   <EngineIcon {id} {workEngineList} />
 {/snippet}
 {#snippet serverMenu()}
-  <button class="ctx-backdrop" data-testid="server-menu-backdrop" aria-label="Close menu" tabindex="-1" onclick={() => { srvMenuOpen = false; srvMenuRenaming = false; }}></button>
-  <div class="srv-menu" data-testid="server-menu" role="menu">
-    <div class="srv-menu-label">Recents</div>
-    <button class="srv-item" data-testid="server-item-local" role="menuitem" onclick={() => requestServerSwitch(null)}>
-      <span class="srv-check">{#if !onServer}✓{/if}</span><span class="srv-item-name">This computer</span>
-    </button>
-    {#each srvList as sv (sv.id)}
-      <button class="srv-item" data-testid="server-item" role="menuitem" title={sv.url} onclick={() => requestServerSwitch(sv.id)}>
-        <span class="srv-check">{#if sv.id === activeServer}✓{/if}</span><span class="srv-item-name">{sv.name}</span>
-      </button>
-    {/each}
-    <div class="srv-sep"></div>
-    {#if onServer && srvVersion}
-      <div class="srv-version" data-testid="server-version">
-        <span>Server v{srvVersion} · App v{clientVersion}</span>
-        {#if srvVersionSkew && !srvUpgradeAvailable}<span class="srv-skew" title="The server and this app run different versions">differs</span>{/if}
-      </div>
-      {#if srvUpgradeAvailable && srvCanUpgrade}
-        <button class="srv-item srv-upgrade" data-testid="server-upgrade" role="menuitem" disabled={srvUpgrading} onclick={upgradeServer}>
-          {#if srvUpgrading}
-            <span class="srv-check"><span class="srv-spin" aria-hidden="true"></span></span>
-            <span class="srv-item-name srv-upgrade-prog" data-testid="server-upgrade-progress">
-              <span class="shimmer">{srvUpgradeStage ?? "Upgrading server…"}</span>
-              {#if srvUpgradePct != null}<span class="srv-upgrade-bar"><span style="width:{srvUpgradePct}%"></span></span>{/if}
-              {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
-            </span>
-          {:else}
-            <span class="srv-check">↑</span><span class="srv-item-name">Upgrade server to v{srvLatest}</span>
-          {/if}
-        </button>
-      {/if}
-      <div class="srv-sep"></div>
-    {/if}
-    {#if onServer && srvCurrent}
-      {#if srvMenuRenaming}
-        <div class="srv-menu-rename-row" data-testid="server-menu-rename-form">
-          <input class="srv-menu-rename-input" data-testid="server-menu-rename-input" placeholder={defaultServerName(srvCurrent.url)} autocomplete="off" spellcheck="false"
-            bind:value={srvEditDraft} disabled={srvRenaming}
-            onkeydown={(e) => { if (e.key === "Enter") void saveMenuRenameServer(); else if (e.key === "Escape") srvMenuRenaming = false; }} />
-          <button class="srv-menu-rename-ok" data-testid="server-menu-rename-save" aria-label="Save name" title="Save" disabled={srvRenaming} onclick={() => void saveMenuRenameServer()}>✓</button>
-        </div>
-      {:else}
-        <button class="srv-item" data-testid="server-menu-rename" role="menuitem" onclick={startMenuRenameServer}>
-          <span class="srv-check">✎</span><span class="srv-item-name">Rename server…</span>
-        </button>
-      {/if}
-    {/if}
-    <button class="srv-item srv-connect" data-testid="server-connect-open" role="menuitem" onclick={openServerDialog}>
-      <span class="srv-check">+</span><span class="srv-item-name">Connect to new server…</span>
-    </button>
-  </div>
+  <ServerMenu
+    srvList={srv.srvList} {onServer} {activeServer} srvVersion={srv.srvVersion} {clientVersion} srvVersionSkew={srv.srvVersionSkew} srvUpgradeAvailable={srv.srvUpgradeAvailable}
+    srvCanUpgrade={srv.srvCanUpgrade} srvUpgrading={srv.srvUpgrading} srvUpgradeStage={srv.srvUpgradeStage} srvUpgradePct={srv.srvUpgradePct} srvUpgradeDetail={srv.srvUpgradeDetail} srvLatest={srv.srvLatest} srvCurrent={srv.srvCurrent}
+    bind:srvMenuRenaming={srv.srvMenuRenaming} bind:srvEditDraft={srv.srvEditDraft} srvRenaming={srv.srvRenaming}
+    onClose={() => { srv.srvMenuOpen = false; srv.srvMenuRenaming = false; }}
+    requestServerSwitch={srv.requestServerSwitch} upgradeServer={srv.upgradeServer} saveMenuRenameServer={srv.saveMenuRenameServer} startMenuRenameServer={srv.startMenuRenameServer} openServerDialog={srv.openServerDialog}
+  />
 {/snippet}
 
 <div class="app">
@@ -10206,7 +7572,7 @@
           <span>New</span>
           <span class="kbd-hint">{isMac ? "⌘N" : "Ctrl+N"}</span>
         </button>
-        <button class="goto" data-testid="goto-btn" title="Search chats ({isMac ? '⌘P' : 'Ctrl+P'})" onclick={openGoto}>
+        <button class="goto" data-testid="goto-btn" title="Search chats ({isMac ? '⌘P' : 'Ctrl+P'})" onclick={palette.openGoto}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
           <span>Search</span>
           <span class="kbd-hint">{isMac ? "⌘P" : "Ctrl+P"}</span>
@@ -10251,93 +7617,26 @@
         {#snippet chatList(items: Chat[])}
           {#each items as c (c.id)}
             {@const live = isSessionStreaming(c.id)}
-            <button
-              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''} {c.archived ? 'archived' : ''} {c.role === 'lead' ? 'lead-row' : ''}"
-              data-testid="chat-item"
-              data-archived={c.archived ? "true" : null}
-              data-streaming={live ? "true" : null}
-              title={live ? liveTitle(c.id) : c.role === "lead" ? c.title : undefined}
-              onclick={() => selectChat(c.id)}
-              onpointerdown={() => { if (c.partial) void ensureChatFull(c, { silent: true }); }}
-              onpointerenter={() => scheduleHoverPrefetch(c)}
-              onpointerleave={cancelHoverPrefetch}
-              oncontextmenu={(e) => openMenu(e, c.id)}
-            >
-              {#if renamingId === c.id}
-                <input
-                  class="rename-input"
-                  data-testid="rename-input"
-                  bind:value={renameDraft}
-                  onclick={(e) => e.stopPropagation()}
-                  onkeydown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === "Enter") commitRename();
-                    else if (e.key === "Escape") cancelRename();
-                  }}
-                  onblur={commitRename}
-                />
-              {:else}
-                {#if live}<span class="stream-dot" aria-hidden="true"></span>{/if}
-                {#if c.role === "lead"}
-                  <span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>
-                {:else}
-                  <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
-                {/if}
-                {@const liveMs = live ? liveElapsedMs(c.id) : null}
-                {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
-                {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
-                {#if c.mode === "work"}
-                  {@const tgSnap = telegramStatuses[c.id]}
-                  {@const tgState = telegramConnState(tgSnap)}
-                  {#if tgState !== "unconfigured"}
-                    <span
-                      class="tg-row-badge {tgState}"
-                      data-testid="telegram-row-badge"
-                      data-status={tgState}
-                      title={telegramConnTitle(tgSnap)}
-                      aria-label={telegramConnTitle(tgSnap)}
-                    >
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
-                    </span>
-                  {/if}
-                  {#each bridgePlugins as bp (bp.id)}
-                    {@const bSnap = bridgeStatuses[bp.id]?.[c.id]}
-                    {@const bState = bridgeConnState(bSnap)}
-                    {#if bState !== "unconfigured"}
-                      {@const bName = bridgeDisplayName(bp)}
-                      {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
-                      <span
-                        class="tg-row-badge {bState}"
-                        style:background={bState === "connected" ? bColor : undefined}
-                        data-testid="bridge-row-badge-{bp.id}"
-                        data-status={bState}
-                        title={bridgeConnTitle(bName, bSnap)}
-                        aria-label={bridgeConnTitle(bName, bSnap)}
-                      >
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
-                      </span>
-                    {/if}
-                  {/each}
-                  {#if showWorkspaceBadge(c, sessionFilter)}
-                    {@const wsIsNone = isNoWorkspacePath(c.workspace)}
-                    {@const wsBase = wsIsNone ? "" : workspaceBase(c.workspace ?? "")}
-                    {#if wsIsNone}
-                      <span class="work-badge ws-badge" data-testid="ws-badge" title="No workspace — uses a temporary empty scratch folder if needed">
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
-                        <span>No workspace</span>
-                      </span>
-                    {:else if wsBase}
-                      <span class="work-badge ws-badge" data-testid="ws-badge" title={displayWorkspace(c.workspace ?? "")}>
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>{wsBase}</span>
-                      </span>
-                    {:else}
-                      <span class="work-badge" title="Work session">Work</span>
-                    {/if}
-                  {/if}
-                {/if}
-              {/if}
-            </button>
+            <SidebarSessionItem
+              {c}
+              active={c.id === activeId}
+              {live}
+              liveTitleText={live ? liveTitle(c.id) : undefined}
+              liveMs={live ? liveElapsedMs(c.id) : null}
+              renaming={renamingId === c.id}
+              bind:renameDraft
+              telegramSnap={bridges.telegramStatuses[c.id]}
+              bridgePlugins={bridges.bridgePlugins}
+              bridgeStatuses={bridges.bridgeStatuses}
+              {sessionFilter}
+              onSelect={selectChat}
+              onPrefetch={(x) => { if (x.partial) void ensureChatFull(x, { silent: true }); }}
+              onHoverEnter={scheduleHoverPrefetch}
+              onHoverLeave={cancelHoverPrefetch}
+              onMenu={openMenu}
+              {commitRename}
+              {cancelRename}
+            />
           {/each}
         {/snippet}
         {#if pinnedChats.length > 0}
@@ -10361,13 +7660,13 @@
           {@render chatList(grouped.older)}
         {/if}
         {#if !chatsLoaded}
-          <div class="skel-list" data-testid="sessions-loading" role="status" aria-label={`Loading sessions${onServer ? ` from ${srvLabel}` : ""}`}>
+          <div class="skel-list" data-testid="sessions-loading" role="status" aria-label={`Loading sessions${onServer ? ` from ${srv.srvLabel}` : ""}`}>
             <div class="skel skel-label"></div>
             {#each [78, 62, 88, 54, 70, 46, 66] as w, k (k)}
               <div class="skel-row"><div class="skel" style="width: {w}%"></div></div>
             {/each}
             {#if loadingSecs >= 5}
-              <div class="skel-note">{onServer ? `Loading from ${srvLabel}` : "Loading"} · {loadingSecs}s</div>
+              <div class="skel-note">{onServer ? `Loading from ${srv.srvLabel}` : "Loading"} · {loadingSecs}s</div>
             {/if}
           </div>
         {:else if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
@@ -10378,14 +7677,14 @@
       <div class="side-footer">
         {#if isTauriRuntime()}
           <div class="srv-pick">
-            {#if srvMenuOpen}
+            {#if srv.srvMenuOpen}
               {@render serverMenu()}
             {/if}
-            <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+            <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srv.srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srv.srvMenuOpen} onclick={srv.toggleServerMenu}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-              <span class="srv-name">{srvLabel}</span>
-              {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
-              <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
+              <span class="srv-name">{srv.srvLabel}</span>
+              {#if onServer && (srv.srvVersionSkew || srv.srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srv.srvUpgradeAvailable ? `Server update available: v${srv.srvLatest}` : `Server v${srv.srvVersion}, app v${clientVersion}`}></span>{/if}
+              <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srv.srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
             </button>
           </div>
         {/if}
@@ -10399,128 +7698,44 @@
         </button>
       </div>
       {#if ctxMenu}
-        <button
-          class="ctx-backdrop"
-          data-testid="session-menu-backdrop"
-          aria-label="Close menu"
-          onclick={() => {
-            ctxMenu = null;
-            workspacePickerOpen = false;
-          }}
-          oncontextmenu={(e) => {
-            e.preventDefault();
-            ctxMenu = null;
-            workspacePickerOpen = false;
-          }}
-          tabindex="-1"
-        ></button>
-        <div
-          class="ctx-menu"
-          data-testid="session-menu"
-          style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;"
-        >
-          <button class="ctx-item" data-testid="rename-item" onclick={() => startRename(ctxMenu!.chatId)}>Rename</button>
-          <button class="ctx-item" data-testid="copy-link-item" onclick={() => copySessionLink(ctxMenu!.chatId)}>Copy Link</button>
-          <button class="ctx-item" data-testid="pin-item" onclick={() => togglePin(ctxMenu!.chatId)}>{ctxChat?.pinned ? "Unpin" : "Pin"}</button>
-          <button class="ctx-item" data-testid="archive-item" onclick={() => setArchived(ctxMenu!.chatId, !ctxChat?.archived)}>{ctxChat?.archived ? "Unarchive" : "Archive"}</button>
-          <div class="ctx-sep" role="separator"></div>
-          {#if (ctxChat?.mode ?? "chat") === "work"}
-            {#if serverPersist}
-              <button class="ctx-item" data-testid="permissions-item" onclick={() => { permissionsFor = ctxMenu!.chatId; ctxMenu = null; }}>Permissions…</button>
-            {/if}
-            {@const tgSnap = ctxChat ? telegramStatuses[ctxChat.id] : null}
-            {@const tgState = telegramStateFor(ctxChat?.id)}
-            {#if ctxChat?.role === "lead"}
-              <button class="ctx-item" data-testid="lead-item" onclick={() => toggleLead(ctxMenu!.chatId)}>Remove lead</button>
-            {:else}
-              {@const hasLead = chats.some((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)}
-              <button
-                class="ctx-item"
-                data-testid="lead-item"
-                onclick={() => { leadPrompt = { id: ctxMenu!.chatId, prevTitle: chats.find((x) => x.role === "lead" && x.id !== ctxMenu!.chatId)?.title ?? null }; ctxMenu = null; }}
-              >{hasLead ? "Replace lead" : "Make lead"}</button>
-            {/if}
-            <button
-              class="ctx-item ctx-telegram"
-              data-testid="telegram-item"
-              title={telegramConnTitle(tgSnap)}
-              onclick={() => { telegramFor = ctxMenu!.chatId; ctxMenu = null; }}
-            >
-              <span class="ctx-tg-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg></span>
-              <span class="ctx-tg-label">Telegram</span>
-              {#if tgSnap?.botUsername}<span class="ctx-tg-bot">@{tgSnap.botUsername}</span>{/if}
-              <span class="ctx-tg-dot {tgState}" data-testid="telegram-status-dot" data-status={tgState} aria-label={telegramConnLabel(tgState)}></span>
-            </button>
-            {#each bridgePlugins as bp (bp.id)}
-              {@const bSnap = ctxChat ? bridgeStatuses[bp.id]?.[ctxChat.id] : null}
-              {@const bState = bridgeConnState(bSnap)}
-              {@const bName = bridgeDisplayName(bp)}
-              {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
-              <button
-                class="ctx-item ctx-telegram"
-                data-testid="bridge-item-{bp.id}"
-                title={bridgeConnTitle(bName, bSnap)}
-                onclick={() => { bridgeModal = { pluginId: bp.id, sessionId: ctxMenu!.chatId }; ctxMenu = null; }}
-              >
-                <span class="ctx-tg-icon" style:background={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
-                <span class="ctx-tg-label">{bName}</span>
-                {#if bSnap?.botUsername}<span class="ctx-tg-bot">@{bSnap.botUsername}</span>{/if}
-                <span class="ctx-tg-dot {bState}" data-testid="bridge-status-dot-{bp.id}" data-status={bState} aria-label={bridgeConnLabel(bName, bState)}></span>
-              </button>
-            {/each}
-          {/if}
-          <div class="ctx-continue-row">
-            <button class="ctx-item ctx-continue" data-testid="continue-work-item" onclick={() => continueInWork(ctxMenu!.chatId)}>Continue in Work</button>
-            <button
-              class="ctx-ws-pill"
-              data-testid="continue-work-workspace"
-              title={continueWorkspace ? `Work folder: ${displayWorkspace(continueWorkspace)} — click to change` : "Pick a work folder"}
-              aria-label="Change work folder"
-              onclick={(e) => void pickContinueWorkspace(e)}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              <span class="ctx-ws-name">{workspaceBase(continueWorkspace) || "Folder"}</span>
-            </button>
-          </div>
-          {#if workspacePickerOpen && (!isTauriRuntime() || onServer)}
-            <form
-              class="ctx-ws-form"
-              data-testid="continue-work-workspace-form"
-              onsubmit={(e) => {
-                e.preventDefault();
-                void commitContinueWorkspace();
-              }}
-            >
-              <input
-                class="pull-input"
-                data-testid="continue-work-workspace-input"
-                placeholder={isWindows ? "C:\\path\\to\\workspace" : "/absolute/path/to/workspace"}
-                bind:value={workspaceDraft}
-                spellcheck={false}
-                onkeydown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    workspacePickerOpen = false;
-                  }
-                }}
-              />
-              {#if workspaceError}
-                <div class="goto-error" data-testid="continue-work-workspace-error">{workspaceError}</div>
-              {/if}
-            </form>
-          {/if}
-          <div class="ctx-sep" role="separator"></div>
-          <button class="ctx-item danger" data-testid="delete-item" onclick={() => requestDelete(ctxMenu!.chatId)}>Delete</button>
-        </div>
+        <SessionContextMenu
+          menu={ctxMenu}
+          {ctxChat}
+          {chats}
+          {serverPersist}
+          {onServer}
+          telegramStatuses={bridges.telegramStatuses}
+          telegramStateFor={bridges.telegramStateFor}
+          bridgePlugins={bridges.bridgePlugins}
+          bridgeStatuses={bridges.bridgeStatuses}
+          {continueWorkspace}
+          {workspacePickerOpen}
+          bind:workspaceDraft
+          {workspaceError}
+          onClose={() => { ctxMenu = null; workspacePickerOpen = false; }}
+          {startRename}
+          {copySessionLink}
+          {togglePin}
+          {setArchived}
+          {toggleLead}
+          openPermissions={(id) => { permissionsFor = id; ctxMenu = null; }}
+          openLeadPrompt={(id, prevTitle) => { leadPrompt = { id, prevTitle }; ctxMenu = null; }}
+          openTelegram={(id) => { bridges.telegramFor = id; ctxMenu = null; }}
+          openBridge={(pluginId, sessionId) => { bridges.bridgeModal = { pluginId, sessionId }; ctxMenu = null; }}
+          {continueInWork}
+          {pickContinueWorkspace}
+          {commitContinueWorkspace}
+          closeWorkspacePicker={() => (workspacePickerOpen = false)}
+          {requestDelete}
+        />
       {/if}
     </aside>
   {/if}
 
   <main class="main">
-    {#if srvLoadError}
+    {#if srv.srvLoadError}
       <div class="srv-strip" data-testid="server-load-error" role="alert">
-        <span>Can't load sessions from {srvLabel}: {srvLoadError}</span>
+        <span>Can't load sessions from {srv.srvLabel}: {srv.srvLoadError}</span>
         <button class="mini-btn" onclick={() => window.location.reload()}>Retry</button>
         {#if onServer}<button class="mini-btn" onclick={() => void switchServer(null)}>Use this computer</button>{/if}
       </div>
@@ -10556,12 +7771,12 @@
         <div class="collapsed-rail-foot">
           {#if isTauriRuntime()}
             <div class="srv-pick">
-              {#if srvMenuOpen}
+              {#if srv.srvMenuOpen}
                 {@render serverMenu()}
               {/if}
-              <button class="icon-btn srv-icon-btn {onServer ? 'remote' : ''}" data-testid="server-btn-collapsed" aria-label={onServer ? `Server: ${srvLabel}` : "Server: This computer"} title={onServer ? (srvCurrent?.url ? `${srvLabel} (${srvCurrent.url})` : srvLabel) : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+              <button class="icon-btn srv-icon-btn {onServer ? 'remote' : ''}" data-testid="server-btn-collapsed" aria-label={onServer ? `Server: ${srv.srvLabel}` : "Server: This computer"} title={onServer ? (srv.srvCurrent?.url ? `${srv.srvLabel} (${srv.srvCurrent.url})` : srv.srvLabel) : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srv.srvMenuOpen} onclick={srv.toggleServerMenu}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-                {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
+                {#if onServer && (srv.srvVersionSkew || srv.srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srv.srvUpgradeAvailable ? `Server update available: v${srv.srvLatest}` : `Server v${srv.srvVersion}, app v${clientVersion}`}></span>{/if}
               </button>
             </div>
           {/if}
@@ -10576,156 +7791,38 @@
     {/if}
 
     {#if !activeChat || activeChat.messages.length === 0}
-      <div class="empty">
-        <div class="seg mode-toggle" role="tablist" aria-label="Session mode" data-testid="mode-toggle">
-          <button class="seg-btn {pendingMode === 'chat' ? 'sel' : ''}" data-testid="mode-chat-btn" role="tab" onclick={() => { pendingMode = "chat"; writeLastMode(localStorage, "chat"); workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}>Chat</button>
-          <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; writeLastMode(localStorage, "work"); if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
-        </div>
-        <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
-        {#if pendingMode === "work"}
-          <p class="engine-line" data-testid="work-engine-line">
-            {#if workEngineInfo?.installed}
-              Engine: {workEngineLabel} {workEngineInfo.version ?? ""}
-            {:else if workEngineInfo}
-              Engine: {workEngineLabel} not found
-            {:else}
-              Engine: checking…
-            {/if}
-          </p>
-        {/if}
-        <div class="suggest-grid" data-testid="empty-suggestions">
-          {#each composerMode === "work" ? WORK_SUGGESTIONS : SUGGESTIONS as s, idx}
-            <button class="suggest-card" data-testid="suggest-card" onclick={() => useSuggestion(s.prompt)}>
-              <span class="suggest-text">
-                <span class="suggest-title">{s.title}</span>
-                <span class="suggest-sub">{s.prompt}</span>
-              </span>
-              <span class="suggest-icon">{@html s.icon}</span>
-            </button>
-          {/each}
-        </div>
-      </div>
+      <EmptyStarter
+        {pendingMode}
+        {composerMode}
+        {workEngineInfo}
+        {workEngineLabel}
+        onPickChat={() => { pendingMode = "chat"; writeLastMode(localStorage, "chat"); workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}
+        onPickWork={() => { pendingMode = "work"; writeLastMode(localStorage, "work"); if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}
+        onSuggestion={useSuggestion}
+      />
     {:else}
       {#if activeChat.mode === "work"}
-        {@const wsLabel = compactWorkspaceLabel(activeChat.workspace)}
-        {@const wsFull = fullWorkspacePath(activeChat.workspace)}
-        {@const wsIsScratch = isNoWorkspacePath(activeChat.workspace)}
-        <div class="work-banner" data-testid="work-banner">
-          <span class="work-badge">Work</span>
-          {#if wsFull}
-            <span class="ctx-wrap work-path-wrap">
-              <button
-                type="button"
-                class="work-path-btn"
-                class:copied={workPathCopied}
-                data-testid="work-path"
-                aria-label={`Workspace path: ${wsFull}. Click to copy.`}
-                onclick={() => copyWorkPath(wsFull)}
-              >
-                <span class="work-path-label">{wsLabel}</span>
-              </button>
-              <span class="ctx-popup work-path-popup" data-testid="work-path-popup">
-                <span class="work-path-popup-head">
-                  <span class="work-path-popup-title">{wsIsScratch ? "Scratch directory" : "Workspace"}</span>
-                  <button
-                    type="button"
-                    class="usage-hover-refresh work-path-copy-btn"
-                    class:copied={workPathCopied}
-                    data-testid="work-path-copy"
-                    onclick={(e) => { e.stopPropagation(); copyWorkPath(wsFull); }}
-                  >{workPathCopied ? "Copied" : "Copy"}</button>
-                </span>
-                <code class="work-path-full" data-testid="work-path-full">{wsFull}</code>
-              </span>
-            </span>
-          {:else}
-            <span class="work-path work-path-empty" data-testid="work-path">{wsLabel}</span>
-          {/if}
-          <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{#if workEngineInfo && !sessionEngineMissing}{@render engineIcon(engineId(workEngineInfo))}{/if}{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? (workAccountLabel ? workEngineShort : engineId(workEngineInfo)) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
-          <span class="hdr-meters">
-          {#if usageHoverEngine}
-            {@const hov = usageStore[usageHoverEngine]}
-            {@const hovLoading = !!usageFetching[usageHoverEngine]}
-            {@const hovLabel = workEngines.find((e) => e.id === usageHoverEngine)?.label ?? usageHoverEngine}
-            {@const hovRows = hov?.report ? usageHoverRows(hov.report) : []}
-            {@const gauge = usageGaugeFrac(hovRows)}
-            <span class="ctx-wrap usage-wrap">
-              <!-- same 18px / r=7 / 2.5 stroke as the context ring, but a 270° gauge arc (gap at the bottom) filled by the most-used quota -->
-              <button class="usage-meter-btn" data-testid="usage-meter-btn" aria-label={`${hovLabel} usage${hovRows.length ? ` ${Math.round(gauge * 100)}%` : ""}`} onmouseenter={() => primeUsageHover()} onfocus={() => primeUsageHover()} onclick={() => void openUsageModal()}>
-                <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-                  <circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-2)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="33 44" transform="rotate(135 9 9)" />
-                  {#if gauge > 0}
-                    <circle cx="9" cy="9" r="7" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray={`${(gauge * 33).toFixed(1)} 44`} transform="rotate(135 9 9)" />
-                  {/if}
-                </svg>
-              </button>
-              <span class="ctx-popup usage-hover" data-testid="usage-hover">
-                <span class="usage-hover-head">
-                  <span class="usage-hover-title">{hovLabel}{hov?.report?.plan ? ` · ${hov.report.plan}` : ""}</span>
-                  <button
-                    class="usage-hover-refresh"
-                    data-testid="usage-hover-refresh"
-                    disabled={hovLoading}
-                    onclick={(e) => { e.stopPropagation(); void fetchUsageEngine(usageHoverEngine, { force: true }); }}
-                    title="Refresh usage"
-                  >{hovLoading ? "Refreshing…" : "Refresh"}</button>
-                </span>
-                {#if hov?.report}
-                  {#if hov.error}
-                    <span class="usage-hover-note usage-tone-low">{hov.error}</span>
-                  {/if}
-                  {#each hovRows as r}
-                    <span class="usage-hover-row">
-                      <span class="usage-hover-line"><span class="usage-hover-label" title={r.label}>{r.label}</span><span class="usage-hover-val {r.tone ? `usage-tone-${r.tone}` : ''}">{r.value}</span></span>
-                      {#if r.usedPct !== null}
-                        <span class="usage-hover-bar"><span class="usage-hover-fill {r.tone ?? ''}" style="width: {r.usedPct}%"></span></span>
-                      {/if}
-                      {#if r.reset}<span class="usage-hover-reset">{r.reset}</span>{/if}
-                    </span>
-                  {:else}
-                    <span class="usage-hover-note">{hov.report.note ?? "No usage reported"}</span>
-                  {/each}
-                {:else if hovLoading}
-                  <span class="usage-hover-note">Fetching usage…</span>
-                {:else if hov?.error}
-                  <span class="usage-hover-note">{hov.error}</span>
-                {:else}
-                  <span class="usage-hover-note">Hover to load usage</span>
-                {/if}
-                <span class="usage-hover-hint">
-                  <span data-testid="usage-hover-updated">
-                    {#if hov?.report}
-                      Updated {formatUsageAge(hov.at, usageNow)}{hovLoading ? " · updating…" : ""}
-                    {:else if hovLoading}
-                      Updating…
-                    {:else}
-                      Not updated yet
-                    {/if}
-                  </span>
-                  <span>Click for details</span>
-                </span>
-                {#if harnessUsageUrl(baseEngineId(usageHoverEngine))}
-                  <button class="usage-hover-refresh usage-provider-link" data-testid="usage-hover-provider-link" onclick={(e) => { e.stopPropagation(); void openExternal(harnessUsageUrl(baseEngineId(usageHoverEngine))!); }}>Open usage page</button>
-                {/if}
-              </span>
-            </span>
-          {/if}
-          {#if workCtx}
-            {@const pct = Math.round(workCtx.frac * 100)}
-            <span class="ctx-wrap" data-testid="ctx-ring" role="img" aria-label={`Context usage ${pct}%, ${workCtx.used.toLocaleString()} tokens`}>
-              <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-                <circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-2)" stroke-width="2.5" />
-                <circle cx="9" cy="9" r="7" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-dasharray={`${(workCtx.frac * 43.98).toFixed(1)} 44`} transform="rotate(-90 9 9)" />
-              </svg>
-              <span class="ctx-popup" data-testid="ctx-popup">
-                <span class="ctx-row"><span>Usage</span><span>{pct}%</span></span>
-                <span class="ctx-row"><span>Tokens</span><span>{workCtx.used.toLocaleString()}</span></span>
-                <span class="ctx-row"><span>Spent</span><span data-testid="ctx-spent">${workSpent.toFixed(2)}</span></span>
-              </span>
-            </span>
-          {/if}
-          </span>
-        </div>
+        <WorkHeader
+          workspace={activeChat.workspace}
+          {workPathCopied}
+          onCopyPath={copyWorkPath}
+          {workEngineInfo}
+          {workEngineLabel}
+          {workEngineShort}
+          {workAccountLabel}
+          {sessionEngineMissing}
+          {workEngineList}
+          {workEngines}
+          {usageHoverEngine}
+          usageStore={usage.usageStore}
+          usageFetching={usage.usageFetching}
+          usageNow={usage.usageNow}
+          onPrimeUsage={usage.primeUsageHover}
+          onOpenUsage={() => void usage.openUsageModal()}
+          onRefreshUsage={(engine) => void usage.fetchUsageEngine(engine, { force: true })}
+          {workCtx}
+          {workSpent}
+        />
       {/if}
       <div
         class="messages"
@@ -11278,13 +8375,13 @@
               class="icon-btn mcp-btn"
               data-testid="mcp-btn"
               aria-label="MCP servers"
-              title={mcpEnabledCount ? `MCP servers (${mcpEnabledCount} enabled)` : "MCP servers"}
-              aria-pressed={mcpOpen}
-              onclick={openMcpPopup}
+              title={mcp.mcpEnabledCount ? `MCP servers (${mcp.mcpEnabledCount} enabled)` : "MCP servers"}
+              aria-pressed={mcp.mcpOpen}
+              onclick={mcp.openMcpPopup}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
-              {#if mcpEnabledCount}
-                <span class="mcp-dot" data-testid="mcp-dot">{mcpEnabledCount}</span>
+              {#if mcp.mcpEnabledCount}
+                <span class="mcp-dot" data-testid="mcp-dot">{mcp.mcpEnabledCount}</span>
               {/if}
             </button>
             <button
@@ -11555,7 +8652,7 @@
                         {#if choice.sub}<span class="model-opt-id">{choice.sub}</span>{/if}
                       </button>
                       {#if choice.provider === "ollama" && !isCloudModel(choice.id)}
-                        {@const loaded = runningNames.has(choice.id)}
+                        {@const loaded = ollamaMgr.runningNames.has(choice.id)}
                         <button
                           class="model-mem-btn"
                           class:is-loaded={loaded}
@@ -11563,9 +8660,9 @@
                           data-name={choice.id}
                           title={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
                           aria-label={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
-                          disabled={modelOp !== null || pulling !== null}
-                          onclick={(e) => { e.stopPropagation(); void toggleModelLoaded(choice.id, loaded); }}
-                        ><span class="mem-ico" class:mem-spin={modelOp === choice.id}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
+                          disabled={ollamaMgr.modelOp !== null || ollamaMgr.pulling !== null}
+                          onclick={(e) => { e.stopPropagation(); void ollamaMgr.toggleModelLoaded(choice.id, loaded); }}
+                        ><span class="mem-ico" class:mem-spin={ollamaMgr.modelOp === choice.id}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
                       {/if}
                     </div>
                   {:else}
@@ -11626,49 +8723,49 @@
         </div>
       </div>
     </div>
-    {#if mcpOpen}
+    {#if mcp.mcpOpen}
       <McpPopup
-        bind:mcpOpen
-        bind:mcpView
-        bind:mcpQuery
-        bind:mcpSel
-        bind:mcpBuiltinSel
-        bind:mcpBuiltinError
-        bind:mcpSearchEl
-        {mcpShowForm}
-        bind:mcpForm
-        {mcpFormError}
-        {mcpConfirmDelete}
-        {mcpHasLogin}
-        {mcpSavingDefaults}
-        {mcpDefaultFeedback}
-        {mcpBusy}
-        {mcpServers}
-        {mcpFiltered}
-        {mcpLive}
-        {builtinShown}
-        bind:mcpPatFor
-        bind:mcpPatToken
-        {mcpPatError}
-        {findMcpServer}
-        {builtinInstalled}
-        {builtinStatus}
-        {builtinPrimary}
-        {mcpIsBusy}
-        {mcpMoveSel}
-        {mcpActivateSelected}
-        {mcpStatusOf}
-        {toggleMcpServer}
-        {signInMcpServer}
-        {openMcpForm}
-        {closeMcpForm}
-        {saveMcpForm}
-        {deleteMcpServerEntry}
-        {signOutMcp}
-        {setMcpDefaults}
-        {refreshMcpTools}
+        bind:mcpOpen={mcp.mcpOpen}
+        bind:mcpView={mcp.mcpView}
+        bind:mcpQuery={mcp.mcpQuery}
+        bind:mcpSel={mcp.mcpSel}
+        bind:mcpBuiltinSel={mcp.mcpBuiltinSel}
+        bind:mcpBuiltinError={mcp.mcpBuiltinError}
+        bind:mcpSearchEl={mcp.mcpSearchEl}
+        mcpShowForm={mcp.mcpShowForm}
+        bind:mcpForm={mcp.mcpForm}
+        mcpFormError={mcp.mcpFormError}
+        mcpConfirmDelete={mcp.mcpConfirmDelete}
+        mcpHasLogin={mcp.mcpHasLogin}
+        mcpSavingDefaults={mcp.mcpSavingDefaults}
+        mcpDefaultFeedback={mcp.mcpDefaultFeedback}
+        mcpBusy={mcp.mcpBusy}
+        mcpServers={mcp.mcpServers}
+        mcpFiltered={mcp.mcpFiltered}
+        mcpLive={mcp.mcpLive}
+        builtinShown={mcp.builtinShown}
+        bind:mcpPatFor={mcp.mcpPatFor}
+        bind:mcpPatToken={mcp.mcpPatToken}
+        mcpPatError={mcp.mcpPatError}
+        findMcpServer={mcp.findMcpServer}
+        builtinInstalled={mcp.builtinInstalled}
+        builtinStatus={mcp.builtinStatus}
+        builtinPrimary={mcp.builtinPrimary}
+        mcpIsBusy={mcp.mcpIsBusy}
+        mcpMoveSel={mcp.mcpMoveSel}
+        mcpActivateSelected={mcp.mcpActivateSelected}
+        mcpStatusOf={mcp.mcpStatusOf}
+        toggleMcpServer={mcp.toggleMcpServer}
+        signInMcpServer={mcp.signInMcpServer}
+        openMcpForm={mcp.openMcpForm}
+        closeMcpForm={mcp.closeMcpForm}
+        saveMcpForm={mcp.saveMcpForm}
+        deleteMcpServerEntry={mcp.deleteMcpServerEntry}
+        signOutMcp={mcp.signOutMcp}
+        setMcpDefaults={mcp.setMcpDefaults}
+        refreshMcpTools={mcp.refreshMcpTools}
         {openTokenPage}
-        {savePatAndConnect}
+        savePatAndConnect={mcp.savePatAndConnect}
       />
     {/if}
   </main>
@@ -11694,17 +8791,17 @@
       {pluginPanels}
       {gitRefreshTick}
       {onServer}
-      {browserTabVisible}
-      {browserStarting}
-      {browserKillArmed}
-      {browserDaemon}
-      {browserProxyUrl}
-      {browserFrameRev}
-      {browserFrameSrc}
-      {browserStartDisplay}
-      {browserDownload}
-      {browserStartSeconds}
-      {browserError}
+      browserTabVisible={browser.browserTabVisible}
+      browserStarting={browser.browserStarting}
+      browserKillArmed={browser.browserKillArmed}
+      browserDaemon={browser.browserDaemon}
+      browserProxyUrl={browser.browserProxyUrl}
+      browserFrameRev={browser.browserFrameRev}
+      browserFrameSrc={browser.browserFrameSrc}
+      browserStartDisplay={browser.browserStartDisplay}
+      browserDownload={browser.browserDownload}
+      browserStartSeconds={browser.browserStartSeconds}
+      browserError={browser.browserError}
       {expNotice}
       {displayWorkspace}
       {formatSize}
@@ -11713,11 +8810,11 @@
       onExpResizeKey={onExpResizeKey}
       onSwitchSideTab={switchSideTab}
       onCloseSideTab={closeSideTab}
-      onRestartBrowserFromButton={restartBrowserFromButton}
-      onRestartBrowserDaemon={restartBrowserDaemon}
-      onEnsureBrowserDaemon={ensureBrowserDaemon}
+      onRestartBrowserFromButton={browser.restartBrowserFromButton}
+      onRestartBrowserDaemon={browser.restartBrowserDaemon}
+      onEnsureBrowserDaemon={browser.ensureBrowserDaemon}
       onOpenSideExplorer={openSideExplorer}
-      onOpenSideTerminal={openSideTerminal}
+      onOpenSideTerminal={terminals.openSideTerminal}
       onOpenSideBrowser={openSideBrowser}
       onOpenSideGit={openSideGit}
       onOpenSidePanel={openSidePanel}
@@ -11731,23 +8828,23 @@
     />
   {/if}
 </div>
-{#if termCtx}
+{#if terminals.termCtx}
   <button
     class="ctx-backdrop"
     data-testid="terminal-menu-backdrop"
     aria-label="Close terminal menu"
-    onclick={() => (termCtx = null)}
+    onclick={() => (terminals.termCtx = null)}
     oncontextmenu={(e) => {
       e.preventDefault();
-      termCtx = null;
+      terminals.termCtx = null;
     }}
     tabindex="-1"
   ></button>
-  <div class="ctx-menu" data-testid="terminal-menu" style="left: {termCtx.x}px; top: {termCtx.y}px;">
-    <button class="ctx-item" data-testid="terminal-copy" disabled={!termCtx.sel} onclick={() => termMenu("copy")}>Copy</button>
-    <button class="ctx-item" data-testid="terminal-paste" onclick={() => termMenu("paste")}>Paste</button>
-    <button class="ctx-item" data-testid="terminal-select-all" onclick={() => termMenu("selectAll")}>Select All</button>
-    <button class="ctx-item" data-testid="terminal-clear" onclick={() => termMenu("clear")}>Clear</button>
+  <div class="ctx-menu" data-testid="terminal-menu" style="left: {terminals.termCtx.x}px; top: {terminals.termCtx.y}px;">
+    <button class="ctx-item" data-testid="terminal-copy" disabled={!terminals.termCtx.sel} onclick={() => terminals.termMenu("copy")}>Copy</button>
+    <button class="ctx-item" data-testid="terminal-paste" onclick={() => terminals.termMenu("paste")}>Paste</button>
+    <button class="ctx-item" data-testid="terminal-select-all" onclick={() => terminals.termMenu("selectAll")}>Select All</button>
+    <button class="ctx-item" data-testid="terminal-clear" onclick={() => terminals.termMenu("clear")}>Clear</button>
   </div>
 {/if}
 {#if expCtx}
@@ -11789,16 +8886,16 @@
     {/if}
   </div>
 {/if}
-{#if showUpdatePrompt && availableAppUpdate}
+{#if appUpdate.showUpdatePrompt && appUpdate.availableAppUpdate}
   <UpdatePromptModal
-    {availableAppUpdate}
-    {appUpdateStatus}
-    {appUpdateError}
-    downloadProgress={appUpdateProgress}
-    onInstall={appUpdateStatus === "installed" ? restartToApplyUpdate : installAppUpdate}
-    onSkipVersion={skipAvailableAppUpdateVersion}
-    onRemindLater={remindAboutAppUpdateLater}
-    onClose={remindAboutAppUpdateLater}
+    availableAppUpdate={appUpdate.availableAppUpdate}
+    appUpdateStatus={appUpdate.appUpdateStatus}
+    appUpdateError={appUpdate.appUpdateError}
+    downloadProgress={appUpdate.appUpdateProgress}
+    onInstall={appUpdate.appUpdateStatus === "installed" ? appUpdate.restartToApplyUpdate : appUpdate.installAppUpdate}
+    onSkipVersion={appUpdate.skipAvailableAppUpdateVersion}
+    onRemindLater={appUpdate.remindAboutAppUpdateLater}
+    onClose={appUpdate.remindAboutAppUpdateLater}
   />
 {/if}
 {#if lightboxSrc}
@@ -11814,7 +8911,7 @@
 {#if folderPicker}
   <FolderPickerModal
     start={folderPicker.start}
-    where={onServer ? srvLabel : ""}
+    where={onServer ? srv.srvLabel : ""}
     pickError={folderPickError}
     onPick={onFolderPicked}
     onClose={() => (folderPicker = null)}
@@ -11829,73 +8926,66 @@
       // read the id BEFORE clearing: `lp` is a derived of leadPrompt and goes null with it
       const id = lp.id;
       leadPrompt = null;
-      void toggleLead(id).then(refreshTelegramStatus);
+      void toggleLead(id).then(bridges.refreshTelegramStatus);
     } }}
-    onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
+    onClose={() => { leadPrompt = null; void bridges.refreshTelegramStatus(); }}
   />
 {/if}
 {#if permissionsFor}
   {@const permChat = chats.find((c) => c.id === permissionsFor)}
   {#if permChat}
-    <button class="confirm-backdrop" data-testid="permissions-backdrop" aria-label="Close permissions" onclick={() => (permissionsFor = null)} tabindex="-1"></button>
-      <div class="confirm-card permissions-modal" role="dialog" aria-modal="true" aria-labelledby="permissions-title" data-testid="permissions-modal">
-        <button class="modal-x" aria-label="Close permissions" onclick={() => (permissionsFor = null)}>×</button>
-        <h2 id="permissions-title">Permissions · {permChat.title}</h2>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-read" checked={sessionPermissions(permChat).read} disabled={permissionBusy} onchange={(e) => void setSessionPermission("read", e.currentTarget.checked)} /><span><b>Read other sessions</b><small>Read another session’s history or state.</small></span></label>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-message" checked={sessionPermissions(permChat).message} disabled={permissionBusy} onchange={(e) => void setSessionPermission("message", e.currentTarget.checked)} /><span><b>Message other sessions</b><small>Send messages to other sessions and start turns.</small></span></label>
-        <label class="permission-row"><input type="checkbox" data-testid="permission-remote" checked={sessionPermissions(permChat).remote} disabled={permissionBusy} onchange={(e) => void setSessionPermission("remote", e.currentTarget.checked)} /><span><b>Use sessions on other servers</b><small>List, read, search, and (with Message other sessions) message sessions on servers saved on this machine. As the lead, also start, stop and archive sessions there{permChat.role === "lead" ? "" : " (creating/stopping/archiving needs the lead)"}.</small></span></label>
-      </div>
+    <PermissionsModal chat={permChat} busy={permissionBusy} onSet={setSessionPermission} onClose={() => (permissionsFor = null)} />
   {/if}
 {/if}
-{#if telegramFor}
+{#if bridges.telegramFor}
   <TelegramModal
-    sessionId={telegramFor}
-    sessionTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""}
-    allStatuses={telegramStatuses}
+    sessionId={bridges.telegramFor}
+    sessionTitle={chats.find((c) => c.id === bridges.telegramFor)?.title ?? ""}
+    allStatuses={bridges.telegramStatuses}
     sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
-    onSelectSession={(id) => { telegramFor = id; void refreshTelegramStatus(); }}
-    onClose={() => { telegramFor = null; void refreshTelegramStatus(); }}
+    onSelectSession={(id) => { bridges.telegramFor = id; void bridges.refreshTelegramStatus(); }}
+    onClose={() => { bridges.telegramFor = null; void bridges.refreshTelegramStatus(); }}
   />
 {/if}
-{#if bridgeModal}
-  {@const activeBridgePlugin = bridgePlugins.find((p) => p.id === bridgeModal!.pluginId)}
+{#if bridges.bridgeModal}
+  {@const activeBridgePlugin = bridges.bridgePlugins.find((p) => p.id === bridges.bridgeModal!.pluginId)}
   {#if activeBridgePlugin}
     <BridgeModal
       plugin={activeBridgePlugin}
-      sessionId={bridgeModal.sessionId}
-      sessionTitle={chats.find((c) => c.id === bridgeModal!.sessionId)?.title ?? ""}
-      allStatuses={bridgeStatuses[activeBridgePlugin.id] ?? {}}
+      sessionId={bridges.bridgeModal.sessionId}
+      sessionTitle={chats.find((c) => c.id === bridges.bridgeModal!.sessionId)?.title ?? ""}
+      allStatuses={bridges.bridgeStatuses[activeBridgePlugin.id] ?? {}}
       sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
-      onSelectSession={(id) => { bridgeModal = { pluginId: activeBridgePlugin.id, sessionId: id }; void refreshBridgeStatuses(); }}
-      onClose={() => { bridgeModal = null; void refreshBridgeStatuses(); }}
+      onSelectSession={(id) => { bridges.bridgeModal = { pluginId: activeBridgePlugin.id, sessionId: id }; void bridges.refreshBridgeStatuses(); }}
+      onClose={() => { bridges.bridgeModal = null; void bridges.refreshBridgeStatuses(); }}
     />
   {/if}
 {/if}
-{#if srvDialogOpen}
+{#if srv.srvDialogOpen}
   <ServerDialogModal
-    bind:srvUrlDraft
-    bind:srvTokenDraft
-    bind:srvNameDraft
-    bind:srvNameTouched
-    {srvBusy}
-    {srvErr}
-    {srvList}
-    {srvEditingId}
-    bind:srvEditDraft
-    {srvRenaming}
-    {srvCopied}
-    {srvCmdCopied}
+    bind:srvUrlDraft={srv.srvUrlDraft}
+    bind:srvTokenDraft={srv.srvTokenDraft}
+    bind:srvNameDraft={srv.srvNameDraft}
+    bind:srvNameTouched={srv.srvNameTouched}
+    srvBusy={srv.srvBusy}
+    srvErr={srv.srvErr}
+    srvList={srv.srvList}
+    srvEditingId={srv.srvEditingId}
+    bind:srvEditDraft={srv.srvEditDraft}
+    srvRenaming={srv.srvRenaming}
+    srvCopied={srv.srvCopied}
+    srvCmdCopied={srv.srvCmdCopied}
     setupCmd={SERVER_SETUP_CMD}
     {defaultServerName}
-    onClose={() => (srvDialogOpen = false)}
-    onSubmit={() => void submitServer()}
-    onFillRecent={fillRecentServer}
-    onStartRename={startRenameServer}
-    onSaveRename={() => void saveRenameServer()}
-    onCancelRename={cancelRenameServer}
-    onCopyUrl={(url) => void copyServerUrl(url)}
-    onForget={(id) => void forgetServer(id)}
-    onCopySetup={() => void copyServerSetup()}
+    onClose={() => (srv.srvDialogOpen = false)}
+    onSubmit={() => void srv.submitServer()}
+    onFillRecent={srv.fillRecentServer}
+    onStartRename={srv.startRenameServer}
+    onSaveRename={() => void srv.saveRenameServer()}
+    onCancelRename={srv.cancelRenameServer}
+    onCopyUrl={(url) => void srv.copyServerUrl(url)}
+    onForget={(id) => void srv.forgetServer(id)}
+    onCopySetup={() => void srv.copyServerSetup()}
   />
 {/if}
 <ConfirmModals
@@ -11911,19 +9001,19 @@
   onCancelSaveConfirm={cancelSaveConfirm}
   onConfirmSaveHere={confirmSaveHere}
 />
-{#if usageOpen}
+{#if usage.usageOpen}
   <UsageModal
     {workEngines}
     {workEngineList}
-    {usageEngine}
-    {usageReport}
-    {usageUpdatedAt}
-    {usageNow}
-    {usageLoading}
-    {usageError}
-    onClose={closeUsageModal}
-    onSelectTab={selectUsageTab}
-    onRefresh={(eng) => void fetchUsageEngine(eng, { force: true })}
+    usageEngine={usage.usageEngine}
+    usageReport={usage.usageReport}
+    usageUpdatedAt={usage.usageUpdatedAt}
+    usageNow={usage.usageNow}
+    usageLoading={usage.usageLoading}
+    usageError={usage.usageError}
+    onClose={usage.closeUsageModal}
+    onSelectTab={usage.selectUsageTab}
+    onRefresh={(eng) => void usage.fetchUsageEngine(eng, { force: true })}
     onOpenExternal={(url) => void openExternal(url)}
   />
 {/if}
@@ -11944,24 +9034,24 @@
   onConfirmCustom={() => void confirmScheduleCustom()}
   onQuitAnyway={() => void quitVicuna(true)}
 />
-{#if gotoOpen}
+{#if palette.gotoOpen}
   <GotoPaletteModal
-    bind:gotoInput
-    bind:gotoSel
-    {gotoError}
-    {searchQuery}
-    {searchItems}
-    {searchShowHosts}
-    {srvLabel}
-    {remoteSearching}
-    {localServerSearching}
-    {remoteFailures}
-    {remoteNotices}
+    bind:gotoInput={palette.gotoInput}
+    bind:gotoSel={palette.gotoSel}
+    gotoError={palette.gotoError}
+    searchQuery={palette.searchQuery}
+    searchItems={palette.searchItems}
+    searchShowHosts={palette.searchShowHosts}
+    srvLabel={srv.srvLabel}
+    remoteSearching={palette.remoteSearching}
+    localServerSearching={palette.localServerSearching}
+    remoteFailures={palette.remoteFailures}
+    remoteNotices={palette.remoteNotices}
     {searchSnippet}
     {highlightHtml}
-    onClose={closeGoto}
-    onKeyDown={onSearchKey}
-    onOpenItem={openSearchItem}
+    onClose={palette.closeGoto}
+    onKeyDown={palette.onSearchKey}
+    onOpenItem={palette.openSearchItem}
     onPrefetchChat={(chat) => void ensureChatFull(chat, { silent: true })}
   />
 {/if}
@@ -11970,17 +9060,17 @@
     bind:settingsOpen
     bind:settingsTab
     {buildInfo}
-    bind:appUpdateStatus
-    bind:appUpdateError
-    {appUpdateLabel}
-    {showUpdatePrompt}
-    {autoCheckAppUpdatesEnabled}
+    bind:appUpdateStatus={appUpdate.appUpdateStatus}
+    bind:appUpdateError={appUpdate.appUpdateError}
+    appUpdateLabel={appUpdate.appUpdateLabel}
+    showUpdatePrompt={appUpdate.showUpdatePrompt}
+    autoCheckAppUpdatesEnabled={appUpdate.autoCheckAppUpdatesEnabled}
     {updateOp}
     {updateRelease}
     {updateNote}
     bind:updateError
-    onOpenAppUpdate={openAppUpdate}
-    onSetAutoCheckAppUpdates={setAutoCheckAppUpdates}
+    onOpenAppUpdate={appUpdate.openAppUpdate}
+    onSetAutoCheckAppUpdates={appUpdate.setAutoCheckAppUpdates}
     onCheckForUpdates={checkForUpdates}
     onApplyUpdate={applyUpdate}
     onOpenExternal={openExternal}
@@ -12006,7 +9096,7 @@
     onQuitVicuna={quitVicuna}
     {workEngineInfo}
     {workEngineLabel}
-    {browserDaemon}
+    browserDaemon={browser.browserDaemon}
     onRefreshWorkEngine={refreshWorkEngine}
     onPickWorkEngine={pickWorkEngine}
     onToggleWorkApproval={toggleWorkApproval}
@@ -12015,101 +9105,87 @@
     bind:stopWordsText
     onSetContinueMode={setContinueMode}
     onSetStopWords={setStopWords}
-    {ollamaVersion}
-    {serverChecking}
-    {serverOp}
-    {serverError}
+    ollamaVersion={ollamaMgr.ollamaVersion}
+    serverChecking={ollamaMgr.serverChecking}
+    serverOp={ollamaMgr.serverOp}
+    serverError={ollamaMgr.serverError}
     {serverChatTurns}
     bind:ollamaBase
-    bind:browseView
-    {runnersError}
-    {sortedManageModels}
-    {runners}
+    bind:browseView={ollamaMgr.browseView}
+    runnersError={ollamaMgr.runnersError}
+    sortedManageModels={ollamaMgr.sortedManageModels}
+    runners={ollamaMgr.runners}
     {selectedModel}
-    {modelOp}
-    {pulling}
-    bind:confirmDeleteModel
-    bind:pullName
-    {pullStatus}
-    {pullDone}
-    {pullTotal}
-    {pullRate}
-    bind:browseQuery
-    bind:browseCat
+    modelOp={ollamaMgr.modelOp}
+    pulling={ollamaMgr.pulling}
+    bind:confirmDeleteModel={ollamaMgr.confirmDeleteModel}
+    bind:pullName={ollamaMgr.pullName}
+    pullStatus={ollamaMgr.pullStatus}
+    pullDone={ollamaMgr.pullDone}
+    pullTotal={ollamaMgr.pullTotal}
+    pullRate={ollamaMgr.pullRate}
+    bind:browseQuery={ollamaMgr.browseQuery}
+    bind:browseCat={ollamaMgr.browseCat}
     browseCats={BROWSE_CATS}
-    {filteredCatalog}
-    {catalog}
-    {catalogUpdated}
-    {fetching}
-    {catalogError}
+    filteredCatalog={ollamaMgr.filteredCatalog}
+    catalog={ollamaMgr.catalog}
+    catalogUpdated={ollamaMgr.catalogUpdated}
+    fetching={ollamaMgr.fetching}
+    catalogError={ollamaMgr.catalogError}
     {models}
-    bind:variantPick
+    bind:variantPick={ollamaMgr.variantPick}
     onOpenModelsTab={openModelsTab}
-    onStartServerFlow={startServerFlow}
-    onStopServerFlow={stopServerFlow}
+    onStartServerFlow={ollamaMgr.startServerFlow}
+    onStopServerFlow={ollamaMgr.stopServerFlow}
     onSetOllamaHost={setOllamaHost}
-    onToggleModelLoaded={toggleModelLoaded}
-    onRequestDeleteModel={requestDeleteModel}
-    onSubmitPull={submitPull}
-    onSubmitPullName={submitPullName}
-    onCancelPull={cancelPull}
-    onFetchCatalog={fetchCatalog}
+    onToggleModelLoaded={ollamaMgr.toggleModelLoaded}
+    onRequestDeleteModel={ollamaMgr.requestDeleteModel}
+    onSubmitPull={ollamaMgr.submitPull}
+    onSubmitPullName={ollamaMgr.submitPullName}
+    onCancelPull={ollamaMgr.cancelPull}
+    onFetchCatalog={ollamaMgr.fetchCatalog}
     {formatPullRate}
     {isMlxVariant}
-    {pickedVariant}
-    {openrouterKey}
-    {openrouterKeyBusy}
-    {openrouterKeyInfo}
-    bind:openrouterKeyEditing
-    bind:openrouterKeyVisible
-    bind:openrouterKeyDraft
-    {openrouterKeyDirty}
-    {openrouterKeyError}
-    bind:openrouterQuery
-    bind:openrouterCat
-    {openrouterLoading}
-    {openrouterModels}
-    {openrouterBrowsing}
-    {filteredOpenRouterModels}
-    {openrouterUpdated}
-    {openrouterError}
-    {openrouterAddedSet}
+    pickedVariant={ollamaMgr.pickedVariant}
+    openrouterKey={openrouter.openrouterKey}
+    openrouterKeyBusy={openrouter.openrouterKeyBusy}
+    openrouterKeyInfo={openrouter.openrouterKeyInfo}
+    bind:openrouterKeyEditing={openrouter.openrouterKeyEditing}
+    bind:openrouterKeyVisible={openrouter.openrouterKeyVisible}
+    bind:openrouterKeyDraft={openrouter.openrouterKeyDraft}
+    openrouterKeyDirty={openrouter.openrouterKeyDirty}
+    openrouterKeyError={openrouter.openrouterKeyError}
+    bind:openrouterQuery={openrouter.openrouterQuery}
+    bind:openrouterCat={openrouter.openrouterCat}
+    openrouterLoading={openrouter.openrouterLoading}
+    openrouterModels={openrouter.openrouterModels}
+    openrouterBrowsing={openrouter.openrouterBrowsing}
+    filteredOpenRouterModels={openrouter.filteredOpenRouterModels}
+    openrouterUpdated={openrouter.openrouterUpdated}
+    openrouterError={openrouter.openrouterError}
+    openrouterAddedSet={openrouter.openrouterAddedSet}
     {openRouterUsageText}
-    onOpenOpenRouterTab={openOpenRouterTab}
-    onVerifyOpenRouterKey={verifyOpenRouterKey}
-    onClearOpenRouterKey={clearOpenRouterKey}
-    onSaveOpenRouterKey={saveOpenRouterKey}
-    onFetchOpenRouterCatalog={fetchOpenRouterCatalog}
-    onToggleOpenRouterAdded={toggleOpenRouterAdded}
+    onOpenOpenRouterTab={openrouter.openOpenRouterTab}
+    onVerifyOpenRouterKey={openrouter.verifyOpenRouterKey}
+    onClearOpenRouterKey={openrouter.clearOpenRouterKey}
+    onSaveOpenRouterKey={openrouter.saveOpenRouterKey}
+    onFetchOpenRouterCatalog={openrouter.fetchOpenRouterCatalog}
+    onToggleOpenRouterAdded={openrouter.toggleOpenRouterAdded}
   />
 {/if}
 {#if clearContextChatId}
-  <button class="confirm-backdrop" data-testid="clear-context-backdrop" aria-label="Cancel clear context" onclick={() => (clearContextChatId = null)} tabindex="-1"></button>
-  <div class="confirm-card" data-testid="clear-context-modal" role="dialog" aria-modal="true" aria-label="Clear context">
-    <p class="confirm-text">Clear context?</p>
-    <p class="confirm-copy">The agent starts fresh from here. Earlier messages stay visible above the line but are no longer sent to the model.</p>
-    <div class="confirm-actions"><button class="confirm-cancel" onclick={() => (clearContextChatId = null)}>Cancel</button><button class="confirm-ok" data-testid="confirm-clear-context" onclick={() => void clearContextSession()}>Clear</button></div>
-  </div>
+  <ClearContextModal onCancel={() => (clearContextChatId = null)} onConfirm={() => void clearContextSession()} />
 {/if}
 {#if pluginsOpen}
-  <button
-    class="confirm-backdrop"
-    data-testid="plugins-backdrop"
-    aria-label="Close plugins"
-    onclick={() => (pluginsOpen = false)}
-    tabindex="-1"
-  ></button>
-  <div
-    class="confirm-card settings-card"
-    data-testid="plugins-modal"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Plugins"
-  >
-    <button class="modal-x" data-testid="close-plugins-btn" aria-label="Close plugins" onclick={() => (pluginsOpen = false)}>×</button>
-    <p class="confirm-text">Plugins</p>
-    <PluginsPanel {plugins} activeThemeKey={pluginTheme?.key ?? null} onChanged={onPluginsChanged} onHarnessesChanged={() => void refreshWorkEngine()} onUseTheme={usePluginTheme} onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }} />
-  </div>
+  <PluginsModal
+    {plugins}
+    activeThemeKey={pluginTheme?.key ?? null}
+    onChanged={onPluginsChanged}
+    onHarnessesChanged={() => void refreshWorkEngine()}
+    onUseTheme={usePluginTheme}
+    onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }}
+    onClose={() => (pluginsOpen = false)}
+  />
 {/if}
 {/if}
 
@@ -12149,56 +9225,6 @@
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
-  .confirm-card.permissions-modal { top: 50%; width: min(520px, calc(100vw - 48px)); padding: 24px; border: 1px solid var(--border); border-radius: 18px; background: var(--card); }
-  .confirm-card.permissions-modal h2 { margin: 0 36px 22px 0; font-size: 18px; }
-  .permission-row { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); cursor: pointer; }
-  .permission-row input { margin-top: 3px; accent-color: var(--accent); }
-  .permission-row span { display: grid; gap: 4px; }
-  .permission-row small { color: var(--muted); }
-  :global(html) { color-scheme: light; }
-  :global(html[data-theme="dark"]) { color-scheme: dark; }
-  :global(:root) {
-    --bg: #ffffff; --text: #111111; --text-dim: #333333;
-    --muted: #9a9a9a; --muted-2: #8a8a8a; --faint: #aaaaaa;
-    --hover: #f0f0f0; --hover-2: #ececec; --hover-3: #f2f2f3;
-    --active-item: #efefef; --item-bg: #f4f4f5; --composer: #f4f4f5;
-    --card: #ffffff; --border: #ececec; --border-2: #e2e2e2; --border-3: #e5e5e5;
-    --border-strong: #c9c9c9; --input-border: #dddddd;
-    --bubble-user: #efefef; --chip: #eeeeee;
-    --icon: #555555; --icon-dim: #909090;
-    --thinking: #7a7a7a; --link: #0b57d0; --link-hover: #084298;
-    --danger: #b3261e; --err-text: #b3261e; --err-bg: #fdecea;
-    --code-bg: #f4f4f5; --code-inline: #f0f0f0;
-    --code-keyword: #d73a49; --code-string: #032f62; --code-comment: #6a737d;
-    --code-number: #005cc5; --code-title: #6f42c1; --code-builtin: #005cc5;
-    --code-literal: #005cc5; --code-attr: #6f42c1;
-    --send-disabled: #d9d9de;
-    --cancel-bg: #ececf1; --cancel-hover: #e0e0e6;
-    --ok: #1a7f37;
-    --pink: #d63384;
-    --accent: #ef6c00; --accent-hover: #d96000; --accent-fg: #ffffff;
-  }
-  :global(html[data-theme="dark"]) {
-    --bg: #3d3332; --text: #ece4e0; --text-dim: #b3a6a3;
-    --muted: #b3a6a3; --muted-2: #a39592; --faint: #8e7f7c;
-    --hover: #5d4f4d; --hover-2: #5d4f4d; --hover-3: #5d4f4d;
-    --active-item: #5d4f4d; --item-bg: #4e4442; --composer: #4e4442;
-    --card: #4e4442; --border: #665b58; --border-2: #756866; --border-3: #756866;
-    --border-strong: #756866; --input-border: #756866;
-    --bubble-user: #5d4f4d; --chip: #5d4f4d;
-    --icon: #b3a6a3; --icon-dim: #a39592;
-    --thinking: #b3a6a3; --link: #7ed491; --link-hover: #a2e1af;
-    --danger: #ff8a80; --err-text: #ffb4a9; --err-bg: #4a1f1a;
-    --code-bg: #4e4442; --code-inline: #5d4f4d;
-    --code-keyword: #ff7b72; --code-string: #a5d6ff; --code-comment: #8b949e;
-    --code-number: #79c0ff; --code-title: #d2a8ff; --code-builtin: #79c0ff;
-    --code-literal: #79c0ff; --code-attr: #7ee787;
-    --send-disabled: #665b58;
-    --cancel-bg: #5d4f4d; --cancel-hover: #665b58;
-    --ok: #7ed491;
-    --pink: #f472b6;
-  }
-  :global(html, body) { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }
   .app { display: flex; height: 100vh; background: var(--bg); -webkit-user-select: none; user-select: none; }
   /* native-app feel: chrome text isn't selectable; message content, code,
      thinking, and every editable field opt back in below */
@@ -12246,90 +9272,24 @@
   .history { overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 2px; }
   .pinned-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .group-label { font-size: 12px; color: var(--muted); margin: 12px 4px 6px 4px; }
-  .chat-item { display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box; min-width: 0; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
-  .chat-item:hover { background: var(--hover-3); }
-  .chat-item.active { background: var(--active-item); }
-  .chat-item.archived .title, .chat-item.archived .lead-badge { opacity: .55; }
-  .archived-badge { opacity: .75; }
   .archive-toggle { flex: none; display: inline-flex; align-items: center; gap: 3px; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 7px; font-size: 11px; color: var(--muted); cursor: pointer; }
   .archive-toggle:hover { background: var(--hover-2); }
   .archive-toggle.on { color: var(--accent); border-color: var(--accent); }
-  .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
-  .chat-item .work-badge { margin-left: 0; }
-  .chat-item.streaming { background: var(--hover-3); }
-  .chat-item.streaming.active { background: var(--active-item); }
-  .stream-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; animation: stream-pulse 1.2s ease-in-out infinite; }
   @keyframes stream-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
-  .live-elapsed { flex-shrink: 0; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
-  .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
-  .cli-oneliner { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; padding: 6px 8px; border: 1px solid var(--border-2); border-radius: 8px; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
   .srv-pick { position: relative; width: 100%; }
   .srv-btn { width: 100%; box-sizing: border-box; }
   .srv-btn .srv-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .srv-btn .srv-chev { flex: none; opacity: .6; }
   .srv-btn.remote { color: var(--accent); }
-  .srv-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; display: flex; flex-direction: column; min-width: 220px; }
-  .srv-menu-label { font-size: 12px; color: var(--muted); padding: 6px 10px 4px; }
-  .srv-item { display: flex; align-items: center; gap: 6px; border: none; background: transparent; text-align: left; font: inherit; font-size: 14px; padding: 8px 10px; border-radius: 10px; cursor: pointer; color: var(--text); }
-  .srv-item:hover { background: var(--hover-3); }
-  .srv-check { width: 16px; flex: none; color: var(--muted); text-align: center; }
-  .srv-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .srv-sep { height: 1px; background: var(--border); margin: 4px 6px; }
-  .srv-version { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 4px 10px; }
-  .srv-skew { font-size: 10.5px; font-weight: 600; color: var(--accent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
-  .srv-upgrade { color: var(--accent); }
-  .srv-spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: srv-spin 0.8s linear infinite; vertical-align: -1px; }
   @keyframes srv-spin { to { transform: rotate(360deg); } }
-  .srv-upgrade-prog { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-  .srv-upgrade-bar { display: block; height: 3px; border-radius: 2px; background: var(--hover-3, rgba(127,127,127,0.25)); overflow: hidden; }
-  .srv-upgrade-bar > span { display: block; height: 100%; background: var(--accent); transition: width 0.4s ease; }
-  .srv-upgrade-detail { font-size: 11px; color: var(--muted, inherit); opacity: 0.8; }
-  @media (prefers-reduced-motion: reduce) { .srv-spin { animation-duration: 2.4s; } }
   .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .srv-menu-rename-row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
-  .srv-menu-rename-input { flex: 1; min-width: 0; border: 1px solid var(--accent); border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 13px; background: transparent; color: var(--text); }
-  .srv-menu-rename-input:focus { outline: none; }
-  .srv-menu-rename-ok { flex: none; width: 28px; height: 28px; border: 1px solid var(--border-2); border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; }
-  .srv-menu-rename-ok:hover { background: var(--hover-3); }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
-  .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
-  .chat-item .work-badge.lead-badge { margin-right: auto; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
   .ctx-item.danger { color: var(--danger); }
-  .ctx-item.ctx-telegram { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
-  .ctx-sep { height: 1px; background: var(--border); margin: 4px 8px; }
-  .ctx-tg-label { flex: 1; min-width: 0; }
-  .ctx-tg-bot { font-size: 12px; color: var(--muted); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }
-  .ctx-tg-dot { flex: none; margin-left: auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
-  .ctx-tg-dot.connected { background: #22c55e; }
-  .ctx-tg-dot.disconnected { background: #ef4444; }
-  .ctx-tg-dot.unconfigured { background: transparent; border: 1.5px solid var(--muted-2); }
-  .tg-row-badge { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; color: #fff; line-height: 0; }
-  .tg-row-badge.connected { background: #2aabee; }
-  .tg-row-badge.disconnected { background: #ef4444; opacity: 0.85; }
-  .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
-  .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
-  .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
-  .ctx-ws-pill:hover { background: var(--hover-3); color: var(--text); border-color: var(--border-3); }
-  .ctx-ws-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ctx-ws-form { display: flex; flex-direction: column; gap: 6px; padding: 4px 8px 6px 8px; }
-  .ctx-ws-form .pull-input { width: 100%; box-sizing: border-box; }
-  .confirm-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 50; }
-  .confirm-card { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); z-index: 51; background: var(--card); border-radius: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.18); padding: 26px 26px 22px 26px; width: 340px; max-width: calc(100vw - 48px); box-sizing: border-box; }
-  .modal-x { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border: none; background: transparent; border-radius: 50%; cursor: pointer; color: var(--icon-dim); font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center; }
-  .modal-x:hover { background: var(--hover); color: var(--text); }
-  .confirm-text { font-size: 17px; font-weight: 700; line-height: 1.4; margin: 0 0 20px 0; color: var(--text); }
-  .confirm-actions { display: flex; gap: 10px; }
-  .confirm-copy { color: var(--muted); font-size: 13px; line-height: 1.5; margin: -10px 0 18px; }
-  .confirm-cancel { flex: 1; border: none; background: var(--cancel-bg); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--text); }
-  .confirm-cancel:hover { background: var(--cancel-hover); }
-  .confirm-ok { flex: 1; border: none; background: var(--accent); border-radius: 14px; padding: 10px 0; font-size: 15px; font-family: inherit; cursor: pointer; color: var(--accent-fg); }
-  .confirm-ok:hover { background: var(--accent-hover); }
   .empty-hint { color: var(--faint); font-size: 13px; padding: 0 8px; }
   .main { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; container-type: inline-size; }
   .stream-bar { position: relative; height: 3px; border-radius: 999px; overflow: hidden; margin: 0 4px 8px 4px; background: var(--border); pointer-events: none; }
@@ -12345,22 +9305,13 @@
   .queue-hint { font-size: 11.5px; color: var(--faint); }
   .esc-hint { position: absolute; right: 24px; bottom: 100%; margin-bottom: 6px; background: var(--card); border: 1px solid var(--border-3); border-radius: 10px; padding: 5px 10px; font-size: 12px; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 6; }
   .collapsed-rail { position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; width: 60px; padding: 10px 8px; box-sizing: border-box; z-index: 5; }
-  .collapsed-rail:has(.srv-menu) { z-index: 41; }
-  .collapsed-rail .srv-menu { left: 0; right: auto; width: 244px; }
+  .collapsed-rail:has(:global(.srv-menu)) { z-index: 41; }
+  .collapsed-rail :global(.srv-menu) { left: 0; right: auto; width: 244px; }
   .collapsed-rail-foot { display: flex; flex-direction: column; gap: 4px; }
   .collapsed-rail .icon-btn { width: 100%; padding: 4px 0; border-radius: 8px; }
   .srv-icon-btn { position: relative; }
   .srv-icon-btn.remote { color: var(--accent); }
   .srv-icon-btn .srv-dot { position: absolute; top: 3px; right: 9px; }
-  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
-  .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
-  .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
-  .suggest-card { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 14px 14px 18px; cursor: pointer; min-width: 0; }
-  .suggest-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); border-color: var(--accent); }
-  .suggest-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-  .suggest-title { font-size: 15px; font-weight: 650; color: var(--text); }
-  .suggest-sub { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .suggest-icon { flex-shrink: 0; width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: var(--accent-fg); display: flex; align-items: center; justify-content: center; }
   .messages { flex: 1; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; min-height: 0; min-width: 0; padding: 40px 24px 12px 24px; display: flex; flex-direction: column; gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
   .row { display: flex; }
   .user-row { justify-content: flex-end; }
@@ -12443,7 +9394,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } .mem-spin::after { animation: none; } .browser-restarting svg { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .mem-spin::after { animation: none; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -12681,32 +9632,16 @@
   .edit-save { background: var(--accent); color: var(--accent-fg); border: none; cursor: pointer; font-size: 13.5px; font-family: inherit; padding: 6px 18px; border-radius: 16px; }
   .edit-save:disabled { opacity: .5; cursor: default; }
   .side-footer { margin-top: auto; padding: 10px 4px 2px 4px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
-  .settings-card { width: 80vw; max-width: 900px; height: 80vh; max-height: 820px; top: 50%; display: flex; flex-direction: column; overflow-y: auto; }
   .mini-btn { border: 1px solid var(--border-strong); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; flex-shrink: 0; }
   .mini-btn:hover:not(:disabled) { background: var(--hover); }
   .mini-btn:disabled { opacity: .5; cursor: default; }
-  .mini-btn.primary { background: var(--accent); border-color: transparent; color: var(--accent-fg); }
-  .mini-btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
-  .mini-btn.danger { border-color: var(--danger); color: var(--danger); }
-  .mini-btn.danger:hover:not(:disabled) { background: var(--err-bg); }
   .pull-input { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 13px; font-family: inherit; padding: 6px 14px; }
   .pull-input:focus { outline: none; border-color: var(--accent); }
   .pull-input:disabled { opacity: .5; }
-  .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }
-  .seg-btn { border: none; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--text-dim); padding: 6px 16px; border-radius: 9px; }
-  .seg-btn.sel { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-  .or-id { font-size: 11.5px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mode-toggle { margin-bottom: 18px; }
-  .mode-toggle .seg-btn { min-width: 90px; }
-  .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
   .workspace-input { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .workspace-picker-drop { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
   .workspace-picker-label { font-size: 12px; color: var(--muted); }
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
-  .work-badge.engine-badge { display: inline-flex; align-items: center; gap: 4px; background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
-  .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
-  .engine-switch { display: flex; gap: 4px; padding: 8px 8px 0; }
-  .engine-switch.settings-engines { padding: 2px 0; flex-wrap: wrap; }
   .engine-select { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 2px; }
   .engine-select-btn, .engine-select-opt { display: flex; align-items: center; gap: 8px; width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 10px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; text-align: left; }
   .engine-select-btn span, .engine-select-opt span { flex: 1; min-width: 0; }
@@ -12740,49 +9675,9 @@
   .engine-signin-copy:hover { background: var(--hover); color: var(--text); }
   .engine-signin-copy.done { color: var(--accent); }
   .engine-select-check { color: var(--accent); }
-  .engine-opt { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 10px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
-  .engine-opt.sel { background: var(--hover); color: var(--text); border-color: var(--border-2); }
-  .engine-opt:disabled { opacity: .5; cursor: default; }
-  .engine-ico { flex: none; display: block; width: 14px; height: 14px; object-fit: contain; }
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
-  .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; min-width: 0; }
-  .chat-item .work-badge.ws-badge { flex-shrink: 1; font-weight: 500; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); padding: 1px 7px; }
-  .ws-badge svg { flex-shrink: 0; }
-  .ws-badge span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .work-banner { position: relative; z-index: 20; display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 6px 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
-  .work-banner .work-badge { margin-left: 0; }
-  .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
-  .ctx-wrap { position: relative; display: inline-flex; cursor: default; }
-  .usage-meter-btn { display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; background: none; cursor: pointer; }
-  .usage-meter-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 50%; }
-  .usage-hover { width: 320px; padding: 12px 16px; }
-  .usage-hover::before { content: ""; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
-  .usage-hover-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text); padding-bottom: 8px; }
-  .usage-hover-title { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .usage-hover-refresh { flex-shrink: 0; border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); border-radius: 6px; padding: 2px 7px; font: inherit; font-size: 11px; font-weight: 500; cursor: pointer; }
-  .usage-hover-refresh:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-  .usage-hover-refresh:disabled { opacity: .55; cursor: default; }
-  .usage-hover-row { display: block; padding: 6px 0; }
-  .usage-hover-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 13px; }
-  .usage-hover-label { color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  .usage-hover-val { white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0; color: var(--text); }
-  .usage-hover-bar { display: block; height: 4px; margin-top: 5px; border-radius: 2px; background: var(--border-2); overflow: hidden; }
-  .usage-hover-fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
-  .usage-hover-fill.ok { background: #16a34a; }
-  .usage-hover-fill.warn { background: #b45309; }
-  .usage-hover-fill.low { background: var(--danger); }
-  .usage-hover-reset { display: block; font-size: 11px; color: var(--muted-2); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .usage-hover-note { display: block; font-size: 12px; color: var(--muted-2); padding: 2px 0; max-width: 280px; }
-  .usage-hover-hint { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted-2); border-top: 1px solid var(--border-2); margin-top: 6px; padding-top: 6px; }
-  .usage-tone-ok { color: #15803d; }
-  .usage-tone-warn { color: #b45309; }
-  .usage-tone-low { color: var(--danger); }
-  .ctx-popup { display: none; position: absolute; right: 0; top: calc(100% + 8px); background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 10px 14px; z-index: 30; min-width: 170px; }
-  .ctx-wrap:hover .ctx-popup, .ctx-wrap:focus-within .ctx-popup { display: block; }
-  .ctx-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; color: var(--text); padding: 2px 0; font-variant-numeric: tabular-nums; }
-  .ctx-row span:first-child { color: var(--muted-2); }
   .compact-div { display: flex; align-items: center; gap: 12px; margin: 16px 0 10px; color: var(--muted-2); font-size: 12.5px; cursor: help; }
   .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--border-2); }
   .compact-div > span { white-space: nowrap; }
@@ -12794,19 +9689,6 @@
   .handoff-part { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
   .ws-handoff-chip { display: inline-flex; align-items: center; opacity: 0.85; }
   .handoff-sep { opacity: 0.5; }
-  .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .work-path-empty { font-size: 12px; color: var(--muted-2); }
-  .work-path-wrap { min-width: 0; max-width: min(260px, 50cqi); }
-  .work-path-btn { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; min-width: 0; padding: 2px 7px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted-2); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.4; cursor: pointer; transition: background .12s, color .12s, border-color .12s; }
-  .work-path-btn:hover, .work-path-btn:focus-visible { background: var(--hover); color: var(--text); border-color: var(--border); outline: none; }
-  .work-path-btn.copied { color: var(--accent); }
-  .work-path-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .work-path-popup { left: 0; right: auto; width: max-content; min-width: 200px; max-width: min(440px, calc(100vw - 48px), calc(100cqi - 110px)); padding: 10px 12px; }
-  .work-path-popup::before { content: ""; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
-  .work-path-popup-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
-  .work-path-popup-title { font-size: 11.5px; font-weight: 600; color: var(--muted-2); }
-  .work-path-copy-btn.copied { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-  .work-path-full { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.45; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; word-break: break-all; overflow-wrap: anywhere; user-select: text; cursor: text; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }
   .work-composer-bar .workspace-input { flex: 1; min-width: 0; }
@@ -12817,9 +9699,6 @@
   /* Narrow main column (small window OR side panels open): shift the Work
    * banner right so the collapsed-rail toggle can't overlap them.
    * Viewport media queries can't see panel-driven narrowing, hence @container. */
-  @container (max-width: 920px) {
-    .work-banner { padding-left: 60px; }
-  }
   /* The collapsed rail (60px, absolute) sits over the column: once the
    * centered 860px thread can't clear it ((w-860)/2 < 60), reserve its width
    * so the thread and composer never slide under the rail icons. */
@@ -12830,21 +9709,9 @@
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
     .composer-wrap { padding: 8px 12px 14px 12px; }
-    .suggest-grid { grid-template-columns: 1fr; }
-    .empty-title { font-size: 20px; margin-bottom: 20px; }
     .model-pill { max-width: 150px; }
     .model-drop { width: 330px; max-width: calc(100vw - 48px); }
   .collapsed-rail-foot { display: none; }
-    .work-banner { padding-left: 60px; }
     .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: 8px 0 30px rgba(0,0,0,.15); }
-    .explorer { position: fixed; right: 0; top: 0; bottom: 0; z-index: 60; background: var(--bg); box-shadow: -8px 0 30px rgba(0,0,0,.15); }
-    .confirm-card { width: calc(100vw - 32px); }
-    .settings-layout { flex-direction: column; }
-    .settings-nav { width: auto; flex-direction: row; align-items: center; gap: 6px; padding: 12px 44px 10px 14px; border-right: none; border-bottom: 1px solid var(--border); overflow-x: auto; }
-    .settings-nav-title, .settings-nav-label { display: none; }
-    .settings-nav-group { flex-direction: row; gap: 4px; flex-shrink: 0; }
-    .settings-nav-btn { width: auto; white-space: nowrap; padding: 6px 10px; font-size: 12.5px; }
-    .settings-pane-head { padding: 12px 16px 10px 16px; }
-    .settings-pane-body { padding: 14px 16px 18px 16px; }
   }
 </style>
