@@ -298,6 +298,25 @@ pub fn write_ask_to(path: &Path, ask: bool) -> Result<(), String> {
     update_prefs(path, "approval", json!(if ask { "ask" } else { "auto" }))
 }
 
+/// Follow-ups sent while a Work turn runs: true (default) = interrupt the
+/// running step and send now; false = queue until the agent finishes.
+/// Shared by windows, Telegram and bridge plugins.
+pub fn read_send_now_from(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("followUps").and_then(|a| a.as_str()).map(|a| a != "queue"))
+        .unwrap_or(true)
+}
+
+pub fn write_send_now_to(path: &Path, now: bool) -> Result<(), String> {
+    update_prefs(path, "followUps", json!(if now { "now" } else { "queue" }))
+}
+
+pub fn send_now_default() -> bool {
+    prefs_path().map_or(true, |p| read_send_now_from(&p))
+}
+
 pub fn approval_ask() -> bool {
     prefs_path().is_some_and(|p| read_ask_from(&p))
 }
@@ -435,6 +454,7 @@ async fn engines_info_for(requested: Option<Engine>) -> WorkEngineInfo {
         .expect("every engine has info");
     info.engines = summaries;
     info.ask_permission = approval_ask();
+    info.send_now = send_now_default();
     // Explain a removed saved account or an unavailable saved plugin.
     if saved.is_none() {
         if let Some(raw) = saved_engine_raw().filter(|r| r.starts_with(crate::agy_accounts::ENGINE_PREFIX)) {
@@ -516,6 +536,12 @@ pub async fn set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
     Ok(engines_info().await)
 }
 
+pub async fn set_send_now(now: bool) -> Result<WorkEngineInfo, String> {
+    let path = prefs_path().ok_or("cannot locate home folder")?;
+    write_send_now_to(&path, now)?;
+    Ok(engines_info().await)
+}
+
 pub fn set_model(engine: Option<&str>, model: Option<&str>) -> Result<(), String> {
     requested_engine(engine)?.save_model(model)
 }
@@ -538,6 +564,12 @@ pub async fn work_models(engine: Option<String>, acp: State<'_, crate::acp::AcpS
 #[tauri::command]
 pub async fn work_set_approval(ask: bool) -> Result<WorkEngineInfo, String> {
     set_approval(ask).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn work_set_send_now(send_now: bool) -> Result<WorkEngineInfo, String> {
+    set_send_now(send_now).await
 }
 
 #[cfg(feature = "desktop")]
@@ -621,5 +653,23 @@ mod tests {
         assert_eq!(read_engine_from(&p), Some(Engine::Claude));
         write_ask_to(&p, false).unwrap();
         assert!(!read_ask_from(&p));
+    }
+
+    #[test]
+    fn send_now_defaults_on_and_toggles() {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let p = base.join(format!("vicuna-sendnow-{n}")).join("work-engine.json");
+        // no file and a file without the key both mean "send now"
+        assert!(read_send_now_from(&p));
+        write_engine_to(&p, Engine::Claude).unwrap();
+        assert!(read_send_now_from(&p));
+        write_send_now_to(&p, false).unwrap();
+        assert!(!read_send_now_from(&p));
+        write_ask_to(&p, true).unwrap();
+        assert!(!read_send_now_from(&p), "other prefs keep the choice");
+        write_send_now_to(&p, true).unwrap();
+        assert!(read_send_now_from(&p));
+        assert!(read_ask_from(&p));
     }
 }

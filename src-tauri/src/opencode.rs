@@ -167,6 +167,14 @@ pub struct WorkEngineInfo {
     /// Tool approval mode: true = ask the user, false = auto-approve.
     #[serde(default)]
     pub ask_permission: bool,
+    /// Follow-ups sent while a turn runs interrupt it and go now (default);
+    /// false = they queue until the agent finishes.
+    #[serde(default = "default_true")]
+    pub send_now: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -203,6 +211,7 @@ pub fn not_installed_info() -> WorkEngineInfo {
         others: Vec::new(),
         warning: None,
         ask_permission: false,
+        send_now: true,
     }
 }
 

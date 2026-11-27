@@ -534,6 +534,26 @@ export async function setWorkApproval(ask: boolean): Promise<WorkEngineInfo> {
   return await invokeCmd<WorkEngineInfo>("work_set_approval", { ask });
 }
 
+/** Follow-ups while a turn runs: true = interrupt and send now (default),
+ *  false = queue until the agent finishes. Applies to windows, Telegram
+ *  and bridge plugins alike (server-side). */
+export async function setWorkSendNow(sendNow: boolean): Promise<WorkEngineInfo> {
+  return await invokeCmd<WorkEngineInfo>("work_set_send_now", { sendNow });
+}
+
+/** Send now without ending the turn: the engine stops its current round and
+ *  runs the queue (`msgId` first) as the next prompt of the same turn.
+ *  false = this engine can't; the caller falls back to stop + new turn. */
+export async function sendWorkAgentNow(turnId: string, msgId: string): Promise<boolean> {
+  if (useLocalIpc()) return false;
+  try {
+    const r = (await bridgeInvoke("work_agent_send_now", { turnId, msgId })) as { soft?: boolean } | null;
+    return !!r?.soft;
+  } catch {
+    return false; // older server / turn gone: use the stop path
+  }
+}
+
 /** Account management is provided by the server that runs Work turns. */
 export async function workAccountSupport(): Promise<string[]> {
   let engines: string[] = [];

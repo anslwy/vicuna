@@ -490,8 +490,7 @@ async fn handle_host_rpc(st: &Arc<BridgeState>, method: &str, params: &Value) ->
             if !images.is_empty() {
                 m["images"] = Value::Array(images);
             }
-            let queued = live_turn(st, &id).is_some();
-            turns::deliver(st, &id, m).await?;
+            let queued = turns::deliver_follow_up(st, &id, m).await?;
             let tid = live_turn(st, &id).map(|(t, _)| t);
             Ok(json!({ "queued": queued, "turnId": tid }))
         }
