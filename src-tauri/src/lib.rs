@@ -273,6 +273,7 @@ pub fn run() {
             work_engine::work_models,
             work_engine::work_set_model,
             work_engine::work_set_approval,
+            work_engine::work_set_send_now,
             work_usage::work_usage
         ])
         .setup(|app| {

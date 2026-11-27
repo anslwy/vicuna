@@ -452,12 +452,46 @@ pub async fn deliver(st: &Arc<BridgeState>, chat_id: &str, msg: Value) -> Result
     start_server_turn(st, chat_id, vec![msg], None).await.map(|_| ())
 }
 
+/// Deliver a message from a messaging bridge (Telegram, bridge plugins):
+/// with the "send follow-ups now" setting on (default) a running turn is
+/// interrupted so it goes right away; off, it just queues. Returns
+/// `queued` = it is waiting for the running turn to finish.
+pub async fn deliver_follow_up(st: &Arc<BridgeState>, chat_id: &str, msg: Value) -> Result<bool, String> {
+    let running = live_turn(st, chat_id).is_some();
+    deliver(st, chat_id, msg).await?;
+    if !running || !crate::work_engine::send_now_default() {
+        return Ok(running);
+    }
+    if let Some((_, turn)) = live_turn(st, chat_id) {
+        if crate::work_agent::agent_send_now(&turn, None) {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false); // the turn ended meanwhile and took the message
+    }
+    // engine without a round interrupt: stop + restart can take a while, so
+    // don't hold up the caller (a bridge's update loop / RPC)
+    let (st, id) = (st.clone(), chat_id.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = send_now(&st, &id).await {
+            eprintln!("vicuna: send-now for {id}: {e}");
+        }
+    });
+    Ok(false)
+}
+
 /// Interrupt a session's running turn so its queued messages go now: the
 /// queue is taken off the turn (a stopped turn would leave it to a window),
 /// the turn is stopped, and once it has ended the messages start a new turn.
 /// Returns how many messages were sent (0 = nothing queued / idle).
 pub async fn send_now(st: &Arc<BridgeState>, chat_id: &str) -> Result<usize, String> {
     let Some((_, turn)) = live_turn(st, chat_id) else { return Ok(0) };
+    // fast path: the engine ends just the current round and runs the queue
+    // as its next prompt, in the same turn (no cancel grace, no respawn)
+    let queued = turn.queue.lock().map(|q| q.len()).unwrap_or(0);
+    if queued > 0 && crate::work_agent::agent_send_now(&turn, None) {
+        return Ok(queued);
+    }
     let msgs: Vec<Value> = turn.queue.lock().map(|mut q| q.drain(..).collect::<Vec<_>>()).unwrap_or_default()
         .into_iter()
         .filter_map(|(_, m)| serde_json::to_value(m).ok())
@@ -469,7 +503,7 @@ pub async fn send_now(st: &Arc<BridgeState>, chat_id: &str) -> Result<usize, Str
     // engines can take ~20 s to honor a cancel
     let until = Instant::now() + Duration::from_secs(45);
     while live_turn(st, chat_id).is_some() && Instant::now() < until {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let n = msgs.len();
     match live_turn(st, chat_id) {

@@ -45,3 +45,11 @@ test("Settings separates Work engine into Work tab and Ollama host into Ollama t
   assert.ok(workBlock.includes('data-testid="browser-engine"'), "Browser engine lives in Work tab");
   assert.ok(modelsBlock.includes('data-testid="ollama-host-input"'), "Ollama host lives in Ollama tab");
 });
+
+test("Settings has a send-follow-ups-now toggle that defaults on", () => {
+  const i = chatApp.indexOf('data-testid="work-send-now-toggle"');
+  assert.ok(i >= 0, "toggle exists");
+  const tag = chatApp.slice(chatApp.lastIndexOf("<input", i), chatApp.indexOf("/>", i));
+  assert.ok(tag.includes("workEngineInfo?.sendNow ?? true"), "missing value = on");
+  assert.ok(tag.includes("onToggleWorkSendNow"), "wired to the server setting");
+});

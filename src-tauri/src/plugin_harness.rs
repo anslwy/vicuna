@@ -932,6 +932,7 @@ pub fn engine_info(key: &str) -> crate::opencode::WorkEngineInfo {
         others: Vec::new(),
         warning: sign_in_hint(r.as_ref().and_then(|r| account_profile(key, r).ok().flatten()).as_ref()),
         ask_permission: false,
+        send_now: true,
     }
 }
 

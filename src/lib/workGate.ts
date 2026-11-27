@@ -51,6 +51,9 @@ export interface WorkEngineInfo {
   warning?: string | null;
   /** tool approval: true = ask in the chat, false = auto-approve */
   askPermission?: boolean;
+  /** follow-ups sent mid-turn interrupt it and go now (default true);
+   *  false = they queue until the agent finishes */
+  sendNow?: boolean;
 }
 
 /** Send gate for Work mode: no opencode, no turn (there is no fallback).

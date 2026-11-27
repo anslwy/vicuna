@@ -88,6 +88,7 @@ pub async fn engine_info() -> WorkEngineInfo {
         others: other_labels,
         warning: None,
         ask_permission: false,
+        send_now: true,
     }
 }
 

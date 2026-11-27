@@ -417,6 +417,16 @@ async fn dispatch(
             let ask = args.get("ask").and_then(|v| v.as_bool()).unwrap_or(false);
             Ok(serde_json::to_value(crate::work_engine::set_approval(ask).await?).map_err(|e| e.to_string())?)
         }
+        "work_set_send_now" => {
+            let now = args.get("sendNow").and_then(|v| v.as_bool()).unwrap_or(true);
+            Ok(serde_json::to_value(crate::work_engine::set_send_now(now).await?).map_err(|e| e.to_string())?)
+        }
+        "work_agent_send_now" => {
+            let turn_id = arg_str(args, "turnId")?;
+            let turn = st.agent.get_turn(&turn_id).ok_or("unknown turn")?;
+            let first = arg_opt_str(args, "msgId");
+            Ok(serde_json::json!({ "soft": crate::work_agent::agent_send_now(&turn, first.as_deref()) }))
+        }
         "work_set_model" => {
             crate::work_engine::set_model(
                 arg_opt_str(args, "engine").as_deref(),
@@ -1588,6 +1598,8 @@ pub const API_ACTIONS: &[&str] = &[
     "work_redo",
     "work_rename",
     "work_set_approval",
+    "work_set_send_now",
+    "work_agent_send_now",
     "work_set_model",
     "work_shell_exec",
     "work_shell_input",
