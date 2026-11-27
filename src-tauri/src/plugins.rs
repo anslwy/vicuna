@@ -787,7 +787,7 @@ fn entry_in_dir(m: &Manifest, i: &InstallInfo, dir: Option<&Path>) -> Value {
     let mut e = json!({ "id": m.id, "name": m.name, "version": m.version, "description": m.description,
             "source": i.source, "installedAt": i.installed_at, "themes": m.themes, "panels": m.panels, "bridge": m.bridge });
     if let (Some(b), Some(dir)) = (&m.bridge, dir) {
-        if let Some(data_url) = crate::plugin_icon::declared_icon(dir, b.icon.as_deref(), m.icon.as_deref()) {
+        if let Some(data_url) = crate::plugin_icon::declared_icon(dir, b.icon.as_deref(), None) {
             if let Some(obj) = e["bridge"].as_object_mut() {
                 obj.insert("iconDataUrl".into(), json!(data_url));
             }
@@ -1570,7 +1570,8 @@ mod tests {
         m.bridge.as_mut().unwrap().icon = Some("missing.svg".into());
         assert!(entry_in_dir(&m, &info, Some(&plugin_dir))["bridge"].get("iconDataUrl").is_none());
 
-        // No icon declared omits iconDataUrl.
+        // No bridge.icon declared omits iconDataUrl even if top-level m.icon is set (keeps Discord/Signal monochrome badges).
+        m.icon = Some("slack.svg".into());
         m.bridge.as_mut().unwrap().icon = None;
         assert!(entry_in_dir(&m, &info, Some(&plugin_dir))["bridge"].get("iconDataUrl").is_none());
 
