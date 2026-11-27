@@ -106,7 +106,8 @@ case ":$PATH:" in
 esac
 say ""
 say "Next:"
-say "  vicuna serve --tailscale        # run a server for the Vicuna desktop app"
+say "  vicuna serve --tailscale        # run a server for the desktop app and browser UI"
+say "  vicuna web                      # open the web UI in your browser (starts the server if needed)"
 say "  vicuna install-service --tailscale   # keep it running in the background"
 say "  vicuna status | start | stop | restart   # manage that background server"
 say "  vicuna upgrade                  # install a newer release in place"
