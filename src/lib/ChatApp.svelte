@@ -72,6 +72,7 @@
   import ScheduleModals from "$lib/ScheduleModals.svelte";
   import McpPopup from "$lib/McpPopup.svelte";
   import ServerMenu from "$lib/ServerMenu.svelte";
+  import SidebarSessionItem from "$lib/SidebarSessionItem.svelte";
   import SettingsModal from "$lib/SettingsModal.svelte";
   import SidePanel, { type SideTab } from "$lib/SidePanel.svelte";
   import ConfirmModals from "$lib/ConfirmModals.svelte";
@@ -9733,93 +9734,26 @@
         {#snippet chatList(items: Chat[])}
           {#each items as c (c.id)}
             {@const live = isSessionStreaming(c.id)}
-            <button
-              class="chat-item {c.id === activeId ? 'active' : ''} {live ? 'streaming' : ''} {c.archived ? 'archived' : ''} {c.role === 'lead' ? 'lead-row' : ''}"
-              data-testid="chat-item"
-              data-archived={c.archived ? "true" : null}
-              data-streaming={live ? "true" : null}
-              title={live ? liveTitle(c.id) : c.role === "lead" ? c.title : undefined}
-              onclick={() => selectChat(c.id)}
-              onpointerdown={() => { if (c.partial) void ensureChatFull(c, { silent: true }); }}
-              onpointerenter={() => scheduleHoverPrefetch(c)}
-              onpointerleave={cancelHoverPrefetch}
-              oncontextmenu={(e) => openMenu(e, c.id)}
-            >
-              {#if renamingId === c.id}
-                <input
-                  class="rename-input"
-                  data-testid="rename-input"
-                  bind:value={renameDraft}
-                  onclick={(e) => e.stopPropagation()}
-                  onkeydown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === "Enter") commitRename();
-                    else if (e.key === "Escape") cancelRename();
-                  }}
-                  onblur={commitRename}
-                />
-              {:else}
-                {#if live}<span class="stream-dot" aria-hidden="true"></span>{/if}
-                {#if c.role === "lead"}
-                  <span class="work-badge lead-badge" data-testid="lead-badge" title="Lead session: can create, message, stop and remove other sessions">Lead</span>
-                {:else}
-                  <span class="title {live ? 'shimmer' : ''}">{c.title}</span>
-                {/if}
-                {@const liveMs = live ? liveElapsedMs(c.id) : null}
-                {#if liveMs != null}<span class="live-elapsed" data-testid="live-elapsed">{formatLiveElapsed(liveMs)}</span>{/if}
-                {#if c.archived}<span class="work-badge archived-badge" data-testid="archived-badge" title="Archived: hidden unless Show archived is on">Archived</span>{/if}
-                {#if c.mode === "work"}
-                  {@const tgSnap = telegramStatuses[c.id]}
-                  {@const tgState = telegramConnState(tgSnap)}
-                  {#if tgState !== "unconfigured"}
-                    <span
-                      class="tg-row-badge {tgState}"
-                      data-testid="telegram-row-badge"
-                      data-status={tgState}
-                      title={telegramConnTitle(tgSnap)}
-                      aria-label={telegramConnTitle(tgSnap)}
-                    >
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>
-                    </span>
-                  {/if}
-                  {#each bridgePlugins as bp (bp.id)}
-                    {@const bSnap = bridgeStatuses[bp.id]?.[c.id]}
-                    {@const bState = bridgeConnState(bSnap)}
-                    {#if bState !== "unconfigured"}
-                      {@const bName = bridgeDisplayName(bp)}
-                      {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
-                      <span
-                        class="tg-row-badge {bState}"
-                        style:background={bState === "connected" ? bColor : undefined}
-                        data-testid="bridge-row-badge-{bp.id}"
-                        data-status={bState}
-                        title={bridgeConnTitle(bName, bSnap)}
-                        aria-label={bridgeConnTitle(bName, bSnap)}
-                      >
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
-                      </span>
-                    {/if}
-                  {/each}
-                  {#if showWorkspaceBadge(c, sessionFilter)}
-                    {@const wsIsNone = isNoWorkspacePath(c.workspace)}
-                    {@const wsBase = wsIsNone ? "" : workspaceBase(c.workspace ?? "")}
-                    {#if wsIsNone}
-                      <span class="work-badge ws-badge" data-testid="ws-badge" title="No workspace — uses a temporary empty scratch folder if needed">
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>
-                        <span>No workspace</span>
-                      </span>
-                    {:else if wsBase}
-                      <span class="work-badge ws-badge" data-testid="ws-badge" title={displayWorkspace(c.workspace ?? "")}>
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        <span>{wsBase}</span>
-                      </span>
-                    {:else}
-                      <span class="work-badge" title="Work session">Work</span>
-                    {/if}
-                  {/if}
-                {/if}
-              {/if}
-            </button>
+            <SidebarSessionItem
+              {c}
+              active={c.id === activeId}
+              {live}
+              liveTitleText={live ? liveTitle(c.id) : undefined}
+              liveMs={live ? liveElapsedMs(c.id) : null}
+              renaming={renamingId === c.id}
+              bind:renameDraft
+              telegramSnap={telegramStatuses[c.id]}
+              {bridgePlugins}
+              {bridgeStatuses}
+              {sessionFilter}
+              onSelect={selectChat}
+              onPrefetch={(x) => { if (x.partial) void ensureChatFull(x, { silent: true }); }}
+              onHoverEnter={scheduleHoverPrefetch}
+              onHoverLeave={cancelHoverPrefetch}
+              onMenu={openMenu}
+              {commitRename}
+              {cancelRename}
+            />
           {/each}
         {/snippet}
         {#if pinnedChats.length > 0}
@@ -11727,22 +11661,10 @@
   .history { overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 2px; }
   .pinned-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .group-label { font-size: 12px; color: var(--muted); margin: 12px 4px 6px 4px; }
-  .chat-item { display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box; min-width: 0; border: none; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 14px; cursor: pointer; text-align: left; color: var(--text); user-select: none; -webkit-user-select: none; }
-  .chat-item:hover { background: var(--hover-3); }
-  .chat-item.active { background: var(--active-item); }
-  .chat-item.archived .title, .chat-item.archived .lead-badge { opacity: .55; }
-  .archived-badge { opacity: .75; }
   .archive-toggle { flex: none; display: inline-flex; align-items: center; gap: 3px; background: transparent; border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 7px; font-size: 11px; color: var(--muted); cursor: pointer; }
   .archive-toggle:hover { background: var(--hover-2); }
   .archive-toggle.on { color: var(--accent); border-color: var(--accent); }
-  .chat-item .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
-  .chat-item .work-badge { margin-left: 0; }
-  .chat-item.streaming { background: var(--hover-3); }
-  .chat-item.streaming.active { background: var(--active-item); }
-  .stream-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; animation: stream-pulse 1.2s ease-in-out infinite; }
   @keyframes stream-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
-  .live-elapsed { flex-shrink: 0; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-2); }
-  .rename-input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px; outline: none; font: inherit; font-size: 14px; padding: 2px 6px; background: var(--card); color: var(--text); }
   .cli-oneliner { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; padding: 6px 8px; border: 1px solid var(--border-2); border-radius: 8px; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
   .srv-pick { position: relative; width: 100%; }
   .srv-btn { width: 100%; box-sizing: border-box; }
@@ -11754,8 +11676,6 @@
   .srv-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 14px; margin: 10px 24px 0; border-radius: 12px; font-size: 13px; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
   .srv-strip span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .ctx-backdrop { position: fixed; inset: 0; background: transparent; border: none; cursor: default; z-index: 40; }
-  .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
-  .chat-item .work-badge.lead-badge { margin-right: auto; }
   .ctx-menu { position: fixed; z-index: 41; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); padding: 6px; min-width: 150px; display: flex; flex-direction: column; }
   .ctx-item { border: none; background: transparent; text-align: left; font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; cursor: pointer; color: var(--text); }
   .ctx-item:hover { background: var(--hover-3); }
@@ -11769,9 +11689,6 @@
   .ctx-tg-dot.connected { background: #22c55e; }
   .ctx-tg-dot.disconnected { background: #ef4444; }
   .ctx-tg-dot.unconfigured { background: transparent; border: 1.5px solid var(--muted-2); }
-  .tg-row-badge { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; color: #fff; line-height: 0; }
-  .tg-row-badge.connected { background: #2aabee; }
-  .tg-row-badge.disconnected { background: #ef4444; opacity: 0.85; }
   .ctx-continue-row { display: flex; align-items: center; gap: 4px; }
   .ctx-continue { flex: 1; min-width: 0; white-space: nowrap; }
   .ctx-ws-pill { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; max-width: 130px; border: 1px solid var(--border-2); background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
@@ -11903,7 +11820,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .stream-dot { animation: none; opacity: .8; } .mem-spin::after { animation: none; } .browser-restarting svg { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .mem-spin::after { animation: none; } .browser-restarting svg { animation: none; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
@@ -12207,10 +12124,6 @@
   .engine-chip { display: inline-flex; align-items: center; flex: none; line-height: 1; transform: translateY(1px); }
   .opencode-missing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border-2); border-radius: 10px; color: var(--muted); font-size: 13px; }
   .opencode-missing span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
-  .ws-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 110px; min-width: 0; }
-  .chat-item .work-badge.ws-badge { flex-shrink: 1; font-weight: 500; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); padding: 1px 7px; }
-  .ws-badge svg { flex-shrink: 0; }
-  .ws-badge span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .work-banner { position: relative; z-index: 20; display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 6px 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }

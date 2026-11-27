@@ -135,9 +135,4 @@
   .shimmer { background: linear-gradient(90deg, var(--muted-2) 25%, var(--text) 50%, var(--muted-2) 75%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer-slide 1.4s linear infinite; }
   @keyframes shimmer-slide { to { background-position: -200% 0; } }
   @media (prefers-reduced-motion: reduce) { .shimmer { animation: none; } }
-  @container (max-width: 500px) {
-    /* Wrapped: tools + workspace start the first line, model pill starts the
-     * second with send pushed right (a right-aligned first line left the
-     * model pill stranded under it). */
-  }
 </style>
