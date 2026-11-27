@@ -400,17 +400,8 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
         }
     }
 
-    // Final DB write settles slightly after turn exits
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    let reply = match st.db.as_ref() {
-        Some(db) => crate::server_store::load_chat(db, &session).await.ok().flatten(),
-        None => None,
-    }
-    .and_then(|c| {
-        let messages = c["messages"].as_array()?;
-        Some(phone_text(super::persist::last_reply(messages)))
-    })
-    .unwrap_or_default();
+    // wait for the recorder's final events + write, not a blind sleep
+    let reply = phone_text(&turns::final_reply(&st, &session, &turn_id).await);
 
     broadcast_notification(
         "turn_event",
