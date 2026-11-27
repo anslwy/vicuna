@@ -147,6 +147,7 @@
   import { createBrowserState } from "$lib/browserState.svelte";
   import { createAppUpdateState } from "$lib/appUpdateState.svelte";
   import { createServerSwitcherState } from "$lib/serverSwitcherState.svelte";
+  import { createUsageState } from "$lib/usageState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -1363,143 +1364,11 @@
     if (scheduled.length && Math.floor(at / 60000) !== Math.floor(scheduleNow / 60000)) scheduleNow = at;
     for (const it of dueItems(scheduled, at)) void deliverScheduled(it.id);
   }
-  type UsageCacheEntry = { report: WorkUsageReport | null; error: string | null; at: number };
-  let usageOpen = $state(false);
-  let usageEngine = $state("agy");
-  let usageNoEngineError = $state<string | null>(null);
-  /** Unified per-engine usage snapshot shared by the header badge, hover popover, and modal. */
-  let usageStore = $state<Record<string, UsageCacheEntry>>({});
-  /** Per-engine in-flight flags so hover, background poll, and modal refreshes deduplicate. */
-  let usageFetching = $state<Record<string, boolean>>({});
-  /** Ticks every 30s so "Updated Xm ago" labels stay fresh without extra fetches. */
-  let usageNow = $state(Date.now());
-  const usageInFlight = new Map<string, Promise<void>>();
-  let usagePollRunning = false;
-
-  const usageEntry = $derived(usageStore[usageEngine] ?? null);
-  const usageReport = $derived(usageEntry?.report ?? null);
-  const usageError = $derived(usageNoEngineError ?? usageEntry?.error ?? null);
-  const usageUpdatedAt = $derived(usageEntry?.at ?? null);
-  const usageLoading = $derived(!!usageFetching[usageEngine]);
-
-  function persistUsageStore() {
-    try {
-      const toSave: Record<string, { report: WorkUsageReport; at: number }> = {};
-      for (const [k, v] of Object.entries(usageStore)) {
-        if (v.report) toSave[k] = { report: v.report, at: v.at };
-      }
-      localStorage.setItem(USAGE_CACHE_KEY, JSON.stringify(toSave));
-    } catch {}
-  }
-
-  function hydrateUsageStore() {
-    try {
-      const loaded = parseUsageCache<WorkUsageReport>(localStorage.getItem(USAGE_CACHE_KEY));
-      if (Object.keys(loaded).length) usageStore = loaded;
-    } catch {}
-  }
-
-  function fetchUsageEngine(engine: string, opts?: { force?: boolean; background?: boolean }): Promise<void> {
-    if (!engine) return Promise.resolve();
-    const force = opts?.force ?? false;
-    const background = opts?.background ?? false;
-    const existing = usageStore[engine];
-    if (!force && existing?.report && !isUsageStale(existing.at, Date.now(), USAGE_POLL_INTERVAL_MS)) {
-      return Promise.resolve();
-    }
-    const inflight = usageInFlight.get(engine);
-    if (inflight) return inflight;
-
-    usageFetching = { ...usageFetching, [engine]: true };
-    const p = (async () => {
-      try {
-        const res = await fetchWorkUsage(engine);
-        const now = Date.now();
-        const prev = usageStore[engine];
-        if (!res.error) {
-          usageStore = { ...usageStore, [engine]: { report: res, error: null, at: now } };
-          persistUsageStore();
-        } else if (background && prev?.report) {
-          // keep last good snapshot on transient background poll failures
-        } else {
-          usageStore = {
-            ...usageStore,
-            [engine]: { report: prev?.report ?? null, error: res.error, at: prev?.report ? prev.at : now },
-          };
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        const prev = usageStore[engine];
-        if (!(background && prev?.report)) {
-          usageStore = {
-            ...usageStore,
-            [engine]: { report: prev?.report ?? null, error: msg, at: prev?.report ? prev.at : Date.now() },
-          };
-        }
-      } finally {
-        usageInFlight.delete(engine);
-        const { [engine]: _, ...rest } = usageFetching;
-        usageFetching = rest;
-        usageNow = Date.now();
-      }
-    })();
-    usageInFlight.set(engine, p);
-    return p;
-  }
-
-  async function pollUsageBackground() {
-    if (usagePollRunning) return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-    const order = usagePollOrder(workEngines, engineId(workEngineInfo));
-    if (!order.length) return;
-    usagePollRunning = true;
-    try {
-      for (const eng of order) {
-        if (typeof document !== "undefined" && document.visibilityState === "hidden") break;
-        await fetchUsageEngine(eng, { background: true });
-      }
-    } finally {
-      usagePollRunning = false;
-    }
-  }
-
-  function primeUsageHover() {
-    usageNow = Date.now();
-    const engine = usageHoverEngine;
-    if (!engine) return;
-    void fetchUsageEngine(engine, { background: true });
-  }
-
-  function closeUsageModal() {
-    usageOpen = false;
-  }
-
-  function selectUsageTab(engine: string) {
-    usageNoEngineError = null;
-    usageEngine = engine;
-    usageNow = Date.now();
-    void fetchUsageEngine(engine, { background: true });
-  }
-
-  async function openUsageModal(engine?: string) {
-    usageOpen = true;
-    usageNoEngineError = null;
-    usageNow = Date.now();
-    if (!engine && !workEngineInfo) await refreshWorkEngine();
-    if (!usageOpen) return;
-    const target = engine ?? usageTabs(workEngines, engineId(workEngineInfo)).initial;
-    if (!target) {
-      usageNoEngineError = "Usage is available for Claude Code, Codex and Antigravity; none of them is installed.";
-      return;
-    }
-    usageEngine = target;
-    void fetchUsageEngine(target, { background: true });
-  }
-
-  $effect(() => {
-    const key = usagePollOrder(workEngines, engineId(workEngineInfo)).join(",");
-    if (!key) return;
-    void pollUsageBackground();
+  const usage = createUsageState({
+    get workEngines() { return workEngines; },
+    get workEngineInfo() { return workEngineInfo; },
+    get usageHoverEngine() { return usageHoverEngine; },
+    get refreshWorkEngine() { return refreshWorkEngine; }
   });
 
   /** Esc closes the top schedule/usage overlay before any other handler sees it */
@@ -1507,7 +1376,7 @@
     if (e.key !== "Escape") return;
     if (scheduleCustom) scheduleCustom = null;
     else if (quitPromptOpen) quitPromptOpen = false;
-    else if (usageOpen) closeUsageModal();
+    else if (usage.usageOpen) usage.closeUsageModal();
     else if (scheduleListOpen) scheduleListOpen = false;
     else if (scheduleMenuOpen) scheduleMenuOpen = false;
     else return;
@@ -8000,13 +7869,13 @@
       }
     }
     const scheduleTimer = setInterval(scheduleTick, 5000);
-    hydrateUsageStore();
-    const usagePollTimer = setInterval(() => void pollUsageBackground(), USAGE_POLL_INTERVAL_MS);
-    const usageTickTimer = setInterval(() => { usageNow = Date.now(); }, 30_000);
+    usage.hydrateUsageStore();
+    const usagePollTimer = setInterval(() => void usage.pollUsageBackground(), USAGE_POLL_INTERVAL_MS);
+    const usageTickTimer = setInterval(() => { usage.usageNow = Date.now(); }, 30_000);
     const onUsageVisibility = () => {
       if (document.visibilityState === "visible") {
-        usageNow = Date.now();
-        void pollUsageBackground();
+        usage.usageNow = Date.now();
+        void usage.pollUsageBackground();
       }
     };
     document.addEventListener("visibilitychange", onUsageVisibility);
@@ -8749,12 +8618,12 @@
           {workEngineList}
           {workEngines}
           {usageHoverEngine}
-          {usageStore}
-          {usageFetching}
-          {usageNow}
-          onPrimeUsage={primeUsageHover}
-          onOpenUsage={() => void openUsageModal()}
-          onRefreshUsage={(engine) => void fetchUsageEngine(engine, { force: true })}
+          usageStore={usage.usageStore}
+          usageFetching={usage.usageFetching}
+          usageNow={usage.usageNow}
+          onPrimeUsage={usage.primeUsageHover}
+          onOpenUsage={() => void usage.openUsageModal()}
+          onRefreshUsage={(engine) => void usage.fetchUsageEngine(engine, { force: true })}
           {workCtx}
           {workSpent}
         />
@@ -9936,19 +9805,19 @@
   onCancelSaveConfirm={cancelSaveConfirm}
   onConfirmSaveHere={confirmSaveHere}
 />
-{#if usageOpen}
+{#if usage.usageOpen}
   <UsageModal
     {workEngines}
     {workEngineList}
-    {usageEngine}
-    {usageReport}
-    {usageUpdatedAt}
-    {usageNow}
-    {usageLoading}
-    {usageError}
-    onClose={closeUsageModal}
-    onSelectTab={selectUsageTab}
-    onRefresh={(eng) => void fetchUsageEngine(eng, { force: true })}
+    usageEngine={usage.usageEngine}
+    usageReport={usage.usageReport}
+    usageUpdatedAt={usage.usageUpdatedAt}
+    usageNow={usage.usageNow}
+    usageLoading={usage.usageLoading}
+    usageError={usage.usageError}
+    onClose={usage.closeUsageModal}
+    onSelectTab={usage.selectUsageTab}
+    onRefresh={(eng) => void usage.fetchUsageEngine(eng, { force: true })}
     onOpenExternal={(url) => void openExternal(url)}
   />
 {/if}
