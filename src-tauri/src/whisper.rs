@@ -88,7 +88,6 @@ struct Progress {
     model: String,
     done: u64,
     total: u64,
-    error: String,
 }
 
 fn progress() -> &'static Mutex<Option<Progress>> {

@@ -39,7 +39,6 @@ pub(crate) struct TermHandle {
 #[derive(Default)]
 pub struct TermState {
     pub(crate) terms: Mutex<HashMap<String, TermHandle>>,
-    seq: AtomicU64,
 }
 
 static TERM_SEQ: AtomicU64 = AtomicU64::new(1);
