@@ -8,6 +8,7 @@
   import { unlockChime, playChime, CHIME_OPTIONS, DEFAULT_CHIME } from "$lib/chime";
   import { renderMarkdown } from "$lib/markdown";
   import "katex/dist/katex.min.css";
+  import "$lib/appTheme.css";
   import { MODEL_CATALOG, CATALOG_UPDATED, type CatalogCat, type CatalogEntry } from "$lib/catalog";
   import { refreshCatalog, type CatalogOverride } from "$lib/library";
   import {
@@ -77,6 +78,7 @@
   import SidebarSessionItem from "$lib/SidebarSessionItem.svelte";
   import SessionContextMenu from "$lib/SessionContextMenu.svelte";
   import WorkHeader from "$lib/WorkHeader.svelte";
+  import EmptyStarter from "$lib/EmptyStarter.svelte";
   import SettingsModal from "$lib/SettingsModal.svelte";
   import SidePanel, { type SideTab } from "$lib/SidePanel.svelte";
   import ConfirmModals from "$lib/ConfirmModals.svelte";
@@ -7736,35 +7738,15 @@
     {/if}
 
     {#if !activeChat || activeChat.messages.length === 0}
-      <div class="empty">
-        <div class="seg mode-toggle" role="tablist" aria-label="Session mode" data-testid="mode-toggle">
-          <button class="seg-btn {pendingMode === 'chat' ? 'sel' : ''}" data-testid="mode-chat-btn" role="tab" onclick={() => { pendingMode = "chat"; writeLastMode(localStorage, "chat"); workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}>Chat</button>
-          <button class="seg-btn {pendingMode === 'work' ? 'sel' : ''}" data-testid="mode-work-btn" role="tab" onclick={() => { pendingMode = "work"; writeLastMode(localStorage, "work"); if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}>Work</button>
-        </div>
-        <h1 class="empty-title">{pendingMode === "work" ? "What should I work on?" : "How can I help you today?"}</h1>
-        {#if pendingMode === "work"}
-          <p class="engine-line" data-testid="work-engine-line">
-            {#if workEngineInfo?.installed}
-              Engine: {workEngineLabel} {workEngineInfo.version ?? ""}
-            {:else if workEngineInfo}
-              Engine: {workEngineLabel} not found
-            {:else}
-              Engine: checking…
-            {/if}
-          </p>
-        {/if}
-        <div class="suggest-grid" data-testid="empty-suggestions">
-          {#each composerMode === "work" ? WORK_SUGGESTIONS : SUGGESTIONS as s, idx}
-            <button class="suggest-card" data-testid="suggest-card" onclick={() => useSuggestion(s.prompt)}>
-              <span class="suggest-text">
-                <span class="suggest-title">{s.title}</span>
-                <span class="suggest-sub">{s.prompt}</span>
-              </span>
-              <span class="suggest-icon">{@html s.icon}</span>
-            </button>
-          {/each}
-        </div>
-      </div>
+      <EmptyStarter
+        {pendingMode}
+        {composerMode}
+        {workEngineInfo}
+        {workEngineLabel}
+        onPickChat={() => { pendingMode = "chat"; writeLastMode(localStorage, "chat"); workspaceError = null; if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "chat"; activeChat.workspace = null; } }}
+        onPickWork={() => { pendingMode = "work"; writeLastMode(localStorage, "work"); if (activeChat && activeChat.messages.length === 0) { activeChat.mode = "work"; activeChat.workspace = pendingWorkspace || null; } }}
+        onSuggestion={useSuggestion}
+      />
     {:else}
       {#if activeChat.mode === "work"}
         <WorkHeader
@@ -9189,50 +9171,6 @@
 <input type="file" bind:this={fileInput} hidden multiple onchange={onFile} data-testid="file-input" />
 
 <style>
-  :global(html) { color-scheme: light; }
-  :global(html[data-theme="dark"]) { color-scheme: dark; }
-  :global(:root) {
-    --bg: #ffffff; --text: #111111; --text-dim: #333333;
-    --muted: #9a9a9a; --muted-2: #8a8a8a; --faint: #aaaaaa;
-    --hover: #f0f0f0; --hover-2: #ececec; --hover-3: #f2f2f3;
-    --active-item: #efefef; --item-bg: #f4f4f5; --composer: #f4f4f5;
-    --card: #ffffff; --border: #ececec; --border-2: #e2e2e2; --border-3: #e5e5e5;
-    --border-strong: #c9c9c9; --input-border: #dddddd;
-    --bubble-user: #efefef; --chip: #eeeeee;
-    --icon: #555555; --icon-dim: #909090;
-    --thinking: #7a7a7a; --link: #0b57d0; --link-hover: #084298;
-    --danger: #b3261e; --err-text: #b3261e; --err-bg: #fdecea;
-    --code-bg: #f4f4f5; --code-inline: #f0f0f0;
-    --code-keyword: #d73a49; --code-string: #032f62; --code-comment: #6a737d;
-    --code-number: #005cc5; --code-title: #6f42c1; --code-builtin: #005cc5;
-    --code-literal: #005cc5; --code-attr: #6f42c1;
-    --send-disabled: #d9d9de;
-    --cancel-bg: #ececf1; --cancel-hover: #e0e0e6;
-    --ok: #1a7f37;
-    --pink: #d63384;
-    --accent: #ef6c00; --accent-hover: #d96000; --accent-fg: #ffffff;
-  }
-  :global(html[data-theme="dark"]) {
-    --bg: #3d3332; --text: #ece4e0; --text-dim: #b3a6a3;
-    --muted: #b3a6a3; --muted-2: #a39592; --faint: #8e7f7c;
-    --hover: #5d4f4d; --hover-2: #5d4f4d; --hover-3: #5d4f4d;
-    --active-item: #5d4f4d; --item-bg: #4e4442; --composer: #4e4442;
-    --card: #4e4442; --border: #665b58; --border-2: #756866; --border-3: #756866;
-    --border-strong: #756866; --input-border: #756866;
-    --bubble-user: #5d4f4d; --chip: #5d4f4d;
-    --icon: #b3a6a3; --icon-dim: #a39592;
-    --thinking: #b3a6a3; --link: #7ed491; --link-hover: #a2e1af;
-    --danger: #ff8a80; --err-text: #ffb4a9; --err-bg: #4a1f1a;
-    --code-bg: #4e4442; --code-inline: #5d4f4d;
-    --code-keyword: #ff7b72; --code-string: #a5d6ff; --code-comment: #8b949e;
-    --code-number: #79c0ff; --code-title: #d2a8ff; --code-builtin: #79c0ff;
-    --code-literal: #79c0ff; --code-attr: #7ee787;
-    --send-disabled: #665b58;
-    --cancel-bg: #5d4f4d; --cancel-hover: #665b58;
-    --ok: #7ed491;
-    --pink: #f472b6;
-  }
-  :global(html, body) { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Helvetica, Arial, sans-serif; }
   .app { display: flex; height: 100vh; background: var(--bg); -webkit-user-select: none; user-select: none; }
   /* native-app feel: chrome text isn't selectable; message content, code,
      thinking, and every editable field opt back in below */
@@ -9320,15 +9258,6 @@
   .srv-icon-btn { position: relative; }
   .srv-icon-btn.remote { color: var(--accent); }
   .srv-icon-btn .srv-dot { position: absolute; top: 3px; right: 9px; }
-  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; overflow-y: auto; }
-  .empty-title { font-size: 24px; font-weight: 500; color: var(--text-dim); margin: 0 0 28px 0; text-align: center; }
-  .suggest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; max-width: 860px; }
-  .suggest-card { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 14px 14px 18px; cursor: pointer; min-width: 0; }
-  .suggest-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); border-color: var(--accent); }
-  .suggest-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-  .suggest-title { font-size: 15px; font-weight: 650; color: var(--text); }
-  .suggest-sub { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .suggest-icon { flex-shrink: 0; width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: var(--accent-fg); display: flex; align-items: center; justify-content: center; }
   .messages { flex: 1; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; min-height: 0; min-width: 0; padding: 40px 24px 12px 24px; display: flex; flex-direction: column; gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; box-sizing: border-box; }
   .row { display: flex; }
   .user-row { justify-content: flex-end; }
@@ -9655,17 +9584,10 @@
   .pull-input { flex: 1; min-width: 0; border: 1px solid var(--input-border); border-radius: 999px; background: transparent; color: var(--text); font-size: 13px; font-family: inherit; padding: 6px 14px; }
   .pull-input:focus { outline: none; border-color: var(--accent); }
   .pull-input:disabled { opacity: .5; }
-  .seg { display: flex; background: var(--hover); border-radius: 12px; padding: 3px; gap: 2px; }
-  .seg-btn { border: none; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--text-dim); padding: 6px 16px; border-radius: 9px; }
-  .seg-btn.sel { background: var(--card); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-  .mode-toggle { margin-bottom: 18px; }
-  .mode-toggle .seg-btn { min-width: 90px; }
-  .mode-toggle .seg-btn.sel { background: var(--accent); color: var(--accent-fg); box-shadow: none; font-weight: 700; }
   .workspace-input { width: 100%; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .workspace-picker-drop { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
   .workspace-picker-label { font-size: 12px; color: var(--muted); }
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
-  .engine-line { margin: -6px 0 18px; color: var(--muted-2); font-size: 12px; }
   .engine-select { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 2px; }
   .engine-select-btn, .engine-select-opt { display: flex; align-items: center; gap: 8px; width: 100%; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 10px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; text-align: left; }
   .engine-select-btn span, .engine-select-opt span { flex: 1; min-width: 0; }
@@ -9733,8 +9655,6 @@
   @media (max-width: 700px) {
     .messages { padding: 20px 12px 8px 12px; }
     .composer-wrap { padding: 8px 12px 14px 12px; }
-    .suggest-grid { grid-template-columns: 1fr; }
-    .empty-title { font-size: 20px; margin-bottom: 20px; }
     .model-pill { max-width: 150px; }
     .model-drop { width: 330px; max-width: calc(100vw - 48px); }
   .collapsed-rail-foot { display: none; }
