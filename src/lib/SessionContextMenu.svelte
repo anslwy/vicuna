@@ -7,7 +7,7 @@
   import { isTauriRuntime } from "$lib/ollama";
   import { isWindows } from "$lib/chatDom";
   import { telegramConnLabel, telegramConnTitle, type TelegramConnState, type TelegramStatusSnapshot } from "$lib/telegram";
-  import { bridgeConnLabel, bridgeConnState, bridgeConnTitle, bridgeDisplayName, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
+  import { bridgeConnLabel, bridgeConnState, bridgeConnTitle, bridgeDisplayName, bridgeIconBg, safeBridgeIconDataUrl, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
   import { safeColor, type InstalledPlugin } from "$lib/pluginTheme";
 
   let {
@@ -123,14 +123,21 @@
       {@const bSnap = ctxChat ? bridgeStatuses[bp.id]?.[ctxChat.id] : null}
       {@const bState = bridgeConnState(bSnap)}
       {@const bName = bridgeDisplayName(bp)}
-      {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
+      {@const bIconUrl = safeBridgeIconDataUrl(bp.bridge?.iconDataUrl)}
+      {@const bColor = bIconUrl ? bridgeIconBg(bp.bridge) : (safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)")}
       <button
         class="ctx-item ctx-telegram"
         data-testid="bridge-item-{bp.id}"
         title={bridgeConnTitle(bName, bSnap)}
         onclick={() => openBridge(bp.id, menu.chatId)}
       >
-        <span class="ctx-tg-icon" style:background={bColor} aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg></span>
+        <span class="ctx-tg-icon" class:has-img={!!bIconUrl} style:background={bColor} aria-hidden="true">
+          {#if bIconUrl}
+            <img src={bIconUrl} width="12" height="12" alt="" />
+          {:else}
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
+          {/if}
+        </span>
         <span class="ctx-tg-label">{bName}</span>
         {#if bSnap?.botUsername}<span class="ctx-tg-bot">@{bSnap.botUsername}</span>{/if}
         <span class="ctx-tg-dot {bState}" data-testid="bridge-status-dot-{bp.id}" data-status={bState} aria-label={bridgeConnLabel(bName, bState)}></span>
@@ -195,6 +202,8 @@
   .ctx-tg-label { flex: 1; min-width: 0; }
   .ctx-tg-bot { font-size: 12px; color: var(--muted); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ctx-tg-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2aabee; color: #fff; line-height: 0; }
+  .ctx-tg-icon.has-img { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08); }
+  .ctx-tg-icon img { display: block; width: 12px; height: 12px; object-fit: contain; }
   .ctx-tg-dot { flex: none; margin-left: auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
   .ctx-tg-dot.connected { background: #22c55e; }
   .ctx-tg-dot.disconnected { background: #ef4444; }

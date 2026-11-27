@@ -6,7 +6,9 @@ import {
   bridgeConnState,
   bridgeConnTitle,
   bridgeDisplayName,
+  bridgeIconBg,
   DEFAULT_BRIDGE_ICON,
+  safeBridgeIconDataUrl,
   safeIconPath,
   safeInputPrompt,
   safeQrDataUrl,
@@ -108,4 +110,27 @@ test("safeInputPrompt keeps a valid capture step and drops unsafe ones", () => {
     assert.equal(safeInputPrompt({ label: "x", capture })!.capture, null, JSON.stringify(capture));
   }
   assert.equal(safeInputPrompt({ label: "x" })!.capture, null);
+});
+
+test("safeBridgeIconDataUrl accepts base64 SVG data URLs and rejects unsafe values", () => {
+  const svg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=";
+  assert.equal(safeBridgeIconDataUrl(svg), svg);
+  assert.equal(safeBridgeIconDataUrl(`  ${svg}  `), svg);
+  assert.equal(safeBridgeIconDataUrl("data:image/png;base64,iVBORw0KGgo="), null);
+  assert.equal(safeBridgeIconDataUrl("data:image/svg+xml,<svg onload=alert(1)>"), null);
+  assert.equal(safeBridgeIconDataUrl("https://evil.example/icon.svg"), null);
+  assert.equal(safeBridgeIconDataUrl("javascript:alert(1)"), null);
+  assert.equal(safeBridgeIconDataUrl("data:image/svg+xml;base64,"), null);
+  assert.equal(safeBridgeIconDataUrl("data:image/svg+xml;base64,not valid!!"), null);
+  assert.equal(safeBridgeIconDataUrl(`data:image/svg+xml;base64,${"A".repeat(70_000)}`), null);
+  assert.equal(safeBridgeIconDataUrl(null), null);
+});
+
+test("bridgeIconBg uses validated iconBg and defaults to white", () => {
+  assert.equal(bridgeIconBg(null), "#ffffff");
+  assert.equal(bridgeIconBg({}), "#ffffff");
+  assert.equal(bridgeIconBg({ color: "#4a154b" }), "#ffffff");
+  assert.equal(bridgeIconBg({ iconBg: "#112233" }), "#112233");
+  assert.equal(bridgeIconBg({ iconBg: "  rgb(255, 255, 255)  " }), "rgb(255, 255, 255)");
+  assert.equal(bridgeIconBg({ iconBg: "url(javascript:alert(1))" }), "#ffffff");
 });

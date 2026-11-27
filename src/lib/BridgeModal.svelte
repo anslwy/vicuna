@@ -8,6 +8,8 @@
     bridgeAuthMode,
     bridgeConnState,
     bridgeDisplayName,
+    bridgeIconBg,
+    safeBridgeIconDataUrl,
     safeIconPath,
     safeQrDataUrl,
     safeInputPrompt,
@@ -51,6 +53,8 @@
   const name = $derived(bridgeDisplayName(plugin));
   const authMode = $derived(bridgeAuthMode(bridge));
   const iconPath = $derived(safeIconPath(bridge.iconPath));
+  const iconUrl = $derived(safeBridgeIconDataUrl(bridge.iconDataUrl));
+  const iconBg = $derived(bridgeIconBg(bridge));
   const brandColor = $derived(safeColor(bridge.color) ? bridge.color! : "var(--accent)");
   const pairPrefix = $derived(bridge.pairCommand?.trim() ? `${bridge.pairCommand.trim()} ` : "");
 
@@ -211,7 +215,11 @@
 <button class="br-backdrop" aria-label="Close" tabindex="-1" onclick={onClose}></button>
 <div class="br-card" role="dialog" aria-modal="true" aria-label={name} data-testid="bridge-dialog-{plugin.id}">
   <div class="br-title">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style:color={brandColor} aria-hidden="true"><path d={iconPath}/></svg>
+    {#if iconUrl}
+      <span class="br-title-icon" style:background={iconBg} aria-hidden="true"><img src={iconUrl} width="15" height="15" alt="" /></span>
+    {:else}
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style:color={brandColor} aria-hidden="true"><path d={iconPath}/></svg>
+    {/if}
     <span>{name}</span>
     {#if sessionTitle}<span class="br-muted br-session-name">· “{sessionTitle}”</span>{/if}
   </div>
@@ -441,6 +449,8 @@
   .br-card { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 61; width: min(500px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow-y: auto; display: flex; flex-direction: column; gap: 12px; background: var(--card); border-radius: 20px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.18); padding: 18px; box-sizing: border-box; color: var(--text); font-size: 14px; }
   .br-title { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; min-width: 0; }
   .br-title svg { flex: none; }
+  .br-title-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08); line-height: 0; }
+  .br-title-icon img { display: block; width: 15px; height: 15px; object-fit: contain; }
   .br-session-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .br-muted { color: var(--muted); font-weight: 400; }
   .small { font-size: 12.5px; }

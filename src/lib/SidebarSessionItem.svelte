@@ -5,7 +5,7 @@
   import { formatLiveElapsed, displayWorkspace, workspaceBase } from "$lib/chatFormat";
   import { isNoWorkspacePath, showWorkspaceBadge } from "$lib/sidebar";
   import { telegramConnState, telegramConnTitle, type TelegramStatusSnapshot } from "$lib/telegram";
-  import { bridgeConnState, bridgeConnTitle, bridgeDisplayName, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
+  import { bridgeConnState, bridgeConnTitle, bridgeDisplayName, bridgeIconBg, safeBridgeIconDataUrl, safeIconPath, type BridgeStatusSnapshot } from "$lib/bridgePlugin";
   import { safeColor, type InstalledPlugin } from "$lib/pluginTheme";
 
   let {
@@ -102,16 +102,22 @@
         {@const bState = bridgeConnState(bSnap)}
         {#if bState !== "unconfigured"}
           {@const bName = bridgeDisplayName(bp)}
-          {@const bColor = safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)"}
+          {@const bIconUrl = safeBridgeIconDataUrl(bp.bridge?.iconDataUrl)}
+          {@const bColor = bIconUrl ? bridgeIconBg(bp.bridge) : (safeColor(bp.bridge?.color) ? bp.bridge!.color! : "var(--accent)")}
           <span
             class="tg-row-badge {bState}"
+            class:has-img={!!bIconUrl}
             style:background={bState === "connected" ? bColor : undefined}
             data-testid="bridge-row-badge-{bp.id}"
             data-status={bState}
             title={bridgeConnTitle(bName, bSnap)}
             aria-label={bridgeConnTitle(bName, bSnap)}
           >
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
+            {#if bIconUrl}
+              <img src={bIconUrl} width="11" height="11" alt="" aria-hidden="true" />
+            {:else}
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={safeIconPath(bp.bridge?.iconPath)}/></svg>
+            {/if}
           </span>
         {/if}
       {/each}
@@ -154,6 +160,8 @@
   .work-badge.lead-badge { background: var(--bg); color: var(--accent); border: 1px solid var(--accent); padding: 0 7px; }
   .chat-item .work-badge.lead-badge { margin-right: auto; }
   .tg-row-badge { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; color: #fff; line-height: 0; }
+  .tg-row-badge.has-img.connected { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08); }
+  .tg-row-badge img { display: block; width: 11px; height: 11px; object-fit: contain; }
   .tg-row-badge.connected { background: #2aabee; }
   .tg-row-badge.disconnected { background: #ef4444; opacity: 0.85; }
   .shimmer { background: linear-gradient(90deg, var(--muted-2) 25%, var(--text) 50%, var(--muted-2) 75%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer-slide 1.4s linear infinite; }

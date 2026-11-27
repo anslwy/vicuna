@@ -85,6 +85,12 @@ pub struct BridgeSpec {
     /// Safe SVG `<path d="...">` for a 24x24 viewBox.
     #[serde(default)]
     pub icon_path: Option<String>,
+    /// Optional relative `.svg` file shipped with the plugin (rendered full-color inside the badge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Optional background color for the circular badge when `icon` is rendered (defaults to `#ffffff` in UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_bg: Option<String>,
     /// Placeholder text for the token input field.
     #[serde(default)]
     pub token_placeholder: String,
@@ -175,7 +181,12 @@ impl Manifest {
                 }
             }
         }
-        for f in self.icon.iter().chain(self.harnesses.iter().filter_map(|h| h.icon.as_ref())) {
+        for f in self
+            .icon
+            .iter()
+            .chain(self.harnesses.iter().filter_map(|h| h.icon.as_ref()))
+            .chain(self.bridge.iter().filter_map(|b| b.icon.as_ref()))
+        {
             if crate::plugin_icon::valid_path(f) && !v.contains(f) {
                 v.push(f.clone());
             }
@@ -327,6 +338,16 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
         if let Some(p) = &b.icon_path {
             if !valid_icon_path(p) {
                 return Err("bridge: iconPath contains disallowed characters".into());
+            }
+        }
+        if let Some(icon) = &b.icon {
+            if !crate::plugin_icon::valid_path(icon) {
+                return Err(format!("bridge: icon must be a safe relative .svg path, got {icon:?}"));
+            }
+        }
+        if let Some(bg) = &b.icon_bg {
+            if !valid_color(bg) {
+                return Err(format!("bridge: iconBg must be a color, got {bg:?}"));
             }
         }
         if let Some(mode) = &b.auth_mode {
@@ -758,10 +779,22 @@ pub fn list_installed_bridges() -> Vec<(Manifest, PathBuf)> {
 }
 
 fn entry(m: &Manifest, i: &InstallInfo) -> Value {
+    let dir = plugins_dir().ok().map(|d| d.join(&m.id));
+    entry_in_dir(m, i, dir.as_deref())
+}
+
+fn entry_in_dir(m: &Manifest, i: &InstallInfo, dir: Option<&Path>) -> Value {
     let mut e = json!({ "id": m.id, "name": m.name, "version": m.version, "description": m.description,
             "source": i.source, "installedAt": i.installed_at, "themes": m.themes, "panels": m.panels, "bridge": m.bridge });
+    if let (Some(b), Some(dir)) = (&m.bridge, dir) {
+        if let Some(data_url) = crate::plugin_icon::declared_icon(dir, b.icon.as_deref(), None) {
+            if let Some(obj) = e["bridge"].as_object_mut() {
+                obj.insert("iconDataUrl".into(), json!(data_url));
+            }
+        }
+    }
     if !m.harnesses.is_empty() {
-        let dir = plugins_dir().map(|d| d.join(&m.id)).unwrap_or_default();
+        let dir = dir.map(Path::to_path_buf).unwrap_or_default();
         let consent = crate::plugin_harness::read_consent(&dir);
         e["harnesses"] = json!(m.harnesses.iter().map(|h| crate::plugin_harness::describe(h, &consent, &m.id)).collect::<Vec<_>>());
         let pending: Vec<Value> = crate::plugin_harness::pending(&consent, &m.harnesses)
@@ -1483,5 +1516,65 @@ mod tests {
 
         m.bridge.as_mut().unwrap().auth_mode = Some("oauth".into());
         assert!(validate(&m).is_err());
+
+        m.bridge.as_mut().unwrap().auth_mode = Some("token".into());
+        m.bridge.as_mut().unwrap().icon = Some("slack.svg".into());
+        m.bridge.as_mut().unwrap().icon_bg = Some("#ffffff".into());
+        assert!(validate(&m).is_ok());
+        assert!(m.files().contains(&"slack.svg".to_string()));
+
+        for bad_icon in ["../slack.svg", "/etc/x.svg", "slack.png", "https://a/x.svg", ""] {
+            m.bridge.as_mut().unwrap().icon = Some(bad_icon.into());
+            assert!(validate(&m).is_err(), "expected error for icon {bad_icon:?}");
+        }
+        m.bridge.as_mut().unwrap().icon = Some("slack.svg".into());
+        m.bridge.as_mut().unwrap().icon_bg = Some("url(evil)".into());
+        assert!(validate(&m).is_err());
+    }
+
+    #[test]
+    fn bridge_entry_serializes_safe_icon_data_url() {
+        let dir = std::env::temp_dir().join(format!("vicuna-bridge-icon-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugin_dir = dir.join("slack-demo");
+        std::fs::create_dir_all(plugin_dir.join("files")).unwrap();
+        let svg = b"<svg viewBox=\"0 0 24 24\"><path fill=\"#E01E5A\" d=\"M0 0h10v10H0z\"/></svg>";
+        std::fs::write(plugin_dir.join("files/slack.svg"), svg).unwrap();
+        std::fs::write(plugin_dir.join("files/evil.svg"), b"<svg onload=\"alert(1)\"/>").unwrap();
+
+        let info = InstallInfo { source: "local/slack-demo".into(), installed_at: 1 };
+        let mut m: Manifest = serde_json::from_value(json!({
+            "id": "slack-demo",
+            "name": "Slack",
+            "version": "0.1.2",
+            "bridge": {
+                "name": "Slack",
+                "color": "#4a154b",
+                "icon": "slack.svg",
+                "iconBg": "#ffffff",
+                "iconPath": "M0 0",
+                "entrypoint": "bin/slack"
+            }
+        })).unwrap();
+
+        let out = entry_in_dir(&m, &info, Some(&plugin_dir));
+        let data_url = out["bridge"]["iconDataUrl"].as_str().expect("iconDataUrl present");
+        assert!(data_url.starts_with("data:image/svg+xml;base64,"), "{data_url}");
+        assert_eq!(out["bridge"]["iconBg"], "#ffffff");
+        assert_eq!(out["bridge"]["color"], "#4a154b");
+
+        // Unsafe SVG or missing file omits iconDataUrl so UI falls back to monochrome iconPath.
+        m.bridge.as_mut().unwrap().icon = Some("evil.svg".into());
+        assert!(entry_in_dir(&m, &info, Some(&plugin_dir))["bridge"].get("iconDataUrl").is_none());
+
+        m.bridge.as_mut().unwrap().icon = Some("missing.svg".into());
+        assert!(entry_in_dir(&m, &info, Some(&plugin_dir))["bridge"].get("iconDataUrl").is_none());
+
+        // No bridge.icon declared omits iconDataUrl even if top-level m.icon is set (keeps Discord/Signal monochrome badges).
+        m.icon = Some("slack.svg".into());
+        m.bridge.as_mut().unwrap().icon = None;
+        assert!(entry_in_dir(&m, &info, Some(&plugin_dir))["bridge"].get("iconDataUrl").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
