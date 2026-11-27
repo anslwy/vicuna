@@ -28,6 +28,20 @@
   // it; declining leaves the harness disabled.
   let consent = $state<{ plugin: InstalledPlugin; harnesses: PluginHarness[] } | null>(null);
   let consentBusy = $state(false);
+  let preview = $state<{ name: string; url: string } | null>(null);
+
+  $effect(() => {
+    if (!preview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      preview = null;
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
 
   /** Move the dialog to <body>: the Plugins modal card is transformed, which
    *  would trap position:fixed inside it (and clip the dialog). */
@@ -220,8 +234,8 @@
           {@const icon = safeImageUrl(e.icon)}
           {@const inst = installedById.get(e.id)}
           {@const repoUrl = githubRepoUrl(e.source)}
+          {@const hasQuickActions = !!(inst && act === "upgrade" && ((inst.panels?.length ?? 0) > 0 || inst.themes.length > 0))}
           <div class="pl-card" data-testid="plugin-card-{e.id}">
-            {#if shot}<img class="pl-shot" src={shot} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
             <div class="pl-card-body">
               <div class="pl-item-top">
                 {#if icon}<img class="pl-icon" src={icon} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
@@ -241,35 +255,45 @@
                   <span class="pl-badge" title="Update Vicuna to install this plugin">Needs Vicuna {e.minVicuna}</span>
                 {/if}
               </div>
-              <div class="pl-muted">{e.description}</div>
-              <div class="pl-tags">
-                {#each e.kinds as k (k)}<span class="pl-kind">{KIND_LABEL[k] ?? k}</span>{/each}
-                {#each e.tags as t (t)}<span class="pl-tag">{t}</span>{/each}
-                <span class="pl-src" title={e.source}>
-                  {#if repoUrl}
-                    <a class="pl-src-link" href={repoUrl} target="_blank" rel="noopener noreferrer" title="Open {e.source} on GitHub" data-testid="plugin-card-repo-{e.id}">
-                      <svg class="pl-gh" width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-                      <span class="pl-src-text">{e.source}</span>
-                    </a>
-                  {:else}
-                    {e.source}
-                  {/if}
-                </span>
-              </div>
-              {#if inst && act === "upgrade"}
-                <div class="pl-themes">
-                  {#each inst.panels ?? [] as pn (pn.id)}
-                    <button class="pl-theme" data-testid="plugin-card-panel-{e.id}-{pn.id}" title="Open this panel in the side bar" onclick={() => onOpenPanel?.(`plugin:${inst.id}:${pn.id}`)}>Open {pn.title}</button>
-                  {/each}
-                  {#each inst.themes as t (t.id)}
-                    {@const key = `${inst.id}/${t.id}`}
-                    <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-card-theme-{e.id}-{t.id}" onclick={() => onUseTheme(inst.id, t.id)} title="Use this theme">
-                      <span class="pl-dot" style="background: {t.vars['--bg'] ?? (t.base === 'dark' ? '#3d3332' : '#ffffff')}; border-color: {t.accent?.bg ?? 'var(--border-2)'}"></span>
-                      {t.name}{#if activeThemeKey === key}{" "}✓{/if}
-                    </button>
-                  {/each}
+              <div class="pl-muted pl-card-desc" title={e.description}>{e.description}</div>
+              <div class="pl-card-foot">
+                <div class="pl-tags">
+                  {#each e.kinds as k (k)}<span class="pl-kind">{KIND_LABEL[k] ?? k}</span>{/each}
+                  {#each e.tags as t (t)}<span class="pl-tag">{t}</span>{/each}
+                  <span class="pl-src" title={e.source}>
+                    {#if repoUrl}
+                      <a class="pl-src-link" href={repoUrl} target="_blank" rel="noopener noreferrer" title="Open {e.source} on GitHub" data-testid="plugin-card-repo-{e.id}">
+                        <svg class="pl-gh" width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+                        <span class="pl-src-text">{e.source}</span>
+                      </a>
+                    {:else}
+                      {e.source}
+                    {/if}
+                  </span>
                 </div>
-              {/if}
+                {#if hasQuickActions || shot}
+                  <div class="pl-themes">
+                    {#if inst && act === "upgrade"}
+                      {#each inst.panels ?? [] as pn (pn.id)}
+                        <button class="pl-theme" data-testid="plugin-card-panel-{e.id}-{pn.id}" title="Open this panel in the side bar" onclick={() => onOpenPanel?.(`plugin:${inst.id}:${pn.id}`)}>Open {pn.title}</button>
+                      {/each}
+                      {#each inst.themes as t (t.id)}
+                        {@const key = `${inst.id}/${t.id}`}
+                        <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-card-theme-{e.id}-{t.id}" onclick={() => onUseTheme(inst.id, t.id)} title="Use this theme">
+                          <span class="pl-dot" style="background: {t.vars['--bg'] ?? (t.base === 'dark' ? '#3d3332' : '#ffffff')}; border-color: {t.accent?.bg ?? 'var(--border-2)'}"></span>
+                          {t.name}{#if activeThemeKey === key}{" "}✓{/if}
+                        </button>
+                      {/each}
+                    {/if}
+                    {#if shot}
+                      <button class="pl-theme pl-preview-btn" data-testid="plugin-card-preview-{e.id}" title="Preview {e.name} screenshot" onclick={() => (preview = { name: e.name, url: shot })}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                        Preview
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
             </div>
           </div>
         {/each}
@@ -380,6 +404,19 @@
   </div>
 {/if}
 
+{#if preview}
+  <div use:portal class="pl-portal">
+    <div class="pl-backdrop" role="presentation" data-testid="plugin-preview-backdrop" onclick={() => (preview = null)}></div>
+    <div class="pl-preview" role="dialog" aria-modal="true" aria-labelledby="pl-preview-title" data-testid="plugin-preview-modal">
+      <div class="pl-preview-head">
+        <h3 id="pl-preview-title">{preview.name}</h3>
+        <button class="pl-btn" data-testid="plugin-preview-close" onclick={() => (preview = null)}>Close</button>
+      </div>
+      <img class="pl-preview-img" src={preview.url} alt="{preview.name} preview" referrerpolicy="no-referrer" />
+    </div>
+  </div>
+{/if}
+
 <style>
   .pl { display: flex; flex-direction: column; gap: 10px; font-size: 14px; color: var(--text); }
   .pl-muted { color: var(--muted); font-size: 12.5px; margin: 0; line-height: 1.5; }
@@ -419,8 +456,9 @@
   .pl-search { font-family: inherit; font-size: 13px; }
   .pl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
   .pl-card { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
-  .pl-shot { width: 100%; height: 150px; object-fit: cover; object-position: top; display: block; border-bottom: 1px solid var(--border); background: var(--hover); }
-  .pl-card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .pl-card-body { flex: 1; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .pl-card-desc { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; min-height: 3em; }
+  .pl-card-foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
   .pl-card-title { display: flex; flex-direction: column; min-width: 0; }
   .pl-card-title .pl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pl-icon { width: 40px; height: 40px; border-radius: 7px; flex: none; object-fit: contain; }
@@ -440,4 +478,8 @@
   .pl-consent-h { display: flex; flex-direction: column; gap: 2px; }
   .pl-warn { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--text); background: var(--err-bg); border-radius: 10px; padding: 8px 10px; }
   .pl-consent-actions { justify-content: flex-end; }
+  .pl-preview { position: fixed; z-index: 1001; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: min(952px, 92vw); max-height: 92vh; box-sizing: border-box; background: var(--bg); color: var(--text); border: 1px solid var(--border-2); border-radius: 14px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3); }
+  .pl-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .pl-preview-head h3 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-preview-img { display: block; max-width: min(920px, 100%); max-height: 80vh; object-fit: contain; border-radius: 8px; border: 1px solid var(--border); background: var(--hover); }
 </style>

@@ -47,3 +47,13 @@ test("standalone Plugins modal hosts PluginsPanel with close controls", () => {
   const panelIdx = chatApp.indexOf("<PluginsPanel", modalStart);
   assert.ok(panelIdx > modalStart, "PluginsPanel renders inside plugins-modal");
 });
+
+test("Explore cards stay compact with 2-line descriptions and a Preview lightbox", () => {
+  const pluginsPanel = readFileSync(root + "src/lib/PluginsPanel.svelte", "utf8");
+  assert.equal(pluginsPanel.includes("pl-shot"), false, "inline screenshot banner removed");
+  assert.ok(pluginsPanel.includes("-webkit-line-clamp: 2"), "descriptions clamp to 2 lines");
+  assert.ok(pluginsPanel.includes("min-height: 3em"), "descriptions reserve 2-line height");
+  assert.ok(pluginsPanel.includes('data-testid="plugin-card-preview-{e.id}"'), "Preview button testid present");
+  assert.ok(pluginsPanel.includes('data-testid="plugin-preview-modal"'), "Preview lightbox modal present");
+  assert.ok(pluginsPanel.includes("e.stopPropagation()"), "Escape stops propagation when lightbox closes");
+});
