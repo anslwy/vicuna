@@ -148,6 +148,7 @@
   import { createAppUpdateState } from "$lib/appUpdateState.svelte";
   import { createServerSwitcherState } from "$lib/serverSwitcherState.svelte";
   import { createUsageState } from "$lib/usageState.svelte";
+  import { createOpenRouterState } from "$lib/openRouterState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -1979,115 +1980,15 @@
   // The key lives in prefs; the catalog is fetched at runtime (the public
   // endpoint is CORS-enabled) and cached in localStorage. Chat + Work both
   // run through OpenRouter selections (`openrouter:` ids).
-  let openrouterKey = $state(initialPrefs.openrouterApiKey ?? "");
-  let openrouterKeyDraft = $state(initialPrefs.openrouterApiKey ?? "");
-  let openrouterKeyVisible = $state(false);
-  /** Once a key is saved the full form collapses (frees room for the model
-   *  list); "Change" reveals it again. Always open when no key is set. */
-  let openrouterKeyEditing = $state(false);
-  let openrouterKeyBusy = $state(false);
-  let openrouterKeyInfo = $state<OpenRouterKeyInfo | null>(null);
-  let openrouterKeyError = $state<string | null>(null);
-  let openrouterModels = $state<OpenRouterModel[]>([]);
-  let openrouterUpdated = $state("");
-  let openrouterLoading = $state(false);
-  let openrouterError = $state<string | null>(null);
-  let openrouterQuery = $state("");
-  let openrouterCat = $state<OpenRouterFilter>("added");
-  const openrouterKeyDirty = $derived(openrouterKeyDraft.trim() !== openrouterKey);
-  /** Curated ids: only these appear in the model picker and under the
-   *  Added chip — the live catalog is 400+ entries. Any other chip or a
-   *  search query browses the full catalog for discovery. */
-  let openrouterAdded = $state<string[]>([...(initialPrefs.openrouterAdded ?? [])]);
+  const openrouter = createOpenRouterState({
+    get initialPrefs() { return initialPrefs; },
+    get persistPrefs() { return persistPrefs; },
+    get settingsTab() { return settingsTab; },
+    set settingsTab(v) { settingsTab = v; }
+  });
   /** Sidebar scope ("all", "chat", or a workspace root). Resolved against the
    *  live folders below, so a stale value can never blank the list. */
   let sessionFilterRaw = $state<string>(initialPrefs.sessionFilter ?? ALL_FILTER);
-  const openrouterAddedSet = $derived(new Set(openrouterAdded));
-  const openrouterBrowsing = $derived(openrouterCat !== "added" || openrouterQuery.trim() !== "");
-  const filteredOpenRouterModels = $derived.by(() => {
-    const base =
-      openrouterCat === "added" && openrouterQuery.trim() === ""
-        ? openrouterModels.filter((m) => openrouterAddedSet.has(m.id))
-        : openrouterModels;
-    return filterOpenRouterModels(base, openrouterQuery, openrouterCat);
-  });
-
-  function toggleOpenRouterAdded(id: string) {
-    openrouterAdded = openrouterAddedSet.has(id)
-      ? openrouterAdded.filter((x) => x !== id)
-      : [...openrouterAdded, id];
-    persistPrefs();
-  }
-
-  function openOpenRouterTab() {
-    settingsTab = "openrouter";
-    // Verify a saved key when the tab opens. Success sticks (no network per
-    // click); a failed check retries next time, which helps after the account
-    // or network is fixed.
-    if (openrouterKey && !openrouterKeyInfo && !openrouterKeyBusy) void verifyOpenRouterKey();
-  }
-
-  /** Persist the trimmed key and verify it immediately. */
-  async function saveOpenRouterKey() {
-    const next = openrouterKeyDraft.trim();
-    const changed = next !== openrouterKey;
-    openrouterKey = next;
-    openrouterKeyDraft = next;
-    openrouterKeyInfo = null;
-    openrouterKeyError = null;
-    setOpenRouterApiKey(next);
-    if (changed) persistPrefs();
-    if (!next) {
-      openrouterKeyVisible = false;
-      return;
-    }
-    await verifyOpenRouterKey();
-    if (!openrouterKeyError) openrouterKeyEditing = false;
-  }
-
-  async function verifyOpenRouterKey() {
-    if (openrouterKeyBusy) return;
-    openrouterKeyError = null;
-    if (!openrouterKey) {
-      openrouterKeyError = "Enter an API key first.";
-      return;
-    }
-    openrouterKeyBusy = true;
-    try {
-      openrouterKeyInfo = await testOpenRouterKey(openrouterKey);
-    } catch (e: any) {
-      openrouterKeyInfo = null;
-      openrouterKeyError = e?.message ?? String(e);
-    } finally {
-      openrouterKeyBusy = false;
-    }
-  }
-
-  function clearOpenRouterKey() {
-    openrouterKey = "";
-    openrouterKeyDraft = "";
-    openrouterKeyVisible = false;
-    openrouterKeyEditing = false;
-    openrouterKeyInfo = null;
-    openrouterKeyError = null;
-    setOpenRouterApiKey("");
-    persistPrefs();
-  }
-
-  async function fetchOpenRouterCatalog() {
-    if (openrouterLoading) return;
-    openrouterLoading = true;
-    openrouterError = null;
-    try {
-      const list = await fetchOpenRouterModels(openrouterKey);
-      openrouterModels = list;
-      openrouterUpdated = writeOpenRouterCache(list);
-    } catch (e: any) {
-      openrouterError = e?.message ?? String(e);
-    } finally {
-      openrouterLoading = false;
-    }
-  }
 
   async function fetchCatalog() {
     if (fetching) return;
@@ -2706,7 +2607,7 @@
   let defaultWorkspaceWrite = Promise.resolve();
 
   function persistPrefs() {
-    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouterKey, openrouterAdded, sessionFilter: sessionFilterRaw });
+    savePrefs({ theme, accent, fontSize, sidebarOpen, stopWords, ollamaBase, zoom: zoomLevel, defaultWorkspace, thinkLevel, continueMode, openrouterApiKey: openrouter.openrouterKey, openrouterAdded: openrouter.openrouterAdded, sessionFilter: sessionFilterRaw });
     if (!serverSessionTools || lastDefaultWorkspace === defaultWorkspace) return;
     const prev = lastDefaultWorkspace;
     const workspace = defaultWorkspace;
@@ -3333,7 +3234,7 @@
       // OpenRouter exposes reasoning as a model capability, not a level list.
       // Effort strings are only offered when the model advertises support;
       // OpenRouter normalizes/falls back otherwise.
-      const om = findOpenRouterModel(openrouterModels, m);
+      const om = findOpenRouterModel(openrouter.openrouterModels, m);
       if (selectedModel !== m) return;
       thinkLevels = om?.reasoning && om.supportedParameters.includes("reasoning_effort") ? ["low", "medium", "high"] : [];
       thinkDefault = null;
@@ -3409,9 +3310,9 @@
     for (const m of models) {
       if (!q || m.toLowerCase().includes(q)) out.push({ id: m, name: m, sub: "", provider: "ollama" });
     }
-    for (const om of openrouterModels) {
+    for (const om of openrouter.openrouterModels) {
       const sel = openRouterSelection(om.id);
-      if (!openrouterAddedSet.has(om.id) && sel !== selectedModel) continue;
+      if (!openrouter.openrouterAddedSet.has(om.id) && sel !== selectedModel) continue;
       if (q && !om.id.toLowerCase().includes(q) && !om.name.toLowerCase().includes(q)) continue;
       out.push({ id: sel, name: displayOpenRouterId(om.id), sub: "", provider: "openrouter" });
     }
@@ -4319,7 +4220,7 @@
         baseRev: operation.operation === "send" && chat ? serverSaveRow(chat)?.baseRev : baseRev,
         ...operation,
         ...options,
-        ...(isOpenRouterSelection(options.model) ? { openRouterApiKey: openrouterKey } : {}),
+        ...(isOpenRouterSelection(options.model) ? { openRouterApiKey: openrouter.openrouterKey } : {}),
         onEvent
       });
     }, onStarted ?? (() => {}), !isOpenRouterSelection(options.model));
@@ -4789,7 +4690,7 @@
       try {
         await runServerSessionTool("session_compact", chat, {
           model: selectedModel,
-          ...(isOpenRouterSelection(selectedModel) ? { openRouterApiKey: openrouterKey } : {})
+          ...(isOpenRouterSelection(selectedModel) ? { openRouterApiKey: openrouter.openrouterKey } : {})
         });
       } finally {
         setToolStatus(chat.id, null);
@@ -5561,7 +5462,7 @@
   async function refreshCtxWindow() {
     const m = selectedModel;
     if (isOpenRouterSelection(m)) {
-      const om = findOpenRouterModel(openrouterModels, m);
+      const om = findOpenRouterModel(openrouter.openrouterModels, m);
       if (selectedModel !== m) return;
       if (om?.contextLength) ctxWindow = om.contextLength;
       return;
@@ -5573,7 +5474,7 @@
   $effect(() => {
     if (!ready) return;
     selectedModel;
-    openrouterModels;
+    openrouter.openrouterModels;
     void refreshCtxWindow();
   });
 
@@ -8020,10 +7921,10 @@
       if (isTauriRuntime() && zoomLevel !== 1) void applyZoom(zoomLevel);
       thinkLevel = prefs.thinkLevel ?? "auto";
       continueMode = normalizeContinueMode(prefs.continueMode);
-      openrouterKey = prefs.openrouterApiKey ?? "";
-      openrouterKeyDraft = openrouterKey;
-      setOpenRouterApiKey(openrouterKey);
-      openrouterAdded = [...(prefs.openrouterAdded ?? [])];
+      openrouter.openrouterKey = prefs.openrouterApiKey ?? "";
+      openrouter.openrouterKeyDraft = openrouter.openrouterKey;
+      setOpenRouterApiKey(openrouter.openrouterKey);
+      openrouter.openrouterAdded = [...(prefs.openrouterAdded ?? [])];
       sessionFilterRaw = prefs.sessionFilter ?? ALL_FILTER;
       // narrow screens start collapsed regardless of the saved preference
       sidebarOpen = window.innerWidth < 700 ? false : prefs.sidebarOpen;
@@ -8123,8 +8024,8 @@
       }
       const cachedOpenRouter = readOpenRouterCache();
       if (cachedOpenRouter) {
-        openrouterModels = cachedOpenRouter.models;
-        openrouterUpdated = cachedOpenRouter.updated;
+        openrouter.openrouterModels = cachedOpenRouter.models;
+        openrouter.openrouterUpdated = cachedOpenRouter.updated;
       }
       const m = await loadModel();
       if (m) selectedModel = m;
@@ -9950,30 +9851,30 @@
     {formatPullRate}
     {isMlxVariant}
     {pickedVariant}
-    {openrouterKey}
-    {openrouterKeyBusy}
-    {openrouterKeyInfo}
-    bind:openrouterKeyEditing
-    bind:openrouterKeyVisible
-    bind:openrouterKeyDraft
-    {openrouterKeyDirty}
-    {openrouterKeyError}
-    bind:openrouterQuery
-    bind:openrouterCat
-    {openrouterLoading}
-    {openrouterModels}
-    {openrouterBrowsing}
-    {filteredOpenRouterModels}
-    {openrouterUpdated}
-    {openrouterError}
-    {openrouterAddedSet}
+    openrouterKey={openrouter.openrouterKey}
+    openrouterKeyBusy={openrouter.openrouterKeyBusy}
+    openrouterKeyInfo={openrouter.openrouterKeyInfo}
+    bind:openrouterKeyEditing={openrouter.openrouterKeyEditing}
+    bind:openrouterKeyVisible={openrouter.openrouterKeyVisible}
+    bind:openrouterKeyDraft={openrouter.openrouterKeyDraft}
+    openrouterKeyDirty={openrouter.openrouterKeyDirty}
+    openrouterKeyError={openrouter.openrouterKeyError}
+    bind:openrouterQuery={openrouter.openrouterQuery}
+    bind:openrouterCat={openrouter.openrouterCat}
+    openrouterLoading={openrouter.openrouterLoading}
+    openrouterModels={openrouter.openrouterModels}
+    openrouterBrowsing={openrouter.openrouterBrowsing}
+    filteredOpenRouterModels={openrouter.filteredOpenRouterModels}
+    openrouterUpdated={openrouter.openrouterUpdated}
+    openrouterError={openrouter.openrouterError}
+    openrouterAddedSet={openrouter.openrouterAddedSet}
     {openRouterUsageText}
-    onOpenOpenRouterTab={openOpenRouterTab}
-    onVerifyOpenRouterKey={verifyOpenRouterKey}
-    onClearOpenRouterKey={clearOpenRouterKey}
-    onSaveOpenRouterKey={saveOpenRouterKey}
-    onFetchOpenRouterCatalog={fetchOpenRouterCatalog}
-    onToggleOpenRouterAdded={toggleOpenRouterAdded}
+    onOpenOpenRouterTab={openrouter.openOpenRouterTab}
+    onVerifyOpenRouterKey={openrouter.verifyOpenRouterKey}
+    onClearOpenRouterKey={openrouter.clearOpenRouterKey}
+    onSaveOpenRouterKey={openrouter.saveOpenRouterKey}
+    onFetchOpenRouterCatalog={openrouter.fetchOpenRouterCatalog}
+    onToggleOpenRouterAdded={openrouter.toggleOpenRouterAdded}
   />
 {/if}
 {#if clearContextChatId}
