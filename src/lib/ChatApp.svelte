@@ -134,6 +134,9 @@
   import pkg from "../../package.json";
   import type { Terminal as XTerm, ITheme as XTermTheme } from "xterm";
   import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
+  import { findMentions, renderMentions, renderUserMessage } from "$lib/mentions";
+  import { type StreamSel, textOffsetIn, nodeForOffset, copyText, copyTermSelection, CODE_CHECK_SVG, hasDroppedFiles, prefillAsk, revealCard, imageFileToDataUrl, pastedImageFiles, openExternal, openTokenPage, withBrowserTimeout, BROWSER_START_TIMEOUT_MS, BROWSER_START_TIMEOUT_MESSAGE, isMac, isWindows, validateWorkspace, canonicalWorkspace, ensureScratchWorkspace, clampExplorerWidth, EXPLORER_MIN_W, EXPLORER_DEFAULT_W } from "$lib/chatDom";
+  import { type PendingAsk, type LaterAsk, type ModelChoice, type RemoteHit, type SearchItem, type ChatTurnEvent, type ChatTurnOperation, BROWSE_CATS, SUGGESTIONS, WORK_SUGGESTIONS, SHOW_ARCHIVED_KEY, USAGE_CACHE_KEY, CLI_INSTALL_CMD, SERVER_SETUP_CMD, WARM_RECENT_COUNT, resolveAppUpdateReleaseNotes, openRouterUsageText, newMcpEnabled, scheduleTz } from "$lib/chatAppData";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -208,46 +211,9 @@
       toolStatuses = { ...toolStatuses, [chatId]: label };
     }
   }
-  /** live multiple-choice question from a work agent turn, per session. The
-   *  turn blocks until the user answers; each session keeps its own card so
-   *  concurrent turns don't overwrite each other's question. */
-  interface PendingAsk {
-    chatId: string;
-    index: number;
-    question: string;
-    options: string[];
-    /** multi-select question (vicuna-mcp ask_user `multiple`) */
-    multi: boolean;
-    /** the labels picked so far in a multi-select question */
-    picked: string[];
-    /** agent question (vicuna-mcp ask_user): choices prefill the answer box
-     *  instead of answering, and the box takes pasted images. Permission
-     *  asks (Allow/Deny) still answer on click. */
-    agentQuestion: boolean;
-    /** the answer box's draft text */
-    text: string;
-    /** images pasted into the answer box (data URLs) */
-    images: string[];
-    /** Other… opened the box on a permission ask */
-    otherOpen: boolean;
-    resolve: (answer: string, outcome: "answer" | "dismiss" | "cancel" | "later", display?: string) => void;
-  }
   let pendingAsks = $state<Record<string, PendingAsk>>({});
   /** the open session's ask card (null when it has none pending) */
   const pendingAsk = $derived(activeId != null ? (pendingAsks[activeId] ?? null) : null);
-  /** agent questions the user put off with "Answer later": the ask_user call
-   *  already returned, so the answer goes to the session as a message */
-  interface LaterAsk {
-    id: string;
-    chatId: string;
-    index: number;
-    question: string;
-    options: string[];
-    multi: boolean;
-    picked: string[];
-    text: string;
-    images: string[];
-  }
   let laterAsks = $state<LaterAsk[]>([]);
   /** file explorer side panel (work mode): lists the workspace tree */
   let explorerOpen = $state(false);
@@ -290,14 +256,6 @@
   /** live xterm instances by tab key (non-reactive on purpose) */
   const termViews = new Map<string, { term: XTerm; fit: XFitAddon; ro: ResizeObserver; resizeTimer: ReturnType<typeof setTimeout> | null }>();
   let lastExplorerRoot = "";
-
-  const EXPLORER_MIN_W = 220;
-  const EXPLORER_DEFAULT_W = 300;
-
-  function clampExplorerWidth(w: number): number {
-    const maxW = Math.max(240, window.innerWidth - 360);
-    return Math.min(Math.max(EXPLORER_MIN_W, Math.round(w)), maxW);
-  }
 
   /** drag the panel's left edge to resize (dragging left widens) */
   function onExpResizeStart(e: PointerEvent) {
@@ -430,11 +388,6 @@
 
   function currentMcpSelection() {
     return activeChat ?? { mcpEnabled: homeMcpEnabled };
-  }
-
-  async function newMcpEnabled(draft?: McpEnabledMap): Promise<McpEnabledMap> {
-    const defaults = await listMcpServers();
-    return resolveMcpEnabled(defaults, { mcpEnabled: draft });
   }
 
   async function setMcpForSession(sid: string | null, id: string, enabled: boolean) {
@@ -897,27 +850,6 @@
     if (!d || d.type !== "live-browser:open-external" || typeof d.url !== "string") return;
     if (!/^https?:\/\//.test(d.url)) return;
     void openExternal(d.url);
-  }
-
-  /** Open a URL outside the app: system browser on desktop (Tauri opener),
-   *  new tab in plain browsers. Never navigates the app webview itself. */
-  async function openExternal(url: string): Promise<void> {
-    if (isTauriRuntime()) {
-      try {
-        const { openUrl } = await import("@tauri-apps/plugin-opener");
-        await openUrl(url);
-        return;
-      } catch {
-        /* fall through to window.open */
-      }
-    }
-    window.open(url, "_blank", "noopener");
-  }
-
-  /** Open the token generation page (github-only PAT prompt). */
-  async function openTokenPage(e: MouseEvent) {
-    e.preventDefault();
-    await openExternal("https://github.com/settings/tokens/new");
   }
 
   /** Save the pasted PAT into the server's Headers and connect. */
@@ -1417,13 +1349,6 @@
   let scheduleCustom = $state<{ date: string; time: string; rescheduleId: string | null; error: string | null } | null>(null);
   /** clock for the schedule UI (preset times, Today/Tomorrow labels) */
   let scheduleNow = $state(Date.now());
-  const scheduleTz = (() => {
-    try {
-      return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-    } catch {
-      return "";
-    }
-  })();
   /** ids being sent right now (a slow workspace check must not double-send) */
   const scheduleSending = new Set<string>();
 
@@ -1900,7 +1825,6 @@
     for (const it of dueItems(scheduled, at)) void deliverScheduled(it.id);
   }
   type UsageCacheEntry = { report: WorkUsageReport | null; error: string | null; at: number };
-  const USAGE_CACHE_KEY = "vicuna-usage-cache";
   let usageOpen = $state(false);
   let usageEngine = $state("agy");
   let usageNoEngineError = $state<string | null>(null);
@@ -2287,7 +2211,6 @@
   let settingsOpen = $state(false);
   let settingsTab = $state<"general" | "work" | "models" | "openrouter" | "chat">("general");
   let pluginsOpen = $state(false);
-  const CLI_INSTALL_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh";
   let cliCopied = $state(false);
   async function copyCliInstall() {
     try {
@@ -2440,10 +2363,6 @@
     } catch (e: any) {
       accountError = typeof e === "string" ? e : (e?.message ?? String(e));
     }
-  }
-  /** Keep the sign-in card visible when it opens under an account row in the scrolling engine list. */
-  function revealCard(node: HTMLElement) {
-    requestAnimationFrame(() => node.scrollIntoView({ block: "nearest", behavior: "smooth" }));
   }
 
   let accountSignInCopiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2675,18 +2594,6 @@
     const suppressPrompt = suppressAutoUpdatePromptUntilNextCheck;
     suppressAutoUpdatePromptUntilNextCheck = false;
     await checkForAppUpdates({ source: "automatic", suppressAutoPrompt: suppressPrompt });
-  }
-
-  async function resolveAppUpdateReleaseNotes(update: {
-    body?: string | null;
-  }): Promise<{ notesPreview: string | null; releaseNotesUrl: string }> {
-    const fallback = createReleaseNotesPreview(update.body ?? null);
-    try {
-      return await fetchGithubReleaseNotesMetadata();
-    } catch (err) {
-      console.warn("Failed to fetch GitHub release notes preview:", err);
-      return { notesPreview: fallback, releaseNotesUrl: APP_UPDATE_RELEASES_URL };
-    }
   }
 
   async function checkForAppUpdates(
@@ -2979,15 +2886,6 @@
     }
   }
 
-  function openRouterUsageText(info: OpenRouterKeyInfo): string {
-    const bits: string[] = [];
-    if (info.usage !== null) bits.push(`usage ${formatUsd(info.usage)}`);
-    if (info.limit !== null && info.limit > 0) {
-      bits.push(info.limitRemaining !== null ? `${formatUsd(info.limitRemaining)} of ${formatUsd(info.limit)} left` : `limit ${formatUsd(info.limit)}`);
-    }
-    return bits.join(" · ");
-  }
-
   async function fetchCatalog() {
     if (fetching) return;
     catalogError = null;
@@ -3011,6 +2909,11 @@
   // chat list and Work turns then live on that machine. Constant per load.
   const onServer = isRemoteServer();
   const activeServer = activeServerId();
+  /** scheduled sends target chat ids, which belong to one backend: keep a
+   *  separate list per server so nothing fires against the wrong machine */
+  function scheduleStoreKey(): string {
+    return activeServer ? `${SCHEDULE_KEY}:server:${activeServer}` : SCHEDULE_KEY;
+  }
   /** `?chat=<id>`: this window was opened on a session from the Cmd+P palette
    *  (a server window gets the session in its URL; read before navigation
    *  rewrites it). */
@@ -3109,12 +3012,6 @@
       srvUpgradePct = null;
       srvUpgradeDetail = null;
     }
-  }
-
-  /** scheduled sends target chat ids, which belong to one backend: keep a
-   *  separate list per server so nothing fires against the wrong machine */
-  function scheduleStoreKey(): string {
-    return activeServer ? `${SCHEDULE_KEY}:server:${activeServer}` : SCHEDULE_KEY;
   }
 
   async function refreshServers() {
@@ -3254,8 +3151,6 @@
       void getCurrentWindow().close();
     }
   }
-
-  const SERVER_SETUP_CMD = "curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh\nvicuna serve --tailscale";
   let srvCmdCopied = $state(false);
   async function copyServerSetup() {
     try {
@@ -3921,7 +3816,6 @@
   /** connected hosts whose chats are NOT loaded in this window */
   const remoteTargets = $derived(srvList.filter((s) => s.id !== activeServer));
   const hasPartialChats = $derived(isServerBacked() && chats.some((c) => c.partial));
-  type RemoteHit = ServerChatHit & { serverId: string; serverName: string };
   let localServerHits = $state<ServerChatHit[]>([]);
   let localServerSearching = $state(false);
   let remoteHits = $state<RemoteHit[]>([]);
@@ -3932,10 +3826,6 @@
   let remoteTimer: ReturnType<typeof setTimeout> | null = null;
   let remotePending: Promise<void> | null = null;
   let remoteResolve: (() => void) | null = null;
-  type SearchItem =
-    | { kind: "new" }
-    | { kind: "chat"; chat: Chat; snippet?: string }
-    | { kind: "remote"; hit: RemoteHit };
   const searchItems = $derived.by((): SearchItem[] => {
     const rows: SearchItem[] = [];
     const seen = new Set<string>();
@@ -4527,9 +4417,6 @@
     persistPrefs();
   }
 
-  // ⌘N on macOS, Ctrl+N elsewhere (shown as the New Chat hover hint)
-  const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent ?? "");
-
   /** human-readable model name, Ollama-style everywhere: OpenRouter picks
    *  show the bare provider id (`org/model…`, `openrouter:` prefix and the
    *  registry's `~` rolling-pointer mark stripped) instead of the catalog
@@ -4541,13 +4428,6 @@
     const engine = sel.split("/", 1)[0];
     const account = workEngineList.find((e) => e.id === engine && e.account);
     return account ? account.label + sel.slice(engine.length) : sel;
-  }
-
-  interface ModelChoice {
-    id: string;
-    name: string;
-    sub: string;
-    provider: "ollama" | "openrouter";
   }
 
   // model menu: installed Ollama tags first (as before), then the added
@@ -4587,9 +4467,6 @@
     const rank = (m: string) => (m === selectedModel ? 0 : running.has(m) ? 1 : 2);
     return models.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m) || a.i - b.i).map((x) => x.m);
   });
-
-  // discover tab: curated registry catalog with client-side search + filters
-  const BROWSE_CATS = ["all", "chat", "code", "reasoning", "vision", "embedding", "small", "mlx"] as const;
   /** variant tags ending in -mlx are Apple-silicon builds (see refresh-catalog.py) */
   const filteredCatalog = $derived.by(() => {
     const q = browseQuery.trim().toLowerCase();
@@ -4612,27 +4489,6 @@
   function pickedVariant(entryName: string, fallback: string): string {
     return variantPick[entryName] ?? fallback;
   }
-
-  // generic starter prompts (no tools required on the model's side)
-  const SUGGESTIONS = [
-    { title: "Explain a concept", prompt: "Explain black holes in simple terms", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
-    { title: "Write code", prompt: "Write a Python function to sort a list", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' },
-    { title: "Draft a message", prompt: "Write a friendly follow-up email", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>' },
-    { title: "Brainstorm ideas", prompt: "Give me ideas for a weekend project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>' },
-    { title: "Summarize text", prompt: "Summarize this paragraph in two sentences:", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
-    { title: "What can you do?", prompt: "What can you do?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
-  ];
-
-  // work starters: each one maps to a real Work-mode capability (list/read,
-  // grep, exec, write, sessions) so the cards demo what the agent can do
-  const WORK_SUGGESTIONS = [
-    { title: "Explore this folder", prompt: "List the files here and explain what this project is", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' },
-    { title: "Find in files", prompt: "Search the workspace for TODO comments and group them by file", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' },
-    { title: "Run a command", prompt: "Run `git status` and summarize what changed", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>' },
-    { title: "Write a file", prompt: "Create a README.md that explains this project", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>' },
-    { title: "Search past chats", prompt: "Search my past chats for this project and summarize what we did", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>' },
-    { title: "What can you do?", prompt: "What can you do in Work mode?", icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/></svg>' }
-  ];
 
   function useSuggestion(prompt: string) {
     input = prompt;
@@ -4663,7 +4519,6 @@
     if (!filterWs) return null;
     return workspaceFilterKey(composerWs) === folderOptionKey(filterWs) ? filterWs : null;
   });
-  const SHOW_ARCHIVED_KEY = "vicuna-show-archived";
   let showArchived = $state(typeof localStorage !== "undefined" && localStorage.getItem(SHOW_ARCHIVED_KEY) === "1");
   // archived sessions leave Pinned (the pin flag is kept for unarchive) and
   // are hidden unless "Show archived" is on — the open one always stays
@@ -4963,40 +4818,6 @@
     activeChat?.messages.length;
     scrollBottom();
   });
-
-  // The streaming reply re-renders `{@html renderMarkdown(...)}` on every
-  // token, which replaces the answer DOM and collapses any selection inside
-  // it. Capture the selection as character offsets before the update and
-  // restore it after Svelte applies the new HTML, so selecting mid-stream
-  // no longer "goes off on its own".
-  type StreamSel = { cls: string; a: number; f: number };
-  function textOffsetIn(root: Element, node: Node | null, nodeOffset: number): number | null {
-    if (!node) return null;
-    try {
-      // length of the scope's text from its start up to the caret: correct
-      // for text anchors, element anchors, and markup-nested carets alike
-      const range = document.createRange();
-      range.selectNodeContents(root);
-      range.setEnd(node, nodeOffset);
-      return range.toString().length;
-    } catch {
-      return null;
-    }
-  }
-  function nodeForOffset(root: Element, offset: number): { node: Node; off: number } {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    let cur: Node | null = walker.nextNode();
-    let acc = 0;
-    let last: Node = root;
-    while (cur) {
-      const len = cur.textContent?.length ?? 0;
-      if (acc + len >= offset) return { node: cur, off: offset - acc };
-      acc += len;
-      last = cur;
-      cur = walker.nextNode();
-    }
-    return { node: last, off: last.textContent?.length ?? 0 };
-  }
   function captureStreamSel(index: number): StreamSel | null {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !messagesEl) return null;
@@ -5122,9 +4943,6 @@
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   });
-
-  // delegated handler for code-block copy buttons rendered via {@html}
-  const CODE_CHECK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
   $effect(() => {
     const el = messagesEl;
     if (!el) return;
@@ -5192,42 +5010,6 @@
       el.removeEventListener("auxclick", onAux);
     };
   });
-
-  async function copyText(t: string): Promise<boolean> {
-    try {
-      await navigator.clipboard.writeText(t);
-      return true;
-    } catch {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = t;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        const ok = document.execCommand("copy");
-        ta.remove();
-        return ok;
-      } catch {
-        return false;
-      }
-    }
-  }
-
-  /** Copy xterm's model selection. Prefer the synchronous copy command:
-   *  xterm's own `copy` listener fills clipboardData, and WebView2 may deny
-   *  the async Clipboard API on the custom scheme. */
-  function copyTermSelection(term: XTerm) {
-    const text = term.getSelection();
-    if (!text) return;
-    let ok = false;
-    try {
-      ok = document.execCommand("copy");
-    } catch {
-      ok = false;
-    }
-    if (!ok) void copyText(text);
-  }
 
   /** terminal right-click menu (see the xterm `contextmenu` listener) */
   let termCtx = $state.raw<{ x: number; y: number; term: XTerm; sel: string } | null>(null);
@@ -5539,15 +5321,6 @@
     continuing: boolean;
     imagesStripped: boolean;
   };
-  type ChatTurnEvent =
-    | { type: "token" | "think" | "replace"; text: string }
-    | { type: "done" | "images_stripped" }
-    | { type: "error"; message: string };
-  type ChatTurnOperation =
-    | { operation: "send"; content: string; images?: string[]; titleSource: string }
-    | { operation: "continue" | "regenerate"; index: number }
-    | { operation: "edit"; index: number; content: string; images?: string[] }
-    | { operation: "fork_edit"; index: number; content: string; images: string[]; forkId: string };
 
   const serverChatFeeds = new Map<string, { stop(): void; close(): void; reconcile(turnId: string | undefined): void }>();
   let startingChatFromHome: string | null = null;
@@ -6462,97 +6235,6 @@
     requestAnimationFrame(() => composerEl?.focus());
   }
 
-  function escapeHtmlText(s: string): string {
-    return s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
-
-  function escapeHtmlAttr(s: string): string {
-    return escapeHtmlText(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  }
-
-  /** join an upload dir and a relative file name with the dir's separator */
-  function joinUploadPath(dir: string, name: string): string {
-    const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
-    return dir.replace(/[\\/]+$/, "") + sep + name;
-  }
-
-  interface MentionToken {
-    start: number;
-    end: number;
-    core: string;
-  }
-
-  /** @path tokens in text: @ + non-space run at start/after whitespace (so
-   *  a@b.com stays plain), trailing [.,;:!?)] excluded. Shared by rendering,
-   *  caret snapping, and unit deletion so all three always agree. */
-  function findMentions(text: string): MentionToken[] {
-    const out: MentionToken[] = [];
-    const re = /(^|[\s(])(@[^\s]+)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const tok: string = m[2];
-      const tail = tok.match(/[.,;:!?)]+$/);
-      const core = tail ? tok.slice(0, -tail[0].length) : tok;
-      if (core.length <= 1) continue;
-      const start = m.index + m[1].length;
-      out.push({ start, end: start + core.length, core });
-    }
-    return out;
-  }
-
-  const mentionFolderIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
-  const mentionFileIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>';
-
-  function mentionIconFor(core: string): string {
-    const base = core.slice(1).split(/[/\\]/).pop() ?? "";
-    return base.includes(".") ? mentionFileIcon : mentionFolderIcon;
-  }
-
-  /** render @path mentions as green pills (ws-badge style) with a folder/file
-   *  icon. Scans the escaped text (entities contain no @/space/paren, so
-   *  boundaries match the raw text). Padding/margin cancel so the composer
-   *  backdrop aligns exactly with the transparent textarea text. */
-  function renderMentions(text: string): string {
-    const esc = escapeHtmlText(text);
-    const toks = findMentions(esc);
-    if (!toks.length) return esc;
-    let out = "";
-    let last = 0;
-    for (const t of toks) {
-      out += esc.slice(last, t.start);
-      out += `<span class="mention-pill">${mentionIconFor(t.core)}<span>${esc.slice(t.start, t.end)}</span></span>`;
-      last = t.end;
-    }
-    return out + esc.slice(last);
-  }
-
-  /** user bubbles: @-mentions become pills, and attached-files notes collapse
-   *  to a clickable file list at the top of the bubble (raw text keeps the
-   *  full note so the agent still sees paths + tool instructions in history) */
-  function renderUserMessage(text: string): string {
-    const re = /\[Attached files saved to ([^\]]*?) \(use the read_upload tool[^)]*\):\r?\n((?:[ \t]*-[ \t]+[^\r\n]*\r?\n?)+)\]/g;
-    const files: { name: string; path: string }[] = [];
-    const body = text.replace(re, (_full, dir: string, list: string) => {
-      for (const x of list.matchAll(/^[ \t]*-[ \t]*(.+?)[ \t]*$/gm)) {
-        const name = x[1];
-        if (name) files.push({ name, path: joinUploadPath(dir, name) });
-      }
-      return "";
-    });
-    if (!files.length) return renderMentions(text);
-    const pills = files
-      .map(
-        (f) =>
-          `<button type="button" class="mention-pill file-pill" data-reveal-path="${escapeHtmlAttr(f.path)}" title="Reveal in Finder">${mentionFileIcon}<span>${escapeHtmlText(f.name)}</span></button>`
-      )
-      .join("");
-    const rest = renderMentions(body.replace(/^\s+/, "").replace(/\s+$/, ""));
-    return `<div class="bubble-files">${pills}</div>${rest}`;
-  }
-
   /** click a file pill in a user bubble → reveal it in Finder/Explorer */
   async function onMessageClick(e: MouseEvent) {
     const el = (e.target as HTMLElement | null)?.closest?.("[data-reveal-path]") as HTMLElement | null;
@@ -7309,30 +6991,6 @@
       : browserStartLabel;
   });
 
-  /** Reject `p` after `ms` so a blocked backend call can never leave the tab
-   *  spinning forever (Windows antivirus/SmartScreen can stall a first launch
-   *  far past every backend timeout). The backend attempt keeps running and a
-   *  later poll adopts the daemon if it did come up. */
-  function withBrowserTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(message)), ms);
-      p.then(
-        (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        (e) => {
-          clearTimeout(timer);
-          reject(e);
-        }
-      );
-    });
-  }
-
-  const BROWSER_START_TIMEOUT_MS = 4 * 60 * 1000;
-  const BROWSER_START_TIMEOUT_MESSAGE =
-    "The browser engine did not respond within 4 minutes. On Windows this is usually antivirus blocking the engine binary — click Retry, or set VICUNA_BROWSER_CHROME to a Chrome/Edge path and relaunch Vicuna.";
-
   async function driveBrowserDaemon(): Promise<BrowserStatus> {
     browserStartLabel = "Starting browser…";
     browserStarting = true;
@@ -7783,21 +7441,11 @@
     }
   }
 
-  /** whether a drag carries OS files (vs. text selection etc.) */
-  function hasDroppedFiles(e: DragEvent): boolean {
-    const types = e.dataTransfer?.types;
-    return !!types && Array.from(types).includes("Files");
-  }
-
   /** composer drop target highlight */
   function onComposerDragEnter(e: DragEvent) {
     if (!hasDroppedFiles(e)) return;
     compDragDepth += 1;
     composerDropActive = true;
-  }
-
-  function onComposerDragOver(e: DragEvent) {
-    e.preventDefault();
   }
 
   function onComposerDragLeave() {
@@ -7949,20 +7597,6 @@
     pendingAsks = rest;
     a.resolve(value, "answer", display);
     scrollBottom();
-  }
-
-  /** a choice on an agent question: copy it into the answer box to edit,
-   *  caret at the end — sending stays a separate, deliberate step */
-  function prefillAsk(card: { text: string }, opt: string, from: HTMLElement) {
-    card.text = opt;
-    // the box of the card that was clicked (live and put-off cards coexist)
-    const box = from.closest(".ask-card");
-    requestAnimationFrame(() => {
-      const el = box?.querySelector<HTMLTextAreaElement>("textarea.ask-input");
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
-    });
   }
 
   /** send the agent-question answer box (text, multi-select picks, images) */
@@ -8311,27 +7945,6 @@
     error = `Note: ${selectedModel} doesn't support images, so the attached picture was not sent.`;
   }
 
-  const isWindows = typeof navigator !== "undefined" && /win/i.test(navigator.userAgent ?? "");
-
-  async function validateWorkspace(path: string): Promise<string | null> {
-    const p = path.trim();
-    if (!p) return null;
-    try {
-      await invokeOrBridge<string>("work_validate_root", { path: p });
-      return null;
-    } catch (e: any) {
-      return typeof e === "string" ? e : (e?.message ?? String(e));
-    }
-  }
-
-  async function canonicalWorkspace(path: string): Promise<string> {
-    return await invokeOrBridge<string>("work_validate_root", { path: path.trim() });
-  }
-
-  async function ensureScratchWorkspace(sessionId: string): Promise<string> {
-    return await invokeOrBridge<string>("work_ensure_scratch_workspace", { sessionId });
-  }
-
   let wsMenuOpen = $state(false);
 
   /** Switch to No Workspace mode: uses an empty per-session scratch folder
@@ -8603,7 +8216,6 @@
   let hoverPrefetchTimer: ReturnType<typeof setTimeout> | null = null;
   let warmCancelled = false;
   let warmStarted = false;
-  const WARM_RECENT_COUNT = 12;
 
   function ensureChatFull(chat: Chat | null | undefined, opts: { silent?: boolean } = {}): Promise<void> {
     if (!chat?.partial) return Promise.resolve();
@@ -9399,27 +9011,6 @@
     await runWorkTurn(fork, fork.messages.length - 1, ws, seedContext);
   }
 
-  // downscale pasted images: full screenshots blow up localStorage quotas
-  // and model context windows, and vision models don't need more than this
-  async function imageFileToDataUrl(f: File | Blob): Promise<string> {
-    const bitmap = await createImageBitmap(f);
-    const MAX = 1568;
-    const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
-    const w = Math.max(1, Math.round(bitmap.width * scale));
-    const h = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      bitmap.close();
-      throw new Error("canvas unavailable");
-    }
-    ctx.drawImage(bitmap, 0, 0, w, h);
-    bitmap.close();
-    return canvas.toDataURL("image/jpeg", 0.85);
-  }
-
   async function onPaste(e: ClipboardEvent) {
     const files = pastedImageFiles(e);
     if (!files.length) return;
@@ -9434,19 +9025,6 @@
     }
     autosizeComposer();
     requestAnimationFrame(() => composerEl?.focus());
-  }
-
-  function pastedImageFiles(e: ClipboardEvent): File[] {
-    const items = e.clipboardData?.items;
-    if (!items) return [];
-    const files: File[] = [];
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        const f = it.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-    return files;
   }
 
   async function onEditPaste(e: ClipboardEvent) {
