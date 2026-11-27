@@ -151,6 +151,7 @@
   import { createOpenRouterState } from "$lib/openRouterState.svelte";
   import { createOllamaModelsState } from "$lib/ollamaModelsState.svelte";
   import { createGotoPaletteState } from "$lib/gotoPaletteState.svelte";
+  import { createMessagingBridgesState } from "$lib/messagingBridgesState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -2438,7 +2439,7 @@
       y: Math.max(8, Math.min(e.clientY, window.innerHeight - 360))
     };
     if ((chats.find((x) => x.id === id)?.mode ?? "chat") === "work") {
-      void refreshTelegramStatus();
+      void bridges.refreshTelegramStatus();
     }
   }
 
@@ -2973,60 +2974,10 @@
 
   /** the lead may manage other sessions; making one the lead also pins it */
   // Per-session Telegram bridge dialog; the session it was opened for
-  let telegramFor = $state<string | null>(null);
-  // Per-session Telegram statuses keyed by session ID (for sidebar badges & context menu dots)
-  let telegramStatuses = $state<Record<string, TelegramStatusSnapshot>>({});
-  function telegramStateFor(id: string | undefined): TelegramConnState {
-    return telegramConnState(id ? telegramStatuses[id] : null);
-  }
-  async function refreshTelegramStatus() {
-    try {
-      const res = await invokeOrBridge<{ bridges?: Record<string, TelegramStatusSnapshot> }>("telegram_list", {});
-      telegramStatuses = res?.bridges ?? {};
-    } catch {
-      // Fallback for older servers that only expose single-lead telegram_status
-      try {
-        const lead = chats.find((c) => c.role === "lead");
-        if (!lead) {
-          telegramStatuses = {};
-          return;
-        }
-        const s = await invokeOrBridge<TelegramStatusSnapshot>("telegram_status", {});
-        telegramStatuses = s?.configured ? { [lead.id]: s } : {};
-      } catch {
-        telegramStatuses = {};
-      }
-    }
-  }
-  // Per-session bridge plugin dialog & statuses
-  const bridgePlugins = $derived(plugins.filter((p) => !!p.bridge));
-  let bridgeModal = $state<{ pluginId: string; sessionId: string } | null>(null);
-  let bridgeStatuses = $state<Record<string, Record<string, BridgeStatusSnapshot>>>({});
-  async function refreshBridgeStatuses() {
-    if (bridgePlugins.length === 0) {
-      bridgeStatuses = {};
-      return;
-    }
-    try {
-      const res = await invokeOrBridge<{ plugins?: Record<string, Record<string, BridgeStatusSnapshot>> }>("bridge_list", {});
-      bridgeStatuses = res?.plugins ?? {};
-    } catch {
-      bridgeStatuses = {};
-    }
-  }
-  $effect(() => {
-    if (!ready) return;
-    void refreshTelegramStatus();
-    const t = setInterval(refreshTelegramStatus, 15000);
-    return () => clearInterval(t);
-  });
-  $effect(() => {
-    if (!ready) return;
-    void bridgePlugins.length;
-    void refreshBridgeStatuses();
-    if (bridgePlugins.length === 0) return;
-    const t = setInterval(refreshBridgeStatuses, 15000);
-    return () => clearInterval(t);
+  const bridges = createMessagingBridgesState({
+    get chats() { return chats; },
+    get plugins() { return plugins; },
+    get ready() { return ready; }
   });
 
   /** Make/Replace lead prompt (explainer + optional Telegram setup). */
@@ -7819,9 +7770,9 @@
               liveMs={live ? liveElapsedMs(c.id) : null}
               renaming={renamingId === c.id}
               bind:renameDraft
-              telegramSnap={telegramStatuses[c.id]}
-              {bridgePlugins}
-              {bridgeStatuses}
+              telegramSnap={bridges.telegramStatuses[c.id]}
+              bridgePlugins={bridges.bridgePlugins}
+              bridgeStatuses={bridges.bridgeStatuses}
               {sessionFilter}
               onSelect={selectChat}
               onPrefetch={(x) => { if (x.partial) void ensureChatFull(x, { silent: true }); }}
@@ -7898,10 +7849,10 @@
           {chats}
           {serverPersist}
           {onServer}
-          {telegramStatuses}
-          {telegramStateFor}
-          {bridgePlugins}
-          {bridgeStatuses}
+          telegramStatuses={bridges.telegramStatuses}
+          telegramStateFor={bridges.telegramStateFor}
+          bridgePlugins={bridges.bridgePlugins}
+          bridgeStatuses={bridges.bridgeStatuses}
           {continueWorkspace}
           {workspacePickerOpen}
           bind:workspaceDraft
@@ -7914,8 +7865,8 @@
           {toggleLead}
           openPermissions={(id) => { permissionsFor = id; ctxMenu = null; }}
           openLeadPrompt={(id, prevTitle) => { leadPrompt = { id, prevTitle }; ctxMenu = null; }}
-          openTelegram={(id) => { telegramFor = id; ctxMenu = null; }}
-          openBridge={(pluginId, sessionId) => { bridgeModal = { pluginId, sessionId }; ctxMenu = null; }}
+          openTelegram={(id) => { bridges.telegramFor = id; ctxMenu = null; }}
+          openBridge={(pluginId, sessionId) => { bridges.bridgeModal = { pluginId, sessionId }; ctxMenu = null; }}
           {continueInWork}
           {pickContinueWorkspace}
           {commitContinueWorkspace}
@@ -9140,9 +9091,9 @@
       // read the id BEFORE clearing: `lp` is a derived of leadPrompt and goes null with it
       const id = lp.id;
       leadPrompt = null;
-      void toggleLead(id).then(refreshTelegramStatus);
+      void toggleLead(id).then(bridges.refreshTelegramStatus);
     } }}
-    onClose={() => { leadPrompt = null; void refreshTelegramStatus(); }}
+    onClose={() => { leadPrompt = null; void bridges.refreshTelegramStatus(); }}
   />
 {/if}
 {#if permissionsFor}
@@ -9151,27 +9102,27 @@
     <PermissionsModal chat={permChat} busy={permissionBusy} onSet={setSessionPermission} onClose={() => (permissionsFor = null)} />
   {/if}
 {/if}
-{#if telegramFor}
+{#if bridges.telegramFor}
   <TelegramModal
-    sessionId={telegramFor}
-    sessionTitle={chats.find((c) => c.id === telegramFor)?.title ?? ""}
-    allStatuses={telegramStatuses}
+    sessionId={bridges.telegramFor}
+    sessionTitle={chats.find((c) => c.id === bridges.telegramFor)?.title ?? ""}
+    allStatuses={bridges.telegramStatuses}
     sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
-    onSelectSession={(id) => { telegramFor = id; void refreshTelegramStatus(); }}
-    onClose={() => { telegramFor = null; void refreshTelegramStatus(); }}
+    onSelectSession={(id) => { bridges.telegramFor = id; void bridges.refreshTelegramStatus(); }}
+    onClose={() => { bridges.telegramFor = null; void bridges.refreshTelegramStatus(); }}
   />
 {/if}
-{#if bridgeModal}
-  {@const activeBridgePlugin = bridgePlugins.find((p) => p.id === bridgeModal!.pluginId)}
+{#if bridges.bridgeModal}
+  {@const activeBridgePlugin = bridges.bridgePlugins.find((p) => p.id === bridges.bridgeModal!.pluginId)}
   {#if activeBridgePlugin}
     <BridgeModal
       plugin={activeBridgePlugin}
-      sessionId={bridgeModal.sessionId}
-      sessionTitle={chats.find((c) => c.id === bridgeModal!.sessionId)?.title ?? ""}
-      allStatuses={bridgeStatuses[activeBridgePlugin.id] ?? {}}
+      sessionId={bridges.bridgeModal.sessionId}
+      sessionTitle={chats.find((c) => c.id === bridges.bridgeModal!.sessionId)?.title ?? ""}
+      allStatuses={bridges.bridgeStatuses[activeBridgePlugin.id] ?? {}}
       sessions={chats.map((c) => ({ id: c.id, title: c.title, archived: !!c.archived }))}
-      onSelectSession={(id) => { bridgeModal = { pluginId: activeBridgePlugin.id, sessionId: id }; void refreshBridgeStatuses(); }}
-      onClose={() => { bridgeModal = null; void refreshBridgeStatuses(); }}
+      onSelectSession={(id) => { bridges.bridgeModal = { pluginId: activeBridgePlugin.id, sessionId: id }; void bridges.refreshBridgeStatuses(); }}
+      onClose={() => { bridges.bridgeModal = null; void bridges.refreshBridgeStatuses(); }}
     />
   {/if}
 {/if}
