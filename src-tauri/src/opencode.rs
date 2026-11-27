@@ -246,13 +246,23 @@ pub async fn engine_info() -> WorkEngineInfo {
     }
 }
 
+/// Upgrade command for an older opencode build: 1.x stays on 1.x under plain
+/// `opencode upgrade` and requires `--major` to move to v2.
+fn upgrade_hint_cmd(version: &str) -> &'static str {
+    match crate::exe_resolve::parse_semver(version) {
+        Some(v) if v.first().copied().unwrap_or(0) < 2 => "opencode upgrade --major",
+        _ => "opencode upgrade",
+    }
+}
+
 /// Warning for a version below MIN_VERSION (None when new enough/unknown).
 pub fn outdated_warning(version: &str) -> Option<String> {
     let have = crate::exe_resolve::parse_semver(version)?;
     let min = crate::exe_resolve::parse_semver(MIN_VERSION)?;
     (have < min).then(|| {
+        let cmd = upgrade_hint_cmd(version);
         format!(
-            "opencode {version} is older than {MIN_VERSION}, the oldest version Vicuna is tested with; it may reject the current opencode config. Update it: opencode upgrade"
+            "opencode {version} is older than {MIN_VERSION}, the oldest version Vicuna is tested with; it may reject the current opencode config. Update it: {cmd}"
         )
     })
 }
@@ -265,14 +275,23 @@ pub fn outdated_hint(err: &str) -> Option<String> {
     if !(low.contains("configuration is invalid") || low.contains("invalid option: expected one of")) {
         return None;
     }
-    let which = find_opencode()
-        .map(|p| {
-            let v = crate::exe_resolve::version_of(&p).and_then(|o| parse_version(&o));
-            format!(" ({}{})", p.display(), v.map(|v| format!(", v{v}")).unwrap_or_default())
+    let found = find_opencode().map(|p| {
+        let v = crate::exe_resolve::version_of(&p).and_then(|o| parse_version(&o));
+        (p, v)
+    });
+    let which = found
+        .as_ref()
+        .map(|(p, v)| {
+            format!(" ({}{})", p.display(), v.as_deref().map(|v| format!(", v{v}")).unwrap_or_default())
         })
         .unwrap_or_default();
+    let cmd = found
+        .as_ref()
+        .and_then(|(_, v)| v.as_deref())
+        .map(upgrade_hint_cmd)
+        .unwrap_or("opencode upgrade");
     Some(format!(
-        "This opencode{which} looks outdated: it rejects the current opencode config. Update it: opencode upgrade (then Settings → Work engine → Refresh)."
+        "This opencode{which} looks outdated: it rejects the current opencode config. Update it: {cmd} (then Settings → Work engine → Refresh)."
     ))
 }
 
@@ -696,11 +715,14 @@ mod tests {
     }
 
 
-    /// The owner's Mac ran opencode 1.3.17: warn below the tested minimum.
+    /// The owner's Mac ran opencode 1.3.17: warn below the tested minimum,
+    /// using `--major` for 1.x so `opencode upgrade` doesn't stay on 1.x.
     #[test]
     fn versions_below_the_tested_minimum_warn() {
         let w = outdated_warning("1.3.17").unwrap();
-        assert!(w.contains("1.3.17") && w.contains(MIN_VERSION) && w.contains("opencode upgrade"), "{w}");
+        assert!(w.contains("1.3.17") && w.contains(MIN_VERSION) && w.contains("opencode upgrade --major"), "{w}");
+        let w2 = outdated_warning("2.1.0").unwrap();
+        assert!(w2.contains("2.1.0") && w2.contains(MIN_VERSION) && w2.contains("opencode upgrade") && !w2.contains("--major"), "{w2}");
         assert_eq!(outdated_warning(MIN_VERSION), None);
         assert_eq!(outdated_warning("2.10.0"), None);
         assert_eq!(outdated_warning("garbage"), None);

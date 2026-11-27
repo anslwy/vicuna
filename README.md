@@ -106,7 +106,7 @@ irm https://raw.githubusercontent.com/anslwy/vicuna/main/install.ps1 | iex
 
 ### Headless server (`vicuna` CLI)
 
-Run Vicuna on a workstation, home server, or VPS and connect from the desktop app (Linux and macOS, no `sudo` required):
+Run Vicuna on a workstation, home server, or VPS and connect from the desktop app or any browser (Linux and macOS, no `sudo` required):
 
 ```sh
 curl -fsSL https://github.com/anslwy/vicuna/releases/latest/download/install-cli.sh | sh
@@ -148,7 +148,7 @@ The CLI also drives any running server directly (`vicuna session`, `vicuna sched
 
 ## Prerequisites
 
-- **Work mode:** at least one supported coding agent CLI installed and signed in on your machine or server — [Claude Code](https://docs.claude.com/en/docs/claude-code/setup), [Codex CLI](https://developers.openai.com/codex/cli), [Antigravity](https://antigravity.google), [OpenCode](https://opencode.ai/docs/#install), `fx`, `pi`, or an ACP harness plugin. Nothing is bundled or proxied through a third-party cloud; Vicuna drives the CLIs with your own credentials.
+- **Work mode:** at least one supported coding agent CLI installed and signed in on your machine or server — [Claude Code](https://docs.claude.com/en/docs/claude-code/setup), [Codex CLI](https://developers.openai.com/codex/cli), [Antigravity](https://antigravity.google), [OpenCode v2](https://opencode.ai/v2/docs) (2.2.6+), `fx`, `pi`, or an ACP harness plugin. Nothing is bundled or proxied through a third-party cloud; Vicuna drives the CLIs with your own credentials.
 - **Chat mode (optional):** [Ollama](https://ollama.com) (`ollama serve` + any pulled model, e.g. `ollama pull qwen3:8b`) for local models, and/or an OpenRouter API key. Ollama is **not** required if you only use Work mode.
 - **Development:** Node.js 24, npm, and a Rust toolchain.
 
