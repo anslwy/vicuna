@@ -11820,7 +11820,7 @@
   .typing span:nth-child(2) { animation-delay: .15s; }
   .typing span:nth-child(3) { animation-delay: .3s; }
   @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .mem-spin::after { animation: none; } .browser-restarting svg { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .typing span { animation: none; opacity: .7; } .shimmer { animation: none; } .stream-bar span { animation: none; width: 100%; } .mem-spin::after { animation: none; } }
   .answer :global(p) { margin: 0 0 12px 0; }
   .answer :global(p:last-child) { margin-bottom: 0; }
   .answer :global(strong) { font-weight: 700; }
