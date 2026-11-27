@@ -13,6 +13,9 @@ export interface PluginBridgeDef {
   name?: string;
   color?: string | null;
   iconPath?: string | null;
+  icon?: string | null;
+  iconBg?: string | null;
+  iconDataUrl?: string | null;
   tokenPlaceholder?: string;
   authMode?: BridgeAuthMode;
   setupSteps?: PluginSetupStep[];
@@ -124,6 +127,27 @@ export function safeQrDataUrl(u: unknown): string | null {
   const body = s.slice(prefix.length);
   if (!body || !/^[A-Za-z0-9+/=\s]+$/.test(body)) return null;
   return s;
+}
+
+const MAX_BRIDGE_ICON_DATA_URL_LEN = 64 * 1024;
+
+/** Validate a backend-resolved SVG data URL for a bridge plugin icon before rendering it in an `<img>`. */
+export function safeBridgeIconDataUrl(u: unknown): string | null {
+  if (typeof u !== "string") return null;
+  const s = u.trim();
+  if (!s || s.length > MAX_BRIDGE_ICON_DATA_URL_LEN) return null;
+  return /^data:image\/svg\+xml;base64,[A-Za-z0-9+/]+={0,2}$/.test(s) ? s : null;
+}
+
+function isSafeColor(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const s = v.trim();
+  return /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s) || /^(rgb|rgba|hsl|hsla)\([0-9 .,%/deg]+\)$/i.test(s);
+}
+
+/** Background color for a full-color bridge icon badge (`iconBg` if valid, else `#ffffff`). */
+export function bridgeIconBg(bridge: PluginBridgeDef | null | undefined): string {
+  return isSafeColor(bridge?.iconBg) ? bridge!.iconBg!.trim() : "#ffffff";
 }
 
 /** Defense-in-depth SVG `<path d="...">` check (matches server validation). */
