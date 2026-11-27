@@ -7803,6 +7803,7 @@
     {:else}
       {#if activeChat.mode === "work"}
         <WorkHeader
+          sessionId={activeChat.id}
           workspace={activeChat.workspace}
           {workPathCopied}
           onCopyPath={copyWorkPath}
