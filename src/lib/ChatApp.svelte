@@ -144,6 +144,7 @@
   import { type StreamSel, textOffsetIn, nodeForOffset, copyText, copyTermSelection, CODE_CHECK_SVG, hasDroppedFiles, prefillAsk, revealCard, imageFileToDataUrl, pastedImageFiles, openExternal, openTokenPage, withBrowserTimeout, BROWSER_START_TIMEOUT_MS, BROWSER_START_TIMEOUT_MESSAGE, isMac, isWindows, validateWorkspace, canonicalWorkspace, ensureScratchWorkspace, clampExplorerWidth, EXPLORER_MIN_W, EXPLORER_DEFAULT_W } from "$lib/chatDom";
   import { type PendingAsk, type LaterAsk, type ModelChoice, type RemoteHit, type SearchItem, type ChatTurnEvent, type ChatTurnOperation, BROWSE_CATS, SUGGESTIONS, WORK_SUGGESTIONS, SHOW_ARCHIVED_KEY, USAGE_CACHE_KEY, CLI_INSTALL_CMD, SERVER_SETUP_CMD, WARM_RECENT_COUNT, resolveAppUpdateReleaseNotes, openRouterUsageText, newMcpEnabled, scheduleTz } from "$lib/chatAppData";
   import { createMcpState } from "$lib/mcpState.svelte";
+  import { createBrowserState } from "$lib/browserState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -389,7 +390,7 @@
     get chats() { return chats; },
     save,
     get activeId() { return activeId; },
-    ensureBrowserDaemon,
+    get ensureBrowserDaemon() { return browser.ensureBrowserDaemon; },
     get onServer() { return onServer; },
     get explorerOpen() { return explorerOpen; },
     set explorerOpen(v) { explorerOpen = v; },
@@ -404,7 +405,7 @@
    *  implementation), so when framed lb posts out instead and the app opens
    *  the URL natively. Strict loopback-origin + shape check. */
   function onBrowserFrameMessage(e: MessageEvent) {
-    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
+    const base = onServer ? browser.browserProxyUrl : (browser.browserDaemon?.url ?? LB_URL);
     if (!base) return;
     try {
       if (e.origin !== new URL(base).origin) return;
@@ -797,7 +798,7 @@
   // advance the live clock while a turn runs (or a browser start is in
   // flight) so elapsed tooltips/labels stay current
   $effect(() => {
-    if (!streaming && !workRunning && !browserStarting) return;
+    if (!streaming && !workRunning && !browser.browserStarting) return;
     const t = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -2728,7 +2729,7 @@
   /** Browser engine row (Settings → Browser engine): which `lb` runs and
    *  its version, from the backend status. Silent on failure. */
   async function refreshBrowserEngine() {
-    browserDaemon = await browserStatus().catch(() => null);
+    browser.browserDaemon = await browserStatus().catch(() => null);
   }
 
   /** Read this build's version + baked timestamp (silent unless it fails:
@@ -6435,315 +6436,17 @@
   // the daemon (and the agent's MCP connection) running. The only tab chrome
   // is a stale-engine strip (owned daemon predates the on-disk bundle):
   // in-place recover can't fix that, so it offers a full restart instead.
-  let browserDaemon = $state<BrowserStatus | null>(null);
-  let browserStarting = $state(false);
-  let browserError = $state<string | null>(null);
-  /** starting-view label: plain starts vs button restarts/takeovers. */
-  let browserStartLabel = $state("Starting browser…");
-  /** live CloakBrowser download progress while an engine fetch is in flight. */
-  let browserDownload = $state<EngineDownloadProgress | null>(null);
-  /** wall-clock start of the in-flight start drive: the starting view shows
-   *  elapsed seconds so a slow Windows first launch never reads as frozen. */
-  let browserStartedAt = $state<number | null>(null);
-  /** iframe key: bumped whenever the daemon behind a live frame is (re)started,
-   *  so the frame re-navigates instead of sitting on a failed navigation. */
-  let browserFrameRev = $state(0);
-  let browserProxyUrl = $state<string | null>(null);
-  /** lb UI url + Vicuna theme/palette/accent: lb reads `?theme=`/`?accent=`/
-   *  `?accentfg=` + palette vars (`bg`, `fg`, `card`, `border`, …) pre-paint
-   *  (older lb builds ignore unknown params and fall back to their saved theme
-   *  + built-in greens). Derived from `themeBase`/`pluginTheme`/`accent`, so
-   *  appearance flips re-navigate the frame into the matching lb look. */
-  const browserFrameSrc = $derived.by(() => {
-    const base = onServer ? browserProxyUrl : (browserDaemon?.url ?? LB_URL);
-    if (!base) return "about:blank";
-    const a = ACCENTS[accent] ?? ACCENTS.orange;
-    const v = pluginAccent && !pluginAccentMuted ? pluginAccent : themeBase === "dark" ? a.dark : a.light;
-    return `${base}/?${browserThemeParams(themeBase, pluginTheme, v).toString()}`;
-  });
-
-  /** status → start when down. Throws on failure (callers surface it).
-   *  Concurrent callers share one in-flight drive (tab-open + visible-tab
-   *  ensure + poll can all fire together) instead of stacking spawns. */
-  let browserDrive: Promise<BrowserStatus> | null = null;
-  function ensureBrowserDaemon(): Promise<BrowserStatus> {
-    browserDrive ??= driveBrowserDaemon().finally(() => {
-      browserDrive = null;
-    });
-    return browserDrive;
-  }
-  /** one-time CloakBrowser fetch with live progress polling (non-blocking on
-   *  new backends so remote servers never hit HTTP timeouts during a slow
-   *  ~200 MB download; falls back gracefully on older backends that ignore
-   *  `background: true`). Best-effort: a failed/blocked download must not
-   *  abort the start, since the backend falls back to a system Chromium. */
-  async function prewarmBrowserEngine(existing?: EngineDownloadProgress | null) {
-    const active = (d?: EngineDownloadProgress | null) =>
-      d != null && (d.phase === "downloading" || d.phase === "extracting");
-    browserDownload = active(existing) ? existing! : null;
-    browserStartLabel = browserDownload
-      ? formatDownloadProgress(browserDownload)
-      : "Downloading browser engine (one-time setup)…";
-    try {
-      let poll = active(existing);
-      if (!poll) {
-        const info = await browserEnsureEngine(true);
-        poll = !!info.downloading;
-      }
-      if (poll) {
-        const deadline = Date.now() + 15 * 60 * 1000;
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const st = await browserStatus();
-          if (st.running) {
-            browserDownload = null;
-            return;
-          }
-          const d = st.download ?? null;
-          if (!active(d)) {
-            browserDownload = null;
-            return;
-          }
-          browserDownload = d;
-          browserStartLabel = formatDownloadProgress(d!);
-        }
-      }
-    } catch {
-      /* fall through: the start path falls back to a system Chromium */
-    } finally {
-      browserDownload = null;
-    }
-  }
-
-  /** Seconds the start drive has been running (0 while idle). */
-  const browserStartSeconds = $derived.by(() => {
-    if (!browserStarting || browserStartedAt == null) return 0;
-    return Math.max(0, Math.floor((now - browserStartedAt) / 1000));
-  });
-  /** Starting label + elapsed tick ("Starting browser… (12s)"). */
-  const browserStartDisplay = $derived.by(() => {
-    return browserStartSeconds >= 3
-      ? `${browserStartLabel} (${browserStartSeconds}s)`
-      : browserStartLabel;
-  });
-
-  async function driveBrowserDaemon(): Promise<BrowserStatus> {
-    browserStartLabel = "Starting browser…";
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    browserError = null;
-    try {
-      let st = await browserStatus();
-      if (!st.running) {
-        await prewarmBrowserEngine(st.download);
-        browserStartedAt = Date.now();
-        browserStartLabel = "Starting browser…";
-        st = await withBrowserTimeout(
-          browserStart(),
-          BROWSER_START_TIMEOUT_MS,
-          BROWSER_START_TIMEOUT_MESSAGE
-        );
-      }
-      if (onServer && !browserProxyUrl) {
-        const sid = activeServerId();
-        if (sid) browserProxyUrl = await serverLbProxyUrl(sid);
-      }
-      browserDaemon = st;
-      return st;
-    } catch (e: any) {
-      // plain browser with no bridge: still allow viewing a manually-run
-      // daemon (`lb web --port 18765` in a terminal) via a direct probe
-      if (!isTauriRuntime()) {
-        try {
-          const r = await fetch(`${LB_URL}/api/health`);
-          const h = await r.json();
-          if (h?.ok === true && typeof h?.probe === "string") {
-            browserDaemon = {
-              running: true,
-              owned: false,
-              engine_stale: false,
-              url: LB_URL,
-              health: { browser_alive: !!h.browser_alive, probe: h.probe, tabs: h.tabs ?? 0 }
-            };
-            return browserDaemon;
-          }
-        } catch {
-          /* fall through to the backend error below */
-        }
-      }
-      browserError = e?.message ?? String(e);
-      browserDaemon = null;
-      throw e;
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** full stop + start of an owned daemon (stale engine / wedged
-   *  browser). Refuses adopted daemons — the backend owns that refusal. */
-  async function restartBrowserDaemon() {
-    // swap the view instantly: the stop + start takes seconds, and the
-    // stale frame meanwhile reads as "nothing happens"
-    browserStartLabel = "Restarting browser…";
-    browserDaemon = null;
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    browserError = null;
-    try {
-      await prewarmBrowserEngine();
-      browserStartLabel = "Restarting browser…";
-      browserDaemon = await withBrowserTimeout(
-        browserRestart(),
-        BROWSER_START_TIMEOUT_MS,
-        BROWSER_START_TIMEOUT_MESSAGE
-      );
-      browserFrameRev += 1;
-    } catch (e: any) {
-      browserError = e?.message ?? String(e);
-      browserDaemon = null;
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** two-step arm for adopted takeovers (first click explains + arms,
-   *  second within 5s executes) — killing a foreign session must stay a
-   *  deliberate act, never a stray click. */
-  let browserKillArmed = $state(false);
-  let browserKillTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** tab-bar button: `lb start` when down, stop + start when owned,
-   *  confirmed kill + start when adopted. Failures flash a transient
-   *  notice instead of replacing a (possibly healthy) frame. */
-  async function restartBrowserFromButton() {
-    if (browserStarting) return;
-    let st: BrowserStatus | null = null;
-    try {
-      st = await browserStatus();
-    } catch {
-      /* fall through to ensure on last-known state */
-    }
-    const action = browserButtonAction(st ?? browserDaemon);
-    if (action === "start") {
-      // instant view swap (a stale running frame would sit blank meanwhile)
-      browserStartLabel = "Starting browser…";
-      browserDaemon = null;
-      const ok = await ensureBrowserDaemon().then(
-        () => true,
-        () => false
-      );
-      if (ok) browserFrameRev += 1;
-      return;
-    }
-    if (action === "restart") {
-      browserStartLabel = "Restarting browser…";
-      browserDaemon = null;
-      browserStarting = true;
-      browserStartedAt = Date.now();
-      try {
-        await prewarmBrowserEngine();
-        browserStartLabel = "Restarting browser…";
-        browserDaemon = await withBrowserTimeout(
-          browserRestart(),
-          BROWSER_START_TIMEOUT_MS,
-          BROWSER_START_TIMEOUT_MESSAGE
-        );
-        browserError = null;
-        browserFrameRev += 1;
-      } catch (e: any) {
-        flashExpNotice(e?.message ?? String(e));
-        // restore truth instead of guessing: stop may have died mid-flight
-        browserDaemon = await browserStatus().catch(() => null);
-      } finally {
-        browserStarting = false;
-        browserStartedAt = null;
-      }
-      return;
-    }
-    if (!browserKillArmed) {
-      browserKillArmed = true;
-      flashExpNotice(
-        "Browser was started outside Vicuna — click again to force-stop it and start Vicuna's own (its tabs will be lost)."
-      );
-      if (browserKillTimer) clearTimeout(browserKillTimer);
-      browserKillTimer = setTimeout(() => {
-        browserKillArmed = false;
-        browserKillTimer = null;
-      }, 5000);
-      return;
-    }
-    if (browserKillTimer) {
-      clearTimeout(browserKillTimer);
-      browserKillTimer = null;
-    }
-    browserKillArmed = false;
-    browserStartLabel = "Taking over browser…";
-    browserDaemon = null;
-    browserStarting = true;
-    browserStartedAt = Date.now();
-    try {
-      // pre-warm BEFORE the kill: a failed download must not cost their tabs
-      // (backend takeover ensures pre-kill too — this is the honest label)
-      await prewarmBrowserEngine();
-      browserStartLabel = "Taking over browser…";
-      browserDaemon = await withBrowserTimeout(
-        browserTakeover(),
-        BROWSER_START_TIMEOUT_MS,
-        BROWSER_START_TIMEOUT_MESSAGE
-      );
-      browserError = null;
-      browserFrameRev += 1;
-    } catch (e: any) {
-      flashExpNotice(e?.message ?? String(e));
-      browserDaemon = await browserStatus().catch(() => null);
-    } finally {
-      browserStarting = false;
-      browserStartedAt = null;
-    }
-  }
-
-  /** one poll tick for a visible running tab (see browserPollAction). */
-  async function pollBrowserDaemon() {
-    if (browserStarting) return;
-    let st: BrowserStatus | null = null;
-    try {
-      st = await browserStatus();
-    } catch {
-      /* backend unreachable: keep the frame, retry next tick */
-    }
-    const action = browserPollAction(browserDaemon, st);
-    if (action === "update" && st) browserDaemon = st;
-    else if (action === "ensure") {
-      const ok = await ensureBrowserDaemon().then(
-        () => true,
-        () => false
-      );
-      if (browserPollRevived(action, ok)) browserFrameRev += 1;
-    }
-  }
-
-  // A visible Browser tab must converge to running: the daemon can die
-  // under a live tab (crash, kill, sleep) leaving a dead iframe with no
-  // recourse, so re-validate on every view and poll while up. Never
-  // revives while hidden; errors stay user-driven (Retry owns them).
-  let browserPoll: ReturnType<typeof setInterval> | null = null;
-  const browserTabVisible = $derived(
-    sideTabs.find((t) => t.key === activeSideTab)?.kind === "browser"
-  );
-  $effect(() => {
-    const visible = browserTabVisible;
-    const running = browserDaemon?.running === true;
-    if (visible && !running && !browserStarting && !browserError) {
-      void ensureBrowserDaemon().catch(() => {});
-    }
-    if (visible && running && !browserPoll) {
-      browserPoll = setInterval(() => void pollBrowserDaemon(), 5000);
-    } else if ((!visible || !running) && browserPoll) {
-      clearInterval(browserPoll);
-      browserPoll = null;
-    }
+  const browser = createBrowserState({
+    get onServer() { return onServer; },
+    get accent() { return accent; },
+    get pluginAccent() { return pluginAccent; },
+    get pluginAccentMuted() { return pluginAccentMuted; },
+    get themeBase() { return themeBase; },
+    get pluginTheme() { return pluginTheme; },
+    get now() { return now; },
+    flashExpNotice,
+    get sideTabs() { return sideTabs; },
+    get activeSideTab() { return activeSideTab; }
   });
 
   /** side-panel tabs: focus the Browser view, creating it if closed */
@@ -6756,7 +6459,7 @@
       sideTabs = [...sideTabs, { key: "browser", kind: "browser", title: "Browser" }];
       activeSideTab = "browser";
     }
-    void ensureBrowserDaemon().catch(() => {});
+    void browser.ensureBrowserDaemon().catch(() => {});
   }
 
   function termTheme(): XTermTheme {
@@ -10462,17 +10165,17 @@
       {pluginPanels}
       {gitRefreshTick}
       {onServer}
-      {browserTabVisible}
-      {browserStarting}
-      {browserKillArmed}
-      {browserDaemon}
-      {browserProxyUrl}
-      {browserFrameRev}
-      {browserFrameSrc}
-      {browserStartDisplay}
-      {browserDownload}
-      {browserStartSeconds}
-      {browserError}
+      browserTabVisible={browser.browserTabVisible}
+      browserStarting={browser.browserStarting}
+      browserKillArmed={browser.browserKillArmed}
+      browserDaemon={browser.browserDaemon}
+      browserProxyUrl={browser.browserProxyUrl}
+      browserFrameRev={browser.browserFrameRev}
+      browserFrameSrc={browser.browserFrameSrc}
+      browserStartDisplay={browser.browserStartDisplay}
+      browserDownload={browser.browserDownload}
+      browserStartSeconds={browser.browserStartSeconds}
+      browserError={browser.browserError}
       {expNotice}
       {displayWorkspace}
       {formatSize}
@@ -10481,9 +10184,9 @@
       onExpResizeKey={onExpResizeKey}
       onSwitchSideTab={switchSideTab}
       onCloseSideTab={closeSideTab}
-      onRestartBrowserFromButton={restartBrowserFromButton}
-      onRestartBrowserDaemon={restartBrowserDaemon}
-      onEnsureBrowserDaemon={ensureBrowserDaemon}
+      onRestartBrowserFromButton={browser.restartBrowserFromButton}
+      onRestartBrowserDaemon={browser.restartBrowserDaemon}
+      onEnsureBrowserDaemon={browser.ensureBrowserDaemon}
       onOpenSideExplorer={openSideExplorer}
       onOpenSideTerminal={openSideTerminal}
       onOpenSideBrowser={openSideBrowser}
@@ -10767,7 +10470,7 @@
     onQuitVicuna={quitVicuna}
     {workEngineInfo}
     {workEngineLabel}
-    {browserDaemon}
+    browserDaemon={browser.browserDaemon}
     onRefreshWorkEngine={refreshWorkEngine}
     onPickWorkEngine={pickWorkEngine}
     onToggleWorkApproval={toggleWorkApproval}
