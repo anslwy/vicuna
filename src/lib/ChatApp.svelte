@@ -149,6 +149,7 @@
   import { createServerSwitcherState } from "$lib/serverSwitcherState.svelte";
   import { createUsageState } from "$lib/usageState.svelte";
   import { createOpenRouterState } from "$lib/openRouterState.svelte";
+  import { createOllamaModelsState } from "$lib/ollamaModelsState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -1951,30 +1952,13 @@
       if (updateError === msg) updateError = null;
     }, 12000);
   });
-  let runners = $state<RunningModel[]>([]);
-  let runnersError = $state<string | null>(null);
-  let modelOp = $state<string | null>(null);
-  let pullName = $state("");
-  let pulling = $state<string | null>(null);
-  let pullStatus = $state("");
-  let pullDone = $state(0);
-  let pullTotal = $state(0);
-  let pullRate = $state(0); // bytes/sec, EMA of completed deltas
-  let pullLastAt = 0;
-  let pullLastDone = 0;
-  let pullLastDigest: string | null = null;
-  let pullAborter: AbortController | null = null;
-  let confirmDeleteModel = $state<string | null>(null);
-  let browseView = $state<"installed" | "discover">("installed");
-  let browseQuery = $state("");
-  let browseCat = $state<"all" | CatalogCat | "small" | "mlx">("all");
-  let variantPick = $state<Record<string, string>>({});
-  // discover catalog: bundled list, replaced by a fetched override when the
-  // user hits Fetch (persisted via store so it survives restarts)
-  let catalog = $state<CatalogEntry[]>([...MODEL_CATALOG]);
-  let catalogUpdated = $state(CATALOG_UPDATED);
-  let fetching = $state<{ done: number; total: number } | null>(null);
-  let catalogError = $state<string | null>(null);
+  const ollamaMgr = createOllamaModelsState({
+    get refreshModels() { return refreshModels; },
+    get models() { return models; },
+    get selectedModel() { return selectedModel; },
+    set selectedModel(v) { selectedModel = v; },
+    get save() { return save; }
+  });
 
   // ── OpenRouter (Settings → OpenRouter) ─────────────────────────────
   // The key lives in prefs; the catalog is fetched at runtime (the public
@@ -1989,24 +1973,6 @@
   /** Sidebar scope ("all", "chat", or a workspace root). Resolved against the
    *  live folders below, so a stale value can never blank the list. */
   let sessionFilterRaw = $state<string>(initialPrefs.sessionFilter ?? ALL_FILTER);
-
-  async function fetchCatalog() {
-    if (fetching) return;
-    catalogError = null;
-    fetching = { done: 0, total: catalog.length };
-    try {
-      const over: CatalogOverride = await refreshCatalog(catalog, (done, total) => {
-        fetching = { done, total };
-      });
-      catalog = over.entries;
-      catalogUpdated = over.updated;
-      saveCatalog(over);
-    } catch (e: any) {
-      catalogError = e?.message ?? String(e);
-    } finally {
-      fetching = null;
-    }
-  }
 
   // ---- remote server (sidebar server menu; src/lib/bridge.ts + src-tauri/src/servers.rs) ----
   // Picking a server reloads the window onto it: every backend call, the
@@ -2174,199 +2140,10 @@
 
   async function openModelsTab() {
     settingsTab = "models";
-    confirmDeleteModel = null;
+    ollamaMgr.confirmDeleteModel = null;
     await refreshModels();
-    await refreshRunners();
-    await refreshServerStatus();
-  }
-
-  let ollamaVersion: string | null = $state(null);
-  let serverChecking = $state(false);
-  let serverOp: null | "start" | "stop" = $state(null);
-  let serverError: string | null = $state(null);
-
-  async function refreshServerStatus() {
-    if (serverChecking) return;
-    serverChecking = true;
-    serverError = null;
-    try {
-      ollamaVersion = await serverVersion();
-    } catch (e: any) {
-      ollamaVersion = null;
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverChecking = false;
-    }
-  }
-
-  async function startServerFlow() {
-    if (serverOp) return;
-    serverOp = "start";
-    serverError = null;
-    try {
-      ollamaVersion = await startOllamaServer();
-      await refreshModels();
-      await refreshRunners();
-    } catch (e: any) {
-      ollamaVersion = null;
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverOp = null;
-    }
-  }
-
-  async function stopServerFlow() {
-    if (serverOp) return;
-    serverOp = "stop";
-    serverError = null;
-    try {
-      await stopOllamaServer();
-      ollamaVersion = null;
-      await refreshModels();
-      await refreshRunners();
-    } catch (e: any) {
-      serverError = e?.message ?? String(e);
-    } finally {
-      serverOp = null;
-    }
-  }
-
-  async function refreshRunners() {
-    runnersError = null;
-    try {
-      runners = await listRunning();
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-      runners = [];
-    }
-  }
-
-  async function toggleModelLoaded(name: string, loaded: boolean) {
-    if (modelOp || pulling) return;
-    modelOp = name;
-    runnersError = null;
-    try {
-      if (loaded) await unloadModelFromMemory(name);
-      else await loadModelIntoMemory(name);
-      await refreshRunners();
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-    } finally {
-      modelOp = null;
-    }
-  }
-
-  async function submitPull() {
-    const name = pullName.trim();
-    if (!name || pulling || modelOp) return;
-    await submitPullName(name);
-    pullName = "";
-  }
-
-  async function submitPullName(name: string) {
-    if (!name || pulling || modelOp) return;
-    pulling = name;
-    pullStatus = "starting…";
-    pullDone = 0;
-    pullTotal = 0;
-    pullRate = 0;
-    pullLastAt = 0;
-    pullLastDone = 0;
-    pullLastDigest = null;
-    runnersError = null;
-    pullAborter = new AbortController();
-    try {
-      await pullModel(
-        name,
-        (p) => {
-          pullStatus = p.status;
-          if (typeof p.completed === "number") pullDone = p.completed;
-          if (typeof p.total === "number") pullTotal = p.total;
-          // Ollama reports per-layer completed/total with no rate, so derive
-          // download speed from completed deltas (EMA over ~second windows).
-          if (typeof p.completed === "number" && p.status.startsWith("pulling")) {
-            const digest = p.digest ?? p.status;
-            const now = performance.now();
-            if (pullLastAt === 0 || digest !== pullLastDigest) {
-              pullLastAt = now;
-              pullLastDone = p.completed;
-              pullLastDigest = digest;
-            } else {
-              const dt = (now - pullLastAt) / 1000;
-              if (dt >= 0.2) {
-                const delta = p.completed - pullLastDone;
-                if (delta < 0) {
-                  // new layer / restart: re-baseline without spiking
-                  pullLastAt = now;
-                  pullLastDone = p.completed;
-                } else {
-                  const inst = delta / dt;
-                  pullRate = pullRate > 0 ? pullRate * 0.7 + inst * 0.3 : inst;
-                  pullLastAt = now;
-                  pullLastDone = p.completed;
-                }
-                pullLastDigest = digest;
-              }
-            }
-          } else if (!p.status.startsWith("pulling")) {
-            pullRate = 0;
-          }
-        },
-        pullAborter.signal
-      );
-      pullName = "";
-      await refreshModels();
-      if (models.includes(name)) {
-        selectedModel = name;
-        save();
-      } else if (models.length > 0 && !models.includes(selectedModel) && !isOpenRouterSelection(selectedModel)) {
-        selectedModel = models[0];
-        save();
-      }
-      await refreshRunners();
-    } catch (e: any) {
-      if (e?.name !== "AbortError") runnersError = e?.message ?? String(e);
-    } finally {
-      pulling = null;
-      pullRate = 0;
-      pullAborter = null;
-    }
-  }
-
-  function cancelPull() {
-    pullAborter?.abort();
-  }
-
-  async function requestDeleteModel(name: string) {
-    if (modelOp || pulling) return;
-    if (confirmDeleteModel !== name) {
-      confirmDeleteModel = name;
-      return;
-    }
-    confirmDeleteModel = null;
-    modelOp = name;
-    runnersError = null;
-    try {
-      // a loaded model may refuse deletion: unload first, then delete
-      if (runners.some((r) => r.name === name)) {
-        try {
-          await unloadModelFromMemory(name);
-        } catch {
-          // fall through: the delete below surfaces the real error
-        }
-      }
-      await deleteModel(name);
-      await refreshModels();
-      await refreshRunners();
-      if (!models.includes(selectedModel) && models.length > 0 && !isOpenRouterSelection(selectedModel)) {
-        selectedModel = models[0];
-        save();
-      }
-    } catch (e: any) {
-      runnersError = e?.message ?? String(e);
-    } finally {
-      modelOp = null;
-    }
+    await ollamaMgr.refreshRunners();
+    await ollamaMgr.refreshServerStatus();
   }
 
   let theme = $state<"light" | "dark">(initialPrefs.theme);
@@ -3199,7 +2976,7 @@
       void refreshWorkEngine().then(() => refreshOpencodeModels());
       return;
     }
-    if (modelOpen) void refreshRunners();
+    if (modelOpen) void ollamaMgr.refreshRunners();
   }
   /** Work picker rows (opencode's list, saved pick kept visible). */
   const workModelChoices = $derived(opencodeModelChoices(ocModels, workModel, modelQuery));
@@ -3320,43 +3097,12 @@
     // the menu, and the model should be right there — not lost in the long
     // list — when it reopens. Stable otherwise, so search order is steady.
     const rank = (c: ModelChoice) =>
-      c.id === selectedModel ? 0 : c.provider === "ollama" && runningNames.has(c.id) ? 1 : 2;
+      c.id === selectedModel ? 0 : c.provider === "ollama" && ollamaMgr.runningNames.has(c.id) ? 1 : 2;
     return out
       .map((c, i) => ({ c, i }))
       .sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i)
       .map((x) => x.c);
   });
-
-  const runningNames = $derived(new Set(runners.map((r) => r.name)));
-
-  // manage tab: current chat's model first, then loaded models, then the rest
-  const sortedManageModels = $derived.by(() => {
-    const running = new Set(runners.map((r) => r.name));
-    const rank = (m: string) => (m === selectedModel ? 0 : running.has(m) ? 1 : 2);
-    return models.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m) || a.i - b.i).map((x) => x.m);
-  });
-  /** variant tags ending in -mlx are Apple-silicon builds (see refresh-catalog.py) */
-  const filteredCatalog = $derived.by(() => {
-    const q = browseQuery.trim().toLowerCase();
-    return catalog.filter((e) => {
-      if (browseCat === "small") {
-        if (Math.max(...e.variants.map((v) => v.sizeMB)) > 2560) return false;
-      } else if (browseCat === "mlx") {
-        if (!e.variants.some((v) => isMlxVariant(v.tag))) return false;
-      } else if (browseCat !== "all" && !e.cats.includes(browseCat)) return false;
-      if (!q) return true;
-      return (
-        e.name.toLowerCase().includes(q) ||
-        e.blurb.toLowerCase().includes(q) ||
-        e.cats.some((c) => c.includes(q)) ||
-        e.variants.some((v) => v.tag.toLowerCase().includes(q))
-      );
-    });
-  });
-
-  function pickedVariant(entryName: string, fallback: string): string {
-    return variantPick[entryName] ?? fallback;
-  }
 
   function useSuggestion(prompt: string) {
     input = prompt;
@@ -8019,8 +7765,8 @@
       }
       const savedCatalog = await loadCatalog();
       if (savedCatalog) {
-        catalog = savedCatalog.entries;
-        catalogUpdated = savedCatalog.updated;
+        ollamaMgr.catalog = savedCatalog.entries;
+        ollamaMgr.catalogUpdated = savedCatalog.updated;
       }
       const cachedOpenRouter = readOpenRouterCache();
       if (cachedOpenRouter) {
@@ -9357,7 +9103,7 @@
                         {#if choice.sub}<span class="model-opt-id">{choice.sub}</span>{/if}
                       </button>
                       {#if choice.provider === "ollama" && !isCloudModel(choice.id)}
-                        {@const loaded = runningNames.has(choice.id)}
+                        {@const loaded = ollamaMgr.runningNames.has(choice.id)}
                         <button
                           class="model-mem-btn"
                           class:is-loaded={loaded}
@@ -9365,9 +9111,9 @@
                           data-name={choice.id}
                           title={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
                           aria-label={loaded ? `Unload ${choice.id}` : `Load ${choice.id}`}
-                          disabled={modelOp !== null || pulling !== null}
-                          onclick={(e) => { e.stopPropagation(); void toggleModelLoaded(choice.id, loaded); }}
-                        ><span class="mem-ico" class:mem-spin={modelOp === choice.id}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
+                          disabled={ollamaMgr.modelOp !== null || ollamaMgr.pulling !== null}
+                          onclick={(e) => { e.stopPropagation(); void ollamaMgr.toggleModelLoaded(choice.id, loaded); }}
+                        ><span class="mem-ico" class:mem-spin={ollamaMgr.modelOp === choice.id}>{#if loaded}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2.5 13.5 9.5h-11z"/><rect x="3" y="11" width="10" height="2" rx="1"/></svg>{:else}<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 13.5 2.5 6.5h11z"/><rect x="3" y="3" width="10" height="2" rx="1"/></svg>{/if}</span></button>
                       {/if}
                     </div>
                   {:else}
@@ -9809,48 +9555,48 @@
     bind:stopWordsText
     onSetContinueMode={setContinueMode}
     onSetStopWords={setStopWords}
-    {ollamaVersion}
-    {serverChecking}
-    {serverOp}
-    {serverError}
+    ollamaVersion={ollamaMgr.ollamaVersion}
+    serverChecking={ollamaMgr.serverChecking}
+    serverOp={ollamaMgr.serverOp}
+    serverError={ollamaMgr.serverError}
     {serverChatTurns}
     bind:ollamaBase
-    bind:browseView
-    {runnersError}
-    {sortedManageModels}
-    {runners}
+    bind:browseView={ollamaMgr.browseView}
+    runnersError={ollamaMgr.runnersError}
+    sortedManageModels={ollamaMgr.sortedManageModels}
+    runners={ollamaMgr.runners}
     {selectedModel}
-    {modelOp}
-    {pulling}
-    bind:confirmDeleteModel
-    bind:pullName
-    {pullStatus}
-    {pullDone}
-    {pullTotal}
-    {pullRate}
-    bind:browseQuery
-    bind:browseCat
+    modelOp={ollamaMgr.modelOp}
+    pulling={ollamaMgr.pulling}
+    bind:confirmDeleteModel={ollamaMgr.confirmDeleteModel}
+    bind:pullName={ollamaMgr.pullName}
+    pullStatus={ollamaMgr.pullStatus}
+    pullDone={ollamaMgr.pullDone}
+    pullTotal={ollamaMgr.pullTotal}
+    pullRate={ollamaMgr.pullRate}
+    bind:browseQuery={ollamaMgr.browseQuery}
+    bind:browseCat={ollamaMgr.browseCat}
     browseCats={BROWSE_CATS}
-    {filteredCatalog}
-    {catalog}
-    {catalogUpdated}
-    {fetching}
-    {catalogError}
+    filteredCatalog={ollamaMgr.filteredCatalog}
+    catalog={ollamaMgr.catalog}
+    catalogUpdated={ollamaMgr.catalogUpdated}
+    fetching={ollamaMgr.fetching}
+    catalogError={ollamaMgr.catalogError}
     {models}
-    bind:variantPick
+    bind:variantPick={ollamaMgr.variantPick}
     onOpenModelsTab={openModelsTab}
-    onStartServerFlow={startServerFlow}
-    onStopServerFlow={stopServerFlow}
+    onStartServerFlow={ollamaMgr.startServerFlow}
+    onStopServerFlow={ollamaMgr.stopServerFlow}
     onSetOllamaHost={setOllamaHost}
-    onToggleModelLoaded={toggleModelLoaded}
-    onRequestDeleteModel={requestDeleteModel}
-    onSubmitPull={submitPull}
-    onSubmitPullName={submitPullName}
-    onCancelPull={cancelPull}
-    onFetchCatalog={fetchCatalog}
+    onToggleModelLoaded={ollamaMgr.toggleModelLoaded}
+    onRequestDeleteModel={ollamaMgr.requestDeleteModel}
+    onSubmitPull={ollamaMgr.submitPull}
+    onSubmitPullName={ollamaMgr.submitPullName}
+    onCancelPull={ollamaMgr.cancelPull}
+    onFetchCatalog={ollamaMgr.fetchCatalog}
     {formatPullRate}
     {isMlxVariant}
-    {pickedVariant}
+    pickedVariant={ollamaMgr.pickedVariant}
     openrouterKey={openrouter.openrouterKey}
     openrouterKeyBusy={openrouter.openrouterKeyBusy}
     openrouterKeyInfo={openrouter.openrouterKeyInfo}
