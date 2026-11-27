@@ -111,6 +111,50 @@ pub fn live_turn(st: &BridgeState, session_id: &str) -> Option<(String, Arc<Turn
     (!turn.done.load(Ordering::Relaxed)).then_some((tid, turn))
 }
 
+/// The final reply text of a turn that just ended, for bridges mirroring it.
+///
+/// `turn.done` flips when the engine loop returns, which is independent of the
+/// recorder applying the last channel events and of `finalize`'s forced write
+/// (queued behind `chat_lock`). Reading the DB after a fixed sleep therefore
+/// returned the last periodic write and dropped the closing text. Instead,
+/// wait until the turn's recorder is gone (finalize removes it after its final
+/// write) and use its in-memory transcript; the DB is only a fallback.
+pub async fn final_reply(st: &BridgeState, session: &str, turn_id: &str) -> String {
+    let find = || -> Option<Arc<Mutex<RecState>>> {
+        let recs: Vec<_> = st.recorders.lock().ok()?.values().cloned().collect();
+        recs.into_iter().find(|r| r.lock().map(|g| g.turn_id == turn_id).unwrap_or(false))
+    };
+    let mut held = find();
+    let until = Instant::now() + Duration::from_secs(60);
+    // a turn with no recorder at all (no db) has nothing to wait for
+    let mut grace = Instant::now() + Duration::from_secs(3);
+    loop {
+        match find() {
+            Some(r) => {
+                held = Some(r);
+                grace = until;
+            }
+            None if held.is_some() || Instant::now() >= grace => break,
+            None => {}
+        }
+        if Instant::now() >= until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if let Some(reply) = held.and_then(|r| r.lock().ok().map(|g| g.rec.last_reply())) {
+        if !reply.is_empty() {
+            return reply;
+        }
+    }
+    match &st.db {
+        Some(db) => crate::server_store::load_chat(db, session).await.ok().flatten()
+            .and_then(|c| Some(persist::last_reply(c["messages"].as_array()?).to_string()))
+            .unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
 /// Start a Work turn (window-started or server-started) and return its id.
 pub async fn launch(st: &Arc<BridgeState>, p: LaunchParams) -> Result<String, String> {
     if !p.engine.is_present() {
@@ -408,12 +452,46 @@ pub async fn deliver(st: &Arc<BridgeState>, chat_id: &str, msg: Value) -> Result
     start_server_turn(st, chat_id, vec![msg], None).await.map(|_| ())
 }
 
+/// Deliver a message from a messaging bridge (Telegram, bridge plugins):
+/// with the "send follow-ups now" setting on (default) a running turn is
+/// interrupted so it goes right away; off, it just queues. Returns
+/// `queued` = it is waiting for the running turn to finish.
+pub async fn deliver_follow_up(st: &Arc<BridgeState>, chat_id: &str, msg: Value) -> Result<bool, String> {
+    let running = live_turn(st, chat_id).is_some();
+    deliver(st, chat_id, msg).await?;
+    if !running || !crate::work_engine::send_now_default() {
+        return Ok(running);
+    }
+    if let Some((_, turn)) = live_turn(st, chat_id) {
+        if crate::work_agent::agent_send_now(&turn, None) {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false); // the turn ended meanwhile and took the message
+    }
+    // engine without a round interrupt: stop + restart can take a while, so
+    // don't hold up the caller (a bridge's update loop / RPC)
+    let (st, id) = (st.clone(), chat_id.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = send_now(&st, &id).await {
+            eprintln!("vicuna: send-now for {id}: {e}");
+        }
+    });
+    Ok(false)
+}
+
 /// Interrupt a session's running turn so its queued messages go now: the
 /// queue is taken off the turn (a stopped turn would leave it to a window),
 /// the turn is stopped, and once it has ended the messages start a new turn.
 /// Returns how many messages were sent (0 = nothing queued / idle).
 pub async fn send_now(st: &Arc<BridgeState>, chat_id: &str) -> Result<usize, String> {
     let Some((_, turn)) = live_turn(st, chat_id) else { return Ok(0) };
+    // fast path: the engine ends just the current round and runs the queue
+    // as its next prompt, in the same turn (no cancel grace, no respawn)
+    let queued = turn.queue.lock().map(|q| q.len()).unwrap_or(0);
+    if queued > 0 && crate::work_agent::agent_send_now(&turn, None) {
+        return Ok(queued);
+    }
     let msgs: Vec<Value> = turn.queue.lock().map(|mut q| q.drain(..).collect::<Vec<_>>()).unwrap_or_default()
         .into_iter()
         .filter_map(|(_, m)| serde_json::to_value(m).ok())
@@ -425,7 +503,7 @@ pub async fn send_now(st: &Arc<BridgeState>, chat_id: &str) -> Result<usize, Str
     // engines can take ~20 s to honor a cancel
     let until = Instant::now() + Duration::from_secs(45);
     while live_turn(st, chat_id).is_some() && Instant::now() < until {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let n = msgs.len();
     match live_turn(st, chat_id) {
@@ -1395,6 +1473,27 @@ mod tests {
         st.recorders.lock().unwrap().insert("channel".into(), rs.clone());
         st.session_turns.lock().unwrap().insert("chat".into(), (tid, "channel".into(), 1));
         (st, rs, turn, dir)
+    }
+
+    #[tokio::test]
+    async fn final_reply_waits_for_the_recorder_not_the_done_flag() {
+        let (st, rs, turn, _dir) = recording().await;
+        let tid = rs.lock().unwrap().turn_id.clone();
+        // a periodic write saved only the opening line
+        let ev = json!({"type":"token", "text":"Searching."});
+        rs.lock().unwrap().rec.apply(&ev, &ev.to_string());
+        write_rec(&st, &rs, false).await;
+        // the engine loop returned before the recorder saw the closing text
+        turn.done.store(true, Ordering::Relaxed);
+        let (st2, rs2) = (st.clone(), rs.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            let ev = json!({"type":"token", "text":" Here are the headlines."});
+            rs2.lock().unwrap().rec.apply(&ev, &ev.to_string());
+            st2.recorders.lock().unwrap().remove("channel");
+        });
+        let reply = final_reply(&st, "chat", &tid).await;
+        assert_eq!(reply, "Searching. Here are the headlines.");
     }
 
     #[tokio::test]

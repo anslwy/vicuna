@@ -601,6 +601,9 @@ async fn run_process(
     let mut started = Instant::now();
     let mut got_output = false;
     let mut interrupted_at: Option<Instant> = None;
+    // the interrupt came from Send now: keep the process, prompt again
+    let mut soft = false;
+    turn.soft_interrupt.store(true, Ordering::Relaxed);
     let mut writer = Some(writer);
     // one interval for the whole loop: a fresh `sleep` per iteration never
     // fires while the engine streams faster than it, so Stop went unseen
@@ -658,7 +661,12 @@ async fn run_process(
                             .or_else(|| (output_chars > 0).then(|| (output_chars as f64 / 4.0) / secs));
                         let gen_cost = msg.get("total_cost_usd").and_then(|c| c.as_f64());
                         emit_ev(on_event, stop, WorkAgentEvent::RoundEnd { gen_ms, gen_tps, gen_cost });
-                        if let Some(e) = result_error(&msg) {
+                        let soft_done = soft && interrupted_at.is_some() && !stop.load(Ordering::Relaxed);
+                        if soft_done {
+                            // the interrupted round ended; the queue goes next
+                            interrupted_at = None;
+                            soft = false;
+                        } else if let Some(e) = result_error(&msg) {
                             if !stop.load(Ordering::Relaxed) && interrupted_at.is_none() {
                                 break Err(RunError::Fatal(acp::friendly_prompt_error(engine, e)));
                             }
@@ -698,8 +706,9 @@ async fn run_process(
                 }
             }
             _ = stop_tick.tick() => {
-                if stop.load(Ordering::Relaxed) && interrupted_at.is_none() {
+                if (stop.load(Ordering::Relaxed) || (turn.interrupt.load(Ordering::Relaxed) && writer.is_some())) && interrupted_at.is_none() {
                     interrupted_at = Some(Instant::now());
+                    soft = !stop.load(Ordering::Relaxed);
                     if let Some(w) = &writer {
                         let _ = w.send(line(&control_request("vicuna-stop", json!({ "subtype": "interrupt" }))));
                     }
@@ -707,7 +716,12 @@ async fn run_process(
                 if idle_waiting && bg_tasks == 0 && writer.is_some() && last_activity.elapsed() > BG_RESUME_GRACE {
                     writer = None; // jobs done but Claude never resumed
                 }
+                if soft && stop.load(Ordering::Relaxed) {
+                    soft = false; // Stop pressed during a Send now
+                }
                 if interrupted_at.is_some_and(|t| t.elapsed() > CANCEL_GRACE) {
+                    // a Send now the CLI never answered becomes a real stop
+                    stop.store(true, Ordering::Relaxed);
                     let _ = child.start_kill();
                     break Ok(());
                 }

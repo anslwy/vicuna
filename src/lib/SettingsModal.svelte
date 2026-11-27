@@ -86,6 +86,7 @@
     onRefreshWorkEngine,
     onPickWorkEngine,
     onToggleWorkApproval,
+    onToggleWorkSendNow,
     // Chat / continue
     continueMode,
     stopWordsText = $bindable(""),
@@ -203,6 +204,7 @@
     onRefreshWorkEngine: () => Promise<void>;
     onPickWorkEngine: (id: string) => Promise<void>;
     onToggleWorkApproval: (ask: boolean) => Promise<void>;
+    onToggleWorkSendNow?: (sendNow: boolean) => Promise<void>;
     continueMode: ContinueMode;
     stopWordsText: string;
     onSetContinueMode: (m: ContinueMode) => void;
@@ -581,6 +583,10 @@
             <label class="setting-note approval-row settings-divider-top" data-testid="work-approval">
               <input type="checkbox" data-testid="work-approval-toggle" checked={workEngineInfo?.askPermission ?? false} disabled={!workEngineInfo} onchange={(e) => void onToggleWorkApproval((e.currentTarget as HTMLInputElement).checked)} />
               Ask before running tools (edits, shell commands, web fetches): each request shows Allow / Reject in the chat. Off = approve automatically and note it in the transcript.
+            </label>
+            <label class="setting-note approval-row" data-testid="work-send-now">
+              <input type="checkbox" data-testid="work-send-now-toggle" checked={workEngineInfo?.sendNow ?? true} disabled={!workEngineInfo} onchange={(e) => void onToggleWorkSendNow?.((e.currentTarget as HTMLInputElement).checked)} />
+              Send follow-ups immediately while the agent works: a message sent mid-turn (also from Telegram and bridge plugins) interrupts the current step and goes now. Off = it queues until the agent finishes (↑ or <code>/send_now</code> sends it now).
             </label>
             <details class="setting-details">
               <summary>How engines &amp; binary overrides work</summary>

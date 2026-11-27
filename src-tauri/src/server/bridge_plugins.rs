@@ -400,17 +400,8 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
         }
     }
 
-    // Final DB write settles slightly after turn exits
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    let reply = match st.db.as_ref() {
-        Some(db) => crate::server_store::load_chat(db, &session).await.ok().flatten(),
-        None => None,
-    }
-    .and_then(|c| {
-        let messages = c["messages"].as_array()?;
-        Some(phone_text(super::persist::last_reply(messages)))
-    })
-    .unwrap_or_default();
+    // wait for the recorder's final events + write, not a blind sleep
+    let reply = phone_text(&turns::final_reply(&st, &session, &turn_id).await);
 
     broadcast_notification(
         "turn_event",
@@ -490,8 +481,7 @@ async fn handle_host_rpc(st: &Arc<BridgeState>, method: &str, params: &Value) ->
             if !images.is_empty() {
                 m["images"] = Value::Array(images);
             }
-            let queued = live_turn(st, &id).is_some();
-            turns::deliver(st, &id, m).await?;
+            let queued = turns::deliver_follow_up(st, &id, m).await?;
             let tid = live_turn(st, &id).map(|(t, _)| t);
             Ok(json!({ "queued": queued, "turnId": tid }))
         }

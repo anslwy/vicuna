@@ -1009,11 +1009,13 @@ async fn handle_update(st: &Arc<BridgeState>, sid: &str, u: &Value) -> Result<()
     if !images.is_empty() {
         m["images"] = json!(images);
     }
-    let queued = live_turn(st, sid).is_some();
-    if let Err(e) = turns::deliver(st, sid, m).await {
-        send_text(&token, chat, &format!("⚠️ {e}"), None).await;
-        return Ok(());
-    }
+    let queued = match turns::deliver_follow_up(st, sid, m).await {
+        Ok(q) => q,
+        Err(e) => {
+            send_text(&token, chat, &format!("⚠️ {e}"), None).await;
+            return Ok(());
+        }
+    };
     if queued {
         let kb = json!({"inline_keyboard": [[{"text": "⚡ Send now", "callback_data": "sn"}]]});
         send_text(&token, chat, "📨 Queued for the running turn. Tap Send now (or /send_now) to interrupt it and send right away.", Some(kb)).await;
@@ -1419,17 +1421,8 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
                 }
             }
         }
-        // the final write lands after `done`; give it a moment
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        let reply = match st.db.as_ref() {
-            Some(db) => crate::server_store::load_chat(db, &session).await.ok().flatten(),
-            None => None,
-        }
-        .and_then(|c| {
-            let messages = c["messages"].as_array()?;
-            Some(phone_text(super::persist::last_reply(messages)))
-        })
-        .unwrap_or_default();
+        // wait for the recorder's final events + write, not a blind sleep
+        let reply = phone_text(&super::turns::final_reply(&st, &session, &turn_id).await);
         let reply = if reply.is_empty() { "(no reply text)".to_string() } else { reply };
         let parts = chunks(&reply);
         let mut it = parts.iter();

@@ -1583,7 +1583,11 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 pub(crate) fn take_queue(turn: &TurnState) -> Vec<(String, ChatMessage)> {
     turn.queue
         .lock()
-        .map(|mut q| std::mem::take(&mut *q))
+        .map(|mut q| {
+            // a send-now aimed at these messages is satisfied: they go out now
+            turn.interrupt.store(false, Ordering::Relaxed);
+            std::mem::take(&mut *q)
+        })
         .unwrap_or_default()
 }
 
@@ -1951,6 +1955,8 @@ async fn run_turn_inner(
     let mut blocks = prompt_blocks(&text, &last_user.images);
 
     let mut first_round = true;
+    // Send now cancels the round and prompts again in this same session
+    turn.soft_interrupt.store(true, Ordering::Relaxed);
     // follow-ups sent after agy ended a turn early on a backgrounded command
     let mut agy_nudges = 0usize;
     loop {
@@ -1977,6 +1983,8 @@ async fn run_turn_inner(
         let mut output_chars = 0usize;
         let mut tools: HashMap<String, ToolState> = HashMap::new();
         let mut cancelled = false;
+        // the cancel came from Send now: the turn carries on with the queue
+        let mut soft = false;
         // a tool call was still running when Stop was pressed
         let mut tool_running_at_stop = false;
         let mut cancel_at: Option<Instant> = None;
@@ -2005,8 +2013,9 @@ async fn run_turn_inner(
                     .and_then(|r| r)
                     .map_err(|e| if client.closed.load(Ordering::Relaxed) { client.dead_error() } else { e }),
                 _ = stop_tick.tick() => {
-                    if stop.load(Ordering::Relaxed) && !cancelled {
+                    if crate::work_agent::round_should_end(turn) && !cancelled {
                         cancelled = true;
+                        soft = !stop.load(Ordering::Relaxed);
                         tool_running_at_stop = tools.values().any(|t| t.started && !t.ended);
                         cancel_at = Some(Instant::now());
                         let _ = client.notify("session/cancel", json!({ "sessionId": acp_session }));
@@ -2044,7 +2053,7 @@ async fn run_turn_inner(
                     .get("stopReason")
                     .and_then(|r| r.as_str())
                     .unwrap_or("end_turn");
-                if stop_reason == "cancelled" || stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || (stop_reason == "cancelled" && !soft) {
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -2054,14 +2063,16 @@ async fn run_turn_inner(
                 // even if Stop raced with the error. The next send rebuilds
                 // text context from Vicuna without replaying native tool media.
                 let reset = key.as_deref().is_some_and(|k| state.forget_poisoned_session(k, &scoped_session_id, &e));
-                if cancelled || stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || (cancelled && !soft) {
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if reset {
+                if reset && !soft {
                     return Err(format!("{}\n\nThe native session contained invalid media/history and was reset. Send another message to continue in a fresh session with the visible conversation.", friendly_prompt_error(engine, e)));
                 }
-                return Err(friendly_prompt_error(engine, e));
+                if !soft {
+                    return Err(friendly_prompt_error(engine, e));
+                }
             }
         }
 

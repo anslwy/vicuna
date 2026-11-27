@@ -124,6 +124,13 @@ fn prune_turns(turns: &mut HashMap<String, Arc<TurnState>>, keep: usize) {
 
 pub struct TurnState {
     pub stop: AtomicBool,
+    /// "Send now": end the current round (not the turn) and run the queued
+    /// messages as the next prompt of this same turn. Cleared when the
+    /// engine takes the queue (`acp::take_queue`).
+    pub interrupt: AtomicBool,
+    /// the running engine honors `interrupt` (claude, codex, ACP engines);
+    /// others fall back to stop + a fresh turn
+    pub soft_interrupt: AtomicBool,
     pub queue: Mutex<Vec<(String, ChatMessage)>>,
     pub ask_pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     pub ask_seq: AtomicU64,
@@ -195,6 +202,8 @@ impl TurnState {
     pub fn new() -> Self {
         Self {
             stop: AtomicBool::new(false),
+            interrupt: AtomicBool::new(false),
+            soft_interrupt: AtomicBool::new(false),
             queue: Mutex::new(Vec::new()),
             ask_pending: Mutex::new(HashMap::new()),
             ask_seq: AtomicU64::new(1),
@@ -229,6 +238,41 @@ pub fn agent_stop(turn: &Arc<TurnState>) {
     if let Ok(mut p) = turn.ask_parked.lock() {
         p.clear();
     }
+}
+
+/// "Send now": move `first` (if given) to the front of the queue and, when
+/// the engine supports it, interrupt only the current round so the queue
+/// runs right away inside the same turn — no engine teardown, no respawn.
+/// Returns false when the engine can't (or nothing is queued): the caller
+/// then falls back to stopping the turn.
+pub fn agent_send_now(turn: &Arc<TurnState>, first: Option<&str>) -> bool {
+    let Ok(mut q) = turn.queue.lock() else { return false };
+    if let Some(id) = first {
+        if let Some(i) = q.iter().position(|(qid, _)| qid == id) {
+            let m = q.remove(i);
+            q.insert(0, m);
+        }
+    }
+    if q.is_empty() || !turn.soft_interrupt.load(Ordering::Relaxed) || turn.stop.load(Ordering::Relaxed) {
+        return false;
+    }
+    turn.interrupt.store(true, Ordering::Relaxed);
+    drop(q);
+    // a question the agent is waiting on would hold the round open
+    if let Ok(mut m) = turn.ask_pending.lock() {
+        for (_, tx) in m.drain() {
+            let _ = tx.send("cancelled".to_string());
+        }
+    }
+    if let Ok(mut p) = turn.ask_parked.lock() {
+        p.clear();
+    }
+    true
+}
+
+/// The engine should end its current round now (Stop or Send now).
+pub fn round_should_end(turn: &TurnState) -> bool {
+    turn.stop.load(Ordering::Relaxed) || turn.interrupt.load(Ordering::Relaxed)
 }
 
 pub fn agent_queue_msg(turn: &Arc<TurnState>, id: String, message: ChatMessage) -> Result<(), String> {
@@ -500,6 +544,32 @@ mod tests {
         let q = t.queue.lock().unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, "b");
+    }
+
+    #[test]
+    fn send_now_interrupts_the_round_not_the_turn() {
+        let t = Arc::new(TurnState::new());
+        agent_queue_msg(&t, "a".into(), msg("one")).unwrap();
+        agent_queue_msg(&t, "b".into(), msg("two")).unwrap();
+        // engine without soft interrupt: caller must fall back, but the
+        // urgent message still moves to the front
+        assert!(!agent_send_now(&t, Some("b")));
+        assert!(!t.interrupt.load(Ordering::Relaxed));
+        assert_eq!(t.queue.lock().unwrap()[0].0, "b");
+        t.soft_interrupt.store(true, Ordering::Relaxed);
+        let (tx, mut rx) = oneshot::channel();
+        t.ask_pending.lock().unwrap().insert("q".into(), tx);
+        assert!(agent_send_now(&t, Some("a")));
+        assert!(round_should_end(&t));
+        assert!(!t.stop.load(Ordering::Relaxed), "the turn keeps running");
+        assert_eq!(rx.try_recv().unwrap(), "cancelled");
+        // the engine takes the queue: urgent first, interrupt satisfied
+        let q = crate::acp::take_queue(&t);
+        assert_eq!(q.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(!round_should_end(&t));
+        // nothing queued: nothing to interrupt for
+        assert!(!agent_send_now(&t, None));
+        assert!(!t.interrupt.load(Ordering::Relaxed));
     }
 
     #[test]

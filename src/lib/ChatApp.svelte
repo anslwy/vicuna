@@ -51,7 +51,8 @@
   import { stopReconcileAction, STOP_RECONCILE_DELAYS_MS } from "$lib/stopReconcile";
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex, canClearContext, isAssistantReply, undoMessageRange } from "$lib/sessionEngine";
-  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workAccountSupport, addWorkAccount, renameWorkAccount, removeWorkAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
+  import { followUpSendsNow, parseSendNow, runningPlaceholder, queuedHint } from "$lib/followUp";
+  import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workAccountSupport, addWorkAccount, renameWorkAccount, removeWorkAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, setWorkSendNow, sendWorkAgentNow, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
   import { baseEngineId, changesCliAccount, type WorkAccountInfo } from "$lib/workGate";
@@ -372,6 +373,13 @@
    *  finished background job): settle restarts with the queue instead of
    *  handing it back to the composer */
   const sendNowIds = new Set<string>();
+  /** sessions whose queued chips are being sent now (chip hint) */
+  let sendingNowFor = $state<string[]>([]);
+  const markSendingNow = (id: string, on: boolean) => {
+    const has = sendingNowFor.includes(id);
+    if (on && !has) sendingNowFor = [...sendingNowFor, id];
+    else if (!on && has) sendingNowFor = sendingNowFor.filter((x) => x !== id);
+  };
   // turn-finished OS notifications: chat turns the user stopped / that
   // errored, and a short debounce so a tool loop's back-to-back streams
   // notify once
@@ -1154,8 +1162,12 @@
       const qid = crypto.randomUUID();
       queuedMsgs = [...queuedMsgs, { chatId: chat.id, id: qid, msg }];
       const turnId = workTurnIds.get(chat.id);
-      if (opts.now) sendQueuedNow(qid);
-      else if (turnId) void queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
+      if (turnId) {
+        const posted = queueWorkAgentMsg(turnId, qid, msg).catch(() => {});
+        queuePosts.set(qid, posted);
+        void posted.finally(() => queuePosts.delete(qid));
+      }
+      if (opts.now) void sendQueuedNow(qid);
       return true;
     }
     const gate = workSendGate(workEngineInfo);
@@ -1829,6 +1841,16 @@
       accountEngines = await workAccountSupport();
     } catch {
       accountEngines = [];
+    }
+  }
+  /** follow-ups mid-turn: interrupt & send now (default) or queue */
+  const followUpNow = $derived(followUpSendsNow(workEngineInfo));
+  async function toggleWorkSendNow(sendNow: boolean) {
+    try {
+      const prev = workEngineInfo ? engineId(workEngineInfo) : null;
+      applyWorkEngine(await setWorkSendNow(sendNow), prev);
+    } catch (e: any) {
+      error = typeof e === "string" ? e : (e?.message ?? String(e));
     }
   }
   async function toggleWorkApproval(ask: boolean) {
@@ -4249,7 +4271,22 @@
           error = "Wait for the turn to finish before sending files.";
           return;
         }
-        queuePrompt(text, attachImages.length ? [...attachImages] : undefined);
+        const chatId = activeId;
+        const cmd = parseSendNow(text);
+        if (cmd && !attachImages.length && chatId) {
+          // /send_now [message]: send what's queued (plus this) right away
+          if (cmd.rest) queuePrompt(cmd.rest);
+          else {
+            input = "";
+            clearDraft(null);
+          }
+          const first = queuedMsgs.find((q) => q.chatId === chatId);
+          if (first) sendQueuedNow(first.id);
+          else flashNotice("Nothing is queued: your messages already reached the agent.");
+          return;
+        }
+        const id = queuePrompt(text, attachImages.length ? [...attachImages] : undefined);
+        if (id && followUpNow) sendQueuedNow(id);
       }
       return;
     }
@@ -4425,25 +4462,33 @@
     attachFiles = [];
   }
 
-  function queuePrompt(text: string, images?: string[]) {
+  /** in-flight queue POSTs: a send-now must not overtake its own message */
+  const queuePosts = new Map<string, Promise<unknown>>();
+  function queuePrompt(text: string, images?: string[]): string | null {
     const chatId = activeId;
-    if (!chatId || (!text && !images?.length)) return;
+    if (!chatId || (!text && !images?.length)) return null;
     const id = crypto.randomUUID();
     const msg: ChatMsg = { role: "user", content: text, ...(images ? { images } : {}) };
     queuedMsgs = [...queuedMsgs, { chatId, id, msg }];
     const turnId = workTurnIds.get(chatId);
-    if (turnId) void queueWorkAgentMsg(turnId, id, msg).catch(() => {});
+    if (turnId) {
+      const posted = queueWorkAgentMsg(turnId, id, msg).catch(() => {});
+      queuePosts.set(id, posted);
+      void posted.finally(() => queuePosts.delete(id));
+    }
     input = "";
     historyIndex = null;
     historyDraft = "";
     clearDraft(null);
     attachImages = [];
     error = null;
+    return id;
   }
 
   /** drain the queued prompts for a chat (they are consumed at once) */
   function takeQueued(chatId: string): ChatMsg[] {
     const taken = queuedMsgs.filter((q) => q.chatId === chatId);
+    markSendingNow(chatId, false);
     if (!taken.length) return [];
     queuedMsgs = queuedMsgs.filter((q) => q.chatId !== chatId);
     return taken.map((q) => q.msg);
@@ -4454,6 +4499,7 @@
   function confirmQueuedDrained(ids: string[]) {
     if (!ids.length) return;
     const gone = new Set(ids);
+    for (const q of queuedMsgs) if (gone.has(q.id)) markSendingNow(q.chatId, false);
     queuedMsgs = queuedMsgs.filter((q) => !gone.has(q.id));
   }
 
@@ -4469,7 +4515,7 @@
   /** Interrupt the session's live turn and start a new one right away with
    *  this message (plus anything else queued there, in order). The backend
    *  never drains its queue after a stop, so settle's leftovers carry them. */
-  function sendQueuedNow(id: string) {
+  async function sendQueuedNow(id: string) {
     const q = queuedMsgs.find((x) => x.id === id);
     if (!q) return;
     const chatId = q.chatId;
@@ -4492,11 +4538,18 @@
       return;
     }
     if (sendNowIds.has(chatId)) return; // already interrupting
-    // stopping the engine can take a while (opencode's cancel grace): say so
-    flashNotice("Interrupting the agent to send this now…");
     // the urgent one goes first
     queuedMsgs = [q, ...queuedMsgs.filter((x) => x.id !== id)];
+    markSendingNow(chatId, true);
     const turnId = workTurnIds.get(chatId);
+    // fast path: the engine ends just its current round and runs the queue
+    // next, in this same turn — QueueDrained then turns the chips into
+    // bubbles. No stop, no settle round trip, no engine respawn.
+    if (turnId) await queuePosts.get(id);
+    if (turnId && (await sendWorkAgentNow(turnId, id))) return;
+    if (!isWorkRunning(chatId) || sendNowIds.has(chatId)) return;
+    // stopping the engine can take a while (opencode's cancel grace): say so
+    flashNotice("Interrupting the agent to send this now…");
     for (const x of queuedMsgs) {
       if (x.chatId === chatId && turnId) void removeWorkAgentMsg(turnId, x.id).catch(() => {});
     }
@@ -8097,7 +8150,7 @@
                 <button class="queue-x" data-testid="queue-remove" aria-label="Remove queued message" title="Remove from queue" onmousedown={(e) => e.preventDefault()} onclick={(e) => { e.stopPropagation(); unqueue(q.id); }}>×</button>
               </div>
           {/each}
-          <span class="queue-hint">queued · joins when the agent finishes · ↑ sends now</span>
+          <span class="queue-hint" data-testid="queue-hint">{queuedHint(sendingNowFor.includes(activeId ?? ""))}</span>
         </div>
       {/if}
       {#if busy}
@@ -8209,7 +8262,7 @@
           <div class="composer-backdrop" data-testid="composer-backdrop" aria-hidden="true" bind:this={composerBackdrop}>{@html renderMentions(input)}</div>
           <textarea
             data-testid="message-input"
-            placeholder={composerMode === "work" ? (activeWorkRunning ? "Queue a follow-up — it joins at the next tool call…" : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
+            placeholder={composerMode === "work" ? (activeWorkRunning ? runningPlaceholder(followUpNow) : "Ask to explore, run, or change workspace files… ( / to focus)") : "Send a message ( / to focus)"}
             bind:this={composerEl}
             bind:value={input}
             onkeydown={onKey}
@@ -9047,6 +9100,7 @@
     onRefreshWorkEngine={refreshWorkEngine}
     onPickWorkEngine={pickWorkEngine}
     onToggleWorkApproval={toggleWorkApproval}
+    onToggleWorkSendNow={toggleWorkSendNow}
     {continueMode}
     bind:stopWordsText
     onSetContinueMode={setContinueMode}

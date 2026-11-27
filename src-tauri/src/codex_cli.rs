@@ -870,6 +870,9 @@ async fn run_turns(
     let mut last_goal: Option<(String, String)> = None;
     let mut started = Instant::now();
     let mut interrupted_at: Option<Instant> = None;
+    // the interrupt came from Send now: the thread carries on with the queue
+    let mut soft = false;
+    turn.soft_interrupt.store(true, Ordering::Relaxed);
     // one interval for the whole loop: a fresh `sleep` per iteration never
     // fires while the engine streams faster than it, so Stop went unseen
     let mut stop_tick = crate::work_agent::stop_check_interval();
@@ -946,9 +949,12 @@ async fn run_turns(
                             let msg = if detail.is_empty() { server.exited_message("Codex turn failed") } else { format!("Codex turn failed: {detail}") };
                             return Err(acp::friendly_prompt_error(engine, msg));
                         }
-                        if stop.load(Ordering::Relaxed) || status == "interrupted" {
+                        let soft_done = soft && !stop.load(Ordering::Relaxed);
+                        if stop.load(Ordering::Relaxed) || (status == "interrupted" && !soft_done) {
                             return Ok(());
                         }
+                        interrupted_at = None;
+                        soft = false;
                         let queued = acp::take_queue(turn);
                         if queued.is_empty() {
                             return Ok(());
@@ -973,6 +979,16 @@ async fn run_turns(
                 }
             }
             _ = stop_tick.tick() => {
+                if !stop.load(Ordering::Relaxed) && turn.interrupt.load(Ordering::Relaxed) && interrupted_at.is_none() {
+                    if let Some(t) = &turn_id {
+                        interrupted_at = Some(Instant::now());
+                        soft = true;
+                        let _ = server.send_request("turn/interrupt", json!({ "threadId": thread, "turnId": t }));
+                    }
+                }
+                if soft && interrupted_at.is_some_and(|t| t.elapsed() > CANCEL_GRACE) {
+                    stop.store(true, Ordering::Relaxed); // never answered: real stop
+                }
                 if stop.load(Ordering::Relaxed) {
                     if interrupted_at.is_none() {
                         if let Some(t) = &turn_id {
