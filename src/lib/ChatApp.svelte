@@ -145,6 +145,7 @@
   import { type PendingAsk, type LaterAsk, type ModelChoice, type RemoteHit, type SearchItem, type ChatTurnEvent, type ChatTurnOperation, BROWSE_CATS, SUGGESTIONS, WORK_SUGGESTIONS, SHOW_ARCHIVED_KEY, USAGE_CACHE_KEY, CLI_INSTALL_CMD, SERVER_SETUP_CMD, WARM_RECENT_COUNT, resolveAppUpdateReleaseNotes, openRouterUsageText, newMcpEnabled, scheduleTz } from "$lib/chatAppData";
   import { createMcpState } from "$lib/mcpState.svelte";
   import { createBrowserState } from "$lib/browserState.svelte";
+  import { createAppUpdateState } from "$lib/appUpdateState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -2060,215 +2061,10 @@
   // download/install + relaunch). The manifest is latest.json on the newest
   // stable GitHub release (tauri.conf.json → plugins.updater.endpoints).
   // Plain-browser/bridge mode has no updater and keeps the download flow above.
-  let showUpdatePrompt = $state(false);
-  let availableAppUpdate = $state<AppUpdateInfo | null>(null);
-  let appUpdateStatus = $state<AppUpdateStatus>("idle");
-  let appUpdateError = $state<string | null>(null);
-  let appUpdateProgress = $state<{ downloadedBytes: number; totalBytes: number | null } | null>(null);
-  let skippedAppUpdateVersion = $state<string | null>(null);
-  let autoCheckAppUpdatesEnabled = $state(true);
-  let suppressAutoUpdatePromptUntilNextCheck = false;
-  /** the plugin's Update handle (not reactive: it owns a native resource) */
-  let updateObject: {
-    version: string;
-    currentVersion?: string;
-    downloadAndInstall: (cb?: (event: unknown) => void) => Promise<void>;
-  } | null = null;
-  const appUpdateLabel = $derived(
-    appUpdateStatus === "checking"
-      ? "Checking for updates…"
-      : appUpdateStatus === "installing"
-        ? "Installing update…"
-        : appUpdateStatus === "installed"
-          ? "Restart to apply update"
-          : appUpdateStatus === "available" && availableAppUpdate
-            ? `Update to v${availableAppUpdate.version}`
-            : "Check for updates"
-  );
-
-  function initializeAppUpdatePreference() {
-    const stored = loadAppUpdatePreferenceFromStorage();
-    skippedAppUpdateVersion = stored.skippedVersion;
-    autoCheckAppUpdatesEnabled = stored.autoCheckEnabled;
-  }
-
-  function setAutoCheckAppUpdates(enabled: boolean) {
-    autoCheckAppUpdatesEnabled = enabled;
-    try {
-      persistAppUpdatePreference({ skippedVersion: skippedAppUpdateVersion, autoCheckEnabled: enabled });
-    } catch {
-      /* storage unavailable: keep the in-memory choice */
-    }
-  }
-
-  function closeUpdatePrompt() {
-    showUpdatePrompt = false;
-  }
-
-  function skipAvailableAppUpdateVersion() {
-    const version = availableAppUpdate?.version?.trim();
-    if (version) {
-      skippedAppUpdateVersion = version;
-      try {
-        persistAppUpdatePreference({ skippedVersion: version, autoCheckEnabled: autoCheckAppUpdatesEnabled });
-      } catch {
-        /* storage unavailable */
-      }
-    }
-    suppressAutoUpdatePromptUntilNextCheck = false;
-    closeUpdatePrompt();
-  }
-
-  function remindAboutAppUpdateLater() {
-    suppressAutoUpdatePromptUntilNextCheck = true;
-    closeUpdatePrompt();
-  }
-
-  async function triggerAutomaticAppUpdateCheck() {
-    if (typeof navigator !== "undefined" && !navigator.onLine) return;
-    if (!autoCheckAppUpdatesEnabled) return;
-    if (appUpdateStatus === "checking" || appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
-    const suppressPrompt = suppressAutoUpdatePromptUntilNextCheck;
-    suppressAutoUpdatePromptUntilNextCheck = false;
-    await checkForAppUpdates({ source: "automatic", suppressAutoPrompt: suppressPrompt });
-  }
-
-  async function checkForAppUpdates(
-    options: { source?: "manual" | "automatic"; suppressAutoPrompt?: boolean } = {}
-  ) {
-    const source = options.source ?? "manual";
-    const suppressAutoPrompt = options.suppressAutoPrompt ?? false;
-    if (!isTauriRuntime()) {
-      void openExternal(APP_UPDATE_RELEASES_URL);
-      return;
-    }
-    if (appUpdateStatus === "checking" || appUpdateStatus === "installing") return;
-
-    const previousAvailable = availableAppUpdate;
-    const previousStatus = appUpdateStatus;
-    const previousError = appUpdateError;
-    const previousUpdateObject = updateObject;
-
-    appUpdateStatus = "checking";
-    appUpdateError = null;
-    appUpdateProgress = null;
-    availableAppUpdate = null;
-    updateObject = null;
-
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (update) {
-        const rawTarget = (update as unknown as { rawJson?: { target?: unknown } }).rawJson?.target;
-        const releaseNotes = await resolveAppUpdateReleaseNotes({
-          body: (update as unknown as { body?: string | null }).body ?? null
-        });
-        availableAppUpdate = {
-          version: update.version,
-          currentVersion: update.currentVersion || "",
-          notes: releaseNotes.notesPreview,
-          publishedAt: (update as unknown as { date?: string | null }).date ?? null,
-          target: typeof rawTarget === "string" ? rawTarget : "",
-          releaseNotesUrl: releaseNotes.releaseNotesUrl
-        };
-        updateObject = update as unknown as typeof updateObject;
-        appUpdateStatus = "available";
-        if (source === "manual") {
-          showUpdatePrompt = true;
-        } else if (!suppressAutoPrompt && update.version !== skippedAppUpdateVersion) {
-          showUpdatePrompt = true;
-        } else {
-          closeUpdatePrompt();
-        }
-      } else {
-        appUpdateStatus = "up_to_date";
-        closeUpdatePrompt();
-        if (source === "manual") flashNotice("Vicuna is already up to date.");
-      }
-    } catch (err) {
-      console.error("Failed to check for app updates:", err);
-      if (source === "automatic") {
-        // background checks never surface errors (offline, no release yet…)
-        availableAppUpdate = previousAvailable;
-        appUpdateStatus = previousStatus;
-        appUpdateError = previousError;
-        updateObject = previousUpdateObject;
-        return;
-      }
-      availableAppUpdate = null;
-      updateObject = null;
-      appUpdateStatus = "error";
-      appUpdateError = normalizeUpdateErrorMessage(err);
-      showUpdatePrompt = false;
-    }
-  }
-
-  async function installAppUpdate() {
-    if (appUpdateStatus === "installing" || appUpdateStatus === "installed") return;
-    // The modal can outlive the in-memory updater handle: re-check instead
-    // of silently doing nothing.
-    if (!updateObject) {
-      appUpdateError = null;
-      await checkForAppUpdates({ source: "manual" });
-      if (!updateObject || appUpdateStatus !== "available") return;
-    }
-    if (appUpdateStatus !== "available" && appUpdateStatus !== "error") return;
-    const handle = updateObject;
-    if (!handle) return;
-    appUpdateStatus = "installing";
-    appUpdateError = null;
-    appUpdateProgress = { downloadedBytes: 0, totalBytes: null };
-    // Keep the dialog visible so progress is seen; it stays dismissible and
-    // the install continues in the background if hidden.
-    showUpdatePrompt = true;
-    try {
-      await handle.downloadAndInstall((event) => {
-        const name = (event as { event?: string })?.event;
-        const data = (event as { data?: { chunkLength?: unknown; contentLength?: unknown } })?.data ?? {};
-        if (name === "Started") {
-          const total = typeof data.contentLength === "number" ? data.contentLength : null;
-          appUpdateProgress = { downloadedBytes: 0, totalBytes: total };
-        } else if (name === "Progress") {
-          const chunk = typeof data.chunkLength === "number" ? data.chunkLength : 0;
-          const prev = appUpdateProgress ?? { downloadedBytes: 0, totalBytes: null };
-          appUpdateProgress = { downloadedBytes: prev.downloadedBytes + chunk, totalBytes: prev.totalBytes };
-        }
-      });
-      appUpdateProgress = null;
-      appUpdateStatus = "installed";
-    } catch (err) {
-      console.error("Failed to install app update:", err);
-      appUpdateProgress = null;
-      appUpdateStatus = "error";
-      appUpdateError = formatAppUpdateInstallError(err);
-    }
-  }
-
-  async function restartToApplyUpdate() {
-    try {
-      const { relaunch } = await import("@tauri-apps/plugin-process");
-      await relaunch();
-    } catch (err) {
-      console.error("Failed to restart after installing update:", err);
-      appUpdateError = normalizeUpdateErrorMessage(err);
-    }
-  }
-
-  /** Settings → App updates button: reopen a known update (incl. one that
-   *  is installing/installed/failed) instead of starting a conflicting check. */
-  async function openAppUpdate() {
-    if (
-      availableAppUpdate &&
-      (appUpdateStatus === "available" ||
-        appUpdateStatus === "installing" ||
-        appUpdateStatus === "installed" ||
-        appUpdateStatus === "error")
-    ) {
-      showUpdatePrompt = true;
-      return;
-    }
-    await checkForAppUpdates({ source: "manual" });
-  }
+  const appUpdate = createAppUpdateState({
+    get flashNotice() { return flashNotice; },
+    get updateError() { return updateError; }
+  });
   /** update errors fade like the main error box (a manual × also exists);
    *  same plain-timer shape as `errorTimer` above */
   let updateErrorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -8469,9 +8265,9 @@
     void loadPlugins();
     void refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
-    initializeAppUpdatePreference();
+    appUpdate.initializeAppUpdatePreference();
     const updateCheckTimer = isTauriRuntime() && !isRemoteServer()
-      ? setTimeout(() => void triggerAutomaticAppUpdateCheck(), 2500)
+      ? setTimeout(() => void appUpdate.triggerAutomaticAppUpdateCheck(), 2500)
       : null;
     // deep links (Copy Link in desktop mode) arrive here, both at launch
     // (getCurrent) and while running (onOpenUrl, e.g. link opened in Safari)
@@ -10260,16 +10056,16 @@
     {/if}
   </div>
 {/if}
-{#if showUpdatePrompt && availableAppUpdate}
+{#if appUpdate.showUpdatePrompt && appUpdate.availableAppUpdate}
   <UpdatePromptModal
-    {availableAppUpdate}
-    {appUpdateStatus}
-    {appUpdateError}
-    downloadProgress={appUpdateProgress}
-    onInstall={appUpdateStatus === "installed" ? restartToApplyUpdate : installAppUpdate}
-    onSkipVersion={skipAvailableAppUpdateVersion}
-    onRemindLater={remindAboutAppUpdateLater}
-    onClose={remindAboutAppUpdateLater}
+    availableAppUpdate={appUpdate.availableAppUpdate}
+    appUpdateStatus={appUpdate.appUpdateStatus}
+    appUpdateError={appUpdate.appUpdateError}
+    downloadProgress={appUpdate.appUpdateProgress}
+    onInstall={appUpdate.appUpdateStatus === "installed" ? appUpdate.restartToApplyUpdate : appUpdate.installAppUpdate}
+    onSkipVersion={appUpdate.skipAvailableAppUpdateVersion}
+    onRemindLater={appUpdate.remindAboutAppUpdateLater}
+    onClose={appUpdate.remindAboutAppUpdateLater}
   />
 {/if}
 {#if lightboxSrc}
@@ -10434,17 +10230,17 @@
     bind:settingsOpen
     bind:settingsTab
     {buildInfo}
-    bind:appUpdateStatus
-    bind:appUpdateError
-    {appUpdateLabel}
-    {showUpdatePrompt}
-    {autoCheckAppUpdatesEnabled}
+    bind:appUpdateStatus={appUpdate.appUpdateStatus}
+    bind:appUpdateError={appUpdate.appUpdateError}
+    appUpdateLabel={appUpdate.appUpdateLabel}
+    showUpdatePrompt={appUpdate.showUpdatePrompt}
+    autoCheckAppUpdatesEnabled={appUpdate.autoCheckAppUpdatesEnabled}
     {updateOp}
     {updateRelease}
     {updateNote}
     bind:updateError
-    onOpenAppUpdate={openAppUpdate}
-    onSetAutoCheckAppUpdates={setAutoCheckAppUpdates}
+    onOpenAppUpdate={appUpdate.openAppUpdate}
+    onSetAutoCheckAppUpdates={appUpdate.setAutoCheckAppUpdates}
     onCheckForUpdates={checkForUpdates}
     onApplyUpdate={applyUpdate}
     onOpenExternal={openExternal}
