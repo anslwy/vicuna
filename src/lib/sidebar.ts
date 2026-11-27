@@ -58,10 +58,51 @@ export function resolveDraftWorkspace(
  *  stripped. Mirrors displayWorkspace/workspaceBase in ChatApp.svelte, which
  *  cannot be imported here (it is a Svelte component). */
 export function workspaceBase(p: string): string {
-  let out = p;
-  if (out.startsWith("\\\\?\\UNC\\")) out = "\\" + out.slice("\\\\?\\UNC\\".length);
-  else if (out.startsWith("\\\\?\\")) out = out.slice("\\\\?\\".length);
-  return out.trim().split(/[/\\]/).filter(Boolean).pop() ?? "";
+  return stripVerbatimPrefix(p).trim().split(/[/\\]/).filter(Boolean).pop() ?? "";
+}
+
+function stripVerbatimPrefix(p: string): string {
+  if (p.startsWith("\\\\?\\UNC\\")) return "\\" + p.slice("\\\\?\\UNC\\".length);
+  if (p.startsWith("\\\\?\\")) return p.slice("\\\\?\\".length);
+  return p;
+}
+
+const GENERIC_PARENT_DIRS = new Set(["users", "home", "volumes", "mnt", "media", "root"]);
+const COMPACT_PATH_MAX_LEN = 36;
+
+/** Full displayable filesystem path for copying/inspecting in the Work banner,
+ *  or null when there is no underlying path (empty or unsent sentinel).
+ *  Materialized scratch paths still return their real path so users can inspect/copy them. */
+export function fullWorkspacePath(p: string | null | undefined): string | null {
+  const s = (p ?? "").trim();
+  if (!s || s === NO_WORKSPACE_SENTINEL || s === NO_WORKSPACE_FILTER) return null;
+  return stripVerbatimPrefix(s);
+}
+
+/** Compact label for the Work header bar:
+ *  - empty / sentinel / scratch dir -> "No workspace"
+ *  - root `/` -> "/"
+ *  - nested path -> `parent/folder` when parent is meaningful and fits cleanly,
+ *    otherwise `folder`, truncated with an ellipsis if a single folder name is huge. */
+export function compactWorkspaceLabel(p: string | null | undefined): string {
+  const s = (p ?? "").trim();
+  if (!s || isNoWorkspacePath(s)) return "No workspace";
+  const clean = stripVerbatimPrefix(s);
+  const segs = clean.split(/[/\\]/).filter(Boolean);
+  if (segs.length === 0) return "/";
+  const folder = segs[segs.length - 1];
+  if (segs.length >= 2) {
+    const parent = segs[segs.length - 2];
+    const isDrive = /^[A-Za-z]:$/.test(parent);
+    const isGeneric = GENERIC_PARENT_DIRS.has(parent.toLowerCase());
+    if (!isDrive && !isGeneric && parent.length + 1 + folder.length <= COMPACT_PATH_MAX_LEN) {
+      return `${parent}/${folder}`;
+    }
+  }
+  if (folder.length > COMPACT_PATH_MAX_LEN) {
+    return `${folder.slice(0, COMPACT_PATH_MAX_LEN - 1)}…`;
+  }
+  return folder;
 }
 
 /** The folder a session lives in: its workspace root, NO_WORKSPACE_FILTER for

@@ -117,7 +117,7 @@
   import { cliStatus, cliInstall, cliUninstall, focusAppWindow, extractOpenPath, type CliStatus } from "$lib/cli";
   import { LB_URL, isBrowserMcpId, browserStatus, browserStart, browserRestart, browserTakeover, browserEnsureEngine, formatDownloadProgress, type BrowserStatus, type EngineDownloadProgress } from "$lib/browser";
   import { browserPollAction, browserPollRevived, browserButtonAction } from "$lib/browserPoll";
-  import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, resolveDraftWorkspace, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
+  import { ALL_FILTER, NO_WORKSPACE_FILTER, NO_WORKSPACE_SENTINEL, isNoWorkspacePath, compactWorkspaceLabel, fullWorkspacePath, resolveDraftWorkspace, folderOptions, resolveSessionFilter, filterChats, groupByDate, workspaceOfFolderKey, workspaceFilterKey, folderOptionKey, visibleChats, isPinnedRow, showWorkspaceBadge } from "$lib/sidebar";
   import {
     captureOpenToolDetails,
     captureViewAnchor,
@@ -1016,6 +1016,20 @@
   let editDraft = $state("");
   let editImages = $state<string[]>([]);
   let copiedKey = $state<string | null>(null);
+  let workPathCopied = $state(false);
+  let workPathCopyTimer: ReturnType<typeof setTimeout> | null = null;
+  function copyWorkPath(path: string | null) {
+    if (!path) return;
+    void copyText(path).then((ok) => {
+      if (!ok) return;
+      workPathCopied = true;
+      if (workPathCopyTimer) clearTimeout(workPathCopyTimer);
+      workPathCopyTimer = setTimeout(() => {
+        workPathCopied = false;
+        workPathCopyTimer = null;
+      }, 1500);
+    });
+  }
   let isPinned = $state(true);
   let scrollFrame = 0;
   /** viewport anchor held across a streamed DOM write while the reader is paused */
@@ -10538,9 +10552,43 @@
       </div>
     {:else}
       {#if activeChat.mode === "work"}
+        {@const wsLabel = compactWorkspaceLabel(activeChat.workspace)}
+        {@const wsFull = fullWorkspacePath(activeChat.workspace)}
+        {@const wsIsScratch = isNoWorkspacePath(activeChat.workspace)}
         <div class="work-banner" data-testid="work-banner">
           <span class="work-badge">Work</span>
-          <span class="work-path" title={activeChat.workspace ? displayWorkspace(activeChat.workspace) : ""}>{activeChat.workspace ? displayWorkspace(activeChat.workspace) : "no workspace"}</span>
+          {#if wsFull}
+            <span class="ctx-wrap work-path-wrap">
+              <button
+                type="button"
+                class="work-path-btn"
+                class:copied={workPathCopied}
+                data-testid="work-path"
+                aria-label={`Workspace path: ${wsFull}. Click to copy.`}
+                onclick={() => copyWorkPath(wsFull)}
+              >
+                <span class="work-path-label">{wsLabel}</span>
+                {#if workPathCopied}
+                  <svg class="work-path-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
+                {/if}
+              </button>
+              <span class="ctx-popup work-path-popup" data-testid="work-path-popup">
+                <span class="work-path-popup-head">
+                  <span class="work-path-popup-title">{wsIsScratch ? "Scratch directory" : "Workspace"}</span>
+                  <button
+                    type="button"
+                    class="usage-hover-refresh work-path-copy-btn"
+                    class:copied={workPathCopied}
+                    data-testid="work-path-copy"
+                    onclick={(e) => { e.stopPropagation(); copyWorkPath(wsFull); }}
+                  >{workPathCopied ? "Copied" : "Copy"}</button>
+                </span>
+                <code class="work-path-full" data-testid="work-path-full">{wsFull}</code>
+              </span>
+            </span>
+          {:else}
+            <span class="work-path work-path-empty" data-testid="work-path">{wsLabel}</span>
+          {/if}
           <span class="work-badge engine-badge" data-testid="work-engine-badge" data-engine={engineId(workEngineInfo)} title={workEngineInfo?.installed ? `${workEngineLabel} ${workEngineInfo.version ?? ""} — ${workEngineInfo.path ?? ""}` : (workEngineInfo?.missing ?? `${workEngineLabel} not found`)}>{#if workEngineInfo && !sessionEngineMissing}{@render engineIcon(engineId(workEngineInfo))}{/if}{sessionEngineMissing ? `no ${sessionEngineMissing}` : workEngineInfo ? (workEngineInfo.installed ? (workAccountLabel ? workEngineShort : engineId(workEngineInfo)) : `no ${engineId(workEngineInfo)}`) : "…"}</span>
           <span class="hdr-meters">
           {#if usageHoverEngine}
@@ -12650,7 +12698,7 @@
   .chat-item .work-badge.ws-badge { flex-shrink: 1; font-weight: 500; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); padding: 1px 7px; }
   .ws-badge svg { flex-shrink: 0; }
   .ws-badge span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 0 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  .work-banner { position: relative; z-index: 20; display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 6px 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
   .ctx-wrap { position: relative; display: inline-flex; cursor: default; }
@@ -12694,6 +12742,19 @@
   .ws-handoff-chip { display: inline-flex; align-items: center; opacity: 0.85; }
   .handoff-sep { opacity: 0.5; }
   .work-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .work-path-empty { font-size: 12px; color: var(--muted-2); }
+  .work-path-wrap { min-width: 0; max-width: min(260px, 50cqi); }
+  .work-path-btn { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; min-width: 0; padding: 2px 7px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted-2); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.4; cursor: pointer; transition: background .12s, color .12s, border-color .12s; }
+  .work-path-btn:hover, .work-path-btn:focus-visible { background: var(--hover); color: var(--text); border-color: var(--border); outline: none; }
+  .work-path-btn.copied { color: var(--accent); }
+  .work-path-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .work-path-ico { flex-shrink: 0; }
+  .work-path-popup { left: 0; right: auto; width: max-content; min-width: 200px; max-width: min(440px, calc(100vw - 48px), calc(100cqi - 110px)); padding: 10px 12px; }
+  .work-path-popup::before { content: ""; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
+  .work-path-popup-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+  .work-path-popup-title { font-size: 11.5px; font-weight: 600; color: var(--muted-2); }
+  .work-path-copy-btn.copied { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .work-path-full { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.45; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; word-break: break-all; overflow-wrap: anywhere; user-select: text; cursor: text; }
   .work-composer-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .work-composer-bar .work-badge { margin-left: 0; }
   .work-composer-bar .workspace-input { flex: 1; min-width: 0; }
