@@ -81,7 +81,6 @@ pub(crate) async fn chats_save(
     let instances = instances.0.read().await;
     let pool = match instances.get(CHATS_DB_KEY) {
         Some(DbPool::Sqlite(pool)) => pool,
-        Some(_) => return Err("chats_save: vicuna.db pool is not sqlite".into()),
         None => return Err("chats_save: vicuna.db is not loaded".into()),
     };
     let mut tx = pool
