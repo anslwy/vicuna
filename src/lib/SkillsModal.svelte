@@ -423,7 +423,7 @@
   .sk-btn.small { padding: 4px 10px; font-size: 12px; }
   .sk-btn:hover:not(:disabled) { background: var(--hover-2); }
   .sk-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg, #fff); font-weight: 600; }
-  .sk-btn.primary:hover:not(:disabled) { opacity: 0.92; }
+  .sk-btn.primary:hover:not(:disabled) { background: var(--accent-hover, var(--accent)); border-color: var(--accent-hover, var(--accent)); }
   .sk-btn.danger { color: var(--danger); }
   .sk-btn:disabled { opacity: 0.55; cursor: default; }
   .sk-foot { border-top: 1px solid var(--border); padding-top: 10px; }
