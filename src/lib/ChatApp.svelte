@@ -152,6 +152,7 @@
   import { createOllamaModelsState } from "$lib/ollamaModelsState.svelte";
   import { createGotoPaletteState } from "$lib/gotoPaletteState.svelte";
   import { createMessagingBridgesState } from "$lib/messagingBridgesState.svelte";
+  import { createTerminalsState } from "$lib/terminalsState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -269,7 +270,21 @@
   let sideTabSeq = 1;
   let newTabMenu = $state(false);
   /** live xterm instances by tab key (non-reactive on purpose) */
-  const termViews = new Map<string, { term: XTerm; fit: XFitAddon; ro: ResizeObserver; resizeTimer: ReturnType<typeof setTimeout> | null }>();
+  const terminals = createTerminalsState({
+    get flashExpNotice() { return flashExpNotice; },
+    get themeBase() { return themeBase; },
+    get pluginTheme() { return pluginTheme; },
+    get sideTabs() { return sideTabs; },
+    set sideTabs(v) { sideTabs = v; },
+    get newTabMenu() { return newTabMenu; },
+    set newTabMenu(v) { newTabMenu = v; },
+    get sideTabSeq() { return sideTabSeq; },
+    set sideTabSeq(v) { sideTabSeq = v; },
+    get explorerRootBase() { return explorerRootBase; },
+    get activeSideTab() { return activeSideTab; },
+    set activeSideTab(v) { activeSideTab = v; },
+    get explorerRoot() { return explorerRoot; }
+  });
   let lastExplorerRoot = "";
 
   /** drag the panel's left edge to resize (dragging left widens) */
@@ -3339,36 +3354,6 @@
     };
   });
 
-  /** terminal right-click menu (see the xterm `contextmenu` listener) */
-  let termCtx = $state.raw<{ x: number; y: number; term: XTerm; sel: string } | null>(null);
-
-  function termMenu(action: "copy" | "paste" | "selectAll" | "clear") {
-    const c = termCtx;
-    termCtx = null;
-    if (!c) return;
-    const { term } = c;
-    if (action === "copy") {
-      void copyText(c.sel).then((ok) => flashExpNotice(ok ? "Copied" : "Copy failed (clipboard unavailable)", 1800));
-    } else if (action === "paste") {
-      const clip = navigator.clipboard;
-      if (!clip?.readText) {
-        flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V.");
-      } else {
-        clip
-          .readText()
-          .then((text) => {
-            if (text) term.paste(text);
-          })
-          .catch(() => flashExpNotice("Paste isn't available here — use ⌘V / Ctrl+Shift+V."));
-      }
-    } else if (action === "selectAll") {
-      term.selectAll();
-    } else {
-      term.clear();
-    }
-    term.focus();
-  }
-
   function copyMessage(i: number) {
     const m = activeChat?.messages[i];
     if (!m) return;
@@ -4547,7 +4532,7 @@
       lastExplorerRoot = explorerRoot.trim();
       void loadExplorer();
       // the aside was display:none: xterm needs a re-fit now it has size
-      void tick().then(() => fitSideTerm(activeSideTab));
+      void tick().then(() => terminals.fitSideTerm(activeSideTab));
     }
   }
 
@@ -5253,196 +5238,11 @@
     void browser.ensureBrowserDaemon().catch(() => {});
   }
 
-  function termTheme(): XTermTheme {
-    // Full 16-color ANSI palettes: PowerShell / PSReadLine assume a dark
-    // console (yellow prompt segments, white text), so the defaults that
-    // ship with xterm go unreadable on a light background. Both palettes
-    // follow the active app/plugin theme's bg/fg while remapping every ANSI
-    // slot to stay legible.
-    const chrome = resolveTerminalColors(themeBase, pluginTheme);
-    if (themeBase === "dark") {
-      return {
-        ...chrome,
-        selectionBackground: "rgba(255,255,255,.25)",
-        selectionInactiveBackground: "rgba(255,255,255,.16)",
-        black: "#000000",
-        red: "#cd3131",
-        green: "#0dbc79",
-        yellow: "#e5e510",
-        blue: "#2472c8",
-        magenta: "#bc3fbc",
-        cyan: "#11a8cd",
-        white: "#e5e5e5",
-        brightBlack: "#666666",
-        brightRed: "#f14c4c",
-        brightGreen: "#23d18b",
-        brightYellow: "#f5f543",
-        brightBlue: "#3b8eea",
-        brightMagenta: "#d670d6",
-        brightCyan: "#29b8db",
-        brightWhite: "#ffffff"
-      };
-    }
-    return {
-      ...chrome,
-      selectionBackground: "rgba(0,0,0,.20)",
-      selectionInactiveBackground: "rgba(0,0,0,.12)",
-      black: "#000000",
-      red: "#b3261e",
-      green: "#0a7a42",
-      yellow: "#795e00",
-      blue: "#0a4fb3",
-      magenta: "#9a3a9a",
-      cyan: "#0a7a8a",
-      white: "#767676",
-      brightBlack: "#5a5a5a",
-      brightRed: "#d32f2f",
-      brightGreen: "#1a7f37",
-      brightYellow: "#8a6d00",
-      brightBlue: "#2563eb",
-      brightMagenta: "#d63384",
-      brightCyan: "#0a8a9a",
-      brightWhite: "#333333"
-    };
-  }
-  // re-theme live terminals when the app theme flips (terminals are created
-  // once with the theme at open time, so existing tabs would go stale)
-  $effect(() => {
-    const t = termTheme();
-    for (const [, v] of termViews) {
-      try {
-        v.term.options.theme = t;
-      } catch {
-        /* terminal mid-dispose */
-      }
-    }
-  });
-
-  /** fit the active terminal to its container and tell the pty the size */
-  function fitSideTerm(key: string) {
-    const el = document.querySelector(`[data-term="${key}"]`);
-    if (!(el instanceof HTMLElement) || el.clientWidth === 0 || el.clientHeight === 0) return;
-    const v = termViews.get(key);
-    const t = sideTabs.find((x) => x.key === key);
-    if (!v || !t?.termId || t.dead) return;
-    try {
-      v.fit.fit();
-      const id = t.termId;
-      if (v.resizeTimer) clearTimeout(v.resizeTimer);
-      v.resizeTimer = setTimeout(() => {
-        void resizeTerm(id, v.term.cols, v.term.rows).catch(() => {});
-      }, 150);
-    } catch {
-      /* container hidden mid-switch */
-    }
-  }
-
-  /** open a Terminal tab rooted at the workspace (desktop or dev bridge) */
-  async function openSideTerminal() {
-    newTabMenu = false;
-    const key = `term-${sideTabSeq++}`;
-    sideTabs = [...sideTabs, { key, kind: "terminal", title: explorerRootBase || "Terminal" }];
-    activeSideTab = key;
-    await tick();
-    if (!isTauriRuntime() && !(await bridgeAvailable())) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: "Terminal needs the Vicuna desktop app." } : t
-      );
-      return;
-    }
-    const root = explorerRoot.trim();
-    if (!root) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: "Pick a workspace folder first." } : t
-      );
-      return;
-    }
-    try {
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
-        import("xterm"),
-        import("@xterm/addon-fit")
-      ]);
-      await import("xterm/css/xterm.css");
-      const el = document.querySelector(`[data-term="${key}"]`);
-      if (!(el instanceof HTMLElement)) throw new Error("terminal view missing");
-      const term = new Terminal({
-        theme: termTheme(),
-        fontSize: 13,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-        cursorBlink: true,
-        scrollback: 5000,
-        windowsPty: /win/i.test(navigator.userAgent ?? "") ? { backend: "conpty" } : undefined
-      });
-      const fit = new FitAddon();
-      term.loadAddon(fit);
-      term.open(el);
-      fit.fit();
-      // xterm leaves clipboard chords to the embedder. macOS WKWebView fires
-      // the browser copy event for ⌘C, but WebView2 does not, so a selection
-      // there could not be copied and Ctrl+C interrupted the shell instead.
-      term.attachCustomKeyEventHandler((ev) => {
-        if (ev.type !== "keydown") return true;
-        const key = ev.key.toLowerCase();
-        // Windows Terminal's select-all chord: a no-drag escape hatch.
-        if (!isMac && ev.ctrlKey && ev.shiftKey && key === "a") {
-          term.selectAll();
-          return false;
-        }
-        if (key !== "c" || !term.hasSelection()) return true;
-        const copyChord = isMac ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.altKey;
-        if (!copyChord) return true;
-        // Returning false also keeps xterm from sending ETX, which sent SIGINT
-        // to the shell and cleared the selection on Windows.
-        copyTermSelection(term);
-        return false;
-      });
-      // Tauri disables the native WebView context menu, so right-click opens
-      // our own (Copy / Paste / Select All / Clear). It used to copy silently
-      // on right-click, with no sign anything happened.
-      el.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        termCtx = {
-          x: Math.max(8, Math.min(ev.clientX, window.innerWidth - 200)),
-          y: Math.max(8, Math.min(ev.clientY, window.innerHeight - 180)),
-          term,
-          // read now: focus leaves the terminal once the menu is clicked
-          sel: term.getSelection()
-        };
-      });
-      const setTab = (patch: Partial<SideTab>) => {
-        sideTabs = sideTabs.map((t) => (t.key === key ? { ...t, ...patch } : t));
-      };
-      const termId = await spawnTerm(
-        root,
-        term.cols,
-        term.rows,
-        (text) => term.write(text),
-        (code) => {
-          setTab({ dead: true });
-          term.write(`\r\n[process exited${code == null ? "" : ` with code ${code}`} — close the tab or open a new one]`);
-        }
-      );
-      term.onData((d) => {
-        void writeTerm(termId, d).catch(() => {});
-      });
-      const ro = new ResizeObserver(() => fitSideTerm(key));
-      ro.observe(el);
-      termViews.set(key, { term, fit, ro, resizeTimer: null });
-      setTab({ termId });
-      term.focus();
-    } catch (e: any) {
-      sideTabs = sideTabs.map((t) =>
-        t.key === key ? { ...t, error: typeof e === "string" ? e : (e?.message ?? String(e)) } : t
-      );
-    }
-  }
-
   /** close a side tab, killing its pty; never strand the active key */
   function closeSideTab(key: string) {
     const t = sideTabs.find((x) => x.key === key);
     if (t?.termId) void killTerm(t.termId);
-    const v = termViews.get(key);
+    const v = terminals.termViews.get(key);
     if (v) {
       v.ro.disconnect();
       if (v.resizeTimer) clearTimeout(v.resizeTimer);
@@ -5451,12 +5251,12 @@
       } catch {
         /* already gone */
       }
-      termViews.delete(key);
+      terminals.termViews.delete(key);
     }
     sideTabs = sideTabs.filter((x) => x.key !== key);
     if (activeSideTab === key) {
       activeSideTab = sideTabs.length ? sideTabs[sideTabs.length - 1].key : "";
-      if (activeSideTab) void tick().then(() => fitSideTerm(activeSideTab));
+      if (activeSideTab) void tick().then(() => terminals.fitSideTerm(activeSideTab));
     }
   }
 
@@ -5465,8 +5265,8 @@
     const t = sideTabs.find((x) => x.key === key);
     if (t?.kind === "terminal") {
       void tick().then(() => {
-        fitSideTerm(key);
-        termViews.get(key)?.term.focus();
+        terminals.fitSideTerm(key);
+        terminals.termViews.get(key)?.term.focus();
       });
     }
   }
@@ -7170,9 +6970,9 @@
         e.preventDefault();
         return;
       }
-      if (termCtx) {
-        termCtx.term.focus();
-        termCtx = null;
+      if (terminals.termCtx) {
+        terminals.termCtx.term.focus();
+        terminals.termCtx = null;
         e.preventDefault();
         return;
       }
@@ -8979,7 +8779,7 @@
       onRestartBrowserDaemon={browser.restartBrowserDaemon}
       onEnsureBrowserDaemon={browser.ensureBrowserDaemon}
       onOpenSideExplorer={openSideExplorer}
-      onOpenSideTerminal={openSideTerminal}
+      onOpenSideTerminal={terminals.openSideTerminal}
       onOpenSideBrowser={openSideBrowser}
       onOpenSideGit={openSideGit}
       onOpenSidePanel={openSidePanel}
@@ -8993,23 +8793,23 @@
     />
   {/if}
 </div>
-{#if termCtx}
+{#if terminals.termCtx}
   <button
     class="ctx-backdrop"
     data-testid="terminal-menu-backdrop"
     aria-label="Close terminal menu"
-    onclick={() => (termCtx = null)}
+    onclick={() => (terminals.termCtx = null)}
     oncontextmenu={(e) => {
       e.preventDefault();
-      termCtx = null;
+      terminals.termCtx = null;
     }}
     tabindex="-1"
   ></button>
-  <div class="ctx-menu" data-testid="terminal-menu" style="left: {termCtx.x}px; top: {termCtx.y}px;">
-    <button class="ctx-item" data-testid="terminal-copy" disabled={!termCtx.sel} onclick={() => termMenu("copy")}>Copy</button>
-    <button class="ctx-item" data-testid="terminal-paste" onclick={() => termMenu("paste")}>Paste</button>
-    <button class="ctx-item" data-testid="terminal-select-all" onclick={() => termMenu("selectAll")}>Select All</button>
-    <button class="ctx-item" data-testid="terminal-clear" onclick={() => termMenu("clear")}>Clear</button>
+  <div class="ctx-menu" data-testid="terminal-menu" style="left: {terminals.termCtx.x}px; top: {terminals.termCtx.y}px;">
+    <button class="ctx-item" data-testid="terminal-copy" disabled={!terminals.termCtx.sel} onclick={() => terminals.termMenu("copy")}>Copy</button>
+    <button class="ctx-item" data-testid="terminal-paste" onclick={() => terminals.termMenu("paste")}>Paste</button>
+    <button class="ctx-item" data-testid="terminal-select-all" onclick={() => terminals.termMenu("selectAll")}>Select All</button>
+    <button class="ctx-item" data-testid="terminal-clear" onclick={() => terminals.termMenu("clear")}>Clear</button>
   </div>
 {/if}
 {#if expCtx}
