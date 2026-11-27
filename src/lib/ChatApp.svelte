@@ -146,6 +146,7 @@
   import { createMcpState } from "$lib/mcpState.svelte";
   import { createBrowserState } from "$lib/browserState.svelte";
   import { createAppUpdateState } from "$lib/appUpdateState.svelte";
+  import { createServerSwitcherState } from "$lib/serverSwitcherState.svelte";
 
   let { sessionId = null }: { sessionId: string | null } = $props();
 
@@ -2258,254 +2259,18 @@
       return null;
     }
   })();
-  let srvList = $state<ServerInfo[]>([]);
-  let srvMenuOpen = $state(false);
-  let srvDialogOpen = $state(false);
-  let srvUrlDraft = $state("");
-  let srvTokenDraft = $state("");
-  let srvNameDraft = $state("");
-  let srvNameTouched = $state(false);
-  let srvBusy = $state(false);
-  let srvErr = $state<string | null>(null);
-  /** chats could not be loaded from the active server */
-  let srvLoadError = $state<string | null>(null);
-  let srvCopied = $state<string | null>(null);
-  const srvCurrent = $derived(srvList.find((x) => x.id === activeServer) ?? null);
-  const srvLabel = $derived(onServer ? (srvCurrent?.name ?? "Remote server") : "This computer");
+  const srv = createServerSwitcherState({
+    get activeServer() { return activeServer; },
+    get onServer() { return onServer; },
+    get clientVersion() { return clientVersion; },
+    get uiReady() { return uiReady; },
+    get flashNotice() { return flashNotice; },
+    get error() { return error; },
+    set error(v) { error = v; }
+  });
 
   /** this app's version vs. the remote `vicuna serve` it talks to */
   const clientVersion: string = pkg.version;
-  let srvVersion = $state<string | null>(null);
-  let srvLatest = $state<string | null>(null);
-  let srvCanUpgrade = $state(false);
-  let srvUpgrading = $state(false);
-  let srvVersionChecked = false;
-  const srvVersionSkew = $derived(!!srvVersion && srvVersion !== clientVersion);
-  const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && cmpVersion(srvLatest, srvVersion) > 0);
-
-  async function loadServerVersion() {
-    const info = await invokeOrBridge<{ version?: string; canUpgrade?: boolean }>("server_info", {}).catch(() => null);
-    srvVersion = info?.version ?? null;
-    srvCanUpgrade = !!info?.canUpgrade;
-    if (!srvCanUpgrade) return;
-    const chk = await invokeOrBridge<{ latest?: string }>("server_upgrade_check", {}).catch(() => null);
-    srvLatest = chk?.latest ?? null;
-  }
-
-  $effect(() => {
-    if (onServer && uiReady && !srvVersionChecked) {
-      srvVersionChecked = true;
-      void loadServerVersion();
-    }
-  });
-
-  /** live progress of a server upgrade (`server_upgrade_status`) */
-  let srvUpgradeStage = $state<string | null>(null);
-  let srvUpgradePct = $state<number | null>(null);
-  let srvUpgradeDetail = $state<string | null>(null);
-
-  async function upgradeServer() {
-    if (srvUpgrading || !srvLatest) return;
-    const from = srvVersion;
-    srvUpgrading = true;
-    srvUpgradeStage = "Starting upgrade…";
-    srvUpgradePct = null;
-    srvUpgradeDetail = null;
-    type St = { running?: boolean; failed?: boolean; error?: string; stage?: string | null; step?: number; steps?: number; percent?: number | null; detail?: string | null };
-    try {
-      await invokeOrBridge("server_upgrade", {});
-      // ~3 minutes: progress from the upgrade log, then the restart
-      for (let i = 0; i < 180; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const st = await invokeOrBridge<St>("server_upgrade_status", {}).catch(() => null);
-        if (st?.failed) throw new Error(st.error || "upgrade failed");
-        if (st?.stage && st.running !== false) {
-          srvUpgradeStage = st.steps && st.step ? `${st.stage} (${st.step}/${st.steps})` : st.stage;
-          srvUpgradePct = st.percent ?? null;
-          srvUpgradeDetail = st.detail ?? null;
-          continue;
-        }
-        // upgrader finished (or the server is down / restarted): wait for the new version
-        srvUpgradeStage = "Restarting the server…";
-        srvUpgradePct = null;
-        srvUpgradeDetail = null;
-        const info = await invokeOrBridge<{ version?: string }>("server_info", {}).catch(() => null);
-        if (info?.version && info.version !== from) {
-          srvVersion = info.version;
-          flashNotice(`${srvLabel} is now on v${info.version}.`);
-          return;
-        }
-      }
-      error = `${srvLabel} did not come back on a new version. Check ~/vicuna/server/upgrade.log there.`;
-    } catch (e) {
-      error = `Server upgrade failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      srvUpgrading = false;
-      srvUpgradeStage = null;
-      srvUpgradePct = null;
-      srvUpgradeDetail = null;
-    }
-  }
-
-  async function refreshServers() {
-    try {
-      srvList = await listServers();
-    } catch {
-      srvList = [];
-    }
-  }
-
-  function toggleServerMenu() {
-    srvMenuOpen = !srvMenuOpen;
-    srvMenuRenaming = false;
-    if (srvMenuOpen) void refreshServers();
-  }
-
-  function openServerDialog() {
-    srvMenuOpen = false;
-    srvMenuRenaming = false;
-    srvEditingId = null;
-    srvEditDraft = "";
-    srvErr = null;
-    srvUrlDraft = "";
-    srvTokenDraft = "";
-    srvNameDraft = "";
-    srvNameTouched = false;
-    srvDialogOpen = true;
-    void refreshServers();
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-url-input]")?.focus());
-  }
-
-  function fillRecentServer(sv: ServerInfo) {
-    srvUrlDraft = sv.url;
-    srvTokenDraft = "";
-    srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-    srvNameTouched = true;
-  }
-
-  /** Open the server's own window (or focus it), or focus the main window
-   *  for This computer. This window keeps running whatever it shows. */
-  async function requestServerSwitch(id: string | null) {
-    srvMenuOpen = false;
-    if (id === activeServer) return;
-    try {
-      if (id) await touchServer(id).catch(() => {});
-      await switchServer(id, srvList.find((x) => x.id === id)?.name);
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  async function submitServer() {
-    if (srvBusy || !srvUrlDraft.trim()) return;
-    srvBusy = true;
-    srvErr = null;
-    try {
-      const sv = await connectServer(
-        srvUrlDraft.trim(),
-        srvTokenDraft.trim(),
-        srvNameTouched ? srvNameDraft.trim() : null
-      );
-      srvDialogOpen = false;
-      await refreshServers();
-      await switchServer(sv.id, sv.name);
-    } catch (e) {
-      srvErr = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvBusy = false;
-    }
-  }
-
-  let srvEditingId = $state<string | null>(null);
-  let srvEditDraft = $state("");
-  let srvRenaming = $state(false);
-  let srvMenuRenaming = $state(false);
-
-  function startRenameServer(sv: ServerInfo) {
-    srvEditingId = sv.id;
-    srvEditDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-rename-input]")?.focus());
-  }
-
-  function cancelRenameServer() {
-    srvEditingId = null;
-    srvEditDraft = "";
-  }
-
-  async function saveRenameServer() {
-    if (srvRenaming || !srvEditingId) return;
-    srvRenaming = true;
-    srvErr = null;
-    try {
-      const sv = await renameServer(srvEditingId, srvEditDraft.trim());
-      srvEditingId = null;
-      srvEditDraft = "";
-      if (srvUrlDraft.trim() === sv.url) {
-        srvNameDraft = sv.name === defaultServerName(sv.url) ? "" : sv.name;
-      }
-      await refreshServers();
-    } catch (e) {
-      srvErr = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvRenaming = false;
-    }
-  }
-
-  function startMenuRenameServer() {
-    if (!srvCurrent) return;
-    srvEditDraft = srvCurrent.name === defaultServerName(srvCurrent.url) ? "" : srvCurrent.name;
-    srvMenuRenaming = true;
-    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("[data-testid=server-menu-rename-input]")?.focus());
-  }
-
-  async function saveMenuRenameServer() {
-    if (srvRenaming || !srvCurrent) return;
-    srvRenaming = true;
-    try {
-      await renameServer(srvCurrent.id, srvEditDraft.trim());
-      srvMenuRenaming = false;
-      srvMenuOpen = false;
-      await refreshServers();
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      srvRenaming = false;
-    }
-  }
-
-  async function forgetServer(id: string) {
-    if (srvEditingId === id) cancelRenameServer();
-    await removeServer(id).catch(() => {});
-    await refreshServers();
-    // removed the server this window shows: back to the main window, close this one
-    if (id === activeServer) {
-      await switchServer(null).catch(() => {});
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      void getCurrentWindow().close();
-    }
-  }
-  let srvCmdCopied = $state(false);
-  async function copyServerSetup() {
-    try {
-      await navigator.clipboard.writeText(SERVER_SETUP_CMD);
-      srvCmdCopied = true;
-      setTimeout(() => (srvCmdCopied = false), 1500);
-    } catch {
-      /* clipboard unavailable */
-    }
-  }
-
-  async function copyServerUrl(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-      srvCopied = url;
-      setTimeout(() => {
-        if (srvCopied === url) srvCopied = null;
-      }, 1500);
-    } catch {
-      /* clipboard unavailable */
-    }
-  }
 
   async function openSettings() {
     pluginsOpen = false;
@@ -3100,7 +2865,7 @@
     gotoSel = 0;
     gotoOpen = true;
     // fresh host list: a pasted link is looked up on every connected server
-    void refreshServers();
+    void srv.refreshServers();
   }
 
   function closeGoto() {
@@ -3147,7 +2912,7 @@
     }).slice(0, 20);
   });
   /** connected hosts whose chats are NOT loaded in this window */
-  const remoteTargets = $derived(srvList.filter((s) => s.id !== activeServer));
+  const remoteTargets = $derived(srv.srvList.filter((s) => s.id !== activeServer));
   const hasPartialChats = $derived(isServerBacked() && chats.some((c) => c.partial));
   let localServerHits = $state<ServerChatHit[]>([]);
   let localServerSearching = $state(false);
@@ -3464,7 +3229,7 @@
    *  every connected server (the session may live on a remote host, whose
    *  window is raised on it). */
   async function openSessionLink(id: string) {
-    if (srvList.length === 0) await refreshServers();
+    if (srv.srvList.length === 0) await srv.refreshServers();
     const action = sessionLinkAction(id, {
       ready,
       localIds: chats.map((c) => c.id),
@@ -3519,7 +3284,7 @@
     if (!p || !isTauriRuntime()) return;
     if (onServer) {
       // `vicuna <path>` names a folder on THIS computer
-      flashNotice(`Switch to This computer to open ${p}: Vicuna is connected to ${srvLabel}.`);
+      flashNotice(`Switch to This computer to open ${p}: Vicuna is connected to ${srv.srvLabel}.`);
       return;
     }
     // links can arrive while hidden in the tray — come forward
@@ -8201,7 +7966,7 @@
 
   function setSidebar(open: boolean) {
     sidebarOpen = open;
-    srvMenuOpen = false;
+    srv.srvMenuOpen = false;
     persistPrefs();
   }
 
@@ -8263,7 +8028,7 @@
     }
     void initApp();
     void loadPlugins();
-    void refreshServers();
+    void srv.refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
     appUpdate.initializeAppUpdatePreference();
     const updateCheckTimer = isTauriRuntime() && !isRemoteServer()
@@ -8307,7 +8072,7 @@
             unlistenOpenChat = u;
           });
           void listen("vicuna-servers-changed", () => {
-            void refreshServers();
+            void srv.refreshServers();
           }).then((u) => {
             unlistenServersChanged = u;
           });
@@ -8404,11 +8169,11 @@
       } catch (e) {
         if (!isServerBacked()) throw e;
         chats = [];
-        srvLoadError = e instanceof Error ? e.message : String(e);
+        srv.srvLoadError = e instanceof Error ? e.message : String(e);
       } finally {
         chatsLoaded = true;
       }
-      if (isServerBacked() && !srvLoadError) {
+      if (isServerBacked() && !srv.srvLoadError) {
         const info = await invokeOrBridge<{ persist?: boolean; chatTurns?: boolean; sessionTools?: boolean; home?: string }>("server_info", {}).catch(() => null);
         serverPersist = info?.persist === true;
         serverChatTurns = info?.chatTurns === true;
@@ -8426,7 +8191,7 @@
         setServerOllama(serverChatTurns);
         if (serverPersist) await installServerSync();
       }
-      if (!hostHomeDir && ((isServerBacked() && !srvLoadError) || await bridgeAvailable())) {
+      if (!hostHomeDir && ((isServerBacked() && !srv.srvLoadError) || await bridgeAvailable())) {
         const listing = await invokeOrBridge<{ path?: string; home?: string }>("fs_list_dirs", { path: null, hidden: false }).catch(() => null);
         const listedHome = typeof listing?.path === "string" && listing.path.trim()
           ? listing.path
@@ -8690,11 +8455,11 @@
 {/snippet}
 {#snippet serverMenu()}
   <ServerMenu
-    {srvList} {onServer} {activeServer} {srvVersion} {clientVersion} {srvVersionSkew} {srvUpgradeAvailable}
-    {srvCanUpgrade} {srvUpgrading} {srvUpgradeStage} {srvUpgradePct} {srvUpgradeDetail} {srvLatest} {srvCurrent}
-    bind:srvMenuRenaming bind:srvEditDraft {srvRenaming}
-    onClose={() => { srvMenuOpen = false; srvMenuRenaming = false; }}
-    {requestServerSwitch} {upgradeServer} {saveMenuRenameServer} {startMenuRenameServer} {openServerDialog}
+    srvList={srv.srvList} {onServer} {activeServer} srvVersion={srv.srvVersion} {clientVersion} srvVersionSkew={srv.srvVersionSkew} srvUpgradeAvailable={srv.srvUpgradeAvailable}
+    srvCanUpgrade={srv.srvCanUpgrade} srvUpgrading={srv.srvUpgrading} srvUpgradeStage={srv.srvUpgradeStage} srvUpgradePct={srv.srvUpgradePct} srvUpgradeDetail={srv.srvUpgradeDetail} srvLatest={srv.srvLatest} srvCurrent={srv.srvCurrent}
+    bind:srvMenuRenaming={srv.srvMenuRenaming} bind:srvEditDraft={srv.srvEditDraft} srvRenaming={srv.srvRenaming}
+    onClose={() => { srv.srvMenuOpen = false; srv.srvMenuRenaming = false; }}
+    requestServerSwitch={srv.requestServerSwitch} upgradeServer={srv.upgradeServer} saveMenuRenameServer={srv.saveMenuRenameServer} startMenuRenameServer={srv.startMenuRenameServer} openServerDialog={srv.openServerDialog}
   />
 {/snippet}
 
@@ -8810,13 +8575,13 @@
           {@render chatList(grouped.older)}
         {/if}
         {#if !chatsLoaded}
-          <div class="skel-list" data-testid="sessions-loading" role="status" aria-label={`Loading sessions${onServer ? ` from ${srvLabel}` : ""}`}>
+          <div class="skel-list" data-testid="sessions-loading" role="status" aria-label={`Loading sessions${onServer ? ` from ${srv.srvLabel}` : ""}`}>
             <div class="skel skel-label"></div>
             {#each [78, 62, 88, 54, 70, 46, 66] as w, k (k)}
               <div class="skel-row"><div class="skel" style="width: {w}%"></div></div>
             {/each}
             {#if loadingSecs >= 5}
-              <div class="skel-note">{onServer ? `Loading from ${srvLabel}` : "Loading"} · {loadingSecs}s</div>
+              <div class="skel-note">{onServer ? `Loading from ${srv.srvLabel}` : "Loading"} · {loadingSecs}s</div>
             {/if}
           </div>
         {:else if grouped.today.length + grouped.yesterday.length + grouped.week.length + grouped.older.length === 0 && pinnedChats.length === 0}
@@ -8827,14 +8592,14 @@
       <div class="side-footer">
         {#if isTauriRuntime()}
           <div class="srv-pick">
-            {#if srvMenuOpen}
+            {#if srv.srvMenuOpen}
               {@render serverMenu()}
             {/if}
-            <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+            <button class="goto srv-btn {onServer ? 'remote' : ''}" data-testid="server-btn" title={onServer ? (srv.srvCurrent?.url ?? "") : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srv.srvMenuOpen} onclick={srv.toggleServerMenu}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-              <span class="srv-name">{srvLabel}</span>
-              {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
-              <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
+              <span class="srv-name">{srv.srvLabel}</span>
+              {#if onServer && (srv.srvVersionSkew || srv.srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srv.srvUpgradeAvailable ? `Server update available: v${srv.srvLatest}` : `Server v${srv.srvVersion}, app v${clientVersion}`}></span>{/if}
+              <svg class="srv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{#if srv.srvMenuOpen}<path d="m6 15 6-6 6 6"/>{:else}<path d="m6 9 6 6 6-6"/>{/if}</svg>
             </button>
           </div>
         {/if}
@@ -8883,9 +8648,9 @@
   {/if}
 
   <main class="main">
-    {#if srvLoadError}
+    {#if srv.srvLoadError}
       <div class="srv-strip" data-testid="server-load-error" role="alert">
-        <span>Can't load sessions from {srvLabel}: {srvLoadError}</span>
+        <span>Can't load sessions from {srv.srvLabel}: {srv.srvLoadError}</span>
         <button class="mini-btn" onclick={() => window.location.reload()}>Retry</button>
         {#if onServer}<button class="mini-btn" onclick={() => void switchServer(null)}>Use this computer</button>{/if}
       </div>
@@ -8921,12 +8686,12 @@
         <div class="collapsed-rail-foot">
           {#if isTauriRuntime()}
             <div class="srv-pick">
-              {#if srvMenuOpen}
+              {#if srv.srvMenuOpen}
                 {@render serverMenu()}
               {/if}
-              <button class="icon-btn srv-icon-btn {onServer ? 'remote' : ''}" data-testid="server-btn-collapsed" aria-label={onServer ? `Server: ${srvLabel}` : "Server: This computer"} title={onServer ? (srvCurrent?.url ? `${srvLabel} (${srvCurrent.url})` : srvLabel) : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srvMenuOpen} onclick={toggleServerMenu}>
+              <button class="icon-btn srv-icon-btn {onServer ? 'remote' : ''}" data-testid="server-btn-collapsed" aria-label={onServer ? `Server: ${srv.srvLabel}` : "Server: This computer"} title={onServer ? (srv.srvCurrent?.url ? `${srv.srvLabel} (${srv.srvCurrent.url})` : srv.srvLabel) : "Sessions and agents run on this computer"} aria-haspopup="menu" aria-expanded={srv.srvMenuOpen} onclick={srv.toggleServerMenu}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
-                {#if onServer && (srvVersionSkew || srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srvUpgradeAvailable ? `Server update available: v${srvLatest}` : `Server v${srvVersion}, app v${clientVersion}`}></span>{/if}
+                {#if onServer && (srv.srvVersionSkew || srv.srvUpgradeAvailable)}<span class="srv-dot" data-testid="server-version-dot" title={srv.srvUpgradeAvailable ? `Server update available: v${srv.srvLatest}` : `Server v${srv.srvVersion}, app v${clientVersion}`}></span>{/if}
               </button>
             </div>
           {/if}
@@ -10081,7 +9846,7 @@
 {#if folderPicker}
   <FolderPickerModal
     start={folderPicker.start}
-    where={onServer ? srvLabel : ""}
+    where={onServer ? srv.srvLabel : ""}
     pickError={folderPickError}
     onPick={onFolderPicked}
     onClose={() => (folderPicker = null)}
@@ -10131,31 +9896,31 @@
     />
   {/if}
 {/if}
-{#if srvDialogOpen}
+{#if srv.srvDialogOpen}
   <ServerDialogModal
-    bind:srvUrlDraft
-    bind:srvTokenDraft
-    bind:srvNameDraft
-    bind:srvNameTouched
-    {srvBusy}
-    {srvErr}
-    {srvList}
-    {srvEditingId}
-    bind:srvEditDraft
-    {srvRenaming}
-    {srvCopied}
-    {srvCmdCopied}
+    bind:srvUrlDraft={srv.srvUrlDraft}
+    bind:srvTokenDraft={srv.srvTokenDraft}
+    bind:srvNameDraft={srv.srvNameDraft}
+    bind:srvNameTouched={srv.srvNameTouched}
+    srvBusy={srv.srvBusy}
+    srvErr={srv.srvErr}
+    srvList={srv.srvList}
+    srvEditingId={srv.srvEditingId}
+    bind:srvEditDraft={srv.srvEditDraft}
+    srvRenaming={srv.srvRenaming}
+    srvCopied={srv.srvCopied}
+    srvCmdCopied={srv.srvCmdCopied}
     setupCmd={SERVER_SETUP_CMD}
     {defaultServerName}
-    onClose={() => (srvDialogOpen = false)}
-    onSubmit={() => void submitServer()}
-    onFillRecent={fillRecentServer}
-    onStartRename={startRenameServer}
-    onSaveRename={() => void saveRenameServer()}
-    onCancelRename={cancelRenameServer}
-    onCopyUrl={(url) => void copyServerUrl(url)}
-    onForget={(id) => void forgetServer(id)}
-    onCopySetup={() => void copyServerSetup()}
+    onClose={() => (srv.srvDialogOpen = false)}
+    onSubmit={() => void srv.submitServer()}
+    onFillRecent={srv.fillRecentServer}
+    onStartRename={srv.startRenameServer}
+    onSaveRename={() => void srv.saveRenameServer()}
+    onCancelRename={srv.cancelRenameServer}
+    onCopyUrl={(url) => void srv.copyServerUrl(url)}
+    onForget={(id) => void srv.forgetServer(id)}
+    onCopySetup={() => void srv.copyServerSetup()}
   />
 {/if}
 <ConfirmModals
@@ -10212,7 +9977,7 @@
     {searchQuery}
     {searchItems}
     {searchShowHosts}
-    {srvLabel}
+    srvLabel={srv.srvLabel}
     {remoteSearching}
     {localServerSearching}
     {remoteFailures}
