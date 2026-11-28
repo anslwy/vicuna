@@ -439,6 +439,9 @@ pub(crate) struct AppShellConfig {
     /// Whether to show the system tray / menu bar icon. Defaults to `false`.
     #[serde(default)]
     pub(crate) show_tray_icon: bool,
+    /// Desktop update channel: `"stable"` (default) or `"dev"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) update_channel: Option<String>,
 }
 
 fn app_shell_config_path_in(home: &Path) -> PathBuf {
@@ -712,7 +715,7 @@ mod tray_pref_tests {
     #[test]
     fn tray_preference_defaults_to_false() {
         let home = scratch_home("default");
-        assert_eq!(read_app_shell_config_in(&home), AppShellConfig { show_tray_icon: false });
+        assert_eq!(read_app_shell_config_in(&home), AppShellConfig { show_tray_icon: false, update_channel: None });
         assert!(!read_tray_enabled_in(&home));
         let _ = std::fs::remove_dir_all(&home);
     }

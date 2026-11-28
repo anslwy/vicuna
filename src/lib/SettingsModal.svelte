@@ -15,7 +15,7 @@
     type ReleaseInfo
   } from "$lib/update";
   import type { ActivePluginTheme } from "$lib/pluginTheme";
-  import { APP_UPDATE_RELEASES_URL, type AppUpdateStatus } from "$lib/appUpdate";
+  import { updateReleasesUrl, type AppUpdateStatus, type UpdateChannel } from "$lib/appUpdate";
   import { CONTINUE_MODES, type ContinueMode } from "$lib/continue";
   import type { CliStatus } from "$lib/cli";
   import type { BrowserStatus } from "$lib/browser";
@@ -53,6 +53,8 @@
     updateError = $bindable<string | null>(null),
     onOpenAppUpdate,
     onSetAutoCheckAppUpdates,
+    updateChannel = "stable",
+    onSetUpdateChannel,
     onCheckForUpdates,
     onApplyUpdate,
     onOpenExternal,
@@ -177,6 +179,8 @@
     updateError: string | null;
     onOpenAppUpdate: () => Promise<void>;
     onSetAutoCheckAppUpdates: (enabled: boolean) => void;
+    updateChannel?: UpdateChannel;
+    onSetUpdateChannel?: (channel: UpdateChannel) => void;
     onCheckForUpdates: () => Promise<void>;
     onApplyUpdate: () => Promise<void>;
     onOpenExternal: (url: string) => Promise<void>;
@@ -423,7 +427,15 @@
                 <input type="checkbox" data-testid="update-autocheck-toggle" checked={autoCheckAppUpdatesEnabled} onchange={(e) => onSetAutoCheckAppUpdates((e.currentTarget as HTMLInputElement).checked)} />
                 Check for updates automatically on startup.
               </label>
-              <span class="setting-note">Signed updates from the newest <a href={APP_UPDATE_RELEASES_URL} onclick={(e) => { e.preventDefault(); void onOpenExternal(APP_UPDATE_RELEASES_URL); }}>GitHub release</a> — install in-app, then restart.</span>
+              <label class="setting-note approval-row" data-testid="update-channel">
+                Update channel
+                <select data-testid="update-channel-select" value={updateChannel} disabled={appUpdateStatus === "installing" || appUpdateStatus === "checking"} onchange={(e) => onSetUpdateChannel?.((e.currentTarget as HTMLSelectElement).value === "dev" ? "dev" : "stable")}>
+                  <option value="stable">Stable</option>
+                  <option value="dev">Dev (pre-release)</option>
+                </select>
+              </label>
+              <span class="setting-note" data-testid="update-channel-note">{#if updateChannel === "dev"}Dev gets a rolling build of every change on main: newest features, less tested. Switching back to Stable takes effect at the next stable release.{:else}Stable gets batched, tested releases.{/if}</span>
+              <span class="setting-note">Signed updates from the {updateChannel === "dev" ? "rolling dev" : "newest"} <a href={updateReleasesUrl(updateChannel)} onclick={(e) => { e.preventDefault(); void onOpenExternal(updateReleasesUrl(updateChannel)); }}>GitHub release</a> — install in-app, then restart.</span>
             {:else}
               {#if updateRelease}
                 {@const platform = currentPlatform()}

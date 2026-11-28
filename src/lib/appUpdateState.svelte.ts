@@ -1,7 +1,7 @@
 // Signed in-app desktop updates (tauri-plugin-updater): automatic and manual
 // checks, the update prompt, skip/remind preferences, download progress and
 // relaunch. Created once by ChatApp.
-import { type AppUpdateInfo, type AppUpdateStatus, loadAppUpdatePreferenceFromStorage, persistAppUpdatePreference, APP_UPDATE_RELEASES_URL, normalizeUpdateErrorMessage, formatAppUpdateInstallError } from "./appUpdate";
+import { type AppUpdateInfo, type AppUpdateStatus, type UpdateChannel, normalizeUpdateChannel, loadAppUpdatePreferenceFromStorage, persistAppUpdatePreference, APP_UPDATE_RELEASES_URL, normalizeUpdateErrorMessage, formatAppUpdateInstallError } from "./appUpdate";
 import { isTauriRuntime } from "./ollama";
 import { openExternal } from "./chatDom";
 import { resolveAppUpdateReleaseNotes } from "./chatAppData";
@@ -9,6 +9,15 @@ import { resolveAppUpdateReleaseNotes } from "./chatAppData";
 export interface AppUpdateStateDeps {
   readonly flashNotice: (text: string, ttl?: number) => void;
   readonly updateError: string | null;
+}
+
+interface RustUpdateInfo {
+  version: string;
+  currentVersion: string;
+  body?: string | null;
+  date?: string | null;
+  target: string;
+  channel: string;
 }
 
 export function createAppUpdateState(deps: AppUpdateStateDeps) {
@@ -25,12 +34,47 @@ export function createAppUpdateState(deps: AppUpdateStateDeps) {
   let skippedAppUpdateVersion = $state<string | null>(null);
   let autoCheckAppUpdatesEnabled = $state(true);
   let suppressAutoUpdatePromptUntilNextCheck = false;
-  /** the plugin's Update handle (not reactive: it owns a native resource) */
+  /** Stable (versioned releases) or Dev (rolling `latest` prerelease from main);
+   *  persisted in ~/vicuna/config/app-shell.json by the desktop shell. */
+  let updateChannel = $state<UpdateChannel>("stable");
+  /** the pending update (the native handle itself stays in the Rust shell) */
   let updateObject: {
     version: string;
     currentVersion?: string;
     downloadAndInstall: (cb?: (event: unknown) => void) => Promise<void>;
   } | null = null;
+  async function loadUpdateChannel() {
+    if (!isTauriRuntime()) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      updateChannel = normalizeUpdateChannel(await invoke<string>("app_get_update_channel"));
+    } catch {
+      /* older shell: stable */
+    }
+  }
+  /** Persist the channel, drop whatever the other channel found, re-check. */
+  async function setUpdateChannel(next: UpdateChannel) {
+    if (!isTauriRuntime() || next === updateChannel) return;
+    if (appUpdateStatus === "installing") {
+      deps.flashNotice("Wait for the update to finish installing before switching channels.");
+      return;
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      updateChannel = normalizeUpdateChannel(await invoke<string>("app_set_update_channel", { channel: next }));
+    } catch (err) {
+      appUpdateStatus = "error";
+      appUpdateError = normalizeUpdateErrorMessage(err);
+      return;
+    }
+    availableAppUpdate = null;
+    updateObject = null;
+    appUpdateProgress = null;
+    appUpdateError = null;
+    showUpdatePrompt = false;
+    appUpdateStatus = "idle";
+    await checkForAppUpdates({ source: "automatic", suppressAutoPrompt: true });
+  }
   const appUpdateLabel = $derived(
     appUpdateStatus === "checking"
       ? "Checking for updates…"
@@ -106,22 +150,29 @@ export function createAppUpdateState(deps: AppUpdateStateDeps) {
     updateObject = null;
 
     try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
+      // Rust checks the saved channel's endpoint (the JS plugin's check()
+      // can't switch endpoints) and keeps the native handle for install.
+      const { invoke, Channel } = await import("@tauri-apps/api/core");
+      const update = await invoke<RustUpdateInfo | null>("app_check_update");
       if (update) {
-        const rawTarget = (update as unknown as { rawJson?: { target?: unknown } }).rawJson?.target;
-        const releaseNotes = await resolveAppUpdateReleaseNotes({
-          body: (update as unknown as { body?: string | null }).body ?? null
-        });
+        const releaseNotes = await resolveAppUpdateReleaseNotes({ body: update.body ?? null });
         availableAppUpdate = {
           version: update.version,
           currentVersion: update.currentVersion || "",
           notes: releaseNotes.notesPreview,
-          publishedAt: (update as unknown as { date?: string | null }).date ?? null,
-          target: typeof rawTarget === "string" ? rawTarget : "",
+          publishedAt: update.date ?? null,
+          target: update.target || "",
           releaseNotesUrl: releaseNotes.releaseNotesUrl
         };
-        updateObject = update as unknown as typeof updateObject;
+        updateObject = {
+          version: update.version,
+          currentVersion: update.currentVersion,
+          downloadAndInstall: async (cb) => {
+            const ch = new Channel<unknown>();
+            if (cb) ch.onmessage = cb;
+            await invoke("app_install_update", { onEvent: ch });
+          }
+        };
         appUpdateStatus = "available";
         if (source === "manual") {
           showUpdatePrompt = true;
@@ -234,6 +285,9 @@ export function createAppUpdateState(deps: AppUpdateStateDeps) {
     set autoCheckAppUpdatesEnabled(v) { autoCheckAppUpdatesEnabled = v; },
     get suppressAutoUpdatePromptUntilNextCheck() { return suppressAutoUpdatePromptUntilNextCheck; },
     set suppressAutoUpdatePromptUntilNextCheck(v) { suppressAutoUpdatePromptUntilNextCheck = v; },
+    get updateChannel() { return updateChannel; },
+    loadUpdateChannel,
+    setUpdateChannel,
     get updateObject() { return updateObject; },
     set updateObject(v) { updateObject = v; },
     get appUpdateLabel() { return appUpdateLabel; },

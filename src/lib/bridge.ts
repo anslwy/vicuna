@@ -142,6 +142,10 @@ export async function switchServer(id: string | null, title?: string): Promise<v
 export const DESKTOP_CMDS = new Set([
   // app + window + tray
   "app_build_info",
+  "app_get_update_channel",
+  "app_set_update_channel",
+  "app_check_update",
+  "app_install_update",
   "github_latest_release",
   "github_download_asset",
   "show_main_window",

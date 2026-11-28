@@ -52,6 +52,7 @@ pub mod cli_launcher;
 pub mod terminal;
 pub mod updates_uploads;
 pub mod app_shell;
+pub mod update_channel;
 pub mod tauri_commands;
 
 #[cfg(test)]
@@ -156,6 +157,7 @@ pub fn run() {
         .manage(acp::AcpState::default())
         .manage(AppQuitState::default())
         .manage(ScheduleState::default())
+        .manage(update_channel::PendingUpdate::default())
         .manage(TrayState::default())
         .manage(browser::shared())
         .manage(mcp::McpManager::default())
@@ -239,6 +241,10 @@ pub fn run() {
             app_shell::tray_get_enabled,
             app_shell::tray_set_enabled,
             app_shell::tray_set_status,
+            update_channel::app_get_update_channel,
+            update_channel::app_set_update_channel,
+            update_channel::app_check_update,
+            update_channel::app_install_update,
             tauri_commands::mcp_list_servers,
             tauri_commands::mcp_set_defaults,
             tauri_commands::mcp_save_server,

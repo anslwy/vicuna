@@ -13,8 +13,36 @@ use crate::server;
 
 const REPO: &str = "anslwy/vicuna";
 
+/// `stable` = newest versioned release; `dev` = the rolling `latest`
+/// prerelease rebuilt from every push to main.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    #[default]
+    Stable,
+    Dev,
+}
+
+impl Channel {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "stable" => Ok(Self::Stable),
+            "dev" => Ok(Self::Dev),
+            other => Err(format!("unknown channel {other:?} (stable or dev)")),
+        }
+    }
+    /// Where the CLI tarballs + .sha256 live for this channel.
+    pub fn download_base(self, stable_tag: Option<&str>) -> String {
+        match (self, stable_tag) {
+            (Self::Dev, _) => format!("https://github.com/{REPO}/releases/download/latest"),
+            (Self::Stable, Some(tag)) => format!("https://github.com/{REPO}/releases/download/{tag}"),
+            (Self::Stable, None) => format!("https://github.com/{REPO}/releases/latest/download"),
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct Opts {
+    pub channel: Channel,
     pub check: bool,
     pub force: bool,
     pub no_restart: bool,
@@ -23,8 +51,16 @@ pub struct Opts {
 
 pub fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts::default();
-    for a in args {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
+            "--dev" => o.channel = Channel::Dev,
+            "--stable" => o.channel = Channel::Stable,
+            "--channel" => {
+                let v = it.next().ok_or("--channel needs a value (stable or dev)")?;
+                o.channel = Channel::parse(v)?;
+            }
+            s if s.starts_with("--channel=") => o.channel = Channel::parse(&s["--channel=".len()..])?,
             "--check" => o.check = true,
             "--force" => o.force = true,
             "--no-restart" => o.no_restart = true,
@@ -196,7 +232,57 @@ pub fn is_dev_build(exe: &Path) -> bool {
 
 // ---------------------------------------------------------------- main flow
 
+/// The rolling dev build has no version of its own, so "newer" means the
+/// archive checksum differs from the last dev archive this machine installed.
+fn dev_marker(server_dir: &Path) -> PathBuf {
+    server_dir.join("upgrade-dev.sha256")
+}
+
+pub fn dev_is_current(server_dir: &Path, remote_sha: &str) -> bool {
+    std::fs::read_to_string(dev_marker(server_dir)).map(|s| s.trim() == remote_sha).unwrap_or(false)
+}
+
+fn run_dev(opts: Opts, server_dir: &Path) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let current = env!("CARGO_PKG_VERSION");
+    let dry = if opts.dry_run { "[dry run] " } else { "" };
+    let tag = "latest (dev)";
+    let tgt = target(std::env::consts::OS, std::env::consts::ARCH)
+        .ok_or_else(|| format!("no release build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let base = std::env::var("VICUNA_DOWNLOAD_BASE").unwrap_or_else(|_| Channel::Dev.download_base(None));
+    let asset = format!("vicuna-{tgt}.tar.gz");
+
+    println!("==> Checking the rolling dev build of {REPO}");
+    if opts.dry_run {
+        println!("==> {dry}Would download {base}/{asset}.sha256, then {base}/{asset}, verify it and replace {}", install_exe(opts.force)?.display());
+        return finish(&opts, None, tag, server_dir, dry);
+    }
+    let sum = rt.block_on(fetch(&format!("{base}/{asset}.sha256")))?;
+    let want = parse_sha256(&String::from_utf8_lossy(&sum)).ok_or("bad .sha256 file")?;
+    let current_dev = dev_is_current(server_dir, &want);
+    println!("    installed: {current}   dev build: {}", &want[..12]);
+    if opts.check {
+        if current_dev {
+            println!("No newer dev build: this machine already installed it (--force would reinstall).");
+        } else {
+            println!("Dev build available. Run `vicuna upgrade --dev` to install it.");
+        }
+        return Ok(());
+    }
+    if current_dev && !opts.force {
+        println!("The latest dev build is already installed (--force reinstalls it).");
+        return Ok(());
+    }
+    download_verify_install(&rt, &opts, &base, &asset, Some(&want), tag, server_dir, dry)?;
+    let _ = std::fs::create_dir_all(server_dir);
+    let _ = std::fs::write(dev_marker(server_dir), format!("{want}\n"));
+    Ok(())
+}
+
 pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
+    if opts.channel == Channel::Dev {
+        return run_dev(opts, server_dir);
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     let current = env!("CARGO_PKG_VERSION");
     let dry = if opts.dry_run { "[dry run] " } else { "" };
@@ -221,8 +307,7 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
 
     let tgt = target(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| format!("no release build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
-    let base = std::env::var("VICUNA_DOWNLOAD_BASE")
-        .unwrap_or_else(|_| format!("https://github.com/{REPO}/releases/download/{tag}"));
+    let base = std::env::var("VICUNA_DOWNLOAD_BASE").unwrap_or_else(|_| Channel::Stable.download_base(Some(&tag)));
     let asset = format!("vicuna-{tgt}.tar.gz");
 
     if opts.dry_run {
@@ -230,10 +315,31 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
         return finish(&opts, None, &tag, server_dir, dry);
     }
 
+    download_verify_install(&rt, &opts, &base, &asset, None, &tag, server_dir, dry)
+}
+
+/// Download `asset`, check it against its `.sha256` (fetched unless already
+/// known), extract, install atomically and hand over to `finish`.
+#[allow(clippy::too_many_arguments)]
+fn download_verify_install(
+    rt: &tokio::runtime::Runtime,
+    opts: &Opts,
+    base: &str,
+    asset: &str,
+    known_sha: Option<&str>,
+    tag: &str,
+    server_dir: &Path,
+    dry: &str,
+) -> Result<(), String> {
     println!("==> Downloading {asset}");
     let archive = rt.block_on(fetch_with_progress(&format!("{base}/{asset}")))?;
-    let sum = rt.block_on(fetch(&format!("{base}/{asset}.sha256")))?;
-    let want = parse_sha256(&String::from_utf8_lossy(&sum)).ok_or("bad .sha256 file")?;
+    let want = match known_sha {
+        Some(s) => s.to_string(),
+        None => {
+            let sum = rt.block_on(fetch(&format!("{base}/{asset}.sha256")))?;
+            parse_sha256(&String::from_utf8_lossy(&sum)).ok_or("bad .sha256 file")?
+        }
+    };
     let got = sha256_hex(&archive);
     if want != got {
         return Err(format!("checksum mismatch for {asset} (want {want}, got {got})"));
@@ -244,10 +350,10 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let result = (|| {
-        std::fs::write(work.join(&asset), &archive).map_err(|e| e.to_string())?;
+        std::fs::write(work.join(asset), &archive).map_err(|e| e.to_string())?;
         let st = Command::new("tar")
             .arg("-xzf")
-            .arg(work.join(&asset))
+            .arg(work.join(asset))
             .arg("-C")
             .arg(&work)
             .status()
@@ -260,7 +366,7 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
             let dest = install_sidecar(&work.join("lb-sidecar"), &install_exe(opts.force)?)?;
             println!("==> Installed the bundled browser engine to {}", dest.display());
         }
-        finish(&opts, Some(&bin), &tag, server_dir, dry)
+        finish(opts, Some(&bin), tag, server_dir, dry)
     })();
     let _ = std::fs::remove_dir_all(&work);
     result
@@ -384,6 +490,7 @@ mod tests {
         let o = parse_opts(&["--check".into(), "--force".into(), "--no-restart".into(), "--dry-run".into()]).unwrap();
         assert!(o.check && o.force && o.no_restart && o.dry_run);
         assert!(parse_opts(&["--nope".into()]).is_err());
+        assert_eq!(o.channel, Channel::Stable);
         assert_eq!(target("linux", "x86_64"), Some("linux-x86_64"));
         assert_eq!(target("linux", "aarch64"), Some("linux-aarch64"));
         assert_eq!(target("macos", "aarch64"), Some("macos-universal"));
@@ -391,6 +498,33 @@ mod tests {
         assert_eq!(parse_sha256(&format!("{}  vicuna.tar.gz\n", "A".repeat(64))), Some("a".repeat(64)));
         assert_eq!(parse_sha256("nothex  x"), None);
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn channel_flags_and_urls() {
+        let p = |a: &[&str]| parse_opts(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(p(&["--dev"]).unwrap().channel, Channel::Dev);
+        assert_eq!(p(&["--channel", "dev", "--check"]).unwrap().channel, Channel::Dev);
+        assert_eq!(p(&["--channel=stable"]).unwrap().channel, Channel::Stable);
+        assert_eq!(p(&["--dev", "--stable"]).unwrap().channel, Channel::Stable);
+        assert!(p(&["--channel"]).is_err());
+        assert!(p(&["--channel", "nightly"]).is_err());
+        assert_eq!(Channel::Dev.download_base(None), "https://github.com/anslwy/vicuna/releases/download/latest");
+        assert_eq!(Channel::Dev.download_base(Some("v1.0.0")), "https://github.com/anslwy/vicuna/releases/download/latest");
+        assert_eq!(Channel::Stable.download_base(Some("v0.0.100")), "https://github.com/anslwy/vicuna/releases/download/v0.0.100");
+    }
+
+    #[test]
+    fn dev_marker_tracks_the_installed_archive() {
+        let d = std::env::temp_dir().join(format!("vicuna-devmark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let sha = "a".repeat(64);
+        assert!(!dev_is_current(&d, &sha));
+        std::fs::write(dev_marker(&d), format!("{sha}\n")).unwrap();
+        assert!(dev_is_current(&d, &sha));
+        assert!(!dev_is_current(&d, &"b".repeat(64)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
