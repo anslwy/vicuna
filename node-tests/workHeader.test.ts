@@ -68,3 +68,13 @@ test("ChatApp passes activeChat.id as sessionId to WorkHeader", () => {
   const usage = chatApp.slice(start, end);
   assert.ok(usage.includes("sessionId={activeChat.id}"), "ChatApp passes sessionId={activeChat.id} to WorkHeader");
 });
+
+test("WorkHeader banner does not create a stacking context above collapsed-rail or explorer toggle", () => {
+  const bannerRule = workHeader.match(/\.work-banner\s*\{[^}]*\}/);
+  assert.ok(bannerRule, ".work-banner CSS rule exists");
+  assert.equal(/\bz-index\s*:/.test(bannerRule[0]), false, ".work-banner must not set z-index (its padding overlaps collapsed-rail and explorer-toggle-btn when narrow)");
+
+  const popupRule = workHeader.match(/\.ctx-popup\s*\{[^}]*\}/);
+  assert.ok(popupRule, ".ctx-popup CSS rule exists");
+  assert.ok(/\bz-index\s*:\s*30\b/.test(popupRule[0]), ".ctx-popup retains z-index: 30 so popovers float above header controls");
+});
