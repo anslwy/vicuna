@@ -8056,6 +8056,7 @@
                   {/if}
                 </div>
               {/if}
+              <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
               {#if m.images?.length}
                 <div class="msg-images assistant-images" data-testid="assistant-images">
                   {#each m.images as img, k}
@@ -8065,7 +8066,6 @@
                   {/each}
                 </div>
               {/if}
-              <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>
               {#if pendingAsk && pendingAsk.index === i && activeId != null}
                 {@const askCard = pendingAsks[activeId]}
                 {#if askCard}
@@ -9549,6 +9549,7 @@
   .msg-image-open { border: none; background: none; padding: 0; cursor: zoom-in; display: block; }
   .image-chip .image-remove { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; border: none; background: rgba(0,0,0,.55); color: #fff; font-size: 12px; line-height: 1; cursor: pointer; padding: 0; }
   .msg-images { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .msg-images.assistant-images { margin-top: 10px; margin-bottom: 2px; }
   .msg-images img { display: block; max-width: min(100%, 320px); max-height: 220px; border-radius: 12px; }
   .lightbox-backdrop { position: fixed; inset: 0; z-index: 60; border: none; padding: 24px; box-sizing: border-box; background: rgba(0, 0, 0, 0.85); cursor: zoom-out; display: flex; align-items: center; justify-content: center; }
   .lightbox-backdrop img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; }
