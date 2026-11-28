@@ -6536,6 +6536,19 @@
           save();
           break;
         }
+        case "assistantimage": {
+          // vicuna-mcp show_image: the picture joins the live reply at once
+          flushNow();
+          const t = live();
+          const m = t?.messages[curIndex];
+          if (t && m && ev.data_url) {
+            t.messages[curIndex] = { ...m, role: "assistant", images: [...(m.images ?? []), ev.data_url] };
+            chats = [...chats];
+            scrollIfOpen();
+            saveSoon();
+          }
+          break;
+        }
         case "displaynote":
           appendContent(formatDisplayNote(ev.text, !!pendingHead && pendingHead.name !== "ask" && pendingHead.name !== "say"));
           scrollIfOpen();
@@ -8041,6 +8054,15 @@
                   {#if expanded}
                     <div class="thinking-body">{m.thinking}</div>
                   {/if}
+                </div>
+              {/if}
+              {#if m.images?.length}
+                <div class="msg-images assistant-images" data-testid="assistant-images">
+                  {#each m.images as img, k}
+                    <button class="msg-image-open" aria-label="View picture {k + 1} fullscreen" onclick={() => openLightbox(img)}>
+                      <img src={img} alt="" />
+                    </button>
+                  {/each}
                 </div>
               {/if}
               <div class="answer">{#if m.content}{@html renderMarkdown(m.content)}{:else if activeStreaming && isLast && !m.thinking}<span class="typing" aria-label="Generating"><span></span><span></span><span></span></span>{/if}</div>

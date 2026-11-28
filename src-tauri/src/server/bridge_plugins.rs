@@ -340,6 +340,30 @@ fn live_view(st: &BridgeState, session: &str) -> Option<(String, Option<Value>)>
     Some((text, g.rec.pending_ask.clone()))
 }
 
+/// `turn_event` `image` payload for one show_image picture.
+pub fn image_event(session: &str, turn_id: &str, img: &turns::OutImage) -> Option<Value> {
+    let (mime, b64) = crate::attachments::parse_data_url(&img.data_url)?;
+    let ext = mime.strip_prefix("image/").map(|e| if e == "jpeg" { "jpg" } else { e }).unwrap_or("png");
+    let filename = img.filename.clone().map(|f| crate::attachments::sanitize_name(&f)).filter(|f| !f.is_empty()).unwrap_or_else(|| format!("image.{ext}"));
+    Some(json!({
+        "event": "image",
+        "sessionId": session,
+        "turnId": turn_id,
+        "mime": mime,
+        "data": b64,
+        "filename": filename,
+        "caption": img.caption,
+    }))
+}
+
+fn broadcast_images(session: &str, turn_id: &str, all: &[Value], seen: &mut std::collections::HashSet<String>) {
+    for img in turns::unseen_images(all, seen) {
+        if let Some(ev) = image_event(session, turn_id, &img) {
+            broadcast_notification("turn_event", ev);
+        }
+    }
+}
+
 async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
     broadcast_notification(
         "turn_event",
@@ -348,6 +372,7 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
     let mut shown = String::new();
     let mut last_edit = std::time::Instant::now();
     let mut asked: Option<String> = None;
+    let mut sent_images: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -355,6 +380,7 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
         if live.as_deref() != Some(turn_id.as_str()) {
             break;
         }
+        broadcast_images(&session, &turn_id, &turns::live_images(&st, &session), &mut sent_images);
         if let Some((text, ask)) = live_view(&st, &session) {
             if let Some(a) = ask {
                 let id = a.get("ask_id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -401,7 +427,9 @@ async fn follow_turn(st: Arc<BridgeState>, session: String, turn_id: String) {
     }
 
     // wait for the recorder's final events + write, not a blind sleep
-    let reply = phone_text(&turns::final_reply(&st, &session, &turn_id).await);
+    let (reply, images) = turns::final_reply_and_images(&st, &session, &turn_id).await;
+    broadcast_images(&session, &turn_id, &images, &mut sent_images);
+    let reply = phone_text(&reply);
 
     broadcast_notification(
         "turn_event",
@@ -653,6 +681,17 @@ pub async fn action(_st: &Arc<BridgeState>, cmd: &str, args: &Value) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_event_carries_the_payload_once() {
+        let all = vec![json!({"dataUrl": "data:image/webp;base64,UklGRg==", "caption": "c", "filename": null}), json!("data:image/webp;base64,UklGRg==")];
+        let mut seen = std::collections::HashSet::new();
+        let imgs = turns::unseen_images(&all, &mut seen);
+        assert_eq!(imgs.len(), 1);
+        let ev = image_event("s1", "turn-1", &imgs[0]).unwrap();
+        assert_eq!(ev, json!({"event": "image", "sessionId": "s1", "turnId": "turn-1", "mime": "image/webp", "data": "UklGRg==", "filename": "image.webp", "caption": "c"}));
+        assert!(turns::unseen_images(&all, &mut seen).is_empty());
+    }
 
     #[test]
     fn config_path_uses_override_dir() {

@@ -262,6 +262,51 @@ async fn send_text(token: &str, chat: i64, text: &str, keyboard: Option<Value>) 
     call(token, "sendMessage", body).await.ok()?.get("message_id").and_then(Value::as_i64)
 }
 
+/// multipart/form-data body for `sendPhoto`: (content type, body).
+pub fn photo_form(chat: i64, file_name: &str, mime: &str, bytes: &[u8], caption: Option<&str>) -> (String, Vec<u8>) {
+    let mut r = [0u8; 8];
+    let _ = getrandom::fill(&mut r);
+    let boundary = format!("vicuna-{:016x}", u64::from_le_bytes(r) ^ bytes.len() as u64);
+    let mut b = Vec::with_capacity(bytes.len() + 512);
+    let field = |b: &mut Vec<u8>, name: &str, value: &str| {
+        b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+    };
+    field(&mut b, "chat_id", &chat.to_string());
+    if let Some(c) = caption.map(str::trim).filter(|c| !c.is_empty()) {
+        // Telegram captions are capped at 1024 chars
+        field(&mut b, "caption", &c.chars().take(1024).collect::<String>());
+    }
+    let safe: String = file_name.chars().filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n')).collect();
+    b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"{safe}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes());
+    b.extend_from_slice(bytes);
+    b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), b)
+}
+
+/// Send one show_image picture. Failures are logged and never stop the
+/// text reply.
+async fn send_photo(token: &str, chat: i64, img: &super::turns::OutImage, n: usize) {
+    let Some((mime, bytes)) = img.decode() else {
+        eprintln!("telegram sendPhoto: undecodable image skipped");
+        return;
+    };
+    let name = img.file_name(&mime, n);
+    let (ctype, body) = photo_form(chat, &name, &mime, &bytes, img.caption.as_deref());
+    let url = format!("{}/bot{}/sendPhoto", api_base(), token);
+    let res = client().post(&url).header("content-type", ctype).body(body).send().await;
+    let err = match res {
+        Ok(r) => match r.json::<Value>().await {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => None,
+            Ok(v) => Some(v.get("description").and_then(Value::as_str).unwrap_or("request failed").to_string()),
+            Err(e) => Some(e.without_url().to_string()),
+        },
+        Err(e) => Some(e.without_url().to_string()),
+    };
+    if let Some(e) = err {
+        eprintln!("telegram sendPhoto {name}: {e}");
+    }
+}
+
 async fn edit_text(token: &str, chat: i64, msg: i64, text: &str) {
     let _ = call(token, "editMessageText", json!({"chat_id": chat, "message_id": msg, "text": text, "disable_web_page_preview": true})).await;
 }
@@ -1382,11 +1427,17 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
         let mut last_edit = std::time::Instant::now();
         let mut asked: Option<String> = None;
         let mut last_typing: Option<std::time::Instant> = None;
+        let mut sent_images: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut photo_n = 0usize;
         loop {
             tokio::time::sleep(Duration::from_millis(1500)).await;
             let live = live_turn(&st, &session).map(|(t, _)| t);
             if live.as_deref() != Some(turn_id.as_str()) {
                 break;
+            }
+            for img in super::turns::unseen_images(&super::turns::live_images(&st, &session), &mut sent_images) {
+                photo_n += 1;
+                send_photo(&token, chat, &img, photo_n).await;
             }
             let view_now = live_view(&st, &session);
             // "typing…" while the model works; a chat action lasts ~5 s, so
@@ -1422,7 +1473,12 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
             }
         }
         // wait for the recorder's final events + write, not a blind sleep
-        let reply = phone_text(&super::turns::final_reply(&st, &session, &turn_id).await);
+        let (reply, images) = super::turns::final_reply_and_images(&st, &session, &turn_id).await;
+        for img in super::turns::unseen_images(&images, &mut sent_images) {
+            photo_n += 1;
+            send_photo(&token, chat, &img, photo_n).await;
+        }
+        let reply = phone_text(&reply);
         let reply = if reply.is_empty() { "(no reply text)".to_string() } else { reply };
         let parts = chunks(&reply);
         let mut it = parts.iter();
@@ -1443,6 +1499,20 @@ fn follow(st: Arc<BridgeState>, token: String, chat: i64, session: String, turn_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photo_form_is_multipart() {
+        let (ctype, body) = photo_form(42, "a\"b.png", "image/png", b"PNGDATA", Some("hi"));
+        let boundary = ctype.strip_prefix("multipart/form-data; boundary=").unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.starts_with(&format!("--{boundary}\r\n")));
+        assert!(s.contains("name=\"chat_id\"\r\n\r\n42\r\n"));
+        assert!(s.contains("name=\"caption\"\r\n\r\nhi\r\n"));
+        assert!(s.contains("name=\"photo\"; filename=\"ab.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n"));
+        assert!(s.ends_with(&format!("--{boundary}--\r\n")));
+        let (_, body) = photo_form(1, "x.png", "image/png", b"x", None);
+        assert!(!String::from_utf8_lossy(&body).contains("caption"));
+    }
 
     #[test]
     fn token_shape_and_pairing() {

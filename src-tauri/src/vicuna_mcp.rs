@@ -54,8 +54,10 @@ pub const OVERVIEW_TOOL: &str = "session_overview";
 pub const SEARCH_TOOL: &str = "search_sessions";
 /// Read each Work harness's remaining subscription quota (read-only, cached).
 pub const USAGE_TOOL: &str = "usage_status";
+/// Show an image file from disk in the assistant's reply (and on paired bridges).
+pub const SHOW_IMAGE_TOOL: &str = "show_image";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 13;
+pub const TOOL_COUNT: usize = 14;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
@@ -71,6 +73,7 @@ pub const CLAUDE_MANAGE_SCHEDULE_TOOL_ID: &str = "mcp__vicuna-mcp__manage_schedu
 pub const CLAUDE_OVERVIEW_TOOL_ID: &str = "mcp__vicuna-mcp__session_overview";
 pub const CLAUDE_SEARCH_TOOL_ID: &str = "mcp__vicuna-mcp__search_sessions";
 pub const CLAUDE_USAGE_TOOL_ID: &str = "mcp__vicuna-mcp__usage_status";
+pub const CLAUDE_SHOW_IMAGE_TOOL_ID: &str = "mcp__vicuna-mcp__show_image";
 
 /// The ask card's "Answer later" sentinel: the waiting ask_user call returns
 /// at once and the answer reaches the session later as a message.
@@ -98,7 +101,7 @@ const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the 
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
 using a built-in question tool; it waits for the answer and returns it. Run commands with your own shell tool \
-(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards; messages list image metadata and the session its `uploads`), `read_attachment` (one listed image or uploaded file, on demand), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
+(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards; messages list image metadata and the session its `uploads`), `read_attachment` (one listed image or uploaded file, on demand), `show_image` (display an image file you generated or edited in the chat; it also reaches the user's Telegram/Discord/Slack), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
 custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `manage_skills` to list, search, read, add, edit, \
@@ -825,6 +828,40 @@ fn read_session_schema() -> Value {
             }
         }
     })
+}
+
+fn show_image_schema() -> Value {
+    json!({
+        "name": SHOW_IMAGE_TOOL,
+        "title": "Show an image to the user",
+        "description": "Display an image file (png, jpeg, webp or gif, up to 10 MB) in your reply in Vicuna's chat; it is also sent to the user's paired Telegram/Discord/Slack. Use it after generating, editing, rendering or screenshotting an image the user should see, instead of only naming the path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path, or a path relative to the workspace, of the image file." },
+                "caption": { "type": "string", "description": "Optional short caption." }
+            },
+            "required": ["path"]
+        }
+    })
+}
+
+/// vicuna-mcp `show_image`: load + validate the file and put it on the turn's
+/// event channel; the recorder/windows append it to the live reply's images.
+fn show_image(target: &Target, args: &Value) -> Value {
+    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+    let caption = args.get("caption").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(1000).collect::<String>());
+    let img = match crate::attachments::load_show_image(path, &target.workspace) {
+        Ok(i) => i,
+        Err(e) => return text_result(&e, true),
+    };
+    let filename = img.filename.clone();
+    emit_ev(
+        &target.on_event,
+        &target.turn.stop,
+        WorkAgentEvent::AssistantImage { data_url: img.data_url, caption, filename: Some(img.filename) },
+    );
+    text_result(&format!("Shown {filename} to the user in the chat."), false)
 }
 
 fn read_attachment_schema() -> Value {
@@ -2313,6 +2350,7 @@ async fn handle_rpc(
             with_caller_arg(get_session_schema()),
             with_caller_arg(read_session_schema()),
             with_caller_arg(read_attachment_schema()),
+            with_caller_arg(show_image_schema()),
             with_caller_arg(list_sessions_schema()),
             with_caller_arg(overview_schema()),
             with_caller_arg(search_schema()),
@@ -2331,6 +2369,7 @@ async fn handle_rpc(
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
                 (t, READ_SESSION_TOOL) => read_session(t, &args).await,
                 (t, READ_ATTACHMENT_TOOL) => read_attachment(t, &args).await,
+                (Some(t), SHOW_IMAGE_TOOL) => show_image(t, &args),
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
                 (Some(t), MANAGE_SCHEDULE_TOOL) => manage_schedule(t, &args, client_gone).await,
@@ -2341,7 +2380,7 @@ async fn handle_rpc(
                 (_, MANAGE_MCP_TOOL) => manage_mcp(target, &args).await,
                 (_, MANAGE_SKILLS_TOOL) => manage_skills(target, &args).await,
                 (None, TOOL_NAME) => text_result("No Vicuna Work turn is running for this chat, so the question cannot be shown.", true),
-                (None, GET_SESSION_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
+                (None, GET_SESSION_TOOL | SHOW_IMAGE_TOOL | SCHEDULE_TOOL | MANAGE_SESSIONS_TOOL | MANAGE_SCHEDULE_TOOL) => text_result("No Vicuna Work turn is running for this chat.", true),
                 _ => return Some(rpc_error(id, -32602, &format!("unknown tool: {name}"))),
             }
         }
@@ -3315,7 +3354,7 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, READ_ATTACHMENT_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, MANAGE_SKILLS_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, READ_ATTACHMENT_TOOL, SHOW_IMAGE_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, MANAGE_SKILLS_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
         let properties = &tools.as_array().unwrap().iter()
             .find(|tool| tool["name"] == MANAGE_SKILLS_TOOL).unwrap()["inputSchema"]["properties"];
         for arg in [CALLER_ARG, "session_id", "query"] {

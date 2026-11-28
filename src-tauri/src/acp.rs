@@ -1569,6 +1569,7 @@ Use your own built-in tools to inspect and change files and run commands. The wo
 - Use `manage_mcp` on vicuna-mcp to list or switch MCP servers for this session or manage shared custom server definitions (e.g. when the user gives an MCP URL endpoint). The fixed `vicuna-mcp` server is always available. When you add or enable a connected server, Vicuna automatically starts a follow-up turn once this turn finishes so you can call its tools right away (pass `wake: false` if no follow-up is needed).\n\
 - Use `manage_skills` on vicuna-mcp to list, search (with `query`), read, add, edit, enable, disable, or remove Vicuna skills. Switches apply to this Work session. The lead can pass `session_id` to target another Work session.\n\
 - To check back later (a slow deploy or CI run, a follow-up the user asks for at a certain time), call `schedule_wakeup` on vicuna-mcp with a `message` for yourself and `in_minutes` or a local `at` time, then end your turn: Vicuna sends that message into this session at the time.\n\
+- To show the user an image you generated, edited, rendered or captured, call `show_image` on vicuna-mcp with its `path` (and an optional `caption`): it appears in your reply in the chat and on the user's paired Telegram/Discord/Slack.\n\
 - Before starting an expensive worker session (or when a harness call fails with a quota/limit error), call `usage_status` on vicuna-mcp to see each harness's remaining quota and reset time, and pick one that has quota left.\n\
 {session_info}\n{skills}{goal}",
         goal = goal

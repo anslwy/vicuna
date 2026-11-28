@@ -120,6 +120,71 @@ pub fn live_turn(st: &BridgeState, session_id: &str) -> Option<(String, Arc<Turn
 /// wait until the turn's recorder is gone (finalize removes it after its final
 /// write) and use its in-memory transcript; the DB is only a fallback.
 pub async fn final_reply(st: &BridgeState, session: &str, turn_id: &str) -> String {
+    final_reply_and_images(st, session, turn_id).await.0
+}
+
+/// One outbound picture (vicuna-mcp show_image) for bridges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutImage {
+    pub data_url: String,
+    pub caption: Option<String>,
+    pub filename: Option<String>,
+}
+
+impl OutImage {
+    /// `{dataUrl, caption, filename}` (Recorder::shown_images) or a bare
+    /// data URL string (a stored message's `images`).
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let (url, caption, filename) = match v {
+            Value::String(s) => (s.clone(), None, None),
+            _ => (
+                v.get("dataUrl")?.as_str()?.to_string(),
+                v.get("caption").and_then(Value::as_str).map(str::to_string),
+                v.get("filename").and_then(Value::as_str).map(str::to_string),
+            ),
+        };
+        url.starts_with("data:image/").then_some(Self { data_url: url, caption, filename })
+    }
+
+    /// (mime, decoded bytes)
+    pub fn decode(&self) -> Option<(String, Vec<u8>)> {
+        use base64::Engine as _;
+        let (mime, b64) = crate::attachments::parse_data_url(&self.data_url)?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok()?;
+        Some((mime, bytes))
+    }
+
+    /// Filename with an extension matching the mime.
+    pub fn file_name(&self, mime: &str, n: usize) -> String {
+        if let Some(f) = self.filename.as_deref().map(crate::attachments::sanitize_name).filter(|f| !f.is_empty()) {
+            return f;
+        }
+        let ext = mime.strip_prefix("image/").map(|e| if e == "jpeg" { "jpg" } else { e }).unwrap_or("png");
+        format!("image-{n}.{ext}")
+    }
+}
+
+/// Images not yet in `seen` (data URLs), marking them seen: each picture of
+/// a turn is forwarded once, whether it was seen live or only at the end.
+pub fn unseen_images(all: &[Value], seen: &mut std::collections::HashSet<String>) -> Vec<OutImage> {
+    all.iter()
+        .filter_map(OutImage::from_value)
+        .filter(|i| seen.insert(i.data_url.clone()))
+        .collect()
+}
+
+/// The live recorder's show_image list for `session` (empty when none).
+pub fn live_images(st: &BridgeState, session: &str) -> Vec<Value> {
+    let Ok(recs) = st.recorders.lock() else { return Vec::new() };
+    let recs: Vec<_> = recs.values().cloned().collect();
+    recs.into_iter()
+        .find_map(|r| r.lock().ok().filter(|g| g.rec.chat_id == session).map(|g| g.rec.shown_images.clone()))
+        .unwrap_or_default()
+}
+
+/// `final_reply` plus the turn's show_image pictures (from the recorder, or
+/// the stored last reply's `images` when no recorder was held).
+pub async fn final_reply_and_images(st: &BridgeState, session: &str, turn_id: &str) -> (String, Vec<Value>) {
     let find = || -> Option<Arc<Mutex<RecState>>> {
         let recs: Vec<_> = st.recorders.lock().ok()?.values().cloned().collect();
         recs.into_iter().find(|r| r.lock().map(|g| g.turn_id == turn_id).unwrap_or(false))
@@ -142,17 +207,30 @@ pub async fn final_reply(st: &BridgeState, session: &str, turn_id: &str) -> Stri
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if let Some(reply) = held.and_then(|r| r.lock().ok().map(|g| g.rec.last_reply())) {
+    let mut images = Vec::new();
+    let had_rec = held.is_some();
+    if let Some((reply, imgs)) = held.and_then(|r| r.lock().ok().map(|g| (g.rec.last_reply(), g.rec.shown_images.clone()))) {
+        images = imgs;
         if !reply.is_empty() {
-            return reply;
+            return (reply, images);
         }
     }
-    match &st.db {
-        Some(db) => crate::server_store::load_chat(db, session).await.ok().flatten()
-            .and_then(|c| Some(persist::last_reply(c["messages"].as_array()?).to_string()))
-            .unwrap_or_default(),
+    let reply = match &st.db {
+        Some(db) => {
+            let chat = crate::server_store::load_chat(db, session).await.ok().flatten();
+            let msgs = chat.as_ref().and_then(|c| c["messages"].as_array().cloned()).unwrap_or_default();
+            // no recorder: the stored last reply's pictures (the recorder's
+            // own list is authoritative when there was one)
+            if !had_rec {
+                if let Some(m) = msgs.iter().rfind(|m| m["role"] == "assistant") {
+                    images = m["images"].as_array().cloned().unwrap_or_default();
+                }
+            }
+            persist::last_reply(&msgs).to_string()
+        }
         None => String::new(),
-    }
+    };
+    (reply, images)
 }
 
 /// Start a Work turn (window-started or server-started) and return its id.
@@ -1430,6 +1508,40 @@ pub fn spawn_scheduler(st: Arc<BridgeState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn assistant_images_record_persist_and_dedupe() {
+        let st = sched_state().await;
+        let db = st.db.clone().unwrap();
+        let msgs = vec![json!({"role": "user", "content": "draw"}), json!({"role": "assistant", "content": "", "thinking": ""})];
+        let mut rec = Recorder::new("me", msgs, 1, None, "claude");
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let ev = json!({"type": "assistantimage", "data_url": png, "caption": "cat", "filename": "cat.png"});
+        rec.apply(&ev, &ev.to_string());
+        let bad = json!({"type": "assistantimage", "data_url": "javascript:x"});
+        rec.apply(&bad, &bad.to_string());
+        assert!(rec.dirty);
+        assert_eq!(rec.messages[1]["images"], json!([png]));
+        assert_eq!(rec.shown_images.len(), 1);
+        let mut chat = crate::server_store::load_chat(&db, "me").await.unwrap().unwrap();
+        chat["messages"] = json!(rec.messages);
+        crate::server_store::merge_json(&db, &json!([chat]), vec![], &Default::default()).await.unwrap();
+        let back = crate::server_store::load_chat(&db, "me").await.unwrap().unwrap();
+        assert_eq!(back["messages"][1]["images"], json!([png]));
+        // no recorder: the stored reply's pictures come back
+        let (_, imgs) = final_reply_and_images(&st, "me", "turn-x").await;
+        assert_eq!(imgs, vec![json!(png)]);
+        // once per turn, live list or final list alike
+        let mut seen = HashSet::new();
+        let first = unseen_images(&rec.shown_images, &mut seen);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].caption.as_deref(), Some("cat"));
+        assert!(unseen_images(&imgs, &mut seen).is_empty());
+        let (mime, bytes) = first[0].decode().unwrap();
+        assert_eq!((mime.as_str(), &bytes[..4]), ("image/png", &b"\x89PNG"[..]));
+        assert_eq!(first[0].file_name(&mime, 1), "cat.png");
+        assert_eq!(OutImage::from_value(&json!("data:image/jpeg;base64,/9j/")).unwrap().file_name("image/jpeg", 2), "image-2.jpg");
+    }
 
     async fn sched_state() -> Arc<BridgeState> {
         let dir = std::env::temp_dir().join(format!("vicuna-sched-{}", uuid()));
