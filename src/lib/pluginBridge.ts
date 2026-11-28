@@ -9,11 +9,11 @@
 // App → panel:  { vicuna: 1, id, result } | { vicuna: 1, id, error }
 // App → panel:  { vicuna: 1, event: "theme" | "context", data }   (pushed on change)
 //
-// Methods: getTheme, getContext, storage.get {key}, storage.set {key, value},
-// storage.remove {key}, storage.keys. Nothing else exists in this version:
-// no file access, commands, network or agent control.
+// Methods: getTheme, getContext, setTitle {title}, storage.get {key},
+// storage.set {key, value}, storage.remove {key}, storage.keys. Nothing else
+// exists in this version: no file access, commands, network or agent control.
 
-export const PANEL_METHODS = ["getTheme", "getContext", "storage.get", "storage.set", "storage.remove", "storage.keys"] as const;
+export const PANEL_METHODS = ["getTheme", "getContext", "setTitle", "storage.get", "storage.set", "storage.remove", "storage.keys"] as const;
 export type PanelMethod = (typeof PANEL_METHODS)[number];
 
 export type PanelRequest = { id: string | number; method: PanelMethod; params: Record<string, unknown> };
@@ -24,10 +24,12 @@ export type PanelContext = { sessionId: string | null; title: string | null; wor
 export interface PanelHost {
   theme(): PanelTheme;
   context(): PanelContext;
+  setTitle?(title: string | null): void;
   storage(cmd: "plugin_storage_get" | "plugin_storage_set" | "plugin_storage_remove" | "plugin_storage_keys", key?: string, value?: unknown): Promise<unknown>;
 }
 
 const MAX_KEY = 128;
+const MAX_TITLE = 64;
 const MAX_VALUE = 64 * 1024;
 
 /** CSS variables a panel gets in `getTheme` (enough to match the app). */
@@ -68,6 +70,19 @@ export async function handlePanelRequest(req: PanelRequest, host: PanelHost): Pr
       case "getContext":
         result = host.context();
         break;
+      case "setTitle": {
+        const raw = req.params.title;
+        if (raw === null || raw === undefined) {
+          host.setTitle?.(null);
+          result = true;
+          break;
+        }
+        if (typeof raw !== "string") throw new Error("title must be a string or null");
+        const clean = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, MAX_TITLE);
+        host.setTitle?.(clean || null);
+        result = true;
+        break;
+      }
       case "storage.get":
         result = await host.storage("plugin_storage_get", key(req.params));
         break;
