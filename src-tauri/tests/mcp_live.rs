@@ -25,6 +25,8 @@ fn test_config() -> McpServerConfig {
         url: None,
         headers: None,
         oauth: None,
+        plugin_id: None,
+        plugin_name: None,
         enabled: true,
     }
 }

@@ -19,6 +19,9 @@ export type InstalledPlugin = {
   /** Work harnesses (plugin_harness.rs), with consent state. */
   harnesses?: import("./pluginHarness").PluginHarness[];
   pendingConsent?: import("./pluginHarness").PluginHarness[];
+  /** MCP servers (plugin_mcp.rs), with consent state. */
+  mcpServers?: import("./pluginMcp").PluginMcpServer[];
+  pendingMcpConsent?: import("./pluginMcp").PluginMcpServer[];
   /** Messaging bridge (plugins.rs `BridgeSpec`). */
   bridge?: import("./bridgePlugin").PluginBridgeDef | null;
 };

@@ -9,7 +9,7 @@ export type CatalogEntry = {
   description: string;
   author: string;
   source: string;
-  kinds: ("theme" | "panel" | "harness" | "bridge")[];
+  kinds: ("theme" | "panel" | "harness" | "mcp" | "bridge")[];
   icon?: string;
   screenshot?: string;
   tags: string[];
@@ -48,7 +48,7 @@ export function cardAction(e: CatalogEntry): CardAction {
   return "install";
 }
 
-export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel", harness: "Harness", bridge: "Bridge" };
+export const KIND_LABEL: Record<string, string> = { theme: "Theme", panel: "Panel", harness: "Harness", mcp: "MCP", bridge: "Bridge" };
 
 /** Turn a GitHub plugin source (`owner/repo`, `github.com/owner/repo`, or
  *  `https://github.com/owner/repo[.git]`) into its canonical https URL,
