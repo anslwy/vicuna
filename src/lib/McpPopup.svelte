@@ -650,7 +650,9 @@
   .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
   .mcp-pat-link:hover { text-decoration: underline; }
   .mcp-plugin-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted, inherit); white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-row.sel .mcp-plugin-badge { color: inherit; border-color: rgba(255,255,255,.55); opacity: .95; }
   .mcp-keys-btn { font: inherit; font-size: 10.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-2); background: transparent; color: inherit; cursor: pointer; white-space: nowrap; }
   .mcp-keys-btn.ok { color: var(--accent); border-color: var(--accent); }
   .mcp-keys-btn.missing { color: var(--danger, #d33); border-color: currentColor; }
+  .mcp-row.sel .mcp-keys-btn { color: inherit; border-color: rgba(255,255,255,.65); }
 </style>
