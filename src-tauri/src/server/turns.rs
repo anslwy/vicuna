@@ -374,8 +374,12 @@ async fn finalize(st: Arc<BridgeState>, rs: Arc<Mutex<RecState>>, uuid: String, 
                 .collect()
         };
         if !leftovers.is_empty() {
-            if let Err(e) = start_server_turn(&st, &chat_id, leftovers, None).await {
-                eprintln!("vicuna: queued prompts for {chat_id} not sent: {e}");
+            let woken = turn.report_woken.load(Ordering::Relaxed)
+                || leftovers.iter().any(|m| m["content"].as_str().is_some_and(persist::is_worker_done_message));
+            match start_server_turn(&st, &chat_id, leftovers, None).await {
+                Ok(_) if woken => mark_report_woken(&st, &chat_id),
+                Ok(_) => {}
+                Err(e) => eprintln!("vicuna: queued prompts for {chat_id} not sent: {e}"),
             }
         }
         if let Some(lead) = report_to {
@@ -410,10 +414,27 @@ async fn report_to_lead(st: &Arc<BridgeState>, worker: &str, lead: &str, reply: 
         "role": "user",
         "content": persist::worker_done_message(worker, &title, engine.id(), model.as_deref(), reply, stopped),
     });
+    deliver_report(st, lead, msg).await;
+}
+
+/// Flag the live turn of `chat_id` as woken by a report callback (see
+/// `TurnState::report_woken`).
+pub fn mark_report_woken(st: &BridgeState, chat_id: &str) {
+    if let Some((_, turn)) = live_turn(st, chat_id) {
+        turn.report_woken.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Deliver a report callback (local `report_to` or a remote watch) into the
+/// receiving session and mark the turn that takes it as report-woken.
+pub async fn deliver_report(st: &Arc<BridgeState>, lead: &str, msg: Value) {
     // the lead may be mid-compaction in a window or briefly unavailable: retry
     for _ in 0..30 {
         match deliver(st, lead, msg.clone()).await {
-            Ok(()) => return,
+            Ok(()) => {
+                mark_report_woken(st, lead);
+                return;
+            }
             Err(e) if e.contains("no longer exists") || e.contains("not a Work session") => {
                 eprintln!("vicuna: worker report for {lead} dropped: {e}");
                 return;
@@ -1676,6 +1697,35 @@ mod tests {
         assert_eq!(rs.lock().unwrap().report_to, None, "the permissioned sender gets an acknowledgement only");
 
         db.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn permissioned_nonlead_send_with_report_true_attaches_report_callback() {
+        let (st, rs, target_turn, dir) = recording().await;
+        let db = st.db.as_ref().unwrap();
+        crate::server_store::create_chat(db, &json!({
+            "id":"sender", "title":"Sender", "createdAt":1, "mode":"work", "workspace":"/srv/p",
+            "extra":r#"{"permissions":{"message":true}}"#, "messages":[]
+        })).await.unwrap();
+        let text = session_control(&st, "sender", "send", &json!({"session_id":"chat", "message":"run this", "report":true})).await.unwrap();
+        assert!(text.contains("Queued into session chat"));
+        assert_eq!(target_turn.queue.lock().unwrap().len(), 1);
+        assert_eq!(rs.lock().unwrap().report_to.as_deref(), Some("sender"), "the reply is reported back to the non-lead caller");
+        db.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn report_delivery_marks_the_receiving_turn_report_woken() {
+        let (st, _, target_turn, dir) = recording().await;
+        assert!(!target_turn.report_woken.load(Ordering::Relaxed));
+        let msg = json!({"role":"user","content":persist::worker_done_message("w","W","claude",None,"done",false)});
+        assert!(persist::is_worker_done_message(msg["content"].as_str().unwrap()));
+        deliver_report(&st, "chat", msg).await;
+        assert!(target_turn.report_woken.load(Ordering::Relaxed));
+        assert_eq!(target_turn.queue.lock().unwrap().len(), 1);
+        st.db.as_ref().unwrap().close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 

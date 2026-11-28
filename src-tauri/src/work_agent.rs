@@ -136,6 +136,10 @@ pub struct TurnState {
     pub ask_seq: AtomicU64,
     /// the session is the user's lead: vicuna-mcp `manage_sessions` works
     pub lead: AtomicBool,
+    /// this turn was woken by a report callback (a worker's reply delivered
+    /// back via `report_to` / a remote watch): non-lead sessions may not
+    /// request a nested `report: true` from it (single-hop loop-breaker)
+    pub report_woken: AtomicBool,
     /// the backend loop for this turn has returned (turns stay in the map
     /// after finishing, so presence alone says nothing about liveness)
     pub done: AtomicBool,
@@ -208,6 +212,7 @@ impl TurnState {
             ask_pending: Mutex::new(HashMap::new()),
             ask_seq: AtomicU64::new(1),
             lead: AtomicBool::new(false),
+            report_woken: AtomicBool::new(false),
             done: AtomicBool::new(false),
             ask_parked: Mutex::new(Vec::new()),
             ask_poll_secs: AtomicU64::new(0),
