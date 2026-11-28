@@ -19,14 +19,21 @@
 
 https://github.com/user-attachments/assets/eb0ea123-c376-4297-bd26-5a47341e23db
 
-<p align="center"><a href="#install"><b>Install</b></a> · <a href="#features">Features</a> · <a href="#highlights">Highlights</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
+<p align="center"><a href="#install"><b>Install</b></a> · <a href="#why-vicuna">Why Vicuna</a> · <a href="#features">Features</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
 
 ## Why Vicuna
 
+- **Lightweight Rust server.** `vicuna serve` (backend + bundled web UI) idles at roughly 10–25 MB of RAM, leaving almost all of your VPS memory for the coding agent CLIs themselves.
 - **Bring your own coding agents.** Use the CLIs and accounts you already have. Pick a harness and model for each session.
 - **Delegate in parallel.** Have a Lead session assign work across harnesses, account for available quota, and collect the results.
 - **Review work where it happens.** Inspect diffs, stage hunks, edit files, and share browser tabs with your agent in the same workspace.
 - **Keep working away from your desk.** Host sessions on your own server and reply from your phone while agents keep running.
+- **Headless server.** Run `vicuna serve --tailscale` on a workstation or VPS. Install it as a systemd or launchd service and switch between connected servers from the sidebar.
+- **Scheduled work.** Schedule prompts to run later, and let agents set wake-ups to follow up on long builds or CI runs.
+- **No-workspace scratch mode.** Start a Work session without choosing a project folder. Vicuna provides a temporary scratch folder when the harness needs one.
+- **Cross-host session search.** Press Cmd+P (Ctrl+P on Windows and Linux) to find sessions on your computer and connected servers.
+- **Optional Chat mode.** Chat with local Ollama models or use OpenRouter alongside your Work sessions.
+- **Session controls.** Steer active Work turns with queued prompts, fork conversations, and share links that reopen sessions in Vicuna.
 
 ## Features
 
@@ -138,16 +145,6 @@ vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 The CLI also drives any running server directly (`vicuna session`, `vicuna schedule`, `vicuna engines`, `vicuna models`, `vicuna mcp`, `vicuna server`, `vicuna api`).
 
 `upgrade` downloads the latest release (`--dev`: the rolling dev build from `main`) with checksum verification and atomic binary replacement, snapshots the open WAL database via `VACUUM INTO` to `~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db`, and restarts a running server automatically. Inside a distrobox/toolbox container, service commands reach the host user manager via `distrobox-host-exec`.
-
-## Highlights
-
-- **Headless server.** Run `vicuna serve --tailscale` on a workstation or VPS. Install it as a systemd or launchd service and switch between connected servers from the sidebar.
-- **Lightweight Rust server.** `vicuna serve` (backend + bundled web UI) idles at roughly 10–25 MB of RAM, leaving almost all of your VPS memory for the coding agent CLIs themselves.
-- **Scheduled work.** Schedule prompts to run later, and let agents set wake-ups to follow up on long builds or CI runs.
-- **No-workspace scratch mode.** Start a Work session without choosing a project folder. Vicuna provides a temporary scratch folder when the harness needs one.
-- **Cross-host session search.** Press Cmd+P (Ctrl+P on Windows and Linux) to find sessions on your computer and connected servers.
-- **Optional Chat mode.** Chat with local Ollama models or use OpenRouter alongside your Work sessions.
-- **Session controls.** Steer active Work turns with queued prompts, fork conversations, and share links that reopen sessions in Vicuna.
 
 ## Prerequisites
 
