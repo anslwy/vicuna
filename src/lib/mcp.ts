@@ -72,6 +72,9 @@ export interface McpServerConfig {
    *  (e.g. your own GitHub OAuth App) — skips dynamic registration */
   oauth?: McpOAuthCreds;
   enabled: boolean;
+  /** set for servers an installed plugin provides (read-only here) */
+  pluginId?: string;
+  pluginName?: string;
 }
 
 export interface McpTool {

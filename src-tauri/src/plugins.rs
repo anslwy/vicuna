@@ -130,6 +130,9 @@ pub struct Manifest {
     /// Work harnesses (ACP agents); see `plugin_harness.rs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub harnesses: Vec<crate::plugin_harness::Harness>,
+    /// MCP servers (http or stdio); see `plugin_mcp.rs`.
+    #[serde(default, rename = "mcpServers", skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<crate::plugin_mcp::PluginMcpServer>,
     /// Messaging bridge (out-of-process binary speaking JSON-RPC over stdio).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeSpec>,
@@ -278,10 +281,11 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
     if m.name.trim().is_empty() || m.version.trim().is_empty() {
         return Err("manifest needs a name and a version".into());
     }
-    if m.themes.is_empty() && m.panels.is_empty() && m.harnesses.is_empty() && m.bridge.is_none() {
-        return Err("this plugin contributes nothing Vicuna supports yet (themes, panels, harnesses or bridge)".into());
+    if m.themes.is_empty() && m.panels.is_empty() && m.harnesses.is_empty() && m.mcp_servers.is_empty() && m.bridge.is_none() {
+        return Err("this plugin contributes nothing Vicuna supports yet (themes, panels, harnesses, MCP servers or bridge)".into());
     }
     crate::plugin_harness::validate(&m.harnesses)?;
+    crate::plugin_mcp::validate(&m.id, &m.mcp_servers)?;
     if m.panels.len() > MAX_PANELS {
         return Err(format!("at most {MAX_PANELS} panels per plugin"));
     }
@@ -673,7 +677,7 @@ fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)], binary:
         }
         // plugin storage + harness consent carry over; consent is bound to
         // the exact command, so a changed command is disabled until approved
-        for keep in [DATA, "consent.json"] {
+        for keep in [DATA, "consent.json", crate::plugin_mcp::CONSENT_FILE] {
             if let Ok(data) = std::fs::read(dir.join(keep)) {
                 std::fs::write(stage.join(keep), data).map_err(|e| e.to_string())?;
             }
@@ -802,6 +806,13 @@ fn entry_in_dir(m: &Manifest, i: &InstallInfo, dir: Option<&Path>) -> Value {
             .map(|h| crate::plugin_harness::describe(h, &consent, &m.id))
             .collect();
         e["pendingConsent"] = json!(pending);
+    }
+    if !m.mcp_servers.is_empty() {
+        let dir = dir.map(Path::to_path_buf).unwrap_or_default();
+        let consent = crate::plugin_mcp::read_consent(&dir);
+        let d = |s: &crate::plugin_mcp::PluginMcpServer| crate::plugin_mcp::describe(s, &consent, &m.id);
+        e["mcpServers"] = json!(m.mcp_servers.iter().map(d).collect::<Vec<_>>());
+        e["pendingMcpConsent"] = json!(crate::plugin_mcp::pending(&consent, &m.mcp_servers).into_iter().map(d).collect::<Vec<_>>());
     }
     if !m.panels.is_empty() {
         // server-relative; the window prefixes its backend's base URL
@@ -1036,7 +1047,7 @@ fn parse_entry(v: &Value) -> Result<CatalogEntry, String> {
     }
     let mut kinds: Vec<String> = Vec::new();
     for k in v["kinds"].as_array().ok_or("missing kinds")? {
-        let k = k.as_str().filter(|k| matches!(*k, "theme" | "panel" | "harness" | "bridge")).ok_or("unknown kind")?;
+        let k = k.as_str().filter(|k| matches!(*k, "theme" | "panel" | "harness" | "mcp" | "bridge")).ok_or("unknown kind")?;
         if !kinds.iter().any(|x| x == k) {
             kinds.push(k.to_string());
         }
@@ -1164,6 +1175,21 @@ pub async fn action(cmd: &str, args: &Value) -> Result<Value, String> {
             let id = s("id")?;
             let (_, dir) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
             crate::plugin_harness::revoke(&dir, args.get("harness").and_then(|v| v.as_str()))?;
+            let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
+            Ok(entry(&m, &i))
+        }
+        "plugin_mcp_consent" => {
+            let id = s("id")?;
+            let (m, dir) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
+            let approved = args.get("servers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            crate::plugin_mcp::grant(&dir, &m.mcp_servers, &approved, chrono_now())?;
+            let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
+            Ok(entry(&m, &i))
+        }
+        "plugin_mcp_revoke" => {
+            let id = s("id")?;
+            let (_, dir) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
+            crate::plugin_mcp::revoke(&dir, args.get("server").and_then(|v| v.as_str()))?;
             let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
             Ok(entry(&m, &i))
         }
@@ -1295,6 +1321,8 @@ mod tests {
         for k in ["icon", "screenshot", "tags", "minVicuna"] {
             e.as_object_mut().unwrap().remove(k);
         }
+        e["kinds"] = json!(["mcp"]);
+        assert_eq!(parse_entry(&e).unwrap().kinds, vec!["mcp".to_string()]);
         e["kinds"] = json!(["panel", "panel", "theme"]);
         let c = parse_entry(&e).unwrap();
         assert_eq!((c.icon, c.tags.len(), c.kinds), (None, 0, vec!["panel".to_string(), "theme".to_string()]));
@@ -1356,6 +1384,17 @@ mod tests {
                     let args = if v == "1.0.0" { json!(["acp"]) } else { json!(["acp", "--other"]) };
                     let m = json!({"id": "agent", "name": "Agent", "version": v,
                         "harnesses": [{"id": "demo", "label": "Demo", "acp": {"command": "true", "args": args}}]});
+                    ("200 OK", m.to_string())
+                } else if req.starts_with("GET /repos/me/tools/contents/vicuna-plugin.json") {
+                    // an MCP plugin whose stdio args change in 3.0.0
+                    let args = if v == "3.0.0" { json!(["--stdio", "--write"]) } else { json!(["--stdio"]) };
+                    let m = json!({"id": "tools", "name": "Tools", "version": v, "mcpServers": [
+                        {"id": "web", "label": "Web", "type": "http", "url": "https://mcp.example.com/mcp"},
+                        {"id": "files", "type": "stdio", "command": "files-mcp", "args": args}]});
+                    ("200 OK", m.to_string())
+                } else if req.starts_with("GET /repos/me/evilmcp/contents/vicuna-plugin.json") {
+                    let m = json!({"id": "evilmcp", "name": "E", "version": "1", "mcpServers": [
+                        {"id": "x", "type": "stdio", "command": "x", "env": {"LD_PRELOAD": "/x.so"}}]});
                     ("200 OK", m.to_string())
                 } else if req.starts_with("GET /repos/me/evil/contents/vicuna-plugin.json") {
                     let m = json!({"id": "evil", "name": "Evil", "version": "1",
@@ -1478,6 +1517,38 @@ mod tests {
         assert!(!Engine::all().contains(&engine));
         assert_eq!(serve_panel(&format!("{base}notes.html")).0, 404);
         assert!(action("plugin_uninstall", &json!({"id": "nord"})).await.is_err());
+
+        // ---- MCP plugins: default-disabled, consent bound to the launch ----
+        assert!(action("plugin_install", &json!({"source": "me/evilmcp"})).await.unwrap_err().contains("LD_PRELOAD"));
+        *version.lock().unwrap() = "1.0.0".into();
+        let e = action("plugin_install", &json!({"source": "me/tools"})).await.unwrap();
+        assert_eq!(e["mcpServers"][0]["serverId"], "tools-web");
+        assert_eq!(e["pendingMcpConsent"].as_array().unwrap().len(), 2);
+        assert!(crate::plugin_mcp::consented_servers().is_empty(), "installing never adds servers");
+        assert_eq!(crate::plugin_mcp::owner("tools-files").as_deref(), Some("Tools"));
+        let web = json!({"id": "web", "type": "http", "url": "https://mcp.example.com/mcp"});
+        let files = |args: Value| json!({"id": "files", "type": "stdio", "command": "files-mcp", "args": args});
+        assert!(action("plugin_mcp_consent", &json!({"id": "tools", "servers": [files(json!(["--other"]))]})).await.is_err());
+        let e = action("plugin_mcp_consent", &json!({"id": "tools", "servers": [web, files(json!(["--stdio"]))]})).await.unwrap();
+        assert_eq!(e["pendingMcpConsent"].as_array().unwrap().len(), 0);
+        let ids: Vec<String> = crate::plugin_mcp::consented_servers().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["tools-files".to_string(), "tools-web".into()]);
+        assert!(crate::plugin_mcp::consented_servers().iter().all(|c| !c.enabled && c.plugin_id.as_deref() == Some("tools")));
+        assert!(dir.join("tools").join(crate::plugin_mcp::CONSENT_FILE).exists());
+        // unchanged upgrade (new version, same launches) keeps consent ...
+        *version.lock().unwrap() = "2.0.0".into();
+        assert_eq!(action("plugin_upgrade", &json!({"id": "tools"})).await.unwrap()["pendingMcpConsent"].as_array().unwrap().len(), 0);
+        assert_eq!(crate::plugin_mcp::consented_servers().len(), 2);
+        // ... changed args invalidate only that server
+        *version.lock().unwrap() = "3.0.0".into();
+        let e = action("plugin_upgrade", &json!({"id": "tools"})).await.unwrap();
+        assert_eq!(e["pendingMcpConsent"][0]["args"], json!(["--stdio", "--write"]));
+        let ids: Vec<String> = crate::plugin_mcp::consented_servers().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["tools-web".to_string()]);
+        action("plugin_mcp_revoke", &json!({"id": "tools", "server": "web"})).await.unwrap();
+        assert!(crate::plugin_mcp::consented_servers().is_empty());
+        action("plugin_uninstall", &json!({"id": "tools"})).await.unwrap();
+        assert!(crate::plugin_mcp::owner("tools-web").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -785,10 +785,27 @@ async fn dispatch(
             bridge_plugins::action(st, cmd, args).await
         }
         "whisper_status" | "whisper_install" | "whisper_uninstall" => telegram::action(st, cmd, args).await,
-        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" | "plugin_harness_consent" | "plugin_harness_revoke" => {
+        "plugin_catalog" | "plugin_list" | "plugin_install" | "plugin_upgrade" | "plugin_uninstall" | "plugin_harness_consent" | "plugin_harness_revoke" | "plugin_mcp_consent" | "plugin_mcp_revoke" => {
+            // plugin MCP servers that lose consent (revoke, uninstall, an
+            // upgrade that changed their launch) are disconnected at once
+            let before: Vec<String> = crate::plugin_mcp::consented_servers().into_iter().map(|c| c.id).collect();
+            let uninstalled = (cmd == "plugin_uninstall")
+                .then(|| args.get("id").and_then(|v| v.as_str()).and_then(crate::plugins::installed_manifest))
+                .flatten()
+                .map(|(m, _)| crate::plugin_mcp::ids_for(&m));
             let res = crate::plugins::action(cmd, &args).await;
             if res.is_ok() && matches!(cmd, "plugin_install" | "plugin_upgrade" | "plugin_uninstall") {
                 bridge_plugins::notify_plugins_changed();
+            }
+            if res.is_ok() {
+                let after: Vec<String> = crate::plugin_mcp::consented_servers().into_iter().map(|c| c.id).collect();
+                let file: Vec<String> = crate::mcp::list_file_servers().unwrap_or_default().into_iter().map(|c| c.id).collect();
+                for id in before.iter().filter(|id| !after.contains(id) && !file.contains(id)) {
+                    let _ = st.mcp.disconnect(id).await;
+                }
+                if let Some(ids) = uninstalled {
+                    let _ = crate::mcp::forget_plugin_defaults(&ids);
+                }
             }
             res
         }
@@ -1553,6 +1570,8 @@ pub const API_ACTIONS: &[&str] = &[
     "plugin_uninstall",
     "plugin_harness_consent",
     "plugin_harness_revoke",
+    "plugin_mcp_consent",
+    "plugin_mcp_revoke",
     "plugin_upgrade",
     "schedule_list",
     "schedule_put",

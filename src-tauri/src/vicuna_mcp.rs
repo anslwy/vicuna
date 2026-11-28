@@ -1966,6 +1966,8 @@ async fn manage_mcp_in(
                 url: final_url,
                 headers: final_headers,
                 oauth: None,
+                plugin_id: None,
+                plugin_name: None,
                 enabled,
             };
             save_server_in(path, &cfg)?;
@@ -2004,6 +2006,9 @@ async fn manage_mcp_in(
                 return Err("`vicuna-mcp` is a fixed built-in server and cannot be modified.".to_string());
             }
             let existing_list = list_servers_in(path)?;
+            if find_server(&existing_list, raw_name).is_none() {
+                crate::mcp::plugin_guard(&json!({}), raw_name)?;
+            }
             let prev = find_server(&existing_list, raw_name)
                 .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
                 .clone();
@@ -2060,6 +2065,8 @@ async fn manage_mcp_in(
                 url: final_url,
                 headers: final_headers,
                 oauth: prev.oauth.clone(),
+                plugin_id: None,
+                plugin_name: None,
                 enabled,
             };
 
@@ -2152,6 +2159,9 @@ async fn manage_mcp_in(
                 return Err("`vicuna-mcp` is a fixed built-in server and cannot be removed.".to_string());
             }
             let existing_list = list_servers_in(path)?;
+            if find_server(&existing_list, raw_name).is_none() {
+                crate::mcp::plugin_guard(&json!({}), raw_name)?;
+            }
             let prev = find_server(&existing_list, raw_name)
                 .ok_or_else(|| format!("MCP server `{}` not found", raw_name.trim()))?
                 .clone();
@@ -3655,6 +3665,29 @@ mod tests {
         assert!(c.ends_with("▸ Bash: ls\n\nFINAL") && c.starts_with('…') && !c.contains('<'), "{c}");
         assert_eq!(t["messages"][0]["chars"], huge.chars().count() as i64);
         assert_eq!(t["messages"][0]["truncated"], true);
+    }
+
+
+    #[tokio::test]
+    async fn manage_mcp_refuses_editing_plugin_servers() {
+        let dir = std::env::temp_dir().join(format!("vicuna-mcp-plugin-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("vicuna.json");
+        let context = TurnMcp { manager: None, resources: None, local: Default::default(), server: None };
+        let plugin = crate::mcp::McpServerConfig {
+            id: "demo-web".into(), name: "demo-web".into(), transport: "http".into(), command: None, env: None,
+            url: Some("https://plugin.example/mcp".into()), headers: None, oauth: None, enabled: false,
+            plugin_id: Some("demo".into()), plugin_name: Some("Demo".into()),
+        };
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = Some(vec![(plugin, true)]));
+        for act in ["edit", "remove"] {
+            let err = manage_mcp_in(Some(&cfg_path), &json!({"action": act, "name": "demo-web", "url": "https://x.dev/mcp"}), &context, "test")
+                .await.err().unwrap();
+            assert!(err.contains("provided by the plugin") && err.contains("Settings → Plugins"), "{act}: {err}");
+        }
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -9230,6 +9230,7 @@
     activeThemeKey={pluginTheme?.key ?? null}
     onChanged={onPluginsChanged}
     onHarnessesChanged={() => void refreshWorkEngine()}
+    onMcpChanged={() => void mcp.loadMcpServers()}
     onUseTheme={usePluginTheme}
     onOpenPanel={(k) => { pluginsOpen = false; openSidePanel(k); }}
     onClose={() => (pluginsOpen = false)}

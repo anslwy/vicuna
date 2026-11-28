@@ -3,6 +3,7 @@
   import { describeServer as describeMcpServer, type McpServerConfig, type McpTool } from "$lib/mcp";
   import type { BuiltinMcp } from "$lib/mcp-builtins";
   import { isBrowserMcpId } from "$lib/browser";
+  import { isPluginMcpServer } from "$lib/pluginMcp";
 
   export type McpFormState = {
     name: string;
@@ -275,7 +276,7 @@
         role="option"
         aria-selected={i === mcpSel}
         tabindex="0"
-        title={isBrowserMcpId(s.id) ? "Built-in shared browser (lb mcp) — same tabs as the Browser tab" : describeMcpServer(s)}
+        title={isBrowserMcpId(s.id) ? "Built-in shared browser (lb mcp) — same tabs as the Browser tab" : isPluginMcpServer(s) ? `From the ${s.pluginName ?? s.pluginId} plugin — ${describeMcpServer(s)}` : describeMcpServer(s)}
         onclick={() => {
           mcpSel = i;
           void toggleMcpServer(s.id);
@@ -293,6 +294,7 @@
         }}
       >
         <span class="mcp-name">{s.name}</span>
+        {#if isPluginMcpServer(s)}<span class="mcp-plugin-badge" data-testid="mcp-plugin-badge" title="Provided by the {s.pluginName ?? s.pluginId} plugin; manage it in Settings → Plugins">{s.pluginName ?? s.pluginId}</span>{/if}
         <span class="mcp-tools-n">{st.kind === "connected" && live ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
         <span class="mcp-status {st.kind}">{st.label}</span>
         {#if st.label === "Sign in required →"}
@@ -301,7 +303,7 @@
             void signInMcpServer(s.id);
           }}>Sign in</button>
         {/if}
-        {#if !isBrowserMcpId(s.id)}
+        {#if !isBrowserMcpId(s.id) && !isPluginMcpServer(s)}
         <span class="mcp-row-actions">
           <button
             class="mcp-mini"
@@ -615,4 +617,5 @@
   .mcp-pat-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--code-inline); border-radius: 6px; padding: 1px 5px; }
   .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
   .mcp-pat-link:hover { text-decoration: underline; }
+  .mcp-plugin-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted, inherit); white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 </style>

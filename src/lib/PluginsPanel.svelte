@@ -6,10 +6,12 @@
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
   import { accountSummary, commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
+  import { mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, type PluginMcpServer } from "./pluginMcp";
   import { cardAction, filterCatalog, githubRepoUrl, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
-  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged }: {
+  let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged, onMcpChanged }: {
     onHarnessesChanged?: () => void;
+    onMcpChanged?: () => void;
     plugins: InstalledPlugin[];
     activeThemeKey: string | null;
     onChanged: (list: InstalledPlugin[]) => void;
@@ -52,6 +54,63 @@
 
   function askConsent(p: InstalledPlugin, list = pendingConsent(p)) {
     if (list.length) consent = { plugin: p, harnesses: list };
+    // MCP servers ask right after (one dialog at a time)
+    const mcp = pendingMcpConsent(p);
+    if (mcp.length) {
+      if (consent) mcpQueued = p;
+      else mcpConsent = { plugin: p, servers: mcp };
+    }
+  }
+
+  // Plugin MCP server consent (plugin_mcp.rs): same flow as harnesses. A
+  // consented server joins the MCP dialog disabled; the user turns it on there.
+  let mcpConsent = $state<{ plugin: InstalledPlugin; servers: PluginMcpServer[] } | null>(null);
+  let mcpQueued: InstalledPlugin | null = null;
+  let mcpBusy = $state(false);
+
+  function nextMcpConsent() {
+    const p = mcpQueued;
+    mcpQueued = null;
+    const list = pendingMcpConsent(p);
+    if (p && list.length) mcpConsent = { plugin: p, servers: list };
+  }
+
+  function askMcpConsent(p: InstalledPlugin, servers: PluginMcpServer[]) {
+    if (servers.length) mcpConsent = { plugin: p, servers };
+  }
+
+  async function acceptMcpConsent() {
+    if (!mcpConsent || mcpBusy) return;
+    mcpBusy = true;
+    try {
+      await invokeOrBridge("plugin_mcp_consent", mcpConsentPayload(mcpConsent.plugin.id, mcpConsent.servers));
+      notice = `Added ${mcpConsent.servers.map((s) => s.label).join(", ")} to the MCP list (off until you enable ${mcpConsent.servers.length === 1 ? "it" : "them"} there).`;
+      mcpConsent = null;
+      onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+      onMcpChanged?.();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+      mcpConsent = null;
+    } finally {
+      mcpBusy = false;
+    }
+  }
+
+  function declineMcpConsent() {
+    if (!mcpConsent) return;
+    notice = `${mcpConsent.servers.map((s) => s.label).join(", ")} not added. Allow ${mcpConsent.servers.length === 1 ? "it" : "them"} later from Installed.`;
+    mcpConsent = null;
+  }
+
+  async function revokeMcp(p: InstalledPlugin, s: PluginMcpServer) {
+    try {
+      await invokeOrBridge("plugin_mcp_revoke", { id: p.id, server: s.id });
+      notice = `Removed ${s.label} from the MCP list.`;
+      onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
+      onMcpChanged?.();
+    } catch (e: any) {
+      error = e?.message ?? String(e);
+    }
   }
 
   async function acceptConsent() {
@@ -68,6 +127,7 @@
       consent = null;
     } finally {
       consentBusy = false;
+      nextMcpConsent();
     }
   }
 
@@ -75,6 +135,7 @@
     if (!consent) return;
     notice = `${consent.harnesses.map((h) => h.label).join(", ")} left disabled. Enable it later from Installed.`;
     consent = null;
+    nextMcpConsent();
   }
 
   async function disableHarness(p: InstalledPlugin, h: PluginHarness) {
@@ -199,6 +260,7 @@
       notice = `Uninstalled ${p.name}.`;
       onChanged(await invokeOrBridge<InstalledPlugin[]>("plugin_list", {}));
       if (p.harnesses?.length) onHarnessesChanged?.();
+      if (p.mcpServers?.length) onMcpChanged?.();
       if (catalog) void loadCatalog();
     } catch (e: any) {
       error = e?.message ?? String(e);
@@ -301,7 +363,7 @@
       <p class="pl-muted pl-foot">From the <a href="https://github.com/anslwy/vicuna-plugins" target="_blank" rel="noopener noreferrer">Vicuna plugin index</a>{#if catalog.skipped} · {catalog.skipped} invalid {catalog.skipped === 1 ? "entry" : "entries"} hidden{/if}. Plugins are made by their authors; install only what you trust.</p>
     {/if}
   {:else}
-  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in), a local folder path, or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes, side panels, Work harnesses, and messaging bridges.</p>
+  <p class="pl-muted">Install plugins from a GitHub repo (<code>owner/repo</code> or its URL — private repos use the server's <code>gh</code> sign-in), a local folder path, or a direct <code>vicuna-plugin.json</code> link. Plugins can add themes, side panels, Work harnesses, MCP servers, and messaging bridges.</p>
   <form class="pl-row" onsubmit={(e) => { e.preventDefault(); void install(); }}>
     <input class="pl-input" data-testid="plugin-source" placeholder="owner/repo, /path/to/plugin, or https://github.com/owner/repo" bind:value={source} spellcheck="false" autocomplete="off" />
     <button class="pl-btn primary" data-testid="plugin-install" type="submit" disabled={installBlocked(source, busy)}>{busy === "install" ? "Installing…" : "Install"}</button>
@@ -359,6 +421,20 @@
               {/if}
             </div>
           {/each}
+          {#each p.mcpServers ?? [] as m (m.id)}
+            <div class="pl-harness" data-testid="plugin-mcp-{p.id}-{m.id}">
+              <span class="pl-name">MCP · {m.label}</span>
+              <code class="pl-cmd" title={m.type === "http" ? "The MCP endpoint" : "The command this MCP server runs"}>{mcpLaunchLine(m)}</code>
+              {#if m.enabled}<span class="pl-badge ok" title="Listed in the MCP dialog as {m.serverId}">Allowed</span>{:else}<span class="pl-badge">Not allowed</span>{/if}
+              {#if !m.installed}<span class="pl-badge" title={m.installHint ?? ""}>`{m.command}` not found</span>{/if}
+              <span class="pl-spacer"></span>
+              {#if m.enabled}
+                <button class="pl-btn" data-testid="plugin-mcp-revoke-{p.id}-{m.id}" onclick={() => revokeMcp(p, m)}>Remove</button>
+              {:else}
+                <button class="pl-btn primary" data-testid="plugin-mcp-allow-{p.id}-{m.id}" onclick={() => askMcpConsent(p, [m])}>Allow…</button>
+              {/if}
+            </div>
+          {/each}
           {#each p.themes as t (t.id)}
             {@const key = `${p.id}/${t.id}`}
             <button class="pl-theme {activeThemeKey === key ? 'sel' : ''}" data-testid="plugin-theme-{p.id}-{t.id}" onclick={() => onUseTheme(p.id, t.id)} title="Use this theme">
@@ -399,6 +475,33 @@
     <div class="pl-row pl-consent-actions">
       <button class="pl-btn" data-testid="harness-consent-decline" onclick={declineConsent}>Not now</button>
       <button class="pl-btn primary" data-testid="harness-consent-accept" disabled={consentBusy} onclick={acceptConsent}>{consentBusy ? "Enabling…" : "Allow and enable"}</button>
+    </div>
+  </div>
+  </div>
+{/if}
+
+{#if mcpConsent}
+  <div use:portal class="pl-portal">
+  <div class="pl-backdrop" role="presentation" onclick={declineMcpConsent}></div>
+  <div class="pl-consent" role="dialog" aria-modal="true" aria-labelledby="pl-mcp-consent-title" data-testid="mcp-consent">
+    <h3 id="pl-mcp-consent-title">Allow {mcpConsent.plugin.name} to add MCP {mcpConsent.servers.length === 1 ? "server" : "servers"}?</h3>
+    <p class="pl-muted">{mcpConsent.servers.length === 1 ? "It" : "They"} will appear in the MCP dialog (switched off until you enable {mcpConsent.servers.length === 1 ? "it" : "them"}). When enabled, Work agents can call {mcpConsent.servers.length === 1 ? "its" : "their"} tools, and Vicuna will connect to exactly:</p>
+    {#each mcpConsent.servers as m (m.id)}
+      <div class="pl-consent-h">
+        <div class="pl-name">{m.label} <span class="pl-muted">({m.serverId})</span></div>
+        {#if m.description}<div class="pl-muted">{m.description}</div>{/if}
+        <code class="pl-cmd big" data-testid="mcp-consent-launch-{m.id}">{mcpLaunchLine(m)}</code>
+        {#if m.type === "stdio"}
+          <div class="pl-muted">{m.installed ? `Found \`${m.command}\` on this server's PATH.` : `\`${m.command}\` is not installed on this server yet. ${m.installHint ?? ""}`}</div>
+        {:else}
+          <div class="pl-muted">A remote server. If it asks you to sign in, Vicuna runs the normal browser sign-in; the plugin never sees your tokens.</div>
+        {/if}
+      </div>
+    {/each}
+    <p class="pl-warn">{mcpConsent.servers.some((m) => m.type === "stdio") ? "Local servers run as you, from your own install (not from the plugin). " : ""}Tool results go to your agent, and the agent can send data to these servers. Only allow plugins you trust. If an upgrade changes the endpoint or command, Vicuna asks again.</p>
+    <div class="pl-row pl-consent-actions">
+      <button class="pl-btn" data-testid="mcp-consent-decline" onclick={declineMcpConsent}>Not now</button>
+      <button class="pl-btn primary" data-testid="mcp-consent-accept" disabled={mcpBusy} onclick={acceptMcpConsent}>{mcpBusy ? "Allowing…" : "Allow"}</button>
     </div>
   </div>
   </div>
