@@ -769,6 +769,25 @@ async fn check_engine_model(engine: &str) -> Result<Engine, String> {
 /// Session control for the `vicuna` CLI (no window, no lead): list, get,
 /// create, send, stop, update, archive/unarchive, delete. Turns run through
 /// the same server-owned path as scheduled sends and worker sessions.
+/// `get` with `omit_images`: swap each message's base64 `images` for
+/// `images_meta` and list the session's staged `uploads` (metadata only).
+pub(crate) fn omit_images(row: &mut Value, id: &str) {
+    if let Some(msgs) = row["messages"].as_array_mut() {
+        for m in msgs {
+            if let Some(imgs) = m.as_object_mut().and_then(|o| o.remove("images")) {
+                let meta = crate::attachments::images_meta(&imgs);
+                if !meta.is_empty() {
+                    m["images_meta"] = json!(meta);
+                }
+            }
+        }
+    }
+    let uploads = crate::attachments::uploads_meta(id);
+    if !uploads.is_empty() {
+        row["uploads"] = json!(uploads);
+    }
+}
+
 pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> Result<Value, String> {
     let db = st.db.as_ref().ok_or("this bridge has no session database; run `vicuna serve`")?;
     let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -815,6 +834,9 @@ pub async fn cli_session(st: &Arc<BridgeState>, action: &str, args: &Value) -> R
         "get" => {
             let mut row = session_row(st, &chat);
             row["messages"] = chat["messages"].clone();
+            if args.get("omit_images").and_then(Value::as_bool) == Some(true) {
+                omit_images(&mut row, &id);
+            }
             row["goal"] = chat.get("goal").cloned().unwrap_or(Value::Null);
             Ok(row)
         }

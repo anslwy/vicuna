@@ -166,8 +166,51 @@ pub async fn control(st: &Arc<BridgeState>, lead_id: &str, action: &str, args: &
 /// (`offset`/`limit`/`tail`, `max_chars_per_message`, `plain`).
 pub async fn read(server: &str, session_id: &str, args: &Value) -> Result<String, String> {
     let entry = resolve(server, &servers::load())?;
-    let s = cli(&entry, "get", json!({"id": session_id})).await?;
+    // updated servers answer `omit_images` with lightweight `images_meta` +
+    // `uploads`; older ones ignore it and still send base64 (`page` strips it)
+    let s = cli(&entry, "get", json!({"id": session_id, "omit_images": true})).await?;
     Ok(page(&entry.name, &s, args).to_string())
+}
+
+/// Image metadata of a remote message: `images_meta` (updated servers) or the
+/// raw `images` data URLs (older servers), never base64.
+fn message_images_meta(m: &Value) -> Vec<Value> {
+    if let Some(meta) = m.get("images_meta").and_then(Value::as_array) {
+        return meta.iter().filter_map(|x| {
+            Some(json!({"index": x.get("index")?.as_u64()?, "mime": x.get("mime")?.as_str()?, "bytes": x.get("bytes")?.as_u64()?}))
+        }).collect();
+    }
+    m.get("images").map(crate::attachments::images_meta).unwrap_or_default()
+}
+
+/// `read_attachment` with `server`: ONE inline image or upload file through
+/// the remote's `server_read_attachment` action.
+pub async fn read_attachment(server: &str, session_id: &str, which: &crate::attachments::Which) -> Result<crate::attachments::Attachment, String> {
+    let entry = resolve(server, &servers::load())?;
+    fetch_attachment(&entry.name, &entry.url, &entry.token, session_id, which).await
+}
+
+pub(crate) fn attachment_args(session_id: &str, which: &crate::attachments::Which) -> Value {
+    use crate::attachments::Which;
+    match which {
+        Which::Inline { message_idx, image_index } => json!({"session_id": session_id, "message_idx": message_idx, "image_index": image_index}),
+        Which::Upload { filename } => json!({"session_id": session_id, "filename": filename}),
+    }
+}
+
+pub(crate) fn attachment_error(name: &str, e: &str) -> String {
+    if e.contains("unknown bridge command") || e.contains("unknown action") || e.contains("unknown command") {
+        format!("{name} runs an older Vicuna without attachment reading; the remote Vicuna server needs to be upgraded (`vicuna upgrade` on that machine).")
+    } else {
+        format!("{name}: {e}")
+    }
+}
+
+async fn fetch_attachment(name: &str, url: &str, token: &str, session_id: &str, which: &crate::attachments::Which) -> Result<crate::attachments::Attachment, String> {
+    let body = json!({"cmd": "server_read_attachment", "args": attachment_args(session_id, which)});
+    let v = servers::request(url, token, "/invoke", Some(&body), CALL_TIMEOUT).await?;
+    let data = unwrap_invoke(v).map_err(|e| attachment_error(name, &e))?;
+    crate::attachments::from_wire(&data)
 }
 
 fn page(server: &str, s: &Value, args: &Value) -> Value {
@@ -194,17 +237,24 @@ fn page(server: &str, s: &Value, args: &Value) -> Value {
         let mut o = json!({"index": i, "role": m["role"], "content": cut, "chars": chars});
         if thinking { if let Some(t) = m.get("thinking").filter(|t| t.is_string()) { o["thinking"] = t.clone(); } }
         if let Some(model) = m.get("model").filter(|v| v.is_string()) { o["model"] = model.clone(); }
+        let imgs = message_images_meta(m);
+        if !imgs.is_empty() { o["images"] = json!(imgs); }
         o
     }).collect();
     let next = offset + out.len();
-    json!({
+    let uploads: Vec<Value> = s["uploads"].as_array().into_iter().flatten().filter_map(|u| {
+        Some(json!({"name": u.get("name")?.as_str()?, "bytes": u.get("bytes")?.as_u64()?}))
+    }).collect();
+    let mut out = json!({
         "server": server, "session_id": s["id"], "title": s["title"], "mode": s["mode"],
         "workspace": s["workspace"], "workspace_note": "This folder is on the other server's machine, not here.",
         "engine": s["engine"], "model": s["model"], "running": s["running"],
         "total": total, "offset": offset, "returned": out.len(),
         "next_offset": if next < total { json!(next) } else { Value::Null },
         "messages": out,
-    })
+    });
+    if !uploads.is_empty() { out["uploads"] = json!(uploads); }
+    out
 }
 
 /// `search_sessions` with `server`.
@@ -358,5 +408,50 @@ mod tests {
         assert_eq!(t["messages"][1]["chars"], 9);
         assert!(t["next_offset"].is_null());
         assert_eq!(page("deck", &s, &json!({"offset": 99}))["returned"], 0);
+    }
+
+    #[test]
+    fn remote_page_extracts_image_metadata_new_and_old_servers() {
+        let b64 = "iVBORw==";
+        // updated server: images_meta + uploads
+        let new = json!({"id":"s","messages":[{"role":"user","content":"a","images_meta":[{"index":0,"mime":"image/png","bytes":4}]}],"uploads":[{"name":"r.pdf","bytes":9}]});
+        let p = page("deck", &new, &json!({}));
+        assert_eq!(p["messages"][0]["images"], json!([{"index":0,"mime":"image/png","bytes":4}]));
+        assert_eq!(p["uploads"], json!([{"name":"r.pdf","bytes":9}]));
+        // older server ignoring omit_images: raw data URLs, never echoed
+        let old = json!({"id":"s","messages":[{"role":"user","content":"a","images":[format!("data:image/png;base64,{b64}")]},{"role":"assistant","content":"b"}]});
+        let p = page("deck", &old, &json!({}));
+        assert_eq!(p["messages"][0]["images"], json!([{"index":0,"mime":"image/png","bytes":4}]));
+        assert!(p["messages"][1].get("images").is_none());
+        assert!(p.get("uploads").is_none());
+        assert!(!p.to_string().contains(b64));
+    }
+
+    #[test]
+    fn server_omits_images_and_old_servers_get_a_clear_error() {
+        let mut row = json!({"messages":[{"role":"user","content":"a","images":["data:image/jpeg;base64,QUJD"]},{"role":"assistant","content":"b"}]});
+        super::turns::omit_images(&mut row, "../bad id");
+        assert!(row["messages"][0].get("images").is_none());
+        assert_eq!(row["messages"][0]["images_meta"], json!([{"index":0,"mime":"image/jpeg","bytes":3}]));
+        assert!(row["messages"][1].get("images_meta").is_none());
+        let e = attachment_error("VPS", "unknown bridge command: server_read_attachment");
+        assert!(e.contains("needs to be upgraded") && e.contains("VPS"), "{e}");
+        assert_eq!(attachment_error("VPS", "Message 3 not found"), "VPS: Message 3 not found");
+        use crate::attachments::Which;
+        assert_eq!(attachment_args("s", &Which::Inline { message_idx: 2, image_index: 1 }), json!({"session_id":"s","message_idx":2,"image_index":1}));
+        assert_eq!(attachment_args("s", &Which::Upload { filename: "f".into() }), json!({"session_id":"s","filename":"f"}));
+    }
+
+    #[tokio::test]
+    async fn server_read_attachment_round_trips_one_image() {
+        use crate::attachments::{from_wire, parse_which, read_local, to_wire};
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE messages (chat_id TEXT, idx INTEGER, images TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages VALUES ('s', 0, '[\"data:image/gif;base64,R0lG\"]')").execute(&pool).await.unwrap();
+        let args = attachment_args("s", &parse_which(&json!({"message_idx": 0})).unwrap());
+        let wire = to_wire(&read_local(Some(&pool), "s", &parse_which(&args).unwrap()).await.unwrap());
+        assert_eq!(wire["mime"], "image/gif");
+        let a = from_wire(&wire).unwrap();
+        assert_eq!(a.data, b"GIF");
     }
 }
