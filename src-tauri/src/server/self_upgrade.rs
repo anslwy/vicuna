@@ -1,22 +1,34 @@
 // In-app upgrade of a headless `vicuna serve` (desktop server menu → Upgrade).
 //
-// `server_upgrade_check` compares this build with the newest stable GitHub
-// release; `server_upgrade` runs `<this exe> upgrade` detached, so the CLI's
+// `server_upgrade_check` compares this build with the newest release on the
+// client's update channel (stable GitHub release, or the rolling dev
+// prerelease's latest.json); `server_upgrade` runs `<this exe> upgrade
+// [--dev]` detached, so the CLI's
 // own checksum-verified install + db backup + restart (bridge/src/upgrade.rs)
 // does the work exactly like a terminal `vicuna upgrade`. The desktop's
 // embedded server never upgrades itself: the app updater owns that binary.
 
 const REPO: &str = "anslwy/vicuna";
 
-pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
-    let s = s.trim().trim_start_matches('v');
-    let core = s.split(['-', '+']).next()?;
-    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
-    Some((it.next()??, it.next().flatten().unwrap_or(0), it.next().flatten().unwrap_or(0)))
+/// Which build the in-app upgrade targets: the app's Settings → Update
+/// channel. Older clients send no `channel` → stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Stable,
+    Dev,
+}
+
+impl Channel {
+    pub fn from_arg(v: Option<&serde_json::Value>) -> Self {
+        match v.and_then(|v| v.as_str()) {
+            Some(s) if s.trim().eq_ignore_ascii_case("dev") => Channel::Dev,
+            _ => Channel::Stable,
+        }
+    }
 }
 
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    matches!((parse_version(latest), parse_version(current)), (Some(l), Some(c)) if l > c)
+    crate::version::is_newer(latest, current)
 }
 
 /// Strip Linux's ` (deleted)` suffix from `/proc/self/exe` when the binary on
@@ -47,36 +59,67 @@ pub fn can_upgrade() -> bool {
     }
 }
 
-pub async fn check() -> Result<serde_json::Value, String> {
-    let url = std::env::var("VICUNA_RELEASE_API")
-        .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"));
+async fn get_json(url: &str) -> Result<serde_json::Value, String> {
     let r = reqwest::Client::builder()
-        .user_agent(concat!("vicuna-server/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("vicuna-server/{}", crate::version::vicuna_version()))
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("release check failed: {e}"))?;
     if !r.status().is_success() {
         return Err(format!("release check failed: HTTP {}", r.status()));
     }
-    let v: serde_json::Value = r.json().await.map_err(|e| format!("release JSON: {e}"))?;
-    let latest = v.get("tag_name").and_then(|t| t.as_str()).ok_or("release has no tag_name")?;
-    let current = env!("CARGO_PKG_VERSION");
+    r.json().await.map_err(|e| format!("release JSON: {e}"))
+}
+
+/// Newest version on `channel`: the stable release's tag, or the rolling dev
+/// prerelease's `latest.json` `version` (`0.1.2-dev.<timestamp>`).
+pub async fn latest_version(channel: Channel) -> Result<String, String> {
+    match channel {
+        Channel::Stable => {
+            let url = std::env::var("VICUNA_RELEASE_API")
+                .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"));
+            let v = get_json(&url).await?;
+            let tag = v.get("tag_name").and_then(|t| t.as_str()).ok_or("release has no tag_name")?;
+            Ok(tag.trim_start_matches('v').to_string())
+        }
+        Channel::Dev => {
+            let url = std::env::var("VICUNA_DEV_MANIFEST_URL")
+                .unwrap_or_else(|_| format!("https://github.com/{REPO}/releases/download/latest/latest.json"));
+            let v = get_json(&url).await?;
+            let ver = v.get("version").and_then(|t| t.as_str()).ok_or("dev manifest has no version")?;
+            Ok(ver.trim_start_matches('v').to_string())
+        }
+    }
+}
+
+pub async fn check(channel: Channel) -> Result<serde_json::Value, String> {
+    let latest = latest_version(channel).await?;
+    let current = crate::version::vicuna_version();
     Ok(serde_json::json!({
         "current": current,
-        "latest": latest.trim_start_matches('v'),
-        "newer": is_newer(latest, current),
+        "latest": latest,
+        "channel": if channel == Channel::Dev { "dev" } else { "stable" },
+        "newer": is_newer(&latest, current),
         "canUpgrade": can_upgrade(),
     }))
+}
+
+/// Arguments for the detached upgrader: `upgrade` or `upgrade --dev`.
+pub fn upgrade_args(channel: Channel) -> &'static [&'static str] {
+    match channel {
+        Channel::Stable => &["upgrade"],
+        Channel::Dev => &["upgrade", "--dev"],
+    }
 }
 
 /// Start `vicuna upgrade` in its own process group, logging to
 /// `~/vicuna/server/upgrade.log`. Returns at once; the server restarts itself
 /// a few seconds later and clients reconnect.
-pub fn start() -> Result<serde_json::Value, String> {
+pub fn start(channel: Channel) -> Result<serde_json::Value, String> {
     if !can_upgrade() {
         return Err("This server can't upgrade itself from the app (desktop or dev build). Run `vicuna upgrade` on it.".into());
     }
@@ -95,7 +138,7 @@ pub fn start() -> Result<serde_json::Value, String> {
         let err = log.try_clone().map_err(|e| e.to_string())?;
         let offset = log.metadata().map(|m| m.len()).unwrap_or(0);
         let child = std::process::Command::new(&exe)
-            .arg("upgrade")
+            .args(upgrade_args(channel))
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(log)
@@ -107,6 +150,7 @@ pub fn start() -> Result<serde_json::Value, String> {
     }
     #[cfg(not(unix))]
     {
+        let _ = channel;
         Err("Run `vicuna upgrade` on the server.".into())
     }
 }
@@ -201,6 +245,24 @@ mod tests {
         assert!(is_newer("v0.0.10", "0.0.9"));
         assert!(!is_newer("v0.0.33", "0.0.33"));
         assert!(!is_newer("garbage", "0.0.1"));
+    }
+    #[test]
+    fn newer_handles_dev_prereleases() {
+        assert!(is_newer("0.1.2-dev.20261128155414", "0.1.1")); // stable → dev
+        assert!(is_newer("0.1.2-dev.20261128160000", "0.1.2-dev.20261128155414")); // dev → newer dev
+        assert!(is_newer("0.1.2", "0.1.2-dev.20261128160000")); // dev → stable
+        assert!(!is_newer("0.1.2-dev.20261128155414", "0.1.2-dev.20261128155414")); // same dev
+        assert!(is_newer("v0.1.2", "0.1.1")); // stable → stable
+        assert!(!is_newer("0.1.1", "0.1.2-dev.20261128155414"));
+    }
+    #[test]
+    fn channel_arg_defaults_to_stable_and_dev_passes_the_flag() {
+        assert_eq!(Channel::from_arg(None), Channel::Stable);
+        assert_eq!(Channel::from_arg(Some(&serde_json::json!("stable"))), Channel::Stable);
+        assert_eq!(Channel::from_arg(Some(&serde_json::json!(42))), Channel::Stable);
+        assert_eq!(Channel::from_arg(Some(&serde_json::json!("dev"))), Channel::Dev);
+        assert_eq!(upgrade_args(Channel::Stable), &["upgrade"]);
+        assert_eq!(upgrade_args(Channel::Dev), &["upgrade", "--dev"]);
     }
     #[test]
     fn strip_deleted_suffix_handles_linux_unlinked_exe() {

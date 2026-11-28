@@ -2050,14 +2050,17 @@
     get activeServer() { return activeServer; },
     get onServer() { return onServer; },
     get clientVersion() { return clientVersion; },
+    get updateChannel() { return appUpdate.updateChannel; },
     get uiReady() { return uiReady; },
     get flashNotice() { return flashNotice; },
     get error() { return error; },
     set error(v) { error = v; }
   });
 
-  /** this app's version vs. the remote `vicuna serve` it talks to */
-  const clientVersion: string = pkg.version;
+  /** this app's version vs. the remote `vicuna serve` it talks to: the
+   *  runtime build (`0.1.2-dev.<ts>` on dev builds) once `app_build_info`
+   *  answers, package.json until then */
+  const clientVersion: string = $derived(buildInfo?.version || pkg.version);
 
   async function openSettings() {
     pluginsOpen = false;
@@ -7145,6 +7148,7 @@
         .catch(() => {});
     }
     void initApp();
+    void refreshBuildInfo();
     void loadPlugins();
     void srv.refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.

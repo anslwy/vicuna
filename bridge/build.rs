@@ -22,6 +22,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=VICUNA_WEB_BUILD_DIR");
+    // the version itself is baked in vicuna_lib (src-tauri/build.rs); listed
+    // here too so a dev-version change relinks the binary
+    println!("cargo:rerun-if-env-changed=VICUNA_BUILD_VERSION");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = std::env::var("VICUNA_WEB_BUILD_DIR").map(PathBuf::from).unwrap_or_else(|_| manifest.join("../build"));
     println!("cargo:rerun-if-changed={}", root.display());

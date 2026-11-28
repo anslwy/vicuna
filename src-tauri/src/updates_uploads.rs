@@ -133,7 +133,7 @@ pub struct UpdateAsset {
 /// Build the `app_build_info` JSON payload for a given version string.
 /// Desktop passes `app.package_info().version` (which includes `--config`
 /// overrides such as `0.1.2-dev.20261128151100`); headless/server falls back
-/// to `CARGO_PKG_VERSION`.
+/// to `vicuna_version()` (the baked dev version on rolling builds).
 pub(crate) fn app_build_info_with_version(version: &str) -> serde_json::Value {
     serde_json::json!({
         "version": version,
@@ -144,7 +144,7 @@ pub(crate) fn app_build_info_with_version(version: &str) -> serde_json::Value {
 /// This build's version + baked timestamp (seconds since epoch, 0 when the
 /// build script couldn't read the clock).
 pub async fn app_build_info_logic() -> Result<serde_json::Value, String> {
-    Ok(app_build_info_with_version(env!("CARGO_PKG_VERSION")))
+    Ok(app_build_info_with_version(crate::version::vicuna_version()))
 }
 
 /// Pick the release-attachment fields the frontend needs out of the GitHub

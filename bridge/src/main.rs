@@ -226,7 +226,7 @@ fn main() {
             run_bridge(port);
         }
         Some("-h") | Some("--help") | Some("help") => println!("{USAGE}"),
-        Some("-V") | Some("--version") | Some("version") => println!("vicuna {}", env!("CARGO_PKG_VERSION")),
+        Some("-V") | Some("--version") | Some("version") => println!("vicuna {}", vicuna_lib::version::vicuna_version()),
         // `cargo run -- <port>` (the old bridge invocation) keeps working
         Some(p) if p.parse::<u16>().is_ok() => {
             run_bridge(p.parse().unwrap())

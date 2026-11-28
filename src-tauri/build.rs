@@ -1,4 +1,6 @@
 fn main() {
+    // rolling dev builds bake their version (crate::version::vicuna_version)
+    println!("cargo:rerun-if-env-changed=VICUNA_BUILD_VERSION");
     // Tauri's build step (config/ACL/resource validation, app context) is only
     // for the desktop app; the headless server build (`--no-default-features`)
     // has no window, no bundle and no frontend to embed.

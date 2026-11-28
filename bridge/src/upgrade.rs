@@ -81,11 +81,10 @@ pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some(v)
 }
 
+/// Full semver incl. `-dev.<timestamp>` prereleases (a dev build is newer
+/// than the stable before it and older than the stable it leads to).
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(l), Some(c)) => l > c,
-        _ => false,
-    }
+    vicuna_lib::version::is_newer(latest, current)
 }
 
 /// Release asset target, same names as install-cli.sh.
@@ -244,7 +243,7 @@ pub fn dev_is_current(server_dir: &Path, remote_sha: &str) -> bool {
 
 fn run_dev(opts: Opts, server_dir: &Path) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    let current = env!("CARGO_PKG_VERSION");
+    let current = vicuna_lib::version::vicuna_version();
     let dry = if opts.dry_run { "[dry run] " } else { "" };
     let tag = "latest (dev)";
     let tgt = target(std::env::consts::OS, std::env::consts::ARCH)
@@ -284,7 +283,7 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
         return run_dev(opts, server_dir);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    let current = env!("CARGO_PKG_VERSION");
+    let current = vicuna_lib::version::vicuna_version();
     let dry = if opts.dry_run { "[dry run] " } else { "" };
 
     println!("==> Checking the latest release of {REPO}");
@@ -483,6 +482,9 @@ mod tests {
         assert!(!is_newer("v0.0.18", "0.0.18"));
         assert!(!is_newer("v0.0.9", "0.0.18"));
         assert!(!is_newer("latest", "0.0.18"));
+        // a dev build is replaced by the stable release it leads to
+        assert!(is_newer("v0.1.2", "0.1.2-dev.20261128160000"));
+        assert!(!is_newer("v0.1.1", "0.1.2-dev.20261128160000"));
     }
 
     #[test]
