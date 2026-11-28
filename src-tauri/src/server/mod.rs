@@ -730,7 +730,7 @@ async fn dispatch(
         "server_info" => Ok(serde_json::json!({
             "app": "vicuna",
             "name": server_name(),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::version::vicuna_version(),
             "os": std::env::consts::OS,
             "home": std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default(),
             "chats": st.db.is_some(),
@@ -741,8 +741,8 @@ async fn dispatch(
             "chatsList": st.db.is_some(),
             "canUpgrade": self_upgrade::can_upgrade(),
         })),
-        "server_upgrade_check" => self_upgrade::check().await,
-        "server_upgrade" => self_upgrade::start(),
+        "server_upgrade_check" => self_upgrade::check(self_upgrade::Channel::from_arg(args.get("channel"))).await,
+        "server_upgrade" => self_upgrade::start(self_upgrade::Channel::from_arg(args.get("channel"))),
         "server_upgrade_status" => self_upgrade::status(),
         "chats_load" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;

@@ -9,6 +9,8 @@ export interface ServerSwitcherDeps {
   readonly activeServer: string | null;
   readonly onServer: boolean;
   readonly clientVersion: string;
+  /** the app's Settings → Update channel; server upgrades follow it */
+  readonly updateChannel: "stable" | "dev";
   readonly uiReady: boolean;
   readonly flashNotice: (text: string, ttl?: number) => void;
   error: string | null;
@@ -41,14 +43,32 @@ export function createServerSwitcherState(deps: ServerSwitcherDeps) {
     srvVersion = info?.version ?? null;
     srvCanUpgrade = !!info?.canUpgrade;
     if (!srvCanUpgrade) return;
-    const chk = await invokeOrBridge<{ latest?: string }>("server_upgrade_check", {}).catch(() => null);
-    srvLatest = chk?.latest ?? null;
+    await checkServerLatest();
+  }
+  /** newest server build on the app's update channel (older servers ignore
+   *  `channel` and answer for stable) */
+  let latestReq = 0;
+  async function checkServerLatest() {
+    const req = ++latestReq;
+    const channel = deps.updateChannel;
+    const chk = await invokeOrBridge<{ latest?: string }>("server_upgrade_check", { channel }).catch(() => null);
+    if (req === latestReq) srvLatest = chk?.latest ?? null;
   }
   $effect(() => {
     if (deps.onServer && deps.uiReady && !srvVersionChecked) {
       srvVersionChecked = true;
       void loadServerVersion();
     }
+  });
+  // switching Stable/Dev in Settings re-checks at once (no reload)
+  let lastChannel: string | null = null;
+  $effect(() => {
+    const ch = deps.updateChannel;
+    if (lastChannel !== null && lastChannel !== ch && srvVersionChecked && srvCanUpgrade && !srvUpgrading) {
+      srvLatest = null;
+      void checkServerLatest();
+    }
+    lastChannel = ch;
   });
   /** live progress of a server upgrade (`server_upgrade_status`) */
   let srvUpgradeStage = $state<string | null>(null);
@@ -63,7 +83,7 @@ export function createServerSwitcherState(deps: ServerSwitcherDeps) {
     srvUpgradeDetail = null;
     type St = { running?: boolean; failed?: boolean; error?: string; stage?: string | null; step?: number; steps?: number; percent?: number | null; detail?: string | null };
     try {
-      await invokeOrBridge("server_upgrade", {});
+      await invokeOrBridge("server_upgrade", { channel: deps.updateChannel });
       // ~3 minutes: progress from the upgrade log, then the restart
       for (let i = 0; i < 180; i++) {
         await new Promise((r) => setTimeout(r, 1000));

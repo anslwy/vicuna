@@ -45,12 +45,7 @@ export function formatLiveElapsed(ms: number): string {
   return `${s}s`;
 }
 
-export function cmpVersion(a: string, b: string): number {
-  const p = (v: string) => v.replace(/^v/, "").split(/[-+]/)[0].split(".").map((x) => Number(x) || 0);
-  const [x, y] = [p(a), p(b)];
-  for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) - (y[i] ?? 0);
-  return 0;
-}
+export { cmpVersion } from "./version";
 
 export function defaultServerName(url: string): string {
   return url.split("://")[1] ?? url;

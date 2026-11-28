@@ -69,7 +69,7 @@
   <div class="srv-sep"></div>
   {#if onServer && srvVersion}
     <div class="srv-version" data-testid="server-version">
-      <span>Server v{srvVersion} · App v{clientVersion}</span>
+      <span class="srv-version-text">Server v{srvVersion} · App v{clientVersion}</span>
       {#if srvVersionSkew && !srvUpgradeAvailable}<span class="srv-skew" title="The server and this app run different versions">differs</span>{/if}
     </div>
     {#if srvUpgradeAvailable && srvCanUpgrade}
@@ -82,7 +82,7 @@
             {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
           </span>
         {:else}
-          <span class="srv-check">↑</span><span class="srv-item-name">Upgrade server to v{srvLatest}</span>
+          <span class="srv-check">↑</span><span class="srv-item-name" title="Upgrade server to v{srvLatest}">Upgrade server to v{srvLatest}</span>
         {/if}
       </button>
     {/if}
@@ -117,7 +117,8 @@
   .srv-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .srv-sep { height: 1px; background: var(--border); margin: 4px 6px; }
   .srv-version { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 4px 10px; }
-  .srv-skew { font-size: 10.5px; font-weight: 600; color: var(--accent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
+  .srv-version-text { min-width: 0; overflow-wrap: anywhere; }
+  .srv-skew { flex: none; font-size: 10.5px; font-weight: 600; color: var(--accent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
   .srv-upgrade { color: var(--accent); }
   .srv-spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: srv-spin 0.8s linear infinite; vertical-align: -1px; }
   @keyframes srv-spin { to { transform: rotate(360deg); } }

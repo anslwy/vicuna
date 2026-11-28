@@ -116,7 +116,7 @@ pub fn tailnet_browser_url(tailnet: &str, token: &str) -> String {
 /// Startup banner lines (everything but tailscale, which runs a command).
 pub fn banner(addr: std::net::SocketAddr, cfg: &Config, token: &str) -> Vec<String> {
     let mut l = vec![
-        format!("vicuna server {} on http://{addr}", env!("CARGO_PKG_VERSION")),
+        format!("vicuna server {} on http://{addr}", vicuna_lib::version::vicuna_version()),
         format!("  chats:   {}", cfg.db.as_ref().map(|d| d.display().to_string()).unwrap_or_default()),
         format!("  Server:  http://{addr}   (desktop app: Connect to new server…)"),
         format!("  Token:   {token}"),

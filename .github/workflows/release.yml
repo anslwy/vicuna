@@ -177,6 +177,8 @@ jobs:
         run: |
           v="$(node scripts/dev-version.mjs)"
           echo "DEV_VERSION=$v" >> "$GITHUB_ENV"
+          # baked into the Rust binaries (vicuna_lib::version::vicuna_version)
+          echo "VICUNA_BUILD_VERSION=$v" >> "$GITHUB_ENV"
           echo "Dev build version: $v"
 
       # `app` must be built alongside `dmg`: the bundler only creates signed
@@ -323,6 +325,8 @@ jobs:
         run: |
           v="$(node scripts/dev-version.mjs)"
           echo "DEV_VERSION=$v" >> "$GITHUB_ENV"
+          # baked into the Rust binaries (vicuna_lib::version::vicuna_version)
+          echo "VICUNA_BUILD_VERSION=$v" >> "$GITHUB_ENV"
           echo "Dev build version: $v"
 
       # Unsigned path (dev builds, or releases before SignPath secrets are set):
@@ -499,6 +503,8 @@ jobs:
         run: |
           v="$(node scripts/dev-version.mjs)"
           echo "DEV_VERSION=$v" >> "$GITHUB_ENV"
+          # baked into the Rust binaries (vicuna_lib::version::vicuna_version)
+          echo "VICUNA_BUILD_VERSION=$v" >> "$GITHUB_ENV"
           echo "Dev build version: $v"
 
       # AppImage is the auto-updatable Linux bundle (.AppImage + .sig);
@@ -575,6 +581,16 @@ jobs:
           npm ci
           npm run build
           test -f build/index.html
+
+      # Rolling dev builds bake <maj>.<min>.<patch+1>-dev.<commit time> into
+      # `vicuna` (--version, /health, server_info, upgrade checks).
+      - name: Dev build version
+        if: ${{ !inputs.version }}
+        shell: bash
+        run: |
+          v="$(node scripts/dev-version.mjs)"
+          echo "VICUNA_BUILD_VERSION=$v" >> "$GITHUB_ENV"
+          echo "Dev build version: $v"
 
       - name: Install musl toolchain (Linux)
         if: ${{ runner.os == 'Linux' }}
@@ -724,6 +740,8 @@ jobs:
         run: |
           v="$(node scripts/dev-version.mjs)"
           echo "DEV_VERSION=$v" >> "$GITHUB_ENV"
+          # baked into the Rust binaries (vicuna_lib::version::vicuna_version)
+          echo "VICUNA_BUILD_VERSION=$v" >> "$GITHUB_ENV"
           echo "Dev build version: $v"
 
       - name: Generate + upload dev latest.json

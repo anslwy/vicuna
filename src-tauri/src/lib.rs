@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, WindowEvent};
 
 pub mod ipc;
+pub mod version;
 pub mod acp;
 pub mod agy;
 pub mod agy_accounts;
