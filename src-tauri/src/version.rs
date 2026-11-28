@@ -63,9 +63,31 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     compare(latest, current) == Some(Ordering::Greater)
 }
 
+/// True when `v` carries a prerelease tag (`0.1.2-dev.<ts>`).
+pub fn is_prerelease(v: &str) -> bool {
+    parse(v).map(|p| !p.pre.is_empty()).unwrap_or(false)
+}
+
+/// Whether an update from `current` to `remote` should be offered on a
+/// channel. Newer always; on Stable also a stable release while running a
+/// prerelease (Dev → Stable switch, even when that stable sorts lower).
+/// Never an older stable over a stable.
+pub fn should_offer_update(stable_channel: bool, current: &str, remote: &str) -> bool {
+    if is_newer(remote, current) {
+        return true;
+    }
+    stable_channel && is_prerelease(current) && parse(remote).is_some() && !is_prerelease(remote)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prerelease_detection() {
+        assert!(is_prerelease("0.1.2-dev.20261128155414"));
+        assert!(!is_prerelease("v0.1.1"));
+        assert!(!is_prerelease("garbage"));
+    }
     #[test]
     fn dev_prereleases_order_like_semver() {
         assert!(is_newer("0.1.2-dev.20261128155414", "0.1.1")); // stable → dev

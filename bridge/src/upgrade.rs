@@ -300,6 +300,10 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     if !newer && !opts.force {
+        if vicuna_lib::version::is_prerelease(current) && !vicuna_lib::version::is_prerelease(&tag) {
+            println!("vicuna {current} is a dev build; the latest stable is {tag}. Run `vicuna upgrade --force` to switch to stable.");
+            return Ok(());
+        }
         println!("vicuna {current} is already the latest version (--force reinstalls {tag}).");
         return Ok(());
     }
@@ -314,6 +318,10 @@ pub fn run(opts: Opts, server_dir: &Path) -> Result<(), String> {
         return finish(&opts, None, &tag, server_dir, dry);
     }
 
+    if !opts.dry_run {
+        // leaving the dev channel: a later `--dev` must not think its build is installed
+        let _ = std::fs::remove_file(dev_marker(server_dir));
+    }
     download_verify_install(&rt, &opts, &base, &asset, None, &tag, server_dir, dry)
 }
 

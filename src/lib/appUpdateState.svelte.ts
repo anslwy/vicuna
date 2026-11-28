@@ -3,6 +3,7 @@
 // relaunch. Created once by ChatApp.
 import { type AppUpdateInfo, type AppUpdateStatus, type UpdateChannel, normalizeUpdateChannel, loadAppUpdatePreferenceFromStorage, persistAppUpdatePreference, APP_UPDATE_RELEASES_URL, normalizeUpdateErrorMessage, formatAppUpdateInstallError } from "./appUpdate";
 import { isTauriRuntime } from "./ollama";
+import { cmpVersion } from "./version";
 import { openExternal } from "./chatDom";
 import { resolveAppUpdateReleaseNotes } from "./chatAppData";
 
@@ -83,7 +84,9 @@ export function createAppUpdateState(deps: AppUpdateStateDeps) {
         : appUpdateStatus === "installed"
           ? "Restart to apply update"
           : appUpdateStatus === "available" && availableAppUpdate
-            ? `Update to v${availableAppUpdate.version}`
+            ? availableAppUpdate.currentVersion && cmpVersion(availableAppUpdate.version, availableAppUpdate.currentVersion) < 0
+              ? `Switch to stable v${availableAppUpdate.version}`
+              : `Update to v${availableAppUpdate.version}`
             : "Check for updates"
   );
   function initializeAppUpdatePreference() {

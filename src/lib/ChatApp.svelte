@@ -7578,7 +7578,7 @@
 {/snippet}
 {#snippet serverMenu()}
   <ServerMenu
-    srvList={srv.srvList} {onServer} {activeServer} srvVersion={srv.srvVersion} {clientVersion} srvVersionSkew={srv.srvVersionSkew} srvUpgradeAvailable={srv.srvUpgradeAvailable}
+    srvList={srv.srvList} {onServer} {activeServer} srvVersion={srv.srvVersion} {clientVersion} srvVersionSkew={srv.srvVersionSkew} srvUpgradeAvailable={srv.srvUpgradeAvailable} srvChannelSwitch={srv.srvChannelSwitch}
     srvCanUpgrade={srv.srvCanUpgrade} srvUpgrading={srv.srvUpgrading} srvUpgradeStage={srv.srvUpgradeStage} srvUpgradePct={srv.srvUpgradePct} srvUpgradeDetail={srv.srvUpgradeDetail} srvLatest={srv.srvLatest} srvCurrent={srv.srvCurrent}
     bind:srvMenuRenaming={srv.srvMenuRenaming} bind:srvEditDraft={srv.srvEditDraft} srvRenaming={srv.srvRenaming}
     onClose={() => { srv.srvMenuOpen = false; srv.srvMenuRenaming = false; }}

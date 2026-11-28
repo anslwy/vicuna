@@ -12,6 +12,7 @@
     clientVersion,
     srvVersionSkew,
     srvUpgradeAvailable,
+    srvChannelSwitch = false,
     srvCanUpgrade,
     srvUpgrading,
     srvUpgradeStage,
@@ -36,6 +37,7 @@
     clientVersion: string;
     srvVersionSkew: boolean;
     srvUpgradeAvailable: boolean;
+    srvChannelSwitch?: boolean;
     srvCanUpgrade: boolean;
     srvUpgrading: boolean;
     srvUpgradeStage: string | null;
@@ -82,7 +84,7 @@
             {#if srvUpgradeDetail}<span class="srv-upgrade-detail">{srvUpgradeDetail}</span>{/if}
           </span>
         {:else}
-          <span class="srv-check">↑</span><span class="srv-item-name" title="Upgrade server to v{srvLatest}">Upgrade server to v{srvLatest}</span>
+          <span class="srv-check">↑</span><span class="srv-item-name" title="{srvChannelSwitch ? 'Switch server' : 'Upgrade server'} to v{srvLatest}">{srvChannelSwitch ? "Switch server" : "Upgrade server"} to v{srvLatest}</span>
         {/if}
       </button>
     {/if}
