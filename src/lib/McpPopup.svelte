@@ -3,7 +3,10 @@
   import { describeServer as describeMcpServer, type McpServerConfig, type McpTool } from "$lib/mcp";
   import type { BuiltinMcp } from "$lib/mcp-builtins";
   import { isBrowserMcpId } from "$lib/browser";
-  import { isPluginMcpServer } from "$lib/pluginMcp";
+  import { findPluginServer, isPluginMcpServer, secretsState, type PluginMcpServer } from "$lib/pluginMcp";
+  import { invokeOrBridge } from "$lib/bridge";
+  import type { InstalledPlugin } from "$lib/pluginTheme";
+  import PluginSecretsModal from "$lib/PluginSecretsModal.svelte";
 
   export type McpFormState = {
     name: string;
@@ -109,6 +112,23 @@
     openTokenPage: (e: MouseEvent) => Promise<void>;
     savePatAndConnect: () => Promise<void>;
   } = $props();
+
+  // Plugin servers with declared secrets get a Keys button; their masked
+  // status comes from plugin_list (the MCP list itself never carries keys).
+  let pluginList = $state<InstalledPlugin[]>([]);
+  let secretsFor = $state<{ pluginId: string; server: PluginMcpServer } | null>(null);
+  async function loadPlugins() {
+    try {
+      pluginList = await invokeOrBridge<InstalledPlugin[]>("plugin_list", {});
+    } catch {
+      pluginList = [];
+    }
+  }
+  $effect(() => {
+    if (mcpOpen && mcpServers.some((s) => isPluginMcpServer(s))) void loadPlugins();
+  });
+  const pluginServerOf = (s: McpServerConfig) => (isPluginMcpServer(s) ? findPluginServer(pluginList, s) : null);
+
 </script>
 
 <button class="mcp-backdrop" data-testid="mcp-backdrop" aria-label="Close MCP servers" onclick={() => (mcpOpen = false)} tabindex="-1"></button>
@@ -295,6 +315,14 @@
       >
         <span class="mcp-name">{s.name}</span>
         {#if isPluginMcpServer(s)}<span class="mcp-plugin-badge" data-testid="mcp-plugin-badge" title="Provided by the {s.pluginName ?? s.pluginId} plugin; manage it in Settings → Plugins">{s.pluginName ?? s.pluginId}</span>{/if}
+        {#if pluginServerOf(s) && secretsState(pluginServerOf(s)?.server) !== "none"}
+          {@const ps = pluginServerOf(s)!}
+          {@const ks = secretsState(ps.server)}
+          <button class="mcp-keys-btn {ks}" data-testid="mcp-plugin-keys-{s.id}" title={ks === "missing" ? "A required API key is not set" : "Configure API keys"} onclick={(e) => {
+            e.stopPropagation();
+            secretsFor = ps;
+          }}>{ks === "missing" ? "Keys needed" : "Keys"}</button>
+        {/if}
         <span class="mcp-tools-n">{st.kind === "connected" && live ? `${live.tools.length} tool${live.tools.length === 1 ? "" : "s"}` : isBrowserMcpId(s.id) ? "built-in" : ""}</span>
         <span class="mcp-status {st.kind}">{st.label}</span>
         {#if st.label === "Sign in required →"}
@@ -533,6 +561,10 @@
   {/if}
 </div>
 
+{#if secretsFor}
+  <PluginSecretsModal pluginId={secretsFor.pluginId} server={secretsFor.server} onClose={() => (secretsFor = null)} onSaved={() => void loadPlugins()} />
+{/if}
+
 <style>
   textarea, input { -webkit-user-select: text; user-select: text; }
   .goto-error { color: var(--danger); font-size: 13px; margin: 0 0 12px 0; }
@@ -618,4 +650,7 @@
   .mcp-pat-link { font-size: 13.5px; color: var(--accent); text-decoration: none; font-weight: 600; align-self: flex-start; border-radius: 6px; }
   .mcp-pat-link:hover { text-decoration: underline; }
   .mcp-plugin-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted, inherit); white-space: nowrap; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-keys-btn { font: inherit; font-size: 10.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-2); background: transparent; color: inherit; cursor: pointer; white-space: nowrap; }
+  .mcp-keys-btn.ok { color: var(--accent); border-color: var(--accent); }
+  .mcp-keys-btn.missing { color: var(--danger, #d33); border-color: currentColor; }
 </style>

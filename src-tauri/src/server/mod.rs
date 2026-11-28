@@ -809,6 +809,16 @@ async fn dispatch(
             }
             res
         }
+        "plugin_mcp_set_secrets" | "plugin_mcp_clear_secrets" => {
+            let res = crate::plugins::action(cmd, &args).await;
+            if res.is_ok() {
+                // the next connect/turn respawns the server with the new env
+                if let (Some(p), Some(srv)) = (args.get("id").and_then(|v| v.as_str()), args.get("server").and_then(|v| v.as_str())) {
+                    let _ = st.mcp.disconnect(&crate::plugin_mcp::server_id(p, srv)).await;
+                }
+            }
+            res
+        }
         "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" => crate::plugins::action(cmd, &args).await,
         "plugin_storage_remove" => crate::plugins::action(cmd, &args).await,
         "cli_session" => turns::cli_session(st, &s("action")?, args).await,
@@ -1572,6 +1582,8 @@ pub const API_ACTIONS: &[&str] = &[
     "plugin_harness_revoke",
     "plugin_mcp_consent",
     "plugin_mcp_revoke",
+    "plugin_mcp_set_secrets",
+    "plugin_mcp_clear_secrets",
     "plugin_upgrade",
     "schedule_list",
     "schedule_put",

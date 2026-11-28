@@ -922,6 +922,8 @@ pub fn uninstall(id: &str) -> Result<Value, String> {
         return Err(format!("plugin {id} is not installed"));
     }
     std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    // user-supplied MCP secrets live outside the plugin folder
+    crate::plugin_mcp::remove_secrets(id)?;
     Ok(json!({ "id": id, "removed": true }))
 }
 
@@ -1193,6 +1195,24 @@ pub async fn action(cmd: &str, args: &Value) -> Result<Value, String> {
             let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
             Ok(entry(&m, &i))
         }
+        "plugin_mcp_set_secrets" | "plugin_mcp_clear_secrets" => {
+            let id = s("id")?;
+            let server = s("server")?;
+            let (m, _) = installed_manifest(&id).ok_or_else(|| format!("plugin {id} is not installed"))?;
+            let srv = m.mcp_servers.iter().find(|x| x.id == server).ok_or_else(|| format!("this plugin has no MCP server {server:?}"))?;
+            if srv.secrets.is_empty() {
+                return Err(format!("MCP server {server} declares no secrets"));
+            }
+            let dir = crate::plugin_mcp::secrets_dir()?;
+            if cmd == "plugin_mcp_set_secrets" {
+                let values = args.get("secrets").and_then(|v| v.as_object()).ok_or("missing secrets")?;
+                crate::plugin_mcp::set_secrets_in(&dir, &id, srv, values)?;
+            } else {
+                crate::plugin_mcp::clear_secrets_in(&dir, &id, &server)?;
+            }
+            let (m, i) = read_installed(&id).ok_or("plugin disappeared")?;
+            Ok(entry(&m, &i))
+        }
         "plugin_storage_get" | "plugin_storage_keys" | "plugin_storage_set" | "plugin_storage_remove" => {
             let key = args.get("key").and_then(|v| v.as_str());
             storage(cmd, &s("id")?, key, args.get("value"))
@@ -1390,7 +1410,8 @@ mod tests {
                     let args = if v == "3.0.0" { json!(["--stdio", "--write"]) } else { json!(["--stdio"]) };
                     let m = json!({"id": "tools", "name": "Tools", "version": v, "mcpServers": [
                         {"id": "web", "label": "Web", "type": "http", "url": "https://mcp.example.com/mcp"},
-                        {"id": "files", "type": "stdio", "command": "files-mcp", "args": args}]});
+                        {"id": "files", "type": "stdio", "command": "files-mcp", "args": args,
+                         "secrets": [{"key": "FILES_API_KEY", "label": "API key", "helpUrl": "https://files.example/keys"}]}]});
                     ("200 OK", m.to_string())
                 } else if req.starts_with("GET /repos/me/evilmcp/contents/vicuna-plugin.json") {
                     let m = json!({"id": "evilmcp", "name": "E", "version": "1", "mcpServers": [
@@ -1420,6 +1441,7 @@ mod tests {
         // SAFETY: only this test reads these variables.
         unsafe {
             std::env::set_var("VICUNA_PLUGINS_DIR", &dir);
+            std::env::set_var("VICUNA_PLUGIN_SECRETS_DIR", dir.join("secrets"));
             std::env::set_var("VICUNA_PLUGINS_GITHUB_API", format!("http://127.0.0.1:{port}"));
             std::env::set_var("GH_TOKEN", "test");
             std::env::set_var("VICUNA_PLUGINS_INDEX_URL", format!("http://127.0.0.1:{port}/index.json"));
@@ -1547,7 +1569,19 @@ mod tests {
         assert_eq!(ids, vec!["tools-web".to_string()]);
         action("plugin_mcp_revoke", &json!({"id": "tools", "server": "web"})).await.unwrap();
         assert!(crate::plugin_mcp::consented_servers().is_empty());
+        // secrets: masked status, refused on servers without declared secrets
+        assert!(action("plugin_mcp_set_secrets", &json!({"id": "tools", "server": "web", "secrets": {"X": "y"}})).await.is_err());
+        let e = action("plugin_mcp_set_secrets", &json!({"id": "tools", "server": "files", "secrets": {"FILES_API_KEY": "fk-live-123456789"}})).await.unwrap();
+        let st = &e["mcpServers"][1]["secretStatus"][0];
+        assert_eq!((st["configured"].as_bool(), st["tail"].as_str()), (Some(true), Some("6789")));
+        assert!(!e.to_string().contains("fk-live"));
+        let secrets_file = dir.join("secrets").join("tools-mcp-secrets.json");
+        assert!(secrets_file.exists() && !dir.join("tools").join("tools-mcp-secrets.json").exists());
+        action("plugin_mcp_clear_secrets", &json!({"id": "tools", "server": "files"})).await.unwrap();
+        assert!(!secrets_file.exists());
+        action("plugin_mcp_set_secrets", &json!({"id": "tools", "server": "files", "secrets": {"FILES_API_KEY": "fk-live-123456789"}})).await.unwrap();
         action("plugin_uninstall", &json!({"id": "tools"})).await.unwrap();
+        assert!(!secrets_file.exists(), "uninstall forgets the plugin's secrets");
         assert!(crate::plugin_mcp::owner("tools-web").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

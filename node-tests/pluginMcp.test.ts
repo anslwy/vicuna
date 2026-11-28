@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { isPluginMcpServer, mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, type PluginMcpServer } from "../src/lib/pluginMcp.ts";
+import { findPluginServer, isPluginMcpServer, maskedSecret, mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, safeHelpUrl, secretsPayload, secretsState, type PluginMcpServer } from "../src/lib/pluginMcp.ts";
 import { KIND_LABEL, filterCatalog, type CatalogEntry } from "../src/lib/pluginCatalog.ts";
 
 const root = new URL("..", import.meta.url).pathname;
@@ -48,4 +48,48 @@ test("Plugins panel asks consent and revokes through API actions", () => {
     assert.ok(read("src-tauri/src/server/mod.rs").includes(`    "${c}",`), `${c} in API_ACTIONS`);
   }
   assert.match(panel, /data-testid="mcp-consent"/);
+});
+
+const sec = (key: string, configured: boolean, required = false, tail: string | null = configured ? "WXYZ" : null) =>
+  ({ key, label: key, required, configured, tail });
+
+test("secrets state drives the Keys indicator", () => {
+  assert.equal(secretsState(stdio), "none");
+  assert.equal(secretsState(null), "none");
+  assert.equal(secretsState({ secretStatus: [sec("A_KEY", false, true)] }), "missing");
+  assert.equal(secretsState({ secretStatus: [sec("A_KEY", true, true), sec("B", false)] }), "partial");
+  assert.equal(secretsState({ secretStatus: [sec("A_KEY", true, true)] }), "ok");
+  assert.equal(maskedSecret(sec("A", true)), "••••WXYZ");
+  assert.equal(maskedSecret(sec("A", true, false, "")), "••••");
+  assert.equal(maskedSecret(sec("A", false)), "");
+});
+
+test("secrets payload sends only typed keys and explicit clears", () => {
+  assert.deepEqual(secretsPayload("demo", "gem", { A_KEY: " sk-1 ", B: "  " }, ["C"]), {
+    id: "demo", server: "gem", secrets: { A_KEY: "sk-1", C: "" },
+  });
+  assert.equal(safeHelpUrl("https://aistudio.google.com/apikey"), "https://aistudio.google.com/apikey");
+  assert.equal(safeHelpUrl("javascript:alert(1)"), null);
+  assert.equal(safeHelpUrl("http://x.dev"), null);
+  assert.equal(safeHelpUrl(null), null);
+});
+
+test("MCP rows map back to their plugin server", () => {
+  const plugins = [{ id: "demo", mcpServers: [http, stdio] }];
+  assert.equal(findPluginServer(plugins, { id: "demo-files", pluginId: "demo" })?.server.id, "files");
+  assert.equal(findPluginServer(plugins, { id: "demo-nope", pluginId: "demo" }), null);
+  assert.equal(findPluginServer(plugins, { id: "demo-files" }), null);
+});
+
+test("Keys buttons and secret actions are wired", () => {
+  const panel = read("src/lib/PluginsPanel.svelte");
+  const popup = read("src/lib/McpPopup.svelte");
+  const modal = read("src/lib/PluginSecretsModal.svelte");
+  assert.match(panel, /data-testid="plugin-mcp-keys-/);
+  assert.match(popup, /data-testid="mcp-plugin-keys-/);
+  assert.match(modal, /type="password"/);
+  for (const c of ["plugin_mcp_set_secrets", "plugin_mcp_clear_secrets"]) {
+    assert.ok(modal.includes(`"${c}"`), c);
+    assert.ok(read("src-tauri/src/server/mod.rs").includes(`    "${c}",`), `${c} in API_ACTIONS`);
+  }
 });
