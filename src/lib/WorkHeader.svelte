@@ -259,7 +259,10 @@
 <style>
   .work-badge { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
   .work-badge.engine-badge { display: inline-flex; align-items: center; gap: 4px; background: transparent; color: var(--muted-2); border: 1px solid var(--border-2); font-weight: 600; cursor: default; }
-  .work-banner { position: relative; z-index: 20; display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 6px 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
+  /* Keep .work-banner static (no stacking context) so its left/right padding
+   * never sits above .collapsed-rail (z-index: 5) or .explorer-toggle-btn (z-index: 7)
+   * when a wide side panel narrows .main; child .ctx-popup stays on top via z-index: 30. */
+  .work-banner { display: flex; align-items: center; gap: 8px; max-width: 860px; width: 100%; margin: 0 auto; padding: 14px 54px 6px 24px; box-sizing: border-box; font-size: 12.5px; color: var(--muted-2); }
   .work-banner .work-badge { margin-left: 0; }
   .hdr-meters { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
   .ctx-wrap { position: relative; display: inline-flex; cursor: default; }
