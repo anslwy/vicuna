@@ -6,7 +6,7 @@
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
   import { accountSummary, commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
-  import { mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, secretsState, type PluginMcpServer } from "./pluginMcp";
+  import { mcpConsentPayload, mcpLaunchLine, mcpStdioNote, pendingMcpConsent, secretsState, type PluginMcpServer } from "./pluginMcp";
   import PluginSecretsModal from "./PluginSecretsModal.svelte";
   import { cardAction, filterCatalog, githubRepoUrl, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
@@ -431,9 +431,9 @@
           {#each p.mcpServers ?? [] as m (m.id)}
             <div class="pl-harness" data-testid="plugin-mcp-{p.id}-{m.id}">
               <span class="pl-name">MCP · {m.label}</span>
-              <code class="pl-cmd" title={m.type === "http" ? "The MCP endpoint" : "The command this MCP server runs"}>{mcpLaunchLine(m)}</code>
+              <code class="pl-cmd" title={m.type === "http" ? "The MCP endpoint" : m.bundled ? `The plugin's bundled binary (SHA-256 ${m.binarySha256 ?? "?"})` : "The command this MCP server runs"}>{mcpLaunchLine(m)}</code>
               {#if m.enabled}<span class="pl-badge ok" title="Listed in the MCP dialog as {m.serverId}">Allowed</span>{:else}<span class="pl-badge">Not allowed</span>{/if}
-              {#if !m.installed}<span class="pl-badge" title={m.installHint ?? ""}>`{m.command}` not found</span>{/if}
+              {#if !m.installed}<span class="pl-badge" title={m.installHint ?? ""}>{m.bundled ? "bundled binary missing" : `\`${m.command}\` not found`}</span>{/if}
               <span class="pl-spacer"></span>
               {#if secretsState(m) !== "none"}
                 {@const ks = secretsState(m)}
@@ -505,13 +505,13 @@
         {#if m.description}<div class="pl-muted">{m.description}</div>{/if}
         <code class="pl-cmd big" data-testid="mcp-consent-launch-{m.id}">{mcpLaunchLine(m)}</code>
         {#if m.type === "stdio"}
-          <div class="pl-muted">{m.installed ? `Found \`${m.command}\` on this server's PATH.` : `\`${m.command}\` is not installed on this server yet. ${m.installHint ?? ""}`}</div>
+          <div class="pl-muted" data-testid="mcp-consent-note-{m.id}">{mcpStdioNote(m)}</div>
         {:else}
           <div class="pl-muted">A remote server. If it asks you to sign in, Vicuna runs the normal browser sign-in; the plugin never sees your tokens.</div>
         {/if}
       </div>
     {/each}
-    <p class="pl-warn">{mcpConsent.servers.some((m) => m.type === "stdio") ? "Local servers run as you, from your own install (not from the plugin). " : ""}Tool results go to your agent, and the agent can send data to these servers. Only allow plugins you trust. If an upgrade changes the endpoint or command, Vicuna asks again.</p>
+    <p class="pl-warn">{mcpConsent.servers.some((m) => m.type === "stdio") ? (mcpConsent.servers.some((m) => m.bundled) ? "Local servers run as you; bundled binaries come from the plugin itself. " : "Local servers run as you, from your own install (not from the plugin). ") : ""}Tool results go to your agent, and the agent can send data to these servers. Only allow plugins you trust. If an upgrade changes the endpoint or command, Vicuna asks again.</p>
     <div class="pl-row pl-consent-actions">
       <button class="pl-btn" data-testid="mcp-consent-decline" onclick={declineMcpConsent}>Not now</button>
       <button class="pl-btn primary" data-testid="mcp-consent-accept" disabled={mcpBusy} onclick={acceptMcpConsent}>{mcpBusy ? "Allowing…" : "Allow"}</button>

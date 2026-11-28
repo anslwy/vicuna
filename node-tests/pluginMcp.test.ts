@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { findPluginServer, isPluginMcpServer, maskedSecret, mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, safeHelpUrl, secretsPayload, secretsState, type PluginMcpServer } from "../src/lib/pluginMcp.ts";
+import { findPluginServer, isPluginMcpServer, maskedSecret, mcpConsentPayload, mcpLaunchLine, mcpStdioNote, pendingMcpConsent, safeHelpUrl, shortSha, secretsPayload, secretsState, type PluginMcpServer } from "../src/lib/pluginMcp.ts";
 import { KIND_LABEL, filterCatalog, type CatalogEntry } from "../src/lib/pluginCatalog.ts";
 
 const root = new URL("..", import.meta.url).pathname;
@@ -92,4 +92,26 @@ test("Keys buttons and secret actions are wired", () => {
     assert.ok(modal.includes(`"${c}"`), c);
     assert.ok(read("src-tauri/src/server/mod.rs").includes(`    "${c}",`), `${c} in API_ACTIONS`);
   }
+});
+
+test("bundled binaries: launch line, note and consent echo", () => {
+  const sha = "a".repeat(64);
+  const b = {
+    id: "img", serverId: "demo-img", label: "Img", type: "stdio" as const, command: null,
+    args: ["--stdio"], env: { IMG_MODE: "fast" }, enabled: false, installed: true,
+    bundled: true, binaryAsset: "vicuna-mcp-image-edit-macos-aarch64", binarySha256: sha,
+  };
+  assert.equal(mcpLaunchLine(b), "IMG_MODE=fast bundled:vicuna-mcp-image-edit-macos-aarch64 --stdio");
+  assert.equal(shortSha(sha), "aaaaaaaaaaaa");
+  assert.match(mcpStdioNote(b), /^Bundled binary: vicuna-mcp-image-edit-macos-aarch64 .*SHA-256 aaaaaaaaaaaa/);
+  assert.match(mcpStdioNote({ ...b, installed: false }), /missing; reinstall/);
+  assert.deepEqual(mcpConsentPayload("demo", [b]).servers[0], {
+    id: "img", type: "stdio", args: ["--stdio"], env: { IMG_MODE: "fast" },
+    binaryAsset: "vicuna-mcp-image-edit-macos-aarch64", binarySha256: sha,
+  });
+  // command servers keep their old shape
+  const c = { ...b, bundled: false, command: "files-mcp", binaryAsset: null, binarySha256: null };
+  assert.equal(mcpLaunchLine(c), "IMG_MODE=fast files-mcp --stdio");
+  assert.equal(mcpStdioNote(c), "Found `files-mcp` on this server's PATH.");
+  assert.equal("binaryAsset" in mcpConsentPayload("demo", [c]).servers[0], false);
 });
