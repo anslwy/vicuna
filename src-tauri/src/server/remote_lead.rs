@@ -299,13 +299,7 @@ async fn run_watch(st: Arc<BridgeState>, w: Watch) {
         let text = persist::worker_done_message(&w.session, &title, engine, model, &last_reply(&s), false)
             + &format!("\n(This worker runs on server \"{}\"; pass server=\"{}\" to manage_sessions for it.)", entry.name, entry.name);
         let msg = json!({"role": "user", "content": text});
-        for _ in 0..30 {
-            match turns::deliver(&st, &lead, msg.clone()).await {
-                Ok(()) => return,
-                Err(e) if e.contains("no longer exists") || e.contains("not a Work session") => return,
-                Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
-            }
-        }
+        turns::deliver_report(&st, &lead, msg).await;
         return;
     }
     finish(&w);

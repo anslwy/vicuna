@@ -515,6 +515,11 @@ pub fn worker_done_message(id: &str, title: &str, engine: &str, model: Option<&s
     format!("Worker session finished: \"{title}\" ({id}, {who}) {how}.\nIts last reply:\n\n{body}\n\nUse manage_sessions (send/stop/delete) or read_session for more.")
 }
 
+/// A report callback written by `worker_done_message`.
+pub fn is_worker_done_message(text: &str) -> bool {
+    text.starts_with("Worker session finished: ")
+}
+
 /// backgroundRun.ts `mcpWakeMessage`.
 pub fn mcp_wake_message(servers: &[(String, Option<usize>)]) -> String {
     let summary = servers

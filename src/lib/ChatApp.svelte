@@ -1232,7 +1232,8 @@
   async function handleSessionControl(leadId: string, leadWs: string, action: string, args: Record<string, any>): Promise<{ ok: boolean; text?: string; error?: string }> {
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string).trim() : "");
     const callerIsLead = chats.find((x) => x.id === leadId)?.role === "lead";
-    const report = callerIsLead && args.report !== false;
+    // vicuna-mcp makes `report` explicit (non-lead may opt in); default as before
+    const report = args.report === true || (callerIsLead && args.report !== false);
     const target = () => {
       const id = str("session_id");
       if (!id) throw new Error("`session_id` is required (see `list`).");

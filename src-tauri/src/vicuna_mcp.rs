@@ -497,7 +497,7 @@ fn manage_sessions_schema() -> Value {
     json!({
         "name": MANAGE_SESSIONS_TOOL,
         "title": "Manage worker sessions (lead controls; permissioned send & remote read/send)",
-        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` (locally, or on another server with Use sessions on other servers). Non-lead `send` always forces `report: false`: it returns only the start/queue acknowledgement, and the target's reply is not sent back to the caller. Other management actions remain lead-only, except `set_workspace` on your own session (works anywhere) and remote `servers`/`list`/`status` (see Other servers below). Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and forced false for permissioned non-lead calls), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). Other servers: with this session's \"Use sessions on other servers\" permission, any session can list saved servers (`servers`), list or inspect remote sessions (`list`/`status` with Read other sessions), and message remote sessions (`send` with Message other sessions; non-lead `send` forces `report: false`). The lead can also pass `server` to `create` (needs `workspace`, an absolute folder on that machine), `stop`, `archive` and `unarchive` there; replies of reported remote workers reach the lead the same way. Deleting remote sessions is not allowed. When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
+        "description": "Manage Vicuna Work sessions, each running its own harness (engine) and model. The user's lead session can delegate work; a non-lead session with the Message other sessions permission may use `send` (locally, or on another server with Use sessions on other servers). `report` on `send` defaults to true for the lead and to false for permissioned non-lead sessions, which may opt into `report: true` (locally and on other servers); a non-lead turn that was itself woken by a report callback cannot nest `report: true` (single-hop loop-breaker: it is downgraded to false). With `report: false` the target's reply is NOT pushed back automatically; use `schedule_wakeup` to follow up later. Other management actions remain lead-only, except `set_workspace` on your own session (works anywhere) and remote `servers`/`list`/`status` (see Other servers below). Actions: `list` (sessions with status, engine/model, workspace, last activity, lead/worker relation and pending questions; archived sessions are hidden unless `include_archived: true`, then tagged `[archived]`; same filters as `list_sessions`), `create` (new worker session: `workspace` defaults to yours, optional `title`, `engine`, `model`, and `message` to start it right away), `send` (`session_id` + `message`: starts a turn, or is queued into the running one; `report` sends the worker's reply back to you when its turn ends, default true for lead calls and false for permissioned non-lead calls, which may pass true), `stop` (`session_id`: stop its running turn), `delete` (`session_id`: remove the session; the user must confirm it in the app, a refusal is final), `archive` / `unarchive` (`session_id`: hide the session from the sidebar or bring it back, no confirm; nothing is deleted or stopped, and `list` hides them unless `include_archived: true`), `status` (`session_id`: running state and the tail of its last reply; use `read_session` for full history), `set_workspace` (`workspace`: absolute folder; omit `session_id` to move your own session, which works in any session and applies from your next turn; another session must be idle), and `permissions` (lead only: inspect or set another session's `read` and `allow_message` booleans). Other servers: with this session's \"Use sessions on other servers\" permission, any session can list saved servers (`servers`), list or inspect remote sessions (`list`/`status` with Read other sessions), and message remote sessions (`send` with Message other sessions; non-lead `send` defaults to `report: false` and may opt into `report: true`). The lead can also pass `server` to `create` (needs `workspace`, an absolute folder on that machine), `stop`, `archive` and `unarchive` there; replies of reported remote workers reach the lead the same way. Deleting remote sessions is not allowed. When a worker you created or messaged finishes a turn with reporting enabled, its reply reaches you as a message automatically, so after delegating, end your turn instead of polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -517,7 +517,7 @@ fn manage_sessions_schema() -> Value {
                 "engine": { "type": "string", "description": "create: harness, e.g. claude, codex, opencode, fx, agy, pi (default: the user's current pick). See `list` for installed ones." },
                 "model": { "type": "string", "description": "create: that engine's model id (default: the engine's default)." },
                 "message": { "type": "string", "description": "create/send: the prompt for the worker." },
-                "report": { "type": "boolean", "description": "create/send: send the worker's reply back to you when its turn ends (default true for lead calls; non-lead send always forces false)." }
+                "report": { "type": "boolean", "description": "create/send: send the target's reply back to you when its turn ends. Default true for lead calls; false for non-lead send, which may pass true (local or remote) unless this turn was woken by a report callback (single-hop loop-breaker). With false, nothing is pushed back: use `schedule_wakeup` to follow up." }
             },
             "required": ["action"]
         }
@@ -600,7 +600,9 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
         "create" | "send" => 120,
         _ => 60,
     };
-    let forwarded_args = forwarded_session_args(args, &action, turn.lead.load(Ordering::Relaxed));
+    let (forwarded_args, report_note) = forwarded_session_args(
+        args, &action, turn.lead.load(Ordering::Relaxed), turn.report_woken.load(Ordering::Relaxed),
+    );
     if target.on_event.send(WorkAgentEvent::SessionControl { req_id: req_id.clone(), action, args: forwarded_args }).is_err() {
         turn.stop.store(true, Ordering::Relaxed);
         turn.ask_pending.lock().ok().map(|mut m| m.remove(&req_id));
@@ -620,7 +622,11 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
     };
     let v: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
-        text_result(v.get("text").and_then(Value::as_str).unwrap_or("Done."), false)
+        let text = v.get("text").and_then(Value::as_str).unwrap_or("Done.");
+        match report_note {
+            Some(note) => text_result(&format!("{text}\n{note}"), false),
+            None => text_result(text, false),
+        }
     } else {
         text_result(v.get("error").and_then(Value::as_str).unwrap_or("the app refused the action"), true)
     }
@@ -734,12 +740,41 @@ async fn may_message(session_id: &Option<String>) -> bool {
 
 fn can_manage_permissions(is_lead: bool) -> bool { is_lead }
 
-fn forwarded_session_args(args: &Value, action: &str, is_lead: bool) -> Value {
-    let mut forwarded = args.clone();
-    if action == "send" && !is_lead {
-        forwarded["report"] = json!(false);
+/// `report: false` sends: the reply is never pushed back on its own.
+const REPORT_OFF_HINT: &str = "Reporting is off (`report: false`): the target's reply will not be sent back to you automatically. To follow up later, call `schedule_wakeup` and check it with `status`/`read_session`.";
+const REPORT_LOOP_BREAKER: &str = "Loop-breaker: this turn was woken by a report callback, so nested `report: true` is disabled for non-lead sessions to prevent reply loops; the send went out with `report: false`.";
+
+/// The `report` a `send` actually runs with. Lead: default true. Non-lead
+/// (already permission-gated): default false, may opt into true unless this
+/// turn was itself woken by a report callback (single-hop loop-breaker).
+/// Returns (report, loop_breaker_applied).
+fn effective_report(args: &Value, is_lead: bool, report_woken: bool) -> (bool, bool) {
+    let asked = args.get("report").and_then(Value::as_bool);
+    if is_lead {
+        return (asked != Some(false), false);
     }
-    forwarded
+    match asked {
+        Some(true) if report_woken => (false, true),
+        Some(true) => (true, false),
+        _ => (false, false),
+    }
+}
+
+/// Args handed to the session controller (`report` made explicit on `send`)
+/// plus the note to append to a successful result.
+fn forwarded_session_args(args: &Value, action: &str, is_lead: bool, report_woken: bool) -> (Value, Option<String>) {
+    let mut forwarded = args.clone();
+    if action != "send" {
+        return (forwarded, None);
+    }
+    let (report, broke) = effective_report(args, is_lead, report_woken);
+    forwarded["report"] = json!(report);
+    let note = match (report, broke) {
+        (true, _) => None,
+        (false, true) => Some(format!("{REPORT_LOOP_BREAKER} {REPORT_OFF_HINT}")),
+        (false, false) => Some(REPORT_OFF_HINT.to_string()),
+    };
+    (forwarded, note)
 }
 
 fn can_manage_sessions_action(is_lead: bool, own: bool, action: &str, message_permission: bool) -> bool {
@@ -2445,6 +2480,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nonlead_send_report_defaults_off_with_wakeup_hint() {
+        let (fwd, note) = forwarded_session_args(&json!({"action":"send","session_id":"s","message":"m"}), "send", false, false);
+        assert_eq!(fwd["report"], false);
+        let note = note.unwrap();
+        assert!(note.contains("schedule_wakeup") && note.contains("will not be sent back"), "{note}");
+        assert!(!note.contains("Loop-breaker"));
+    }
+
+    #[test]
+    fn nonlead_send_may_opt_into_report_local_and_remote() {
+        for args in [
+            json!({"action":"send","session_id":"s","message":"m","report":true}),
+            json!({"action":"send","server":"VPS","session_id":"s","message":"m","report":true}),
+        ] {
+            let (fwd, note) = forwarded_session_args(&args, "send", false, false);
+            assert_eq!(fwd["report"], true, "{args}");
+            assert_eq!(note, None, "{args}");
+        }
+    }
+
+    #[test]
+    fn report_woken_nonlead_turn_cannot_nest_report_true() {
+        for args in [
+            json!({"action":"send","session_id":"s","message":"m","report":true}),
+            json!({"action":"send","server":"VPS","session_id":"s","message":"m","report":true}),
+        ] {
+            let (fwd, note) = forwarded_session_args(&args, "send", false, true);
+            assert_eq!(fwd["report"], false, "downgraded: {args}");
+            let note = note.unwrap();
+            assert!(note.contains("Loop-breaker") && note.contains("woken by a report callback"), "{note}");
+            assert!(note.contains("schedule_wakeup"), "{note}");
+        }
+        // a woken non-lead turn without report: true just gets the plain hint
+        let (_, note) = forwarded_session_args(&json!({"action":"send"}), "send", false, true);
+        assert!(!note.unwrap().contains("Loop-breaker"));
+    }
+
+    #[test]
+    fn report_woken_lead_still_delegates_with_report() {
+        assert_eq!(effective_report(&json!({}), true, true), (true, false));
+        assert_eq!(effective_report(&json!({"report":true}), true, true), (true, false));
+        let (fwd, note) = forwarded_session_args(&json!({"action":"send","server":"VPS","report":true}), "send", true, true);
+        assert_eq!((fwd["report"].clone(), note), (json!(true), None));
+    }
+
+    #[test]
+    fn explicit_report_false_gets_wakeup_hint() {
+        for lead in [true, false] {
+            let (fwd, note) = forwarded_session_args(&json!({"action":"send","report":false}), "send", lead, false);
+            assert_eq!(fwd["report"], false);
+            assert!(note.unwrap().contains("schedule_wakeup"), "lead={lead}");
+        }
+    }
+
+    #[test]
     fn session_permission_defaults_and_explicit_overrides() {
         assert!(effective_permission(&json!({}), "read"));
         assert!(!effective_permission(&json!({}), "message"));
@@ -2460,9 +2550,9 @@ mod tests {
         assert!(can_read_other(Some("worker"), "other", Some(true)));
         assert!(can_manage_permissions(true));
         assert!(!can_manage_permissions(false));
-        assert_eq!(forwarded_session_args(&json!({"action":"send", "report":true}), "send", false)["report"], false);
-        assert_eq!(forwarded_session_args(&json!({"action":"send"}), "send", true)["report"], Value::Null);
-        assert_eq!(forwarded_session_args(&json!({"action":"stop", "report":true}), "stop", false)["report"], true);
+        assert_eq!(forwarded_session_args(&json!({"action":"send", "report":true}), "send", false, false).0["report"], true);
+        assert_eq!(forwarded_session_args(&json!({"action":"send"}), "send", true, false).0["report"], true);
+        assert_eq!(forwarded_session_args(&json!({"action":"stop", "report":true}), "stop", false, false), (json!({"action":"stop", "report":true}), None));
         assert!(can_manage_sessions_action(false, false, "send", true));
         assert!(!can_manage_sessions_action(false, false, "send", false));
         for action in ["create", "stop", "delete", "archive", "unarchive", "status", "list"] {
@@ -2588,19 +2678,13 @@ mod tests {
             no_saved_names(err);
         }
 
-        // Non-lead remote send forces report: false while preserving server
-        let fwd = forwarded_session_args(
-            &json!({"action": "send", "server": "Oracle VPS", "session_id": "s1", "message": "hi", "report": true}),
-            "send",
-            false,
-        );
-        assert_eq!(fwd["report"], false);
+        // Non-lead remote send may opt into report: true; server is preserved
+        let remote = json!({"action": "send", "server": "Oracle VPS", "session_id": "s1", "message": "hi", "report": true});
+        let (fwd, note) = forwarded_session_args(&remote, "send", false, false);
+        assert_eq!(fwd["report"], true);
         assert_eq!(fwd["server"], "Oracle VPS");
-        let fwd_lead = forwarded_session_args(
-            &json!({"action": "send", "server": "Oracle VPS", "session_id": "s1", "message": "hi", "report": true}),
-            "send",
-            true,
-        );
+        assert_eq!(note, None);
+        let (fwd_lead, _) = forwarded_session_args(&remote, "send", true, false);
         assert_eq!(fwd_lead["report"], true);
     }
 
