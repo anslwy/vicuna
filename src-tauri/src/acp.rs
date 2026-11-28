@@ -1538,7 +1538,7 @@ pub(crate) fn system_prompt(workspace: &str, goal: Option<&str>, session_id: Opt
     let session_info = session_id
         .map(|id| {
             format!(
-                "- Session context: your Vicuna session ID is `{id}`; pass `caller_session_id: \"{id}\"` on every vicuna-mcp call (ask_user, schedule_wakeup, manage_sessions, manage_skills, read_session, get_session_id) so it reaches this session even when other sessions share the workspace. If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
+                "- Session context: your Vicuna session ID is `{id}`; pass `caller_session_id: \"{id}\"` on every vicuna-mcp call (ask_user, schedule_wakeup, manage_sessions, manage_skills, read_session, read_attachment, get_session_id) so it reaches this session even when other sessions share the workspace. If the workspace or harness/engine changed mid-conversation, or if earlier messages were omitted from the prompt, call `read_session` (paginated with `offset`/`limit` or `tail: true`) on vicuna-mcp to read the full session history, or `list_sessions` to browse other sessions.\n\
 Files the user attached to this session live in ~/vicuna/uploads/{id}/ — read them directly when the prompt mentions attachments."
             )
         })

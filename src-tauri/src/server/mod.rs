@@ -807,6 +807,15 @@ async fn dispatch(
             turns::schedule_put(st, items).await
         }
         "schedule_remove" => turns::schedule_remove(st, arg_str_list(args, "ids")).await,
+        // read_attachment(server=…) from another machine: ONE inline image
+        // (session_id, message_idx, image_index) or upload file (session_id,
+        // filename); the caller's session gates ran on its own server
+        "server_read_attachment" => {
+            let id = arg_opt_str(args, "session_id").ok_or("session_id required")?;
+            let which = crate::attachments::parse_which(args)?;
+            let att = crate::attachments::read_local(st.db.as_ref(), &id, &which).await?;
+            Ok(crate::attachments::to_wire(&att))
+        }
         // cross-host Cmd+P: another window searches this server's sessions
         "server_search_chats" => {
             let db = st.db.as_ref().ok_or("This bridge stores no chats (run `vicuna serve`).")?;
@@ -1549,6 +1558,7 @@ pub const API_ACTIONS: &[&str] = &[
     "schedule_put",
     "schedule_remove",
     "server_info",
+    "server_read_attachment",
     "server_search_chats",
     "server_upgrade",
     "server_upgrade_check",

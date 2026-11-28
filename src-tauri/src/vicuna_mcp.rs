@@ -38,6 +38,8 @@ pub const SERVER_NAME: &str = "vicuna-mcp";
 pub const TOOL_NAME: &str = "ask_user";
 pub const GET_SESSION_TOOL: &str = "get_session_id";
 pub const READ_SESSION_TOOL: &str = "read_session";
+/// One inline image or uploaded file of a session, on demand.
+pub const READ_ATTACHMENT_TOOL: &str = "read_attachment";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const MANAGE_MCP_TOOL: &str = "manage_mcp";
 /// List/read/add/edit/enable/disable/remove Vicuna skills (~/vicuna/skills/<slug>/SKILL.md).
@@ -53,12 +55,13 @@ pub const SEARCH_TOOL: &str = "search_sessions";
 /// Read each Work harness's remaining subscription quota (read-only, cached).
 pub const USAGE_TOOL: &str = "usage_status";
 /// Tools this server adds to the engine's tool budget.
-pub const TOOL_COUNT: usize = 12;
+pub const TOOL_COUNT: usize = 13;
 /// Claude's tool ids, pre-approved: ask_user is itself the question, and
 /// session/mcp tools are explicit.
 pub const CLAUDE_TOOL_ID: &str = "mcp__vicuna-mcp__ask_user";
 pub const CLAUDE_GET_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__get_session_id";
 pub const CLAUDE_READ_SESSION_TOOL_ID: &str = "mcp__vicuna-mcp__read_session";
+pub const CLAUDE_READ_ATTACHMENT_TOOL_ID: &str = "mcp__vicuna-mcp__read_attachment";
 pub const CLAUDE_LIST_SESSIONS_TOOL_ID: &str = "mcp__vicuna-mcp__list_sessions";
 pub const CLAUDE_MANAGE_MCP_TOOL_ID: &str = "mcp__vicuna-mcp__manage_mcp";
 pub const CLAUDE_MANAGE_SKILLS_TOOL_ID: &str = "mcp__vicuna-mcp__manage_skills";
@@ -95,7 +98,7 @@ const INSTRUCTIONS: &str = "Vicuna shows questions to the user as a card in the 
 When you need a decision, a preference or missing information from the user, call ask_user \
 (with short choices when there are a few likely answers) instead of asking in plain text or \
 using a built-in question tool; it waits for the answer and returns it. Run commands with your own shell tool \
-(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
+(use its background mode, where it has one, for servers and other long-running jobs). Use `get_session_id`, `read_session` (paginated; `plain: true` collapses tool cards; messages list image metadata and the session its `uploads`), `read_attachment` (one listed image or uploaded file, on demand), `session_overview` (what the most recently active sessions are doing), `search_sessions` (full-text search), \
 and `list_sessions` to inspect the current Vicuna session or earlier conversation history if the workspace/harness \
 changed or earlier messages were truncated. Use `manage_mcp` to list, add, edit, enable, disable, or remove \
 custom MCP servers in Vicuna (except the fixed `vicuna-mcp` server). Use `manage_skills` to list, search, read, add, edit, \
@@ -631,7 +634,7 @@ async fn manage_sessions(target: &Target, args: &Value, client_gone: impl std::f
 fn is_remote_call(tool: &str, args: &Value) -> bool {
     match tool {
         MANAGE_SESSIONS_TOOL => args.get("action").and_then(Value::as_str).map(str::trim) == Some("servers") || remote_server(args).is_some(),
-        READ_SESSION_TOOL | SEARCH_TOOL => remote_server(args).is_some(),
+        READ_SESSION_TOOL | READ_ATTACHMENT_TOOL | SEARCH_TOOL => remote_server(args).is_some(),
         _ => false,
     }
 }
@@ -772,7 +775,7 @@ fn read_session_schema() -> Value {
     json!({
         "name": READ_SESSION_TOOL,
         "title": "Read Vicuna session history (paginated)",
-        "description": "Read messages from a Vicuna session stored in vicuna.db. Useful when the workspace or harness/engine changed mid-conversation, when earlier messages were truncated from the prompt, or when inspecting another session. Paginated with `offset` and `limit` (or `tail: true` for the latest page; with `tail`, long messages keep their END, which is cheap even for 150 KB replies). Each message reports its full `chars`. `plain: true` returns readable text without tool-card HTML.",
+        "description": "Read messages from a Vicuna session stored in vicuna.db. Useful when the workspace or harness/engine changed mid-conversation, when earlier messages were truncated from the prompt, or when inspecting another session. Paginated with `offset` and `limit` (or `tail: true` for the latest page; with `tail`, long messages keep their END, which is cheap even for 150 KB replies). Each message reports its full `chars`. `plain: true` returns readable text without tool-card HTML. Messages with pasted images carry `images: [{index, mime, bytes}]` and the session lists staged files as `uploads: [{name, bytes}]`; read one with `read_attachment`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -787,6 +790,103 @@ fn read_session_schema() -> Value {
             }
         }
     })
+}
+
+fn read_attachment_schema() -> Value {
+    json!({
+        "name": READ_ATTACHMENT_TOOL,
+        "title": "Read one session attachment",
+        "description": "Read ONE attachment that `read_session` listed: an inline image of a message (`message_idx` = the message's `idx`, `image_index` from its `images`) or an uploaded file (`filename` from `uploads`). Supported images (png/jpeg/webp/gif) come back as an image you can see; other files, or any file with `save_to_file: true`, are saved under ~/vicuna/cache/remote-attachments/ and the local path is returned. Limit 10 MB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "Read from another Vicuna server the user saved (its name). Needs this session's \"Use sessions on other servers\" and \"Read other sessions\" permissions." },
+                "session_id": { "type": "string", "description": "Session to read from. Defaults to the current session (required with `server`)." },
+                "message_idx": { "type": "integer", "minimum": 0, "description": "0-based message index (`idx` in read_session) holding the image." },
+                "image_index": { "type": "integer", "minimum": 0, "description": "Which image of that message (default 0)." },
+                "filename": { "type": "string", "description": "Uploaded file name from read_session's `uploads` (instead of `message_idx`)." },
+                "save_to_file": { "type": "boolean", "description": "Save to ~/vicuna/cache/remote-attachments/ and return the path instead of an inline image (default false)." }
+            }
+        }
+    })
+}
+
+/// Permission decision for `read_attachment`, kept pure. Own session: always.
+/// Another local session: `read` or lead. Another server: `remote` AND
+/// (`read` or lead).
+fn attachment_gate(has_session: bool, own: bool, remote: bool, remote_perm: bool, read_perm: bool, lead: bool) -> Result<(), &'static str> {
+    if remote {
+        if !has_session || !remote_perm {
+            Err(REMOTE_READ_DENIED)
+        } else if !(read_perm || lead) {
+            Err(READ_OTHER_DENIED)
+        } else {
+            Ok(())
+        }
+    } else if !has_session || own || read_perm || lead {
+        Ok(())
+    } else {
+        Err(READ_OTHER_DENIED)
+    }
+}
+
+/// (remote, read, lead) permissions of the calling session.
+async fn caller_perms(target: Option<&Target>) -> (bool, bool, bool) {
+    let Some(t) = target else { return (false, false, false) };
+    let turn_lead = t.turn.lead.load(Ordering::Relaxed);
+    let Some(id) = t.session_id.as_deref() else { return (false, false, turn_lead) };
+    let Ok(pool) = db_pool().await else { return (false, false, turn_lead) };
+    caller_perms_in(&pool, id, turn_lead).await
+}
+
+async fn caller_perms_in(pool: &sqlx::SqlitePool, id: &str, turn_lead: bool) -> (bool, bool, bool) {
+    let extra = match sqlx::query("SELECT extra FROM chats WHERE id = ?").bind(id).fetch_optional(pool).await {
+        Ok(Some(row)) => row.try_get::<Option<String>, _>("extra").ok().flatten().and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null),
+        _ => return (false, false, turn_lead),
+    };
+    let lead = turn_lead || extra.get("role").and_then(Value::as_str) == Some("lead");
+    (effective_permission(&extra, "remote"), effective_permission(&extra, "read"), lead)
+}
+
+async fn read_attachment(target: Option<&Target>, args: &Value) -> Value {
+    let server = remote_server(args);
+    let caller = target.and_then(|t| t.session_id.clone());
+    let requested = args.get("session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let own = server.is_none() && (requested.is_none() || requested == caller);
+    // with no turn at all (plain MCP client) local reads are unrestricted, like read_session
+    if target.is_some() || server.is_some() {
+        let (remote_perm, read_perm, lead) = if own && server.is_none() { (false, true, false) } else { caller_perms(target).await };
+        if let Err(e) = attachment_gate(caller.is_some(), own, server.is_some(), remote_perm, read_perm, lead) {
+            return text_result(e, true);
+        }
+    }
+    let which = match crate::attachments::parse_which(args) {
+        Ok(w) => w,
+        Err(e) => return text_result(&e, true),
+    };
+    let save = args.get("save_to_file").and_then(Value::as_bool).unwrap_or(false);
+    let (att, source) = if let Some(server) = server {
+        let Some(id) = requested else {
+            return text_result("`session_id` is required with `server` (find it with search_sessions or manage_sessions list on that server).", true);
+        };
+        match crate::server::remote_lead::read_attachment(&server, &id, &which).await {
+            Ok(a) => (a, format!("Session {id} on server {server}")),
+            Err(e) => return text_result(&e, true),
+        }
+    } else {
+        let Some(id) = requested.or(caller) else {
+            return text_result("No `session_id` provided and current turn has no session_id.", true);
+        };
+        let pool = db_pool().await.ok();
+        match crate::attachments::read_local(pool.as_ref(), &id, &which).await {
+            Ok(a) => (a, format!("Session {id}")),
+            Err(e) => return text_result(&e, true),
+        }
+    };
+    match crate::attachments::mcp_result(&att, &source, save) {
+        Ok(v) => v,
+        Err(e) => text_result(&e, true),
+    }
 }
 
 fn list_sessions_schema() -> Value {
@@ -1252,6 +1352,16 @@ async fn read_session_from_pool(
     session_id: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    let uploads_dir = crate::updates_uploads::upload_session_dir(session_id).ok();
+    read_session_page(pool, session_id, args, uploads_dir.as_deref()).await
+}
+
+async fn read_session_page(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    args: &Value,
+    uploads_dir: Option<&std::path::Path>,
+) -> Result<Value, String> {
     let chat_row = sqlx::query("SELECT id, title, mode, workspace, goal FROM chats WHERE id = $1")
         .bind(session_id)
         .fetch_optional(pool)
@@ -1299,7 +1409,7 @@ async fn read_session_from_pool(
         (false, false) => "substr(content, 1, $4)",
     };
     let rows = sqlx::query(&format!(
-        "SELECT idx, role, {content_sql} AS content, length(content) AS chars, thinking, model, context_cleared FROM messages WHERE chat_id = $1{filter} ORDER BY idx ASC LIMIT $2 OFFSET $3",
+        "SELECT idx, role, {content_sql} AS content, length(content) AS chars, thinking, model, context_cleared, images FROM messages WHERE chat_id = $1{filter} ORDER BY idx ASC LIMIT $2 OFFSET $3",
     ))
     .bind(session_id)
     .bind(limit)
@@ -1336,6 +1446,12 @@ async fn read_session_from_pool(
         if r.try_get::<Option<i64>, _>("context_cleared").ok().flatten() == Some(1) {
             msg["contextCleared"] = json!(true);
         }
+        if let Some(raw) = r.try_get::<Option<String>, _>("images").ok().flatten() {
+            let meta = crate::attachments::images_meta(&Value::String(raw));
+            if !meta.is_empty() {
+                msg["images"] = json!(meta);
+            }
+        }
         if include_thinking {
             let raw_thinking: String = r.try_get("thinking").unwrap_or_default();
             if !raw_thinking.is_empty() {
@@ -1350,7 +1466,7 @@ async fn read_session_from_pool(
     let next_offset = offset + returned;
     let has_more = next_offset < total;
 
-    Ok(json!({
+    let mut out = json!({
         "session": {
             "id": chat_row.try_get::<String, _>("id").unwrap_or_default(),
             "title": chat_row.try_get::<String, _>("title").unwrap_or_default(),
@@ -1365,7 +1481,12 @@ async fn read_session_from_pool(
         "has_more": has_more,
         "next_offset": if has_more { json!(next_offset) } else { Value::Null },
         "messages": messages,
-    }))
+    });
+    let uploads = uploads_dir.map(crate::attachments::uploads_meta_in).unwrap_or_default();
+    if !uploads.is_empty() {
+        out["uploads"] = json!(uploads);
+    }
+    Ok(out)
 }
 
 async fn read_session(target: Option<&Target>, args: &Value) -> Value {
@@ -2156,6 +2277,7 @@ async fn handle_rpc(
             with_caller_arg(tool_schema()),
             with_caller_arg(get_session_schema()),
             with_caller_arg(read_session_schema()),
+            with_caller_arg(read_attachment_schema()),
             with_caller_arg(list_sessions_schema()),
             with_caller_arg(overview_schema()),
             with_caller_arg(search_schema()),
@@ -2173,6 +2295,7 @@ async fn handle_rpc(
                 (Some(t), TOOL_NAME) => ask(t, &args, client_gone).await,
                 (Some(t), GET_SESSION_TOOL) => get_session_id(t).await,
                 (t, READ_SESSION_TOOL) => read_session(t, &args).await,
+                (t, READ_ATTACHMENT_TOOL) => read_attachment(t, &args).await,
                 (Some(t), SCHEDULE_TOOL) => schedule_wakeup(t, &args, client_gone).await,
                 (Some(t), MANAGE_SESSIONS_TOOL) => manage_sessions(t, &args, client_gone).await,
                 (Some(t), MANAGE_SCHEDULE_TOOL) => manage_schedule(t, &args, client_gone).await,
@@ -3108,7 +3231,7 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["question"]));
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, MANAGE_SKILLS_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
+        assert_eq!(names, vec![TOOL_NAME, GET_SESSION_TOOL, READ_SESSION_TOOL, READ_ATTACHMENT_TOOL, LIST_SESSIONS_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, USAGE_TOOL, MANAGE_MCP_TOOL, MANAGE_SKILLS_TOOL, SCHEDULE_TOOL, MANAGE_SESSIONS_TOOL, MANAGE_SCHEDULE_TOOL]);
         let properties = &tools.as_array().unwrap().iter()
             .find(|tool| tool["name"] == MANAGE_SKILLS_TOOL).unwrap()["inputSchema"]["properties"];
         for arg in [CALLER_ARG, "session_id", "query"] {
@@ -3261,6 +3384,87 @@ mod tests {
         let v: Value = serde_json::from_str(txt).unwrap();
         assert_eq!(v["session_id"], "sess-123");
         assert_eq!(v["workspace"], "/tmp/ws-test");
+    }
+
+    async fn attachment_pool() -> sqlx::SqlitePool {
+        use base64::Engine as _;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE chats (id TEXT PRIMARY KEY, title TEXT NOT NULL, mode TEXT, workspace TEXT, goal TEXT, extra TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE messages (chat_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT NOT NULL, model TEXT, idx INTEGER NOT NULL, images TEXT, context_cleared INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chats (id, title, extra) VALUES ('s1', 'T', NULL), ('noread', 'N', '{\"permissions\":{\"read\":false}}'), ('remote-only', 'R', '{\"permissions\":{\"remote\":true,\"read\":false}}'), ('remote-read', 'RR', '{\"permissions\":{\"remote\":true}}'), ('lead', 'L', '{\"role\":\"lead\",\"permissions\":{\"read\":false}}')").execute(&pool).await.unwrap();
+        let png = base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G']);
+        let imgs = json!([format!("data:image/png;base64,{png}"), "data:text/html;base64,PGI+"]).to_string();
+        sqlx::query("INSERT INTO messages (chat_id, role, content, thinking, idx, images) VALUES ('s1', 'user', 'look', '', 0, $1), ('s1', 'assistant', 'ok', '', 1, NULL), ('s1', 'user', 'empty', '', 2, '[]')")
+            .bind(imgs).execute(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn read_session_lists_attachment_metadata_without_base64() {
+        use base64::Engine as _;
+        let pool = attachment_pool().await;
+        let dir = crate::attachments::test_dir("rs-up");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+        let v = read_session_page(&pool, "s1", &json!({}), Some(&dir)).await.unwrap();
+        let text = v.to_string();
+        assert!(!text.contains("base64") && !text.contains(&base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G'])), "{text}");
+        assert_eq!(v["messages"][0]["images"], json!([{"index":0,"mime":"image/png","bytes":4},{"index":1,"mime":"text/html","bytes":3}]));
+        assert!(v["messages"][1].get("images").is_none());
+        assert!(v["messages"][2].get("images").is_none(), "empty arrays are omitted");
+        assert_eq!(v["uploads"], json!([{"name":"notes.txt","bytes":5}]));
+        let none = read_session_page(&pool, "s1", &json!({}), Some(&dir.join("missing"))).await.unwrap();
+        assert!(none.get("uploads").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_attachment_local_inline_and_validation() {
+        use crate::attachments::{mcp_result_in, read_local, Which};
+        let pool = attachment_pool().await;
+        let cache = crate::attachments::test_dir("rs-cache");
+        let a = read_local(Some(&pool), "s1", &Which::Inline { message_idx: 0, image_index: 0 }).await.unwrap();
+        assert_eq!((a.mime.as_str(), a.data.len()), ("image/png", 4));
+        let r = mcp_result_in(&a, "Session s1", false, &cache).unwrap();
+        assert_eq!(r["content"][0]["type"], "text");
+        assert_eq!(r["content"][1], json!({"type":"image","data":"iVBORw==","mimeType":"image/png"}));
+        // a non-whitelisted mime is saved to the cache instead of an image block
+        let html = read_local(Some(&pool), "s1", &Which::Inline { message_idx: 0, image_index: 1 }).await.unwrap();
+        let r = mcp_result_in(&html, "Session s1", false, &cache).unwrap();
+        assert_eq!(r["content"].as_array().unwrap().len(), 1);
+        assert!(r["content"][0]["text"].as_str().unwrap().contains(&cache.display().to_string()));
+        let r = mcp_result_in(&a, "Session s1", true, &cache).unwrap();
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("saved to"), "save_to_file forces a file");
+        assert!(read_local(Some(&pool), "s1", &Which::Inline { message_idx: 1, image_index: 0 }).await.is_err());
+        assert!(read_local(Some(&pool), "s1", &Which::Inline { message_idx: 9, image_index: 0 }).await.unwrap_err().contains("not found"));
+        assert!(read_local(Some(&pool), "s1", &Which::Upload { filename: "../x".into() }).await.is_err());
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[tokio::test]
+    async fn read_attachment_permission_gates() {
+        // own session always; others need read or lead; remote needs remote + read
+        assert!(attachment_gate(true, true, false, false, false, false).is_ok());
+        assert_eq!(attachment_gate(true, false, false, false, false, false), Err(READ_OTHER_DENIED));
+        assert!(attachment_gate(true, false, false, false, true, false).is_ok());
+        assert!(attachment_gate(true, false, false, false, false, true).is_ok());
+        assert_eq!(attachment_gate(true, false, true, false, true, true), Err(REMOTE_READ_DENIED));
+        assert_eq!(attachment_gate(true, false, true, true, false, false), Err(READ_OTHER_DENIED));
+        assert!(attachment_gate(true, false, true, true, true, false).is_ok());
+        assert_eq!(attachment_gate(false, false, true, true, true, true), Err(REMOTE_READ_DENIED));
+        let pool = attachment_pool().await;
+        assert_eq!(caller_perms_in(&pool, "s1", false).await, (false, true, false));
+        assert_eq!(caller_perms_in(&pool, "noread", false).await, (false, false, false));
+        assert_eq!(caller_perms_in(&pool, "remote-only", false).await, (true, false, false));
+        assert_eq!(caller_perms_in(&pool, "remote-read", false).await, (true, true, false));
+        assert_eq!(caller_perms_in(&pool, "lead", false).await, (false, false, true));
+        assert_eq!(caller_perms_in(&pool, "missing", false).await, (false, false, false));
+        // through the tool: a remote read without a permitted session is refused before any server lookup
+        let (ch, _) = capture();
+        let t = Target { seq: 0, workspace: ws(), session_id: Some("no-such-session".into()), turn: Arc::new(TurnState::new()), on_event: ch };
+        let r = read_attachment(Some(&t), &json!({"server": "vps", "session_id": "x", "message_idx": 0})).await;
+        assert_eq!(gate_text(&r), (REMOTE_READ_DENIED.to_string(), true));
+        assert!(is_remote_call(READ_ATTACHMENT_TOOL, &json!({"server": "vps"})));
     }
 
     #[tokio::test]

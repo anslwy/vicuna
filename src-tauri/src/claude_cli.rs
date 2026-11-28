@@ -244,6 +244,7 @@ pub fn question_tool_args(mcp: &[Value]) -> Vec<String> {
         args.push(crate::vicuna_mcp::CLAUDE_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_GET_SESSION_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_READ_SESSION_TOOL_ID.to_string());
+        args.push(crate::vicuna_mcp::CLAUDE_READ_ATTACHMENT_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_LIST_SESSIONS_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_OVERVIEW_TOOL_ID.to_string());
         args.push(crate::vicuna_mcp::CLAUDE_SEARCH_TOOL_ID.to_string());
@@ -828,6 +829,7 @@ mod tests {
                 "mcp__vicuna-mcp__ask_user",
                 "mcp__vicuna-mcp__get_session_id",
                 "mcp__vicuna-mcp__read_session",
+                "mcp__vicuna-mcp__read_attachment",
                 "mcp__vicuna-mcp__list_sessions",
                 "mcp__vicuna-mcp__session_overview",
                 "mcp__vicuna-mcp__search_sessions",

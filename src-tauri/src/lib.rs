@@ -31,6 +31,7 @@ pub mod work_agent;
 pub mod work_usage;
 pub mod vicuna_mcp;
 pub mod session_insight;
+pub mod attachments;
 pub mod git_panel;
 pub mod server_store;
 pub mod servers;
