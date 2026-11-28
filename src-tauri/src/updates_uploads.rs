@@ -7,7 +7,14 @@ pub(crate) async fn upload_read_file(session_id: String, name: String) -> Result
     upload_read_file_logic(session_id, name).await
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub(crate) async fn app_build_info(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let version = app.package_info().version.to_string();
+    Ok(app_build_info_with_version(&version))
+}
+
+#[cfg(not(feature = "desktop"))]
 pub(crate) async fn app_build_info() -> Result<serde_json::Value, String> {
     app_build_info_logic().await
 }
@@ -123,13 +130,21 @@ pub struct UpdateAsset {
     pub size: Option<u64>,
 }
 
+/// Build the `app_build_info` JSON payload for a given version string.
+/// Desktop passes `app.package_info().version` (which includes `--config`
+/// overrides such as `0.1.2-dev.20261128151100`); headless/server falls back
+/// to `CARGO_PKG_VERSION`.
+pub(crate) fn app_build_info_with_version(version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "builtAtUnix": option_env!("VICUNA_BUILD_UNIX").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+    })
+}
+
 /// This build's version + baked timestamp (seconds since epoch, 0 when the
 /// build script couldn't read the clock).
 pub async fn app_build_info_logic() -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "builtAtUnix": option_env!("VICUNA_BUILD_UNIX").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-    }))
+    Ok(app_build_info_with_version(env!("CARGO_PKG_VERSION")))
 }
 
 /// Pick the release-attachment fields the frontend needs out of the GitHub
