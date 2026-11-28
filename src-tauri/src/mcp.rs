@@ -440,6 +440,14 @@ impl McpManager {
         if cfg.name.trim().is_empty() {
             return Err("mcp: server name is required".to_string());
         }
+        // plugin servers get their stored secrets here (the window's copy
+        // of the config never carries them)
+        let mut cfg_owned = cfg.clone();
+        if cfg.plugin_id.is_some() {
+            let values = crate::plugin_mcp::secrets_for(cfg);
+            crate::plugin_mcp::apply_secrets(&mut cfg_owned, values);
+        }
+        let cfg = &cfg_owned;
         // connecting twice replaces the old connection (stale child killed)
         self.disconnect(&cfg.id).await.ok();
         let mut guard = self.inner.lock().await;
@@ -1591,16 +1599,38 @@ pub(crate) fn plugin_guard(doc: &serde_json::Value, id: &str) -> Result<(), Stri
     }
 }
 
+/// The MCP dialog's list (`mcp_list_servers`, manage_mcp): plugin secrets
+/// are never part of it, so they can't reach a window or a transcript.
 pub(crate) fn session_servers(resource_dir: Option<&std::path::Path>) -> Result<Vec<McpServerConfig>, String> {
-    Ok(session_catalog(resource_dir)?.0)
+    Ok(session_servers_in(&vicuna_config_path()?, resource_dir))
 }
 
+fn session_servers_in(path: &std::path::Path, resource_dir: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+    let (mut servers, _) = session_catalog_with(path, resource_dir, &crate::plugin_mcp::consented_servers());
+    for s in servers.iter_mut().filter(|s| s.plugin_id.is_some()) {
+        let values = crate::plugin_mcp::secrets_for(s);
+        crate::plugin_mcp::redact(s, &values);
+    }
+    servers
+}
+
+/// The catalog a Work turn hands to its engine: plugin stdio servers carry
+/// their stored secrets in `env`.
 pub(crate) fn session_catalog(resource_dir: Option<&std::path::Path>) -> Result<(Vec<McpServerConfig>, bool), String> {
     Ok(session_catalog_in(&vicuna_config_path()?, resource_dir))
 }
 
 fn session_catalog_in(path: &std::path::Path, resource_dir: Option<&std::path::Path>) -> (Vec<McpServerConfig>, bool) {
-    session_catalog_with(path, resource_dir, &crate::plugin_mcp::consented_servers())
+    let (mut servers, browser) = session_catalog_with(path, resource_dir, &crate::plugin_mcp::consented_servers());
+    with_plugin_secrets(&mut servers);
+    (servers, browser)
+}
+
+fn with_plugin_secrets(servers: &mut [McpServerConfig]) {
+    for s in servers.iter_mut().filter(|s| s.plugin_id.is_some()) {
+        let values = crate::plugin_mcp::secrets_for(s);
+        crate::plugin_mcp::apply_secrets(s, values);
+    }
 }
 
 fn session_catalog_with(
@@ -1912,6 +1942,30 @@ mod config_tests {
         assert!(!sel.is_enabled("demo-web", true));
         // unconsented/uninstalled plugin -> the saved default is inert
         assert!(!defaults_with(Some(&path), &[]).contains_key("demo-web"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn plugin_secrets_reach_turns_but_never_the_dialog_list() {
+        let path = tmp_config("plugin-secrets");
+        let mut cfg = plugin_cfg("demo-gem");
+        cfg.transport = "stdio".into();
+        cfg.url = None;
+        cfg.command = Some(vec!["gem-mcp".into()]);
+        cfg.env = Some(HashMap::from([("GEM_MODE".into(), "ro".into())]));
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = Some(vec![(cfg, true)]));
+        crate::plugin_mcp::TEST_SECRETS.with(|t| {
+            *t.borrow_mut() = Some(HashMap::from([("demo-gem".into(), HashMap::from([("GEMINI_API_KEY".into(), "sk-secret-1234".into())]))]))
+        });
+        let (cat, _) = session_catalog_in(&path, None);
+        let env = cat.iter().find(|s| s.id == "demo-gem").unwrap().env.clone().unwrap();
+        assert_eq!((env["GEMINI_API_KEY"].as_str(), env["GEM_MODE"].as_str()), ("sk-secret-1234", "ro"));
+        let listed = session_servers_in(&path, None);
+        let json = serde_json::to_string(&listed).unwrap();
+        assert!(!json.contains("sk-secret-1234") && !json.contains("GEMINI_API_KEY"), "{json}");
+        assert!(json.contains("GEM_MODE"));
+        crate::plugin_mcp::TEST_SECRETS.with(|t| *t.borrow_mut() = None);
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = None);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

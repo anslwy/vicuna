@@ -6,7 +6,8 @@
   import { invokeOrBridge } from "./bridge";
   import { installBlocked, type InstalledPlugin } from "./pluginTheme";
   import { accountSummary, commandLine, consentPayload, pendingConsent, type PluginHarness } from "./pluginHarness";
-  import { mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, type PluginMcpServer } from "./pluginMcp";
+  import { mcpConsentPayload, mcpLaunchLine, pendingMcpConsent, secretsState, type PluginMcpServer } from "./pluginMcp";
+  import PluginSecretsModal from "./PluginSecretsModal.svelte";
   import { cardAction, filterCatalog, githubRepoUrl, KIND_LABEL, safeImageUrl, type Catalog, type CatalogEntry } from "./pluginCatalog";
 
   let { plugins, activeThemeKey, onChanged, onUseTheme, onOpenPanel, onHarnessesChanged, onMcpChanged }: {
@@ -24,6 +25,12 @@
   let error = $state("");
   let notice = $state("");
   let confirmRemove = $state<string | null>(null);
+  // API keys for a plugin MCP server (declared `secrets`)
+  let secretsFor = $state<{ pluginId: string; server: PluginMcpServer } | null>(null);
+  function secretsSaved(entry: InstalledPlugin) {
+    onChanged(plugins.map((p) => (p.id === entry.id ? entry : p)));
+    onMcpChanged?.();
+  }
 
   // Harness consent: shown after install/upgrade (or "Enable…") for every
   // harness whose exact command the user hasn't approved. The server enforces
@@ -428,6 +435,12 @@
               {#if m.enabled}<span class="pl-badge ok" title="Listed in the MCP dialog as {m.serverId}">Allowed</span>{:else}<span class="pl-badge">Not allowed</span>{/if}
               {#if !m.installed}<span class="pl-badge" title={m.installHint ?? ""}>`{m.command}` not found</span>{/if}
               <span class="pl-spacer"></span>
+              {#if secretsState(m) !== "none"}
+                {@const ks = secretsState(m)}
+                <button class="pl-btn" data-testid="plugin-mcp-keys-{p.id}-{m.id}" title={ks === "missing" ? "A required key is not set" : ks === "ok" ? "All keys set" : "Some optional keys are not set"} onclick={() => (secretsFor = { pluginId: p.id, server: m })}>
+                  <span class="pl-key-dot {ks}"></span>Keys
+                </button>
+              {/if}
               {#if m.enabled}
                 <button class="pl-btn" data-testid="plugin-mcp-revoke-{p.id}-{m.id}" onclick={() => revokeMcp(p, m)}>Remove</button>
               {:else}
@@ -505,6 +518,10 @@
     </div>
   </div>
   </div>
+{/if}
+
+{#if secretsFor}
+  <PluginSecretsModal pluginId={secretsFor.pluginId} server={secretsFor.server} onClose={() => (secretsFor = null)} onSaved={secretsSaved} />
 {/if}
 
 {#if preview}
@@ -585,4 +602,7 @@
   .pl-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .pl-preview-head h3 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pl-preview-img { display: block; max-width: min(920px, 100%); max-height: 80vh; object-fit: contain; border-radius: 8px; border: 1px solid var(--border); background: var(--hover); }
+  .pl-key-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; background: var(--muted); }
+  .pl-key-dot.ok { background: var(--accent); }
+  .pl-key-dot.missing { background: var(--danger, #d33); }
 </style>
