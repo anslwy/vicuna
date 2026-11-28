@@ -52,6 +52,7 @@
   import { isPluginEngine, pluginHarnessName, pluginEngineIcon } from "$lib/pluginHarness";
   import { sessionPick, missingHarnessReason, handoffAt, labelHarness, workspaceHandoffLabels, latestSummaryIndex, canClearContext, isAssistantReply, undoMessageRange } from "$lib/sessionEngine";
   import { followUpSendsNow, parseSendNow, runningPlaceholder, queuedHint } from "$lib/followUp";
+  import { promptHistoryStepDir, historyCaretPos } from "$lib/promptHistory";
   import { formatToolCallHead, formatToolCallTail, formatToolResult, formatAskRecord, formatDisplayNote, listWorkTree, collectDropEntries, fileToBase64, stageUploadFile, renameWorkFile, deleteWorkFile, openWorkPathExternal, spawnTerm, writeTerm, resizeTerm, killTerm, completeMentionText, estimateWorkTokens, startWorkAgentTurn, stopWorkAgentTurn, workTurnLive, liveWorkTurns, attachWorkAgentTurn, attachWorkAgentSnapshot, queueWorkAgentMsg, removeWorkAgentMsg, answerWorkAgentAsk, ASK_LATER, workEngineInfo as fetchWorkEngineInfo, workAccountSupport, addWorkAccount, renameWorkAccount, removeWorkAccount, workSendGate, workReplyModel, listWorkModels, setWorkModel, selectWorkEngine, setWorkApproval, setWorkSendNow, sendWorkAgentNow, engineId, engineLabel, workEngineChoices, workEngineMenuItems, opencodeModelChoices, fetchWorkUsage, usageMeterTone, usageTabs, usageHoverRows, usageGaugeFrac, USAGE_POLL_INTERVAL_MS, formatUsageAge, isUsageStale, usagePollOrder, parseUsageCache, type WorkTreeEntry, type WorkAgentEvent, type WorkEngineInfo, type OpencodeModels, type WorkUsageReport } from "$lib/work";
   import Tooltip from "$lib/Tooltip.svelte";
   import GitPanel from "$lib/GitPanel.svelte";
@@ -5652,25 +5653,28 @@
         input = historyDraft;
         historyIndex = null;
         historyDraft = "";
-        historyAfterFill();
+        historyAfterFill(dir);
         return true;
       }
       if (next >= hist.length) return true; // already at the oldest entry
       historyIndex = next;
     }
     input = hist[historyIndex];
-    historyAfterFill();
+    historyAfterFill(dir);
     return true;
   }
 
-  /** caret to the end + autosize after a history fill (no input event fires
-   *  for a programmatic value change, so do the upkeep by hand) */
-  function historyAfterFill() {
+  /** place caret (top-left on ArrowUp, end on ArrowDown) + autosize after a
+   *  history fill (no input event fires for a programmatic value change, so
+   *  do the upkeep by hand; tick() ensures rapid Up presses see caret 0) */
+  function historyAfterFill(dir: -1 | 1) {
     autosizeComposer();
-    requestAnimationFrame(() => {
+    const pos = historyCaretPos(dir, input);
+    tick().then(() => {
       const el = composerEl;
       if (el) {
-        el.setSelectionRange(input.length, input.length);
+        el.setSelectionRange(pos, pos);
+        if (pos === 0) el.scrollTop = 0;
         el.focus();
       }
       syncBackdropScroll();
@@ -5759,26 +5763,22 @@
         return;
       }
     }
-    // terminal-style prompt history: ArrowUp recalls the last sent message
-    // (even over typed text, as long as the caret is on the first line),
-    // ArrowUp again walks older, ArrowDown returns toward the draft. While
-    // browsing, Down on the last line steps past the newest entry and hands
-    // the draft back. Collapsed carets only, so in-message navigation wins.
+    // terminal-style prompt history: ArrowUp steps older only when the caret is
+    // collapsed before the first character (position 0), so Up on the first
+    // line moves to the leftmost position first and a second Up walks older.
+    // Once browsing, ArrowDown on the last line walks newer / restores the draft.
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && noMod && !e.shiftKey) {
       const el = composerEl;
-      const collapsed = !el || el.selectionStart === el.selectionEnd;
-      if (collapsed) {
-        const caret = el?.selectionStart ?? input.length;
-        const firstLine = !input.slice(0, caret).includes("\n");
-        const lastLine = !input.slice(caret).includes("\n");
-        const up = e.key === "ArrowUp";
-        const browsing = historyIndex != null;
-        const canRecall = up && (browsing ? firstLine : input.trim() === "" || firstLine);
-        const canForward = !up && browsing && lastLine;
-        if ((canRecall || canForward) && historyStep(up ? -1 : 1)) {
-          e.preventDefault();
-          return;
-        }
+      const stepDir = promptHistoryStepDir({
+        key: e.key,
+        input,
+        selectionStart: el?.selectionStart,
+        selectionEnd: el?.selectionEnd,
+        browsing: historyIndex != null,
+      });
+      if (stepDir !== 0 && historyStep(stepDir)) {
+        e.preventDefault();
+        return;
       }
     }
     if (e.key === "Enter" && !e.shiftKey) {
