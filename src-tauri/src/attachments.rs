@@ -121,6 +121,55 @@ pub fn mime_for_name(name: &str) -> &'static str {
     }
 }
 
+/// Largest image `show_image` puts into a reply (decoded bytes).
+pub const SHOW_IMAGE_MAX: u64 = 10 * 1024 * 1024;
+
+/// Image MIME type from magic bytes (png/jpeg/webp/gif only).
+pub fn sniff_image_mime(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// A shown image: data URL + display file name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShownImage {
+    pub data_url: String,
+    pub filename: String,
+    pub mime: &'static str,
+}
+
+/// `show_image`: resolve `path` (absolute, or relative to `workspace`), check
+/// it is a png/jpeg/webp/gif file of at most 10 MB, and encode it.
+pub fn load_show_image(path: &str, workspace: &str) -> Result<ShownImage, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("`path` is required.".into());
+    }
+    let p = Path::new(path);
+    let p = if p.is_absolute() || workspace.trim().is_empty() { p.to_path_buf() } else { Path::new(workspace).join(p) };
+    let meta = std::fs::metadata(&p).map_err(|_| format!("No file at {}.", p.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file.", p.display()));
+    }
+    if meta.len() > SHOW_IMAGE_MAX {
+        return Err(format!("{} is {} bytes; the limit is 10 MB.", p.display(), meta.len()));
+    }
+    let data = std::fs::read(&p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
+    let mime = sniff_image_mime(&data).ok_or_else(|| format!("{} is not a png, jpeg, webp or gif image.", p.display()))?;
+    let filename = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+    let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data));
+    Ok(ShownImage { data_url, filename, mime })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attachment {
     pub name: String,
@@ -285,6 +334,37 @@ pub fn test_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_image_validates_files() {
+        let d = test_dir("show-image");
+        std::fs::create_dir_all(&d).unwrap();
+        let cases: [(&str, &[u8], &str); 4] = [
+            ("a.png", b"\x89PNG\r\n\x1a\nrest", "image/png"),
+            ("b.jpg", &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2], "image/jpeg"),
+            ("c.webp", b"RIFF\x10\0\0\0WEBPVP8 ", "image/webp"),
+            ("d.gif", b"GIF89a\x01\0", "image/gif"),
+        ];
+        for (name, bytes, mime) in cases {
+            std::fs::write(d.join(name), bytes).unwrap();
+            let s = load_show_image(name, d.to_str().unwrap()).unwrap();
+            assert_eq!(s.mime, mime);
+            assert_eq!(s.filename, name);
+            assert!(s.data_url.starts_with(&format!("data:{mime};base64,")));
+            let (m, b64) = parse_data_url(&s.data_url).unwrap();
+            assert_eq!(m, mime);
+            assert_eq!(b64_decoded_len(&b64), bytes.len());
+        }
+        // absolute path works too
+        assert!(load_show_image(d.join("a.png").to_str().unwrap(), "").is_ok());
+        std::fs::write(d.join("x.png"), b"not an image").unwrap();
+        assert!(load_show_image("x.png", d.to_str().unwrap()).unwrap_err().contains("not a png"));
+        assert!(load_show_image("missing.png", d.to_str().unwrap()).unwrap_err().contains("No file"));
+        assert!(load_show_image("", d.to_str().unwrap()).is_err());
+        let big = std::fs::File::create(d.join("big.png")).unwrap();
+        big.set_len(SHOW_IMAGE_MAX + 1).unwrap();
+        assert!(load_show_image("big.png", d.to_str().unwrap()).unwrap_err().contains("10 MB"));
+    }
 
     #[test]
     fn data_urls_and_sizes() {

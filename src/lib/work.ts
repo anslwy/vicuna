@@ -486,6 +486,7 @@ export type WorkAgentEvent =
   | { type: "model"; model: string }
   | { type: "roundend"; gen_ms: number; gen_tps: number | null; gen_cost?: number | null }
   | { type: "displaynote"; text: string }
+  | { type: "assistantimage"; data_url: string; caption?: string | null; filename?: string | null }
   | { type: "queuedrained"; ids: string[]; messages: ChatMsg[] }
   | { type: "toolstart"; name: string; args: Record<string, any> }
   | { type: "toolend"; name: string; output: string }

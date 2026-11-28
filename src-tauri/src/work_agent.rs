@@ -29,6 +29,9 @@ pub enum WorkAgentEvent {
     Model { model: String },
     RoundEnd { gen_ms: u64, gen_tps: Option<f64>, gen_cost: Option<f64> },
     DisplayNote { text: String },
+    /// vicuna-mcp `show_image`: a picture for the live assistant reply
+    /// (`data:image/<mime>;base64,…`), appended to its `images`.
+    AssistantImage { data_url: String, caption: Option<String>, filename: Option<String> },
     QueueDrained { ids: Vec<String>, messages: Vec<ChatMessage> },
     ToolStart { name: String, args: serde_json::Value },
     ToolEnd { name: String, output: String },

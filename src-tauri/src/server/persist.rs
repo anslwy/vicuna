@@ -157,6 +157,9 @@ pub struct Recorder {
     pub dirty: bool,
     /// a user message was added (bumps the session's activity time)
     pub touched: bool,
+    /// show_image pictures of this turn, in order (`dataUrl`/`caption`/
+    /// `filename`): what Telegram and bridge plugins forward
+    pub shown_images: Vec<Value>,
 }
 
 impl Recorder {
@@ -187,6 +190,7 @@ impl Recorder {
             pending_ask_records: Vec::new(),
             dirty: false,
             touched: false,
+            shown_images: Vec::new(),
         }
     }
 
@@ -262,6 +266,30 @@ impl Recorder {
             "displaynote" => {
                 let in_card = self.pending_head.as_ref().is_some_and(|(n, _, _)| n != "ask" && n != "say");
                 self.append(&display_note(&text("text"), in_card));
+            }
+            "assistantimage" => {
+                let url = text("data_url");
+                let model = self.turn_model.clone();
+                if url.starts_with("data:image/") {
+                    self.shown_images.push(json!({
+                        "dataUrl": url,
+                        "caption": ev.get("caption").and_then(Value::as_str),
+                        "filename": ev.get("filename").and_then(Value::as_str),
+                    }));
+                    if let Some(m) = self.cur_mut() {
+                        m.insert("role".into(), json!("assistant"));
+                        if !m.contains_key("model") {
+                            m.insert("model".into(), json!(model));
+                        }
+                        match m.get_mut("images").and_then(Value::as_array_mut) {
+                            Some(a) => a.push(json!(url)),
+                            None => {
+                                m.insert("images".into(), json!([url]));
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                }
             }
             "contextcompacted" => self.append(&format!("\n{}\n", text("note"))),
             "queuedrained" => {
