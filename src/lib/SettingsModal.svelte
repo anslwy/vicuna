@@ -434,7 +434,7 @@
                   <option value="dev">Dev (pre-release)</option>
                 </select>
               </label>
-              <span class="setting-note" data-testid="update-channel-note">{#if updateChannel === "dev"}Dev gets a rolling build of every change on main: newest features, less tested. Switching back to Stable takes effect at the next stable release.{:else}Stable gets batched, tested releases.{/if}</span>
+              <span class="setting-note" data-testid="update-channel-note">{#if updateChannel === "dev"}Dev gets a rolling build of every change on main: newest features, less tested. Switch back to Stable anytime to reinstall the latest stable release.{:else}Stable gets batched, tested releases.{/if}</span>
               <span class="setting-note">Signed updates from the {updateChannel === "dev" ? "rolling dev" : "newest"} <a href={updateReleasesUrl(updateChannel)} onclick={(e) => { e.preventDefault(); void onOpenExternal(updateReleasesUrl(updateChannel)); }}>GitHub release</a> — install in-app, then restart.</span>
             {:else}
               {#if updateRelease}

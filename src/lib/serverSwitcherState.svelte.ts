@@ -2,7 +2,8 @@
 // rename/forget, the server's version + one-click upgrade, and copy helpers.
 // Created once by ChatApp; each server opens in its own window.
 import { type ServerInfo, invokeOrBridge, listServers, touchServer, switchServer, connectServer, renameServer, removeServer } from "./bridge";
-import { cmpVersion, defaultServerName } from "./chatFormat";
+import { defaultServerName } from "./chatFormat";
+import { offersUpdate, isChannelSwitch } from "./version";
 import { SERVER_SETUP_CMD } from "./chatAppData";
 
 export interface ServerSwitcherDeps {
@@ -37,7 +38,9 @@ export function createServerSwitcherState(deps: ServerSwitcherDeps) {
   let srvUpgrading = $state(false);
   let srvVersionChecked = false;
   const srvVersionSkew = $derived(!!srvVersion && srvVersion !== deps.clientVersion);
-  const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && cmpVersion(srvLatest, srvVersion) > 0);
+  // newer, or the Dev → Stable switch (a lower-sorting stable over a dev build)
+  const srvUpgradeAvailable = $derived(!!srvLatest && !!srvVersion && offersUpdate(deps.updateChannel, srvLatest, srvVersion));
+  const srvChannelSwitch = $derived(!!srvLatest && !!srvVersion && isChannelSwitch(deps.updateChannel, srvLatest, srvVersion));
   async function loadServerVersion() {
     const info = await invokeOrBridge<{ version?: string; canUpgrade?: boolean }>("server_info", {}).catch(() => null);
     srvVersion = info?.version ?? null;
@@ -300,6 +303,7 @@ export function createServerSwitcherState(deps: ServerSwitcherDeps) {
     set srvVersionChecked(v) { srvVersionChecked = v; },
     get srvVersionSkew() { return srvVersionSkew; },
     get srvUpgradeAvailable() { return srvUpgradeAvailable; },
+    get srvChannelSwitch() { return srvChannelSwitch; },
     loadServerVersion,
     get srvUpgradeStage() { return srvUpgradeStage; },
     set srvUpgradeStage(v) { srvUpgradeStage = v; },

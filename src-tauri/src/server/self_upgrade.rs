@@ -103,14 +103,30 @@ pub async fn check(channel: Channel) -> Result<serde_json::Value, String> {
         "current": current,
         "latest": latest,
         "channel": if channel == Channel::Dev { "dev" } else { "stable" },
-        "newer": is_newer(&latest, current),
+        "newer": should_offer_server_upgrade(channel, &latest, current),
+        "channelSwitch": is_channel_switch(channel, &latest, current),
         "canUpgrade": can_upgrade(),
     }))
 }
 
-/// Arguments for the detached upgrader: `upgrade` or `upgrade --dev`.
-pub fn upgrade_args(channel: Channel) -> &'static [&'static str] {
+/// Offer the in-app upgrade? Newer on either channel, plus the Dev → Stable
+/// switch (the stable release while running a prerelease, even when it
+/// sorts lower: `0.1.1` vs `0.1.2-dev.<ts>`); never an older stable.
+pub fn should_offer_server_upgrade(channel: Channel, latest: &str, current: &str) -> bool {
+    crate::version::should_offer_update(channel == Channel::Stable, current, latest)
+}
+
+/// The offer is a Dev → Stable switch rather than a plain upgrade.
+pub fn is_channel_switch(channel: Channel, latest: &str, current: &str) -> bool {
+    channel == Channel::Stable && !is_newer(latest, current) && should_offer_server_upgrade(channel, latest, current)
+}
+
+/// Arguments for the detached upgrader: `upgrade`, `upgrade --dev`, or
+/// `upgrade --force` when a dev build goes back to stable (plain `upgrade`
+/// refuses a stable that sorts below the running dev build).
+pub fn upgrade_args(channel: Channel, current: &str) -> &'static [&'static str] {
     match channel {
+        Channel::Stable if crate::version::is_prerelease(current) => &["upgrade", "--force"],
         Channel::Stable => &["upgrade"],
         Channel::Dev => &["upgrade", "--dev"],
     }
@@ -138,7 +154,7 @@ pub fn start(channel: Channel) -> Result<serde_json::Value, String> {
         let err = log.try_clone().map_err(|e| e.to_string())?;
         let offset = log.metadata().map(|m| m.len()).unwrap_or(0);
         let child = std::process::Command::new(&exe)
-            .args(upgrade_args(channel))
+            .args(upgrade_args(channel, crate::version::vicuna_version()))
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(log)
@@ -261,8 +277,25 @@ mod tests {
         assert_eq!(Channel::from_arg(Some(&serde_json::json!("stable"))), Channel::Stable);
         assert_eq!(Channel::from_arg(Some(&serde_json::json!(42))), Channel::Stable);
         assert_eq!(Channel::from_arg(Some(&serde_json::json!("dev"))), Channel::Dev);
-        assert_eq!(upgrade_args(Channel::Stable), &["upgrade"]);
-        assert_eq!(upgrade_args(Channel::Dev), &["upgrade", "--dev"]);
+        assert_eq!(upgrade_args(Channel::Stable, "0.1.1"), &["upgrade"]);
+        assert_eq!(upgrade_args(Channel::Stable, "0.1.2-dev.20261128155414"), &["upgrade", "--force"]);
+        assert_eq!(upgrade_args(Channel::Dev, "0.1.1"), &["upgrade", "--dev"]);
+        assert_eq!(upgrade_args(Channel::Dev, "0.1.2-dev.20261128155414"), &["upgrade", "--dev"]);
+    }
+    #[test]
+    fn dev_server_can_switch_back_to_stable() {
+        let dev = "0.1.2-dev.20261128155414";
+        assert!(should_offer_server_upgrade(Channel::Stable, "0.1.1", dev));
+        assert!(is_channel_switch(Channel::Stable, "0.1.1", dev));
+        assert!(should_offer_server_upgrade(Channel::Stable, "0.1.2", dev));
+        assert!(!is_channel_switch(Channel::Stable, "0.1.2", dev), "newer stable is a plain upgrade");
+        assert!(!should_offer_server_upgrade(Channel::Stable, "0.1.0", "0.1.1"));
+        assert!(!should_offer_server_upgrade(Channel::Stable, "0.1.1", "0.1.1"));
+        assert!(should_offer_server_upgrade(Channel::Stable, "0.1.2", "0.1.1"));
+        assert!(!should_offer_server_upgrade(Channel::Dev, "0.1.1", dev));
+        assert!(!should_offer_server_upgrade(Channel::Dev, "0.1.2-dev.20261128151100", dev));
+        assert!(should_offer_server_upgrade(Channel::Dev, "0.1.2-dev.20261128160000", dev));
+        assert!(!is_channel_switch(Channel::Dev, "0.1.1", dev));
     }
     #[test]
     fn strip_deleted_suffix_handles_linux_unlinked_exe() {

@@ -43,6 +43,14 @@ impl UpdateChannel {
     }
 }
 
+/// Offer `remote` over `current`? Newer on either channel; on Stable also the
+/// stable release while running a dev prerelease, so switching Dev → Stable
+/// can reinstall it right away (`0.1.1` over `0.1.2-dev.<ts>`). Never an
+/// older stable over a stable.
+pub fn should_offer_update(channel: UpdateChannel, current: &str, remote: &str) -> bool {
+    crate::version::should_offer_update(channel == UpdateChannel::Stable, current, remote)
+}
+
 pub(crate) fn read_channel_in(home: &Path) -> UpdateChannel {
     UpdateChannel::parse(crate::app_shell::read_app_shell_config_in(home).update_channel.as_deref())
 }
@@ -122,6 +130,9 @@ mod desktop {
             .updater_builder()
             .endpoints(vec![url])
             .map_err(|e| e.to_string())?
+            .version_comparator(move |current, release| {
+                should_offer_update(ch, &current.to_string(), &release.version.to_string())
+            })
             .build()
             .map_err(|e| e.to_string())?;
         let found = updater.check().await.map_err(|e| e.to_string())?;
@@ -186,6 +197,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn dev_to_stable_switch_is_offered_but_never_a_stable_downgrade() {
+        use UpdateChannel::*;
+        let cases = [
+            (Stable, "0.1.2-dev.20261128155414", "0.1.1", true),
+            (Stable, "0.1.1", "0.1.1", false),
+            (Stable, "0.1.1", "0.1.0", false),
+            (Stable, "0.1.1", "0.1.2", true),
+            (Dev, "0.1.1", "0.1.2-dev.20261128155414", true),
+            (Dev, "0.1.2-dev.20261128155414", "0.1.2-dev.20261128151100", false),
+            (Dev, "0.1.2-dev.20261128151100", "0.1.2-dev.20261128155414", true),
+            (Dev, "0.1.2-dev.20261128155414", "0.1.1", false),
+        ];
+        for (ch, cur, remote, want) in cases {
+            assert_eq!(should_offer_update(ch, cur, remote), want, "{ch:?} {cur} -> {remote}");
+        }
     }
 
     #[test]
