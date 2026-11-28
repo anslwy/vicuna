@@ -89,10 +89,13 @@ usage:
   vicuna restart [serve options]            restart it detached, so it also
         completes from a session the server itself is hosting
   vicuna status                             running / how it runs / pid / version / log
-  vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
+  vicuna upgrade [--dev | --channel stable|dev] [--check] [--force] [--no-restart] [--dry-run]
         Install the latest release (checksum-verified, atomic replace), back up
         the server db to ~/vicuna/server/backups/<time>/ and restart a running
         `vicuna serve` (systemd / launchd / plain process) on the new version.
+        --dev installs the rolling dev build from main (the `latest` prerelease)
+        instead of the newest stable release; `vicuna upgrade` goes back to stable
+        at the next stable release.
   vicuna open [path]                       open a folder in the Vicuna desktop app
   vicuna [path]                            same as `vicuna open [path]`
   vicuna bridge [port]                     dev bridge for browser testing (127.0.0.1, no auth, 1421)

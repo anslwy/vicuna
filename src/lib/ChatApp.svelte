@@ -7136,6 +7136,7 @@
     void srv.refreshServers();
     // Automatic update detection on startup (desktop only), same as cojudge.
     appUpdate.initializeAppUpdatePreference();
+    void appUpdate.loadUpdateChannel();
     const updateCheckTimer = isTauriRuntime() && !isRemoteServer()
       ? setTimeout(() => void appUpdate.triggerAutomaticAppUpdateCheck(), 2500)
       : null;
@@ -9092,6 +9093,8 @@
     bind:updateError
     onOpenAppUpdate={appUpdate.openAppUpdate}
     onSetAutoCheckAppUpdates={appUpdate.setAutoCheckAppUpdates}
+    updateChannel={appUpdate.updateChannel}
+    onSetUpdateChannel={(c) => void appUpdate.setUpdateChannel(c)}
     onCheckForUpdates={checkForUpdates}
     onApplyUpdate={applyUpdate}
     onOpenExternal={openExternal}

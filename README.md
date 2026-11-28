@@ -128,7 +128,7 @@ vicuna restart [serve options]          # detached restart (safe from inside a h
 vicuna status                           # running state, pid, version, and log path
 vicuna token                            # print the server auth token
 vicuna web [serve options] [--no-open]  # open the web UI in your browser, starting the server if needed
-vicuna upgrade [--check] [--force] [--no-restart] [--dry-run]
+vicuna upgrade [--dev] [--check] [--force] [--no-restart] [--dry-run]
                                         # checksum-verified atomic upgrade + live DB backup
 vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 ```
@@ -137,7 +137,7 @@ vicuna open [path] / vicuna [path]      # open a folder in the desktop app
 
 The CLI also drives any running server directly (`vicuna session`, `vicuna schedule`, `vicuna engines`, `vicuna models`, `vicuna mcp`, `vicuna server`, `vicuna api`).
 
-`upgrade` downloads the latest release with checksum verification and atomic binary replacement, snapshots the open WAL database via `VACUUM INTO` to `~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db`, and restarts a running server automatically. Inside a distrobox/toolbox container, service commands reach the host user manager via `distrobox-host-exec`.
+`upgrade` downloads the latest release (`--dev`: the rolling dev build from `main`) with checksum verification and atomic binary replacement, snapshots the open WAL database via `VACUUM INTO` to `~/vicuna/server/backups/<YYYYMMDD-HHMMSSZ>/vicuna.db`, and restarts a running server automatically. Inside a distrobox/toolbox container, service commands reach the host user manager via `distrobox-host-exec`.
 
 ## Highlights
 

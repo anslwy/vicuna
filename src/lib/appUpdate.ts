@@ -11,6 +11,25 @@ export const APP_UPDATE_LATEST_JSON_URL = `https://github.com/${APP_UPDATE_REPO}
 export const APP_UPDATE_RELEASES_URL = `https://github.com/${APP_UPDATE_REPO}/releases/latest`;
 export const APP_UPDATE_GITHUB_API_URL = `https://api.github.com/repos/${APP_UPDATE_REPO}/releases/latest`;
 
+/** Dev channel: latest.json on the rolling `latest` prerelease (built from main). */
+export const APP_UPDATE_DEV_LATEST_JSON_URL = `https://github.com/${APP_UPDATE_REPO}/releases/download/latest/latest.json`;
+export const APP_UPDATE_DEV_RELEASES_URL = `https://github.com/${APP_UPDATE_REPO}/releases/tag/latest`;
+
+export type UpdateChannel = 'stable' | 'dev';
+
+/** Anything but "dev" is stable (mirrors update_channel.rs). */
+export function normalizeUpdateChannel(value: unknown): UpdateChannel {
+  return typeof value === 'string' && value.trim().toLowerCase() === 'dev' ? 'dev' : 'stable';
+}
+
+export function updateManifestUrl(channel: UpdateChannel): string {
+  return channel === 'dev' ? APP_UPDATE_DEV_LATEST_JSON_URL : APP_UPDATE_LATEST_JSON_URL;
+}
+
+export function updateReleasesUrl(channel: UpdateChannel): string {
+  return channel === 'dev' ? APP_UPDATE_DEV_RELEASES_URL : APP_UPDATE_RELEASES_URL;
+}
+
 export const APP_UPDATE_PREFERENCES_STORAGE_KEY = 'vicuna.app-update-preferences.v1';
 export const DEFAULT_AUTO_CHECK_APP_UPDATES = true;
 
