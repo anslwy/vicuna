@@ -17,6 +17,10 @@
   <img src="docs/assets/hero.jpg" alt="Vicuna Work mode showing a Lead session coordinating work on a remote server" width="900">
 </p>
 
+<p align="center">
+  <video src="https://github.com/anslwy/vicuna/raw/main/docs/assets/demo.mp4" width="900" controls muted playsinline></video>
+</p>
+
 <p align="center"><a href="#install"><b>Install</b></a> · <a href="#features">Features</a> · <a href="#highlights">Highlights</a> · <a href="#headless-server-vicuna-cli">Headless server</a> · <a href="#architecture">Architecture</a></p>
 
 ## Why Vicuna
