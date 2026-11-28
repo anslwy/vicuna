@@ -50,6 +50,12 @@ pub struct McpServerConfig {
     pub oauth: Option<OAuthCreds>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Set when the server comes from an installed plugin's `mcpServers`
+    /// (see `plugin_mcp.rs`): read-only in the UI, never in vicuna.json.
+    #[serde(default, rename = "pluginId", skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, rename = "pluginName", skip_serializing_if = "Option::is_none")]
+    pub plugin_name: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -1438,6 +1444,8 @@ fn entry_to_config(name: &str, v: &serde_json::Value) -> Option<McpServerConfig>
         url,
         headers,
         oauth,
+        plugin_id: None,
+        plugin_name: None,
         enabled,
     })
 }
@@ -1535,12 +1543,52 @@ pub(crate) fn defaults() -> EnabledMap {
 }
 
 pub(crate) fn defaults_in(path: Option<&std::path::Path>) -> EnabledMap {
+    defaults_with(path, &crate::plugin_mcp::consented_servers())
+}
+
+fn plugin_default(doc: &serde_json::Value, id: &str) -> bool {
+    doc.get("pluginMcpEnabled").and_then(|m| m.get(id)).and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+fn doc_has_id(doc: &serde_json::Value, id: &str) -> bool {
+    doc.get("mcp").and_then(serde_json::Value::as_object)
+        .is_some_and(|map| map.keys().any(|k| k.trim().eq_ignore_ascii_case(id.trim())))
+}
+
+/// Consented plugin servers not shadowed by a vicuna.json entry (the user's
+/// file wins on an id collision, like `browser`), with their saved default.
+fn plugin_servers_in(doc: &serde_json::Value, plugins: &[McpServerConfig]) -> Vec<McpServerConfig> {
+    plugins.iter()
+        .filter(|p| !doc_has_id(doc, &p.id) && !p.id.eq_ignore_ascii_case(BROWSER_ID))
+        .map(|p| McpServerConfig { enabled: plugin_default(doc, &p.id), ..p.clone() })
+        .collect()
+}
+
+fn defaults_with(path: Option<&std::path::Path>, plugins: &[McpServerConfig]) -> EnabledMap {
     let doc = path.map(read_doc_in).unwrap_or_default();
     let mut map: EnabledMap = servers_in_doc(&doc).into_iter().map(|s| (s.id, s.enabled)).collect();
     if !map.keys().any(|id| id.eq_ignore_ascii_case(BROWSER_ID)) {
         map.insert(BROWSER_ID.into(), browser_default(&doc));
     }
+    for p in plugin_servers_in(&doc, plugins) {
+        map.insert(p.id, p.enabled);
+    }
     map
+}
+
+/// Refuse to edit/delete a plugin-owned server (one the user's vicuna.json
+/// doesn't shadow): it is managed in Settings → Plugins.
+pub(crate) fn plugin_guard(doc: &serde_json::Value, id: &str) -> Result<(), String> {
+    if id.trim().is_empty() || doc_has_id(doc, id) {
+        return Ok(());
+    }
+    match crate::plugin_mcp::owner(id) {
+        Some(name) => Err(format!(
+            "MCP server `{}` is provided by the plugin \"{name}\" and is read-only; manage it in Settings → Plugins (you can still enable or disable it)",
+            id.trim()
+        )),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn session_servers(resource_dir: Option<&std::path::Path>) -> Result<Vec<McpServerConfig>, String> {
@@ -1552,8 +1600,17 @@ pub(crate) fn session_catalog(resource_dir: Option<&std::path::Path>) -> Result<
 }
 
 fn session_catalog_in(path: &std::path::Path, resource_dir: Option<&std::path::Path>) -> (Vec<McpServerConfig>, bool) {
+    session_catalog_with(path, resource_dir, &crate::plugin_mcp::consented_servers())
+}
+
+fn session_catalog_with(
+    path: &std::path::Path,
+    resource_dir: Option<&std::path::Path>,
+    plugins: &[McpServerConfig],
+) -> (Vec<McpServerConfig>, bool) {
     let doc = read_doc_in(path);
     let mut servers = servers_in_doc(&doc);
+    servers.extend(plugin_servers_in(&doc, plugins));
     if !servers.iter().any(|s| s.id.eq_ignore_ascii_case(BROWSER_ID)) {
         if let Ok(command) = crate::browser::browser_mcp_command(resource_dir) {
             servers.insert(0, McpServerConfig {
@@ -1565,6 +1622,8 @@ fn session_catalog_in(path: &std::path::Path, resource_dir: Option<&std::path::P
                 url: None,
                 headers: None,
                 oauth: None,
+                plugin_id: None,
+                plugin_name: None,
                 enabled: browser_default(&doc),
             });
             return (servers, true);
@@ -1580,6 +1639,10 @@ pub(crate) fn set_defaults(enabled: &EnabledMap) -> Result<(), String> {
 }
 
 fn set_defaults_in(path: &std::path::Path, enabled: &EnabledMap) -> Result<(), String> {
+    set_defaults_with(path, enabled, &crate::plugin_mcp::consented_servers())
+}
+
+fn set_defaults_with(path: &std::path::Path, enabled: &EnabledMap, plugins: &[McpServerConfig]) -> Result<(), String> {
     let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
     let mut doc = read_doc_in(path);
     if !doc.is_object() {
@@ -1592,6 +1655,14 @@ fn set_defaults_in(path: &std::path::Path, enabled: &EnabledMap) -> Result<(), S
             doc["browserMcpEnabled"] = serde_json::json!(on);
         }
     }
+    for p in plugin_servers_in(&doc, plugins) {
+        if let Some(on) = enabled.get(&p.id) {
+            if !doc.get("pluginMcpEnabled").is_some_and(serde_json::Value::is_object) {
+                doc["pluginMcpEnabled"] = serde_json::json!({});
+            }
+            doc["pluginMcpEnabled"][&p.id] = serde_json::json!(on);
+        }
+    }
     if let Some(map) = doc.get_mut("mcp").and_then(serde_json::Value::as_object_mut) {
         for (id, entry) in map {
             if !is_fixed(id) && entry_to_config(id, entry).is_some() {
@@ -1602,6 +1673,21 @@ fn set_defaults_in(path: &std::path::Path, enabled: &EnabledMap) -> Result<(), S
         }
     }
     write_doc_in(path, &doc)
+}
+
+/// Drop saved `pluginMcpEnabled` defaults (plugin uninstalled), so a
+/// reinstall starts disabled again.
+pub(crate) fn forget_plugin_defaults(ids: &[String]) -> Result<(), String> {
+    let path = vicuna_config_path()?;
+    let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
+    let mut doc = read_doc_in(&path);
+    let Some(map) = doc.get_mut("pluginMcpEnabled").and_then(serde_json::Value::as_object_mut) else { return Ok(()) };
+    let before = map.len();
+    map.retain(|k, _| !ids.iter().any(|id| id == k));
+    if map.len() == before {
+        return Ok(());
+    }
+    write_doc_in(&path, &doc)
 }
 
 /// All MCP servers in vicuna.json (empty when the file is missing).
@@ -1718,6 +1804,10 @@ fn write_file_server(
     if !doc.is_object() {
         doc = serde_json::json!({});
     }
+    plugin_guard(&doc, name)?;
+    if let Some(old) = old_id {
+        plugin_guard(&doc, old)?;
+    }
     let map = doc
         .as_object_mut()
         .expect("object")
@@ -1771,6 +1861,7 @@ pub(crate) fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<
     }
     let _write = CONFIG_WRITE.lock().map_err(|e| e.to_string())?;
     let mut doc = read_doc_in(path);
+    plugin_guard(&doc, id)?;
     if let Some(map) = doc.get_mut("mcp").and_then(|m| m.as_object_mut()) {
         map.remove(id);
         map.remove(id.trim());
@@ -1783,6 +1874,61 @@ pub(crate) fn delete_file_server_in(path: &std::path::Path, id: &str) -> Result<
 mod config_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn plugin_cfg(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.into(), name: id.into(), transport: "http".into(), command: None, env: None,
+            url: Some("https://plugin.example/mcp".into()), headers: None, oauth: None, enabled: false,
+            plugin_id: Some("demo".into()), plugin_name: Some("Demo".into()),
+        }
+    }
+
+    #[test]
+    fn plugin_servers_merge_default_disabled_and_file_wins() {
+        let path = tmp_config("plugin-merge");
+        let plugins = vec![plugin_cfg("demo-web"), plugin_cfg("demo-shadow")];
+        // vicuna.json has its own "demo-shadow": the user's entry wins
+        save_file_server_in(&path, &local("demo-shadow", &["mine"], true)).unwrap();
+        let (cat, _) = session_catalog_with(&path, None, &plugins);
+        let web = cat.iter().find(|s| s.id == "demo-web").unwrap();
+        assert!(!web.enabled && web.plugin_id.as_deref() == Some("demo"));
+        let shadow: Vec<_> = cat.iter().filter(|s| s.id == "demo-shadow").collect();
+        assert_eq!(shadow.len(), 1);
+        assert!(shadow[0].plugin_id.is_none() && shadow[0].command.as_ref().unwrap()[0] == "mine");
+        let d = defaults_with(Some(&path), &plugins);
+        assert_eq!((d["demo-web"], d["demo-shadow"]), (false, true));
+
+        // toggling persists pluginMcpEnabled, never an mcp entry
+        let mut on = d.clone();
+        on.insert("demo-web".into(), true);
+        set_defaults_with(&path, &on, &plugins).unwrap();
+        let doc = read_doc_in(&path);
+        assert_eq!(doc["pluginMcpEnabled"]["demo-web"], true);
+        assert!(doc["mcp"].get("demo-web").is_none());
+        assert!(defaults_with(Some(&path), &plugins)["demo-web"]);
+        assert!(session_catalog_with(&path, None, &plugins).0.iter().any(|s| s.id == "demo-web" && s.enabled));
+        // per-session overrides work by id
+        let sel = SessionSelection { enabled: Some(HashMap::from([("demo-web".into(), false)])), only: None };
+        assert!(!sel.is_enabled("demo-web", true));
+        // unconsented/uninstalled plugin -> the saved default is inert
+        assert!(!defaults_with(Some(&path), &[]).contains_key("demo-web"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn plugin_servers_are_read_only() {
+        let path = tmp_config("plugin-guard");
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = Some(vec![(plugin_cfg("demo-web"), false)]));
+        let err = save_file_server_in(&path, &local("demo-web", &["x"], true)).unwrap_err();
+        assert!(err.contains("plugin \"Demo\"") && err.contains("read-only"), "{err}");
+        assert!(delete_file_server_in(&path, "demo-web").unwrap_err().contains("read-only"));
+        assert!(write_file_server(&path, &local("other", &["x"], true), true, Some("demo-web")).is_err());
+        // unrelated servers still save
+        save_file_server_in(&path, &local("mine", &["x"], true)).unwrap();
+        delete_file_server_in(&path, "mine").unwrap();
+        crate::plugin_mcp::TEST_SERVERS.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn mcp_session_switches_and_saved_defaults() {
@@ -1836,6 +1982,8 @@ mod config_tests {
             url: None,
             headers: None,
             oauth: None,
+            plugin_id: None,
+            plugin_name: None,
             enabled,
         }
     }
@@ -1904,6 +2052,8 @@ mod config_tests {
                 url: Some("https://mcp.higgsfield.ai/mcp".to_string()),
                 headers: None,
                 oauth: None,
+                plugin_id: None,
+                plugin_name: None,
                 enabled: true,
             },
         )
@@ -1952,6 +2102,8 @@ mod config_tests {
                 url: Some("https://mcp.higgsfield.ai/mcp".to_string()),
                 headers: None,
                 oauth: None,
+                plugin_id: None,
+                plugin_name: None,
                 enabled: false,
             },
         )
@@ -2020,6 +2172,8 @@ mod config_tests {
                 url: None,
                 headers: None,
                 oauth: None,
+                plugin_id: None,
+                plugin_name: None,
                 enabled: true,
             },
         )
@@ -2096,6 +2250,8 @@ mod oauth_tests {
             url: Some(url),
             headers: None,
             oauth: None,
+            plugin_id: None,
+            plugin_name: None,
             enabled: true,
         }
     }
@@ -2426,6 +2582,8 @@ mod oauth_tests {
             url: None,
             headers: None,
             oauth: None,
+            plugin_id: None,
+            plugin_name: None,
             enabled: true,
         };
         let mgr = McpManager::default();

@@ -8,6 +8,7 @@
     activeThemeKey,
     onChanged,
     onHarnessesChanged,
+    onMcpChanged,
     onUseTheme,
     onOpenPanel,
     onClose
@@ -16,6 +17,7 @@
     activeThemeKey: string | null;
     onChanged: (list: InstalledPlugin[]) => void;
     onHarnessesChanged: () => void;
+    onMcpChanged?: () => void;
     onUseTheme: (pluginId: string, themeId: string) => void;
     onOpenPanel: (key: string) => void;
     onClose: () => void;
@@ -38,7 +40,7 @@
 >
   <button class="modal-x" data-testid="close-plugins-btn" aria-label="Close plugins" onclick={onClose}>×</button>
   <p class="confirm-text">Plugins</p>
-  <PluginsPanel {plugins} {activeThemeKey} {onChanged} {onHarnessesChanged} {onUseTheme} {onOpenPanel} />
+  <PluginsPanel {plugins} {activeThemeKey} {onChanged} {onHarnessesChanged} {onMcpChanged} {onUseTheme} {onOpenPanel} />
 </div>
 
 <style>
