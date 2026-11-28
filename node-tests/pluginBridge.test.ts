@@ -19,9 +19,11 @@ test("only well-formed requests for known methods are accepted", () => {
 function fakeHost() {
   const store = new Map<string, unknown>();
   const calls: string[] = [];
+  const titles: (string | null)[] = [];
   const host: PanelHost = {
     theme: () => ({ base: "dark", vars: { "--bg": "#000" } }),
     context: () => ({ sessionId: "s1", title: "T", workspace: "/ws", mode: "work" }),
+    setTitle: (t) => { titles.push(t); },
     async storage(cmd, key, value) {
       calls.push(cmd);
       if (cmd === "plugin_storage_get") return store.get(key!) ?? null;
@@ -30,14 +32,21 @@ function fakeHost() {
       return [...store.keys()];
     }
   };
-  return { host, store, calls };
+  return { host, store, calls, titles };
 }
 
 test("requests are answered with the same id, errors as messages", async () => {
-  const { host, store } = fakeHost();
+  const { host, store, titles } = fakeHost();
   const ask = (method: string, params?: object) => handlePanelRequest(parsePanelRequest({ vicuna: 1, id: 7, method, params })!, host);
   assert.deepEqual(await ask("getTheme"), { vicuna: 1, id: 7, result: { base: "dark", vars: { "--bg": "#000" } } });
   assert.equal(((await ask("getContext")).result as any).workspace, "/ws");
+  assert.deepEqual(await ask("setTitle", { title: "25:00 - Time to focus!" }), { vicuna: 1, id: 7, result: true });
+  assert.deepEqual(await ask("setTitle", { title: "  04:56\n-\tBreak  " }), { vicuna: 1, id: 7, result: true });
+  assert.deepEqual(await ask("setTitle", { title: "x".repeat(80) }), { vicuna: 1, id: 7, result: true });
+  assert.deepEqual(await ask("setTitle", { title: "   " }), { vicuna: 1, id: 7, result: true });
+  assert.deepEqual(await ask("setTitle", { title: null }), { vicuna: 1, id: 7, result: true });
+  assert.deepEqual(titles, ["25:00 - Time to focus!", "04:56 - Break", "x".repeat(64), null, null]);
+  assert.match((await ask("setTitle", { title: 42 })).error!, /title must be/);
   assert.deepEqual(await ask("storage.set", { key: "note", value: { text: "hi" } }), { vicuna: 1, id: 7, result: true });
   assert.deepEqual(store.get("note"), { text: "hi" });
   assert.deepEqual((await ask("storage.get", { key: "note" })).result, { text: "hi" });

@@ -2366,22 +2366,29 @@
     };
   }
 
-  function panelHost(pluginId: string): PanelHost {
+  function panelHost(pluginId: string, panelKey: string): PanelHost {
     return {
       theme: panelTheme,
       context: panelContext,
+      setTitle: (title) => {
+        const fallback = pluginPanels.find((p) => p.key === panelKey)?.title ?? "Panel";
+        const next = title ?? fallback;
+        if (sideTabs.some((t) => t.key === panelKey && t.title !== next)) {
+          sideTabs = sideTabs.map((t) => (t.key === panelKey ? { ...t, title: next } : t));
+        }
+      },
       // the plugin id comes from the frame that asked, never the message
       storage: (cmd, key, value) => invokeOrBridge(cmd, { id: pluginId, key, value })
     };
   }
 
   function onPanelMessage(e: MessageEvent) {
-    for (const f of panelFrames.values()) {
+    for (const [panelKey, f] of panelFrames.entries()) {
       if (!f.el.contentWindow || e.source !== f.el.contentWindow) continue;
       const req = parsePanelRequest(e.data);
       if (!req) return;
       const target = f.el.contentWindow;
-      void handlePanelRequest(req, panelHost(f.pluginId)).then((reply) => target.postMessage(reply, "*"));
+      void handlePanelRequest(req, panelHost(f.pluginId, panelKey)).then((reply) => target.postMessage(reply, "*"));
       return;
     }
   }
