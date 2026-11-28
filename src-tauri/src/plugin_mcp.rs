@@ -65,6 +65,15 @@ pub struct PluginMcpServer {
     /// outside the plugin folder (`~/vicuna/config/plugins/<id>-mcp-secrets.json`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<PluginMcpSecret>,
+    /// Bundled native binaries (stdio only, instead of `command`): platform
+    /// key (`macos-aarch64`, `linux-x86_64`, …) -> release asset file name.
+    /// Installed into `<plugin_dir>/bin/<asset>` (0755), like bridge plugins.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub binaries: BTreeMap<String, String>,
+    /// Relative path of the binary inside a local plugin folder (stdio only,
+    /// instead of `command`); installed as `bin/<file name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
 }
 
 /// One declared secret field (a key the user types in Configure).
@@ -96,18 +105,84 @@ pub struct Launch {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Installed bundled binary (file name in `bin/`) and its SHA-256: a
+    /// plugin upgrade shipping different bytes needs fresh consent. Absent
+    /// for `command` servers, so their old consent files still match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
 }
 
+/// Platform keys a bundled binary may be published for.
+pub const PLATFORMS: [&str; 5] = ["macos-aarch64", "macos-x86_64", "linux-x86_64", "linux-aarch64", "windows-x86_64"];
+
 impl PluginMcpServer {
-    pub fn launch(&self) -> Launch {
+    pub fn bundled(&self) -> bool {
+        !self.binaries.is_empty() || self.entrypoint.is_some()
+    }
+
+    /// The installed file name of this platform's bundled binary (`bin/<name>`).
+    pub fn bundled_asset_names(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(a) = self.binaries.get(&crate::plugins::current_platform()) {
+            v.push(a.clone());
+        }
+        if let Some(n) = self.entrypoint.as_deref().and_then(|e| Path::new(e).file_name()).and_then(|f| f.to_str()) {
+            v.push(n.to_string());
+        }
+        v
+    }
+
+    /// What the user approves, with the bundled binary's digest read from
+    /// the installed plugin folder.
+    pub fn launch_in(&self, plugin_dir: &Path) -> Launch {
+        let (binary_asset, binary_sha256) = match resolve_bundled_binary(plugin_dir, self) {
+            Some(p) => (
+                p.file_name().map(|f| f.to_string_lossy().into_owned()),
+                std::fs::read(&p).ok().map(|b| sha256_hex(&b)),
+            ),
+            None if self.bundled() => (self.bundled_asset_names().into_iter().next(), None),
+            None => (None, None),
+        };
         Launch {
             transport: self.transport.clone(),
             url: self.url.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
             env: self.env.clone(),
+            binary_asset,
+            binary_sha256,
         }
     }
+}
+
+pub fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The installed bundled binary of a stdio server: a regular file directly
+/// in `<plugin_dir>/bin/` (no symlinks, nothing outside the plugin folder).
+pub fn resolve_bundled_binary(plugin_dir: &Path, server: &PluginMcpServer) -> Option<std::path::PathBuf> {
+    if !server.bundled() {
+        return None;
+    }
+    let root = plugin_dir.canonicalize().ok()?;
+    for name in server.bundled_asset_names() {
+        if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+            continue;
+        }
+        let p = plugin_dir.join("bin").join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        if p.canonicalize().ok().is_some_and(|c| c.starts_with(&root)) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn valid_id(s: &str) -> bool {
@@ -186,8 +261,8 @@ pub fn validate(plugin_id: &str, list: &[PluginMcpServer]) -> Result<(), String>
         }
         match s.transport.as_str() {
             "http" => {
-                if s.command.is_some() || !s.args.is_empty() || !s.env.is_empty() {
-                    return Err(e("http servers take only url (no command, args or env)".into()));
+                if s.command.is_some() || !s.args.is_empty() || !s.env.is_empty() || s.bundled() {
+                    return Err(e("http servers take only url (no command, binaries, entrypoint, args or env)".into()));
                 }
                 valid_url(s.url.as_deref().ok_or_else(|| e("http servers need a url".into()))?).map_err(e)?;
             }
@@ -195,8 +270,26 @@ pub fn validate(plugin_id: &str, list: &[PluginMcpServer]) -> Result<(), String>
                 if s.url.is_some() {
                     return Err(e("stdio servers take a command, not a url".into()));
                 }
-                let cmd = s.command.as_deref().ok_or_else(|| e("stdio servers need a command".into()))?;
-                crate::plugin_harness::valid_command(cmd).map_err(e)?;
+                match (s.command.as_deref(), s.bundled()) {
+                    (Some(_), true) => return Err(e("stdio servers take either command or binaries/entrypoint, not both".into())),
+                    (None, false) => return Err(e("stdio servers need a command or bundled binaries/entrypoint".into())),
+                    (Some(cmd), false) => crate::plugin_harness::valid_command(cmd).map_err(e)?,
+                    (None, true) => {
+                        for (plat, asset) in &s.binaries {
+                            if !PLATFORMS.contains(&plat.as_str()) {
+                                return Err(e(format!("binaries: unknown platform {plat:?} (one of {})", PLATFORMS.join(", "))));
+                            }
+                            if !crate::plugins::valid_asset_name(asset) {
+                                return Err(e(format!("binaries: invalid asset name {asset:?}")));
+                            }
+                        }
+                        if let Some(ep) = &s.entrypoint {
+                            if !crate::plugins::valid_rel_path(ep) || Path::new(ep).file_name().is_none() {
+                                return Err(e(format!("invalid entrypoint {ep:?}")));
+                            }
+                        }
+                    }
+                }
                 if s.args.len() > MAX_ARGS {
                     return Err(e(format!("at most {MAX_ARGS} arguments")));
                 }
@@ -415,7 +508,7 @@ pub fn secrets_for(cfg: &McpServerConfig) -> HashMap<String, String> {
     let consent = read_consent(&dir);
     let stored = read_secrets(pid);
     m.mcp_servers.iter()
-        .find(|s| server_id(pid, &s.id).eq_ignore_ascii_case(&cfg.id) && consented(&consent, s))
+        .find(|s| server_id(pid, &s.id).eq_ignore_ascii_case(&cfg.id) && consented(&dir, &consent, s))
         .map(|s| declared_values(s, &stored))
         .unwrap_or_default()
 }
@@ -453,12 +546,16 @@ fn write_consent(plugin_dir: &Path, c: &Consent) -> Result<(), String> {
 
 pub const CONSENT_FILE: &str = CONSENT;
 
-pub fn consented(consent: &Consent, s: &PluginMcpServer) -> bool {
-    consent.get(&s.id).is_some_and(|g| g.launch == s.launch())
+pub fn consented(plugin_dir: &Path, consent: &Consent, s: &PluginMcpServer) -> bool {
+    consent.get(&s.id).is_some_and(|g| {
+        let l = s.launch_in(plugin_dir);
+        // a bundled server whose binary is missing never runs
+        g.launch == l && (!s.bundled() || l.binary_sha256.is_some())
+    })
 }
 
-pub fn pending<'a>(consent: &Consent, list: &'a [PluginMcpServer]) -> Vec<&'a PluginMcpServer> {
-    list.iter().filter(|s| !consented(consent, s)).collect()
+pub fn pending<'a>(plugin_dir: &Path, consent: &Consent, list: &'a [PluginMcpServer]) -> Vec<&'a PluginMcpServer> {
+    list.iter().filter(|s| !consented(plugin_dir, consent, s)).collect()
 }
 
 /// Grant consent. The window echoes the exact launch it showed; anything
@@ -477,8 +574,13 @@ pub fn grant(plugin_dir: &Path, list: &[PluginMcpServer], approved: &[Value], no
             env: a.get("env").and_then(Value::as_object)
                 .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
                 .unwrap_or_default(),
+            binary_asset: a.get("binaryAsset").and_then(Value::as_str).map(str::to_string),
+            binary_sha256: a.get("binarySha256").and_then(Value::as_str).map(str::to_string),
         };
-        if shown != s.launch() {
+        if s.bundled() && resolve_bundled_binary(plugin_dir, s).is_none() {
+            return Err(format!("MCP server {id}: its bundled binary is missing; reinstall the plugin"));
+        }
+        if shown != s.launch_in(plugin_dir) {
             return Err(format!("MCP server {id}: its launch changed since it was shown; review it again"));
         }
         consent.insert(id.to_string(), Grant { launch: shown, granted_at: now });
@@ -500,27 +602,35 @@ pub fn revoke(plugin_dir: &Path, id: Option<&str>) -> Result<Consent, String> {
 }
 
 /// One server as the Plugins panel / consent dialog renders it.
-pub fn describe(s: &PluginMcpServer, consent: &Consent, plugin_id: &str) -> Value {
+pub fn describe(s: &PluginMcpServer, consent: &Consent, plugin_id: &str, plugin_dir: &Path) -> Value {
+    let launch = s.launch_in(plugin_dir);
     json!({
         "id": s.id, "serverId": server_id(plugin_id, &s.id),
         "label": if s.label.trim().is_empty() { s.id.clone() } else { s.label.clone() },
         "description": s.description, "type": s.transport, "url": s.url,
         "command": s.command, "args": s.args, "env": s.env, "installHint": s.install_hint,
-        "enabled": consented(consent, s),
+        "bundled": s.bundled(), "binaryAsset": launch.binary_asset, "binarySha256": launch.binary_sha256,
+        "enabled": consented(plugin_dir, consent, s),
         "secretStatus": secret_status(s, &read_secrets(plugin_id)),
-        "installed": s.command.as_deref().is_none_or(|c| crate::plugin_harness::find_command(c).is_some()),
+        "installed": if s.bundled() { launch.binary_sha256.is_some() }
+            else { s.command.as_deref().is_none_or(|c| crate::plugin_harness::find_command(c).is_some()) },
     })
 }
 
 // ---------- the MCP dialog's view ----------
 
-fn to_config(plugin_id: &str, plugin_name: &str, s: &PluginMcpServer) -> McpServerConfig {
+fn to_config(plugin_id: &str, plugin_name: &str, s: &PluginMcpServer, plugin_dir: &Path) -> McpServerConfig {
     let id = server_id(plugin_id, &s.id);
-    let command = s.command.as_deref().map(|c| {
+    let bundled = resolve_bundled_binary(plugin_dir, s).map(|p| {
+        // absolute, so McpManager and every harness spawn it without PATH
+        let p = p.canonicalize().unwrap_or(p);
+        std::iter::once(p.to_string_lossy().into_owned()).chain(s.args.iter().cloned()).collect::<Vec<_>>()
+    });
+    let command = bundled.or_else(|| s.command.as_deref().map(|c| {
         // engines like fx need an absolute command; resolve like a terminal
         let bin = crate::plugin_harness::find_command(c).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| c.to_string());
         std::iter::once(bin).chain(s.args.iter().cloned()).collect::<Vec<_>>()
-    });
+    }));
     McpServerConfig {
         id: id.clone(),
         name: id,
@@ -556,7 +666,7 @@ pub fn all_servers() -> Vec<(McpServerConfig, bool)> {
         }
         let consent = read_consent(&dir);
         for s in &m.mcp_servers {
-            out.push((to_config(&m.id, &m.name, s), consented(&consent, s)));
+            out.push((to_config(&m.id, &m.name, s, &dir), consented(&dir, &consent, s)));
         }
     }
     out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
@@ -637,30 +747,103 @@ mod tests {
         let dir = Dir(tmp);
         let s = srv(json!({"id": "files", "type": "stdio", "command": "files-mcp", "args": ["--stdio"]}));
         let list = vec![s.clone()];
-        assert!(!consented(&read_consent(dir.path()), &s));
-        assert_eq!(pending(&read_consent(dir.path()), &list).len(), 1);
+        assert!(!consented(dir.path(), &read_consent(dir.path()), &s));
+        assert_eq!(pending(dir.path(), &read_consent(dir.path()), &list).len(), 1);
         // a mismatched echo is refused
         assert!(grant(dir.path(), &list, &[json!({"id": "files", "type": "stdio", "command": "files-mcp", "args": ["--other"]})], 1).is_err());
         assert!(grant(dir.path(), &list, &[json!({"id": "nope", "type": "stdio"})], 1).is_err());
         grant(dir.path(), &list, &[json!({"id": "files", "type": "stdio", "command": "files-mcp", "args": ["--stdio"], "env": {}})], 1).unwrap();
-        assert!(consented(&read_consent(dir.path()), &s));
+        assert!(consented(dir.path(), &read_consent(dir.path()), &s));
         // unchanged after an upgrade -> still consented; changed args/url -> not
         let mut changed = s.clone();
         changed.args.push("--write".into());
-        assert!(!consented(&read_consent(dir.path()), &changed));
+        assert!(!consented(dir.path(), &read_consent(dir.path()), &changed));
         let mut env = s.clone();
         env.env.insert("FILES_MODE".into(), "rw".into());
-        assert!(!consented(&read_consent(dir.path()), &env));
+        assert!(!consented(dir.path(), &read_consent(dir.path()), &env));
         revoke(dir.path(), Some("files")).unwrap();
-        assert!(!consented(&read_consent(dir.path()), &s));
+        assert!(!consented(dir.path(), &read_consent(dir.path()), &s));
 
         let h = srv(json!({"id": "web", "type": "http", "url": "https://a.dev/mcp"}));
         grant(dir.path(), std::slice::from_ref(&h), &[json!({"id": "web", "type": "http", "url": "https://a.dev/mcp"})], 2).unwrap();
         let mut moved = h.clone();
         moved.url = Some("https://b.dev/mcp".into());
-        assert!(consented(&read_consent(dir.path()), &h) && !consented(&read_consent(dir.path()), &moved));
+        assert!(consented(dir.path(), &read_consent(dir.path()), &h) && !consented(dir.path(), &read_consent(dir.path()), &moved));
         revoke(dir.path(), None).unwrap();
         assert!(read_consent(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn bundled_binary_validation() {
+        let plat = crate::plugins::current_platform();
+        let ok = [
+            json!({"id": "img", "type": "stdio", "binaries": {"macos-aarch64": "img-mcp-macos-aarch64", "linux-x86_64": "img-mcp-linux-x86_64"}, "args": ["--stdio"]}),
+            json!({"id": "img", "type": "stdio", "entrypoint": "target/release/img-mcp"}),
+        ];
+        for o in ok {
+            validate("demo", &[srv(o.clone())]).unwrap_or_else(|e| panic!("{o}: {e}"));
+        }
+        let bad = [
+            json!({"id": "a", "type": "stdio", "command": "x", "binaries": {"linux-x86_64": "x"}}),
+            json!({"id": "a", "type": "stdio", "command": "x", "entrypoint": "bin/x"}),
+            json!({"id": "a", "type": "stdio"}),
+            json!({"id": "a", "type": "http", "url": "https://x.dev", "binaries": {"linux-x86_64": "x"}}),
+            json!({"id": "a", "type": "http", "url": "https://x.dev", "entrypoint": "bin/x"}),
+            json!({"id": "a", "type": "stdio", "binaries": {"linux-x86_64": "../x"}}),
+            json!({"id": "a", "type": "stdio", "binaries": {"linux-x86_64": "bin/x"}}),
+            json!({"id": "a", "type": "stdio", "binaries": {"linux-x86_64": "a\\b"}}),
+            json!({"id": "a", "type": "stdio", "binaries": {"plan9-mips": "x"}}),
+            json!({"id": "a", "type": "stdio", "entrypoint": "../x"}),
+            json!({"id": "a", "type": "stdio", "entrypoint": "/usr/bin/x"}),
+        ];
+        for b in bad {
+            assert!(validate("demo", &[srv(b.clone())]).is_err(), "{b}");
+        }
+        assert!(srv(json!({"id": "a", "type": "stdio", "binaries": {plat.clone(): "x"}})).bundled());
+    }
+
+    #[test]
+    fn bundled_binary_consent_binds_sha256() {
+        let tmp = std::env::temp_dir().join(format!("vicuna-mcp-bin-{}-{}", std::process::id(), crate::plugins::now_ms()));
+        std::fs::create_dir_all(tmp.join("bin")).unwrap();
+        let plat = crate::plugins::current_platform();
+        let s = srv(json!({"id": "img", "type": "stdio", "binaries": {plat: "img-mcp"}, "args": ["--stdio"]}));
+        let list = vec![s.clone()];
+        // nothing installed: no binary to approve, never consented
+        assert!(resolve_bundled_binary(&tmp, &s).is_none());
+        assert!(grant(&tmp, &list, &[json!({"id": "img", "type": "stdio", "args": ["--stdio"], "binaryAsset": "img-mcp"})], 1).unwrap_err().contains("missing"));
+        std::fs::write(tmp.join("bin").join("img-mcp"), b"v1").unwrap();
+        let l = s.launch_in(&tmp);
+        assert_eq!((l.binary_asset.as_deref(), l.binary_sha256.clone()), (Some("img-mcp"), Some(sha256_hex(b"v1"))));
+        let d = describe(&s, &Consent::new(), "demo", &tmp);
+        assert_eq!((d["bundled"].as_bool(), d["binaryAsset"].as_str(), d["installed"].as_bool()), (Some(true), Some("img-mcp"), Some(true)));
+        // a stale digest is refused, the shown one granted
+        assert!(grant(&tmp, &list, &[json!({"id": "img", "type": "stdio", "args": ["--stdio"], "binaryAsset": "img-mcp", "binarySha256": sha256_hex(b"v0")})], 1).is_err());
+        grant(&tmp, &list, &[json!({"id": "img", "type": "stdio", "args": ["--stdio"], "binaryAsset": "img-mcp", "binarySha256": sha256_hex(b"v1")})], 1).unwrap();
+        assert!(consented(&tmp, &read_consent(&tmp), &s));
+        // command points at the absolute installed binary
+        let cfg = to_config("demo", "Demo", &s, &tmp);
+        let cmd = cfg.command.unwrap();
+        assert!(Path::new(&cmd[0]).is_absolute() && cmd[0].ends_with("img-mcp") && cmd[1] == "--stdio", "{cmd:?}");
+        // new bytes -> consent dropped
+        std::fs::write(tmp.join("bin").join("img-mcp"), b"v2").unwrap();
+        assert!(!consented(&tmp, &read_consent(&tmp), &s));
+        std::fs::write(tmp.join("bin").join("img-mcp"), b"v1").unwrap();
+        assert!(consented(&tmp, &read_consent(&tmp), &s));
+        // a symlink is never resolved
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(tmp.join("bin").join("img-mcp")).unwrap();
+            std::fs::write(tmp.join("real"), b"v1").unwrap();
+            std::os::unix::fs::symlink(tmp.join("real"), tmp.join("bin").join("img-mcp")).unwrap();
+            assert!(resolve_bundled_binary(&tmp, &s).is_none());
+            assert!(!consented(&tmp, &read_consent(&tmp), &s));
+        }
+        // command servers keep the old consent shape (no binary fields)
+        let c = srv(json!({"id": "files", "type": "stdio", "command": "files-mcp"}));
+        let v = serde_json::to_value(c.launch_in(&tmp)).unwrap();
+        assert!(v.get("binaryAsset").is_none() && v.get("binarySha256").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn gem(secrets: Value) -> PluginMcpServer {
@@ -727,7 +910,7 @@ mod tests {
         assert_eq!((st[0]["configured"].as_bool(), st[1]["configured"].as_bool()), (Some(true), Some(false)));
         assert!(st[1]["tail"].is_null());
         // injection merges only declared, stored keys into a stdio env
-        let mut cfg = to_config("demo", "Demo", &s);
+        let mut cfg = to_config("demo", "Demo", &s, Path::new("/nonexistent"));
         apply_secrets(&mut cfg, declared_values(&s, &read_secrets_in(&dir, "demo")));
         let env = cfg.env.clone().unwrap();
         assert_eq!((env["GEMINI_API_KEY"].as_str(), env["GEM_MODE"].as_str()), ("AIzaSy-abcdef-WXYZ", "ro"));
@@ -743,11 +926,11 @@ mod tests {
 
     #[test]
     fn config_is_plugin_tagged_and_disabled() {
-        let c = to_config("demo", "Demo", &srv(json!({"id": "web", "type": "http", "url": "https://a.dev/mcp"})));
+        let c = to_config("demo", "Demo", &srv(json!({"id": "web", "type": "http", "url": "https://a.dev/mcp"})), Path::new("/nonexistent"));
         assert_eq!((c.id.as_str(), c.enabled, c.plugin_id.as_deref(), c.plugin_name.as_deref()), ("demo-web", false, Some("demo"), Some("Demo")));
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!((v["pluginId"].as_str(), v["pluginName"].as_str()), (Some("demo"), Some("Demo")));
-        let s = to_config("demo", "Demo", &srv(json!({"id": "f", "type": "stdio", "command": "definitely-not-installed-xyz", "args": ["a"]})));
+        let s = to_config("demo", "Demo", &srv(json!({"id": "f", "type": "stdio", "command": "definitely-not-installed-xyz", "args": ["a"]})), Path::new("/nonexistent"));
         assert_eq!(s.command.unwrap(), vec!["definitely-not-installed-xyz".to_string(), "a".into()]);
     }
 }

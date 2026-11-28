@@ -245,7 +245,7 @@ pub fn valid_icon_path(p: &str) -> bool {
         && p.bytes().all(|b| b.is_ascii_alphanumeric() || b" .,-".contains(&b))
 }
 
-fn valid_rel_path(p: &str) -> bool {
+pub(crate) fn valid_rel_path(p: &str) -> bool {
     let p = p.trim();
     !p.is_empty()
         && !p.starts_with('/')
@@ -255,7 +255,7 @@ fn valid_rel_path(p: &str) -> bool {
         && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
 }
 
-fn valid_asset_name(p: &str) -> bool {
+pub(crate) fn valid_asset_name(p: &str) -> bool {
     let p = p.trim();
     !p.is_empty()
         && !p.contains('/')
@@ -641,10 +641,67 @@ async fn fetch_bridge_binary(m: &Manifest, src: &FileSrc) -> Result<Option<(Stri
     }
 }
 
+/// Fetch this platform's bundled binary for every stdio MCP server that
+/// declares `binaries`/`entrypoint`. Two servers may share an asset name only
+/// when the bytes are identical.
+async fn fetch_mcp_binaries(m: &Manifest, src: &FileSrc) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let plat = current_platform();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for s in m.mcp_servers.iter().filter(|s| s.transport == "stdio" && s.bundled()) {
+        let (name, bytes) = match src {
+            FileSrc::Local(root) => {
+                let p = s.binaries.get(&plat).map(|n| root.join(n)).filter(|p| p.is_file())
+                    .or_else(|| s.entrypoint.as_deref().map(|ep| root.join(ep)).filter(|p| p.is_file()))
+                    .ok_or_else(|| {
+                        let tried = s.binaries.get(&plat).map(String::as_str).or(s.entrypoint.as_deref()).unwrap_or("(none)");
+                        format!("MCP server {}: no binary for platform {plat} in {} (expected {tried}; build it first)", s.id, root.display())
+                    })?;
+                let bytes = std::fs::read(&p).map_err(|e| format!("cannot read MCP binary {}: {e}", p.display()))?;
+                if bytes.len() > MAX_BINARY {
+                    return Err(format!("MCP server {}: binary exceeds 64 MB limit", s.id));
+                }
+                (p.file_name().and_then(|f| f.to_str()).unwrap_or(&s.id).to_string(), bytes)
+            }
+            FileSrc::Release { assets, token } => {
+                let asset = s.binaries.get(&plat)
+                    .ok_or_else(|| format!("MCP server {}: no binary for platform {plat}", s.id))?;
+                let url = assets.iter().find(|(n, _)| n == asset).map(|(_, u)| u.clone())
+                    .ok_or_else(|| format!("MCP server {}: release asset {asset} not found", s.id))?;
+                let bytes = get_capped(&client()?, &url, "application/octet-stream", token.as_deref(), MAX_BINARY)
+                    .await?
+                    .ok_or_else(|| format!("MCP server {}: release asset {asset} returned 404", s.id))?;
+                (asset.clone(), bytes)
+            }
+            FileSrc::Branch { .. } | FileSrc::BaseUrl(_) => {
+                return Err(format!("MCP server {}: bundled binaries need a GitHub release (or a local folder install)", s.id));
+            }
+        };
+        match out.iter().find(|(n, _)| *n == name) {
+            Some((_, b)) if *b != bytes => return Err(format!("MCP servers ship two different binaries named {name}")),
+            Some(_) => {}
+            None => out.push((name, bytes)),
+        }
+    }
+    Ok(out)
+}
+
+/// Every executable a plugin installs into `bin/` (bridge + MCP servers).
+async fn fetch_binaries(m: &Manifest, src: &FileSrc) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = fetch_mcp_binaries(m, src).await?;
+    if let Some((name, bytes)) = fetch_bridge_binary(m, src).await? {
+        match out.iter().find(|(n, _)| *n == name) {
+            Some((_, b)) if *b != bytes => return Err(format!("the bridge and an MCP server ship two different binaries named {name}")),
+            Some(_) => {}
+            None => out.push((name, bytes)),
+        }
+    }
+    Ok(out)
+}
+
 /// Install a plugin as a whole: build it in a staging folder, then swap it
 /// in, so an upgrade never leaves old and new files mixed. The plugin's own
 /// storage (`data.json`) carries over.
-fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)], binary: Option<&(String, Vec<u8>)>) -> Result<(), String> {
+fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)], binaries: &[(String, Vec<u8>)]) -> Result<(), String> {
     let root = plugins_dir()?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let dir = root.join(&m.id);
@@ -664,7 +721,7 @@ fn write_plugin(m: &Manifest, source: &str, files: &[(String, Vec<u8>)], binary:
             std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(target, bytes).map_err(|e| e.to_string())?;
         }
-        if let Some((fname, bytes)) = binary {
+        for (fname, bytes) in binaries {
             let bin_dir = stage.join("bin");
             std::fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
             let target = bin_dir.join(fname);
@@ -810,9 +867,9 @@ fn entry_in_dir(m: &Manifest, i: &InstallInfo, dir: Option<&Path>) -> Value {
     if !m.mcp_servers.is_empty() {
         let dir = dir.map(Path::to_path_buf).unwrap_or_default();
         let consent = crate::plugin_mcp::read_consent(&dir);
-        let d = |s: &crate::plugin_mcp::PluginMcpServer| crate::plugin_mcp::describe(s, &consent, &m.id);
+        let d = |s: &crate::plugin_mcp::PluginMcpServer| crate::plugin_mcp::describe(s, &consent, &m.id, &dir);
         e["mcpServers"] = json!(m.mcp_servers.iter().map(d).collect::<Vec<_>>());
-        e["pendingMcpConsent"] = json!(crate::plugin_mcp::pending(&consent, &m.mcp_servers).into_iter().map(d).collect::<Vec<_>>());
+        e["pendingMcpConsent"] = json!(crate::plugin_mcp::pending(&dir, &consent, &m.mcp_servers).into_iter().map(d).collect::<Vec<_>>());
     }
     if !m.panels.is_empty() {
         // server-relative; the window prefixes its backend's base URL
@@ -886,8 +943,8 @@ pub async fn install(source: &str) -> Result<Value, String> {
         }
     }
     let files = fetch_files(&m, &src).await?;
-    let binary = fetch_bridge_binary(&m, &src).await?;
-    write_plugin(&m, source, &files, binary.as_ref())?;
+    let binaries = fetch_binaries(&m, &src).await?;
+    write_plugin(&m, source, &files, &binaries)?;
     let (m, i) = read_installed(&m.id).ok_or("install failed")?;
     Ok(entry(&m, &i))
 }
@@ -899,12 +956,14 @@ pub async fn upgrade(id: &str) -> Result<Value, String> {
         return Err(format!("the source now publishes plugin {:?}, not {:?}", m.id, old.id));
     }
     let files = fetch_files(&m, &src).await?;
-    let binary = fetch_bridge_binary(&m, &src).await?;
-    let dir = plugins_dir()?.join(id).join("files");
+    let binaries = fetch_binaries(&m, &src).await?;
+    let pdir = plugins_dir()?.join(id);
+    let dir = pdir.join("files");
     let files_changed = files.iter().any(|(n, b)| std::fs::read(dir.join(n)).ok().as_deref() != Some(b.as_slice()));
-    let changed = m != old || files_changed || binary.is_some();
+    let bins_changed = binaries.iter().any(|(n, b)| std::fs::read(pdir.join("bin").join(n)).ok().as_deref() != Some(b.as_slice()));
+    let changed = m != old || files_changed || bins_changed;
     if changed {
-        write_plugin(&m, &info.source, &files, binary.as_ref())?;
+        write_plugin(&m, &info.source, &files, &binaries)?;
     }
     let (m, i) = read_installed(id).ok_or("upgrade failed")?;
     let mut e = entry(&m, &i);
@@ -1413,6 +1472,16 @@ mod tests {
                         {"id": "files", "type": "stdio", "command": "files-mcp", "args": args,
                          "secrets": [{"key": "FILES_API_KEY", "label": "API key", "helpUrl": "https://files.example/keys"}]}]});
                     ("200 OK", m.to_string())
+                } else if req.starts_with("GET /repos/me/binmcp/releases/latest") {
+                    let a = |n: &str| json!({"name": n, "url": format!("http://127.0.0.1:{port}/assets/{n}")});
+                    ("200 OK", json!({"assets": [a("vicuna-plugin.json"), a("img-mcp-bin")]}).to_string())
+                } else if req.starts_with("GET /assets/vicuna-plugin.json") {
+                    let m = json!({"id": "binmcp", "name": "Bin", "version": v, "mcpServers": [
+                        {"id": "img", "type": "stdio", "binaries": {crate::plugins::current_platform(): "img-mcp-bin", "windows-x86_64": "img-mcp.exe"}, "args": ["--stdio"]}]});
+                    ("200 OK", m.to_string())
+                } else if req.starts_with("GET /assets/img-mcp-bin") {
+                    // bytes change only in 3.0.0
+                    ("200 OK", if v == "3.0.0" { "BIN-v3".to_string() } else { "BIN-v1".to_string() })
                 } else if req.starts_with("GET /repos/me/evilmcp/contents/vicuna-plugin.json") {
                     let m = json!({"id": "evilmcp", "name": "E", "version": "1", "mcpServers": [
                         {"id": "x", "type": "stdio", "command": "x", "env": {"LD_PRELOAD": "/x.so"}}]});
@@ -1583,6 +1652,43 @@ mod tests {
         action("plugin_uninstall", &json!({"id": "tools"})).await.unwrap();
         assert!(!secrets_file.exists(), "uninstall forgets the plugin's secrets");
         assert!(crate::plugin_mcp::owner("tools-web").is_none());
+
+        // ---- bundled MCP binaries: downloaded 0755, consent bound to sha256 ----
+        *version.lock().unwrap() = "1.0.0".into();
+        let e = action("plugin_install", &json!({"source": "me/binmcp"})).await.unwrap();
+        let bin = dir.join("binmcp").join("bin").join("img-mcp-bin");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"BIN-v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&bin).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        let p = &e["pendingMcpConsent"][0];
+        let sha1 = crate::plugin_mcp::sha256_hex(b"BIN-v1");
+        assert_eq!((p["bundled"].as_bool(), p["binaryAsset"].as_str(), p["binarySha256"].as_str(), p["command"].clone()),
+            (Some(true), Some("img-mcp-bin"), Some(sha1.as_str()), Value::Null));
+        let img = |sha: &str| json!({"id": "img", "type": "stdio", "args": ["--stdio"], "binaryAsset": "img-mcp-bin", "binarySha256": sha});
+        action("plugin_mcp_consent", &json!({"id": "binmcp", "servers": [img(&sha1)]})).await.unwrap();
+        let cfgs = crate::plugin_mcp::consented_servers();
+        let cmd = cfgs[0].command.clone().unwrap();
+        assert_eq!(cmd[0], bin.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(cmd[1], "--stdio");
+        // upgrade with the same binary bytes keeps consent
+        *version.lock().unwrap() = "2.0.0".into();
+        let e = action("plugin_upgrade", &json!({"id": "binmcp"})).await.unwrap();
+        assert_eq!((e["changed"].as_bool(), e["pendingMcpConsent"].as_array().unwrap().len()), (Some(true), 0));
+        assert_eq!(crate::plugin_mcp::consented_servers().len(), 1);
+        // new binary bytes drop consent
+        *version.lock().unwrap() = "3.0.0".into();
+        let e = action("plugin_upgrade", &json!({"id": "binmcp"})).await.unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), b"BIN-v3");
+        let sha3 = crate::plugin_mcp::sha256_hex(b"BIN-v3");
+        assert_eq!(e["pendingMcpConsent"][0]["binarySha256"].as_str(), Some(sha3.as_str()));
+        assert!(crate::plugin_mcp::consented_servers().is_empty());
+        assert!(action("plugin_mcp_consent", &json!({"id": "binmcp", "servers": [img(&sha1)]})).await.is_err());
+        action("plugin_mcp_consent", &json!({"id": "binmcp", "servers": [img(&sha3)]})).await.unwrap();
+        assert_eq!(crate::plugin_mcp::consented_servers().len(), 1);
+        action("plugin_uninstall", &json!({"id": "binmcp"})).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
