@@ -18,10 +18,10 @@ test("live turns append show_image pictures to the reply", () => {
   assert.match(body, /chats = \[\.\.\.chats\]/);
 });
 
-test("assistant bubbles render m.images with the lightbox", () => {
-  const i = app.indexOf('data-testid="assistant-images"');
-  assert.ok(i > 0, "assistant image strip missing");
-  const answer = app.indexOf('<div class="answer">', i);
-  assert.ok(answer > i && answer - i < 800, "strip sits right before the answer");
-  assert.match(app.slice(i, answer), /openLightbox\(img\)/);
+test("assistant bubbles render m.images below the answer with the lightbox", () => {
+  const answer = app.indexOf('<div class="answer">');
+  assert.ok(answer > 0, "answer div missing");
+  const i = app.indexOf('data-testid="assistant-images"', answer);
+  assert.ok(i > answer && i - answer < 800, "strip sits right after the answer");
+  assert.match(app.slice(i, i + 500), /openLightbox\(img\)/);
 });
